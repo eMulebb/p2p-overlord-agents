@@ -53,7 +53,9 @@ use overlord_kad_proto::{
 use overlord_kad_routing::Contact;
 
 use crate::config::EmuleAgentConfig;
-use crate::ed2k_tcp::{FirewallCheckUdpRequest, request_udp_firewall_check, run_ed2k_listener};
+use crate::ed2k_tcp::{
+    Ed2kHelloIdentity, FirewallCheckUdpRequest, request_udp_firewall_check, run_ed2k_listener,
+};
 use crate::kad_firewall::{FirewallUdpPacketOutcome, KadFirewallState};
 use crate::kad_store::{KadLocalStore, KadLocalStoreConfig};
 use crate::logging::current_log_file_status;
@@ -3052,6 +3054,10 @@ impl OverlordAgentEmule {
         let udp_firewall_check_timeout =
             Duration::from_secs(config.p2p.kad.udp_firewall_check_timeout_secs.max(1));
         let udp_firewall_check_contact_count = config.p2p.kad.udp_firewall_check_contact_count;
+        let ed2k_hello_identity = Ed2kHelloIdentity {
+            user_hash: source_publish_client_hash(self.indexer_id).0,
+            tcp_port: config.p2p.ed2k.listen_port,
+        };
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             if !udp_firewall_check_enabled {
                 return;
@@ -3117,9 +3123,13 @@ impl OverlordAgentEmule {
                     let helper_addr = SocketAddr::new(IpAddr::V4(contact.ip), contact.tcp_port);
                     let helper_ip = IpAddr::V4(contact.ip);
                     request_tasks.push(tokio::spawn(async move {
-                        let result =
-                            request_udp_firewall_check(helper_addr, request, udp_firewall_check_timeout)
-                                .await;
+                        let result = request_udp_firewall_check(
+                            helper_addr,
+                            ed2k_hello_identity,
+                            request,
+                            udp_firewall_check_timeout,
+                        )
+                        .await;
                         (helper_ip, helper_addr, result)
                     }));
                 }

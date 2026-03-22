@@ -26,6 +26,8 @@ use overlord_kad_dht::DhtNode;
 use overlord_kad_proto::{FirewallUdp, KadPacket};
 
 const OP_EMULEPROT: u8 = 0xC5;
+const OP_EDONKEYPROT: u8 = 0xE3;
+const OP_HELLO: u8 = 0x01;
 const OP_FWCHECKUDPREQ: u8 = 0xA7;
 const TCP_PACKET_HEADER_LEN: usize = 6;
 
@@ -72,9 +74,19 @@ impl FirewallCheckUdpRequest {
     }
 }
 
+/// Minimal identity announced during the helper TCP hello handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ed2kHelloIdentity {
+    /// Stable 16-byte user hash / client hash.
+    pub user_hash: [u8; 16],
+    /// TCP port advertised in the hello packet.
+    pub tcp_port: u16,
+}
+
 /// Send one `OP_FWCHECKUDPREQ` to a helper peer over eD2k TCP.
 pub async fn request_udp_firewall_check(
     helper_addr: SocketAddr,
+    hello_identity: Ed2kHelloIdentity,
     request: FirewallCheckUdpRequest,
     timeout: Duration,
 ) -> Result<()> {
@@ -84,12 +96,30 @@ pub async fn request_udp_firewall_check(
     stream
         .set_nodelay(true)
         .with_context(|| format!("failed to enable TCP_NODELAY for helper {helper_addr}"))?;
+    let hello_packet = encode_minimal_hello(hello_identity);
+    tokio::time::timeout(timeout, stream.write_all(&hello_packet))
+        .await
+        .with_context(|| format!("timed out sending OP_HELLO to {helper_addr}"))??;
+    let _ = tokio::time::timeout(Duration::from_millis(500), read_packet(&mut stream)).await;
     let payload = request.encode();
     let packet = encode_packet(OP_EMULEPROT, OP_FWCHECKUDPREQ, &payload);
     tokio::time::timeout(timeout, stream.write_all(&packet))
         .await
         .with_context(|| format!("timed out sending OP_FWCHECKUDPREQ to {helper_addr}"))??;
     Ok(())
+}
+
+fn encode_minimal_hello(identity: Ed2kHelloIdentity) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(33);
+    // OP_HELLO starts with an explicit user-hash length byte.
+    payload.push(16);
+    payload.extend_from_slice(&identity.user_hash);
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&identity.tcp_port.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    encode_packet(OP_EDONKEYPROT, OP_HELLO, &payload)
 }
 
 /// Run the minimal eD2k TCP listener needed for inbound firewall-check requests.
@@ -228,7 +258,10 @@ fn is_transient_accept_error(error: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{FirewallCheckUdpRequest, OP_EMULEPROT, OP_FWCHECKUDPREQ, encode_packet};
+    use super::{
+        Ed2kHelloIdentity, FirewallCheckUdpRequest, OP_EDONKEYPROT, OP_EMULEPROT, OP_FWCHECKUDPREQ,
+        OP_HELLO, encode_minimal_hello, encode_packet,
+    };
 
     #[test]
     fn firewall_check_udp_request_roundtrip() {
@@ -255,5 +288,23 @@ mod tests {
         );
         assert_eq!(packet[5], OP_FWCHECKUDPREQ);
         assert_eq!(&packet[6..], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn minimal_hello_encoding_matches_ed2k_framing() {
+        let packet = encode_minimal_hello(Ed2kHelloIdentity {
+            user_hash: [0x11; 16],
+            tcp_port: 41001,
+        });
+
+        assert_eq!(packet[0], OP_EDONKEYPROT);
+        assert_eq!(
+            u32::from_le_bytes([packet[1], packet[2], packet[3], packet[4]]),
+            34
+        );
+        assert_eq!(packet[5], OP_HELLO);
+        assert_eq!(packet[6], 16);
+        assert_eq!(&packet[7..23], &[0x11; 16]);
+        assert_eq!(u16::from_le_bytes([packet[27], packet[28]]), 41001);
     }
 }
