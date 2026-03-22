@@ -75,6 +75,20 @@ pub struct KadConfig {
     pub routing_refresh_interval_secs: u64,
     /// Maximum delay between `nodes.dat` snapshots while the routing table changes.
     pub nodes_dat_refresh_interval_secs: u64,
+    /// Whether the agent should retain inbound Kad publishes and serve them back to peers.
+    pub local_store_enabled: bool,
+    /// Retention window for locally stored keyword publishes.
+    pub local_store_keyword_ttl_secs: u64,
+    /// Retention window for locally stored source publishes.
+    pub local_store_source_ttl_secs: u64,
+    /// Retention window for locally stored note publishes.
+    pub local_store_notes_ttl_secs: u64,
+    /// Maximum number of retained keyword publish entries.
+    pub local_store_keyword_capacity: usize,
+    /// Maximum number of retained source publish entries.
+    pub local_store_source_capacity: usize,
+    /// Maximum number of retained notes publish entries.
+    pub local_store_notes_capacity: usize,
     pub max_outbound_pps: u32,
     pub search_phase2_fanout: usize,
     pub keyword_result_cap: usize,
@@ -190,6 +204,13 @@ impl Default for KadConfig {
             republish_interval_secs: 18_000,
             routing_refresh_interval_secs: 120,
             nodes_dat_refresh_interval_secs: 300,
+            local_store_enabled: true,
+            local_store_keyword_ttl_secs: 86_400,
+            local_store_source_ttl_secs: 21_600,
+            local_store_notes_ttl_secs: 86_400,
+            local_store_keyword_capacity: 20_000,
+            local_store_source_capacity: 20_000,
+            local_store_notes_capacity: 5_000,
             max_outbound_pps: 50,
             search_phase2_fanout: 50,
             keyword_result_cap: 5_000,
@@ -676,5 +697,12 @@ state_dir = "{state_dir}"
 
         assert_eq!(config.p2p.kad.routing_refresh_interval_secs, 120);
         assert_eq!(config.p2p.kad.nodes_dat_refresh_interval_secs, 300);
+        assert!(config.p2p.kad.local_store_enabled);
+        assert_eq!(config.p2p.kad.local_store_keyword_ttl_secs, 86_400);
+        assert_eq!(config.p2p.kad.local_store_source_ttl_secs, 21_600);
+        assert_eq!(config.p2p.kad.local_store_notes_ttl_secs, 86_400);
+        assert_eq!(config.p2p.kad.local_store_keyword_capacity, 20_000);
+        assert_eq!(config.p2p.kad.local_store_source_capacity, 20_000);
+        assert_eq!(config.p2p.kad.local_store_notes_capacity, 5_000);
     }
 }

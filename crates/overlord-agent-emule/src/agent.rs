@@ -50,6 +50,7 @@ use overlord_kad_proto::{
 use overlord_kad_routing::Contact;
 
 use crate::config::EmuleAgentConfig;
+use crate::kad_store::{KadLocalStore, KadLocalStoreConfig};
 use crate::logging::current_log_file_status;
 use crate::snoop_queue::{SnoopQueue, SnoopQueueFamilyCounts};
 
@@ -63,6 +64,7 @@ const COORDINATOR_RECONNECT_SECS: u64 = 1;
 const SNOOP_FLUSH_SECS: u64 = 30;
 const PASSIVE_CRAWL_SECS: u64 = 45;
 const EMULE_LARGE_FILE_SIZE_THRESHOLD: u64 = u32::MAX as u64;
+const LOCAL_SEARCH_RESPONSE_LIMIT: usize = 64;
 
 async fn wait_for_shutdown_signal() -> Result<&'static str> {
     #[cfg(windows)]
@@ -574,6 +576,7 @@ pub struct OverlordAgentEmule {
     started_at: Instant,
     state_paths: AgentStatePaths,
     snoop_queue: Arc<Mutex<SnoopQueue>>,
+    local_store: Arc<Mutex<KadLocalStore>>,
     publish_observability: Arc<Mutex<KadPublishObservability>>,
     harvest_observability: Arc<Mutex<KadHarvestObservability>>,
     runtime: Arc<Mutex<Option<AgentNetworkRuntime>>>,
@@ -613,6 +616,7 @@ impl OverlordAgentEmule {
         let p2p_selection_state =
             Self::resolve_p2p_selection_state(&config, &interfaces, None, false, false);
         let snoop_queue_config = config.p2p.snoop_queue.clone();
+        let local_store = KadLocalStore::new(KadLocalStoreConfig::from_kad_config(&config.p2p.kad));
 
         Ok(Self {
             config: Arc::new(RwLock::new(config)),
@@ -621,6 +625,7 @@ impl OverlordAgentEmule {
             started_at: Instant::now(),
             state_paths,
             snoop_queue: Arc::new(Mutex::new(SnoopQueue::new(snoop_queue_config))),
+            local_store: Arc::new(Mutex::new(local_store)),
             publish_observability: Arc::new(Mutex::new(KadPublishObservability::default())),
             harvest_observability: Arc::new(Mutex::new(KadHarvestObservability::default())),
             runtime: Arc::new(Mutex::new(None)),
@@ -1499,6 +1504,7 @@ async fn seed_popular_from_source(
     source_publish_identity: NodeId,
     source: PublishSeedSource,
     hashes: Vec<PopularHash>,
+    local_store: &Arc<Mutex<KadLocalStore>>,
     publish_observability: &Arc<Mutex<KadPublishObservability>>,
 ) -> Result<()> {
     info!(
@@ -1511,6 +1517,7 @@ async fn seed_popular_from_source(
         source_publish_identity,
         source,
         hashes,
+        local_store,
         publish_observability,
     )
     .await
@@ -1520,6 +1527,7 @@ async fn seed_popular_from_coordinator_or_fallback(
     dht: &DhtNode,
     source_publish_identity: NodeId,
     coordinator: &CoordinatorClient,
+    local_store: &Arc<Mutex<KadLocalStore>>,
     publish_observability: &Arc<Mutex<KadPublishObservability>>,
 ) -> Result<()> {
     let (source, hashes) = fetch_popular_hashes_for_seeding(coordinator).await?;
@@ -1528,6 +1536,7 @@ async fn seed_popular_from_coordinator_or_fallback(
         source_publish_identity,
         source,
         hashes,
+        local_store,
         publish_observability,
     )
     .await
@@ -1563,6 +1572,7 @@ async fn seed_popular_impl(
     source_publish_identity: NodeId,
     seed_source: PublishSeedSource,
     hashes: Vec<PopularHash>,
+    local_store: &Arc<Mutex<KadLocalStore>>,
     publish_observability: &Arc<Mutex<KadPublishObservability>>,
 ) -> Result<()> {
     if !dht.is_bootstrapped() {
@@ -1597,6 +1607,17 @@ async fn seed_popular_impl(
             Tag::filesize(hash.size),
             Tag::sources(hash.source_count),
         ];
+        {
+            let mut store = local_store.lock().await;
+            store.record_keyword_publish_batch(
+                keyword_hash,
+                &[overlord_kad_proto::PublishEntry {
+                    hash: file_hash,
+                    tags: keyword_tags.clone(),
+                }],
+                Utc::now(),
+            );
+        }
         info!(
             "kad publish start family=keyword seed_source={} item={}/{} target={} hash={}",
             seed_source.label(),
@@ -1638,6 +1659,16 @@ async fn seed_popular_impl(
                 TagValue::U8(emule_source_encryption_options()),
             ),
         ];
+        if let IpAddr::V4(source_ip) = bind_addr.ip() {
+            let mut store = local_store.lock().await;
+            store.record_source_publish(
+                NodeId::from_bytes(file_hash.0),
+                source_publish_identity,
+                source_ip,
+                &source_tags,
+                Utc::now(),
+            );
+        }
         info!(
             "kad publish start family=source seed_source={} item={}/{} target={} hash={}",
             seed_source.label(),
@@ -2087,6 +2118,7 @@ async fn persist_nodes_dat_for(dht: &DhtNode, state_paths: &AgentStatePaths) -> 
 async fn handle_unsolicited_packet(
     dht: &DhtNode,
     snoop_queue: &Arc<Mutex<SnoopQueue>>,
+    local_store: &Arc<Mutex<KadLocalStore>>,
     harvest_observability: &Arc<Mutex<KadHarvestObservability>>,
     packet: KadPacket,
     from: SocketAddr,
@@ -2174,33 +2206,80 @@ async fn handle_unsolicited_packet(
             .await?;
         }
         KadPacket::SearchKeyReq(req) => {
+            let observed_at = Utc::now();
             record_snoop_entry(
                 snoop_queue,
                 harvest_observability,
                 from,
-                build_keyword_snoop_entry(&req, Utc::now()),
+                build_keyword_snoop_entry(&req, observed_at),
             )
-            .await
+            .await;
+            let response = {
+                let mut store = local_store.lock().await;
+                // Restrictive keyword searches carry opaque payloads which we
+                // do not parse yet, so only non-restrictive queries are served
+                // from the local store in v1.
+                store.keyword_search_response(
+                    dht.own_id(),
+                    &req,
+                    LOCAL_SEARCH_RESPONSE_LIMIT,
+                    observed_at,
+                )
+            };
+            if let Some(response) = response {
+                let _ = dht.send_packet(from, &KadPacket::SearchRes(response)).await;
+            }
         }
         KadPacket::SearchSourceReq(req) => {
+            let observed_at = Utc::now();
             record_snoop_entry(
                 snoop_queue,
                 harvest_observability,
                 from,
-                build_source_snoop_entry(&req, Utc::now()),
+                build_source_snoop_entry(&req, observed_at),
             )
-            .await
+            .await;
+            let response = {
+                let mut store = local_store.lock().await;
+                store.source_search_response(
+                    dht.own_id(),
+                    &req,
+                    LOCAL_SEARCH_RESPONSE_LIMIT,
+                    observed_at,
+                )
+            };
+            if let Some(response) = response {
+                let _ = dht.send_packet(from, &KadPacket::SearchRes(response)).await;
+            }
         }
         KadPacket::SearchNotesReq(req) => {
+            let observed_at = Utc::now();
             record_snoop_entry(
                 snoop_queue,
                 harvest_observability,
                 from,
-                build_notes_snoop_entry(&req, Utc::now()),
+                build_notes_snoop_entry(&req, observed_at),
             )
-            .await
+            .await;
+            let response = {
+                let mut store = local_store.lock().await;
+                store.notes_search_response(
+                    dht.own_id(),
+                    &req,
+                    LOCAL_SEARCH_RESPONSE_LIMIT,
+                    observed_at,
+                )
+            };
+            if let Some(response) = response {
+                let _ = dht.send_packet(from, &KadPacket::SearchRes(response)).await;
+            }
         }
         KadPacket::PublishKeyReq(req) => {
+            let observed_at = Utc::now();
+            {
+                let mut store = local_store.lock().await;
+                store.record_keyword_publish_batch(req.target, &req.entries, observed_at);
+            }
             let _ = dht
                 .send_packet(
                     from,
@@ -2212,6 +2291,16 @@ async fn handle_unsolicited_packet(
                 .await;
         }
         KadPacket::PublishSourceReq(req) => {
+            if let IpAddr::V4(ip) = from.ip() {
+                let mut store = local_store.lock().await;
+                store.record_source_publish(
+                    req.target,
+                    req.publisher_id,
+                    ip,
+                    &req.tags,
+                    Utc::now(),
+                );
+            }
             let _ = dht
                 .send_packet(
                     from,
@@ -2223,6 +2312,10 @@ async fn handle_unsolicited_packet(
                 .await;
         }
         KadPacket::PublishNotesReq(req) => {
+            {
+                let mut store = local_store.lock().await;
+                store.record_notes_publish(req.target, req.note_hash, &req.tags, Utc::now());
+            }
             let _ = dht
                 .send_packet(
                     from,
@@ -2569,6 +2662,7 @@ impl IndexerService for OverlordAgentEmule {
             source_publish_identity,
             PublishSeedSource::ManualApi,
             hashes,
+            &self.local_store,
             &self.publish_observability,
         )
         .await
@@ -2640,6 +2734,7 @@ impl OverlordAgentEmule {
         let shutdown = Arc::clone(&runtime.shutdown);
         let state_paths = self.state_paths.clone();
         let coordinator = self.coordinator.clone();
+        let local_store = Arc::clone(&self.local_store);
         let publish_observability = Arc::clone(&self.publish_observability);
         let source_publish_identity = source_publish_client_hash(self.indexer_id);
         runtime.tasks.lock().await.push(tokio::spawn(async move {
@@ -2653,6 +2748,7 @@ impl OverlordAgentEmule {
                             &dht,
                             source_publish_identity,
                             &coordinator,
+                            &local_store,
                             &publish_observability,
                         )
                         .await
@@ -2670,6 +2766,7 @@ impl OverlordAgentEmule {
         let dht = runtime.dht.clone();
         let shutdown = Arc::clone(&runtime.shutdown);
         let snoop_queue = Arc::clone(&self.snoop_queue);
+        let local_store = Arc::clone(&self.local_store);
         let harvest_observability = Arc::clone(&self.harvest_observability);
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             let mut packets = dht.subscribe_packets();
@@ -2679,6 +2776,7 @@ impl OverlordAgentEmule {
                         if let Err(error) = handle_unsolicited_packet(
                             &dht,
                             &snoop_queue,
+                            &local_store,
                             &harvest_observability,
                             packet,
                             from,
@@ -2810,6 +2908,7 @@ impl OverlordAgentEmule {
         let dht = runtime.dht.clone();
         let shutdown = Arc::clone(&runtime.shutdown);
         let republish_secs = config.p2p.kad.republish_interval_secs;
+        let local_store = Arc::clone(&self.local_store);
         let publish_observability = Arc::clone(&self.publish_observability);
         let source_publish_identity = source_publish_client_hash(self.indexer_id);
         runtime.tasks.lock().await.push(tokio::spawn(async move {
@@ -2822,6 +2921,7 @@ impl OverlordAgentEmule {
                     &dht,
                     source_publish_identity,
                     &coordinator,
+                    &local_store,
                     &publish_observability,
                 )
                 .await
