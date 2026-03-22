@@ -71,6 +71,10 @@ pub struct KadConfig {
     pub search_timeout_secs: u64,
     pub store_timeout_secs: u64,
     pub republish_interval_secs: u64,
+    /// Interval between random-target Kad routing refresh walks.
+    pub routing_refresh_interval_secs: u64,
+    /// Maximum delay between `nodes.dat` snapshots while the routing table changes.
+    pub nodes_dat_refresh_interval_secs: u64,
     pub max_outbound_pps: u32,
     pub search_phase2_fanout: usize,
     pub keyword_result_cap: usize,
@@ -184,6 +188,8 @@ impl Default for KadConfig {
             search_timeout_secs: 45,
             store_timeout_secs: 140,
             republish_interval_secs: 18_000,
+            routing_refresh_interval_secs: 120,
+            nodes_dat_refresh_interval_secs: 300,
             max_outbound_pps: 50,
             search_phase2_fanout: 50,
             keyword_result_cap: 5_000,
@@ -662,5 +668,13 @@ state_dir = "{state_dir}"
         );
 
         fs::remove_dir_all(&temp_root).unwrap();
+    }
+
+    #[test]
+    fn default_kad_config_enables_periodic_routing_refresh() {
+        let config = EmuleAgentConfig::default();
+
+        assert_eq!(config.p2p.kad.routing_refresh_interval_secs, 120);
+        assert_eq!(config.p2p.kad.nodes_dat_refresh_interval_secs, 300);
     }
 }
