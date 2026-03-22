@@ -75,6 +75,14 @@ pub struct KadConfig {
     pub routing_refresh_interval_secs: u64,
     /// Maximum delay between `nodes.dat` snapshots while the routing table changes.
     pub nodes_dat_refresh_interval_secs: u64,
+    /// Whether the agent should actively verify UDP reachability using Kad helper peers.
+    pub udp_firewall_check_enabled: bool,
+    /// Delay between active Kad UDP firewall re-check rounds.
+    pub udp_firewall_recheck_interval_secs: u64,
+    /// Timeout budget for one active Kad UDP firewall-check round.
+    pub udp_firewall_check_timeout_secs: u64,
+    /// Number of helper peers to ask during each active Kad UDP firewall-check round.
+    pub udp_firewall_check_contact_count: usize,
     /// Whether the agent should retain inbound Kad publishes and serve them back to peers.
     pub local_store_enabled: bool,
     /// Retention window for locally stored keyword publishes.
@@ -204,6 +212,10 @@ impl Default for KadConfig {
             republish_interval_secs: 18_000,
             routing_refresh_interval_secs: 120,
             nodes_dat_refresh_interval_secs: 300,
+            udp_firewall_check_enabled: true,
+            udp_firewall_recheck_interval_secs: 300,
+            udp_firewall_check_timeout_secs: 20,
+            udp_firewall_check_contact_count: 2,
             local_store_enabled: true,
             local_store_keyword_ttl_secs: 86_400,
             local_store_source_ttl_secs: 21_600,
@@ -697,6 +709,10 @@ state_dir = "{state_dir}"
 
         assert_eq!(config.p2p.kad.routing_refresh_interval_secs, 120);
         assert_eq!(config.p2p.kad.nodes_dat_refresh_interval_secs, 300);
+        assert!(config.p2p.kad.udp_firewall_check_enabled);
+        assert_eq!(config.p2p.kad.udp_firewall_recheck_interval_secs, 300);
+        assert_eq!(config.p2p.kad.udp_firewall_check_timeout_secs, 20);
+        assert_eq!(config.p2p.kad.udp_firewall_check_contact_count, 2);
         assert!(config.p2p.kad.local_store_enabled);
         assert_eq!(config.p2p.kad.local_store_keyword_ttl_secs, 86_400);
         assert_eq!(config.p2p.kad.local_store_source_ttl_secs, 21_600);

@@ -23,7 +23,9 @@ use overlord_agent_nat::{
     TransportProtocol, build_interface_binding_report, built_in_upnp_port_mapping_providers,
     default_upnp_backend_order, detect_interfaces, recommend_interface, resolve_bind_ip,
 };
+use rand::seq::SliceRandom;
 use tokio::{
+    net::TcpListener,
     sync::{Mutex, Notify, RwLock},
     task::JoinHandle,
 };
@@ -51,6 +53,8 @@ use overlord_kad_proto::{
 use overlord_kad_routing::Contact;
 
 use crate::config::EmuleAgentConfig;
+use crate::ed2k_tcp::{FirewallCheckUdpRequest, request_udp_firewall_check, run_ed2k_listener};
+use crate::kad_firewall::{FirewallUdpPacketOutcome, KadFirewallState};
 use crate::kad_store::{KadLocalStore, KadLocalStoreConfig};
 use crate::logging::current_log_file_status;
 use crate::snoop_queue::{SnoopQueue, SnoopQueueFamilyCounts};
@@ -66,6 +70,7 @@ const SNOOP_FLUSH_SECS: u64 = 30;
 const PASSIVE_CRAWL_SECS: u64 = 45;
 const EMULE_LARGE_FILE_SIZE_THRESHOLD: u64 = u32::MAX as u64;
 const LOCAL_SEARCH_RESPONSE_LIMIT: usize = 64;
+const FIREWALLED_TCP_PROBE_TIMEOUT_SECS: u64 = 5;
 
 async fn wait_for_shutdown_signal() -> Result<&'static str> {
     #[cfg(windows)]
@@ -554,7 +559,9 @@ struct AgentStatePaths {
 #[derive(Clone)]
 struct AgentNetworkRuntime {
     dht: DhtNode,
+    ed2k_listener: Arc<TcpListener>,
     nat: Arc<NatManager>,
+    kad_firewall: Arc<Mutex<KadFirewallState>>,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     shutdown: Arc<AtomicBool>,
     passive_result_count: Arc<std::sync::atomic::AtomicU64>,
@@ -1212,6 +1219,8 @@ impl OverlordAgentEmule {
         let udp_key = load_or_create_udp_key(&self.state_paths.udp_key_path)?;
         let bind_addr = resolved_socket_addr(config.p2p.kad.listen_port, Some(bind_ip))
             .context("invalid p2p.kad.listen_port")?;
+        let ed2k_bind_addr = resolved_socket_addr(config.p2p.ed2k.listen_port, Some(bind_ip))
+            .context("invalid p2p.ed2k.listen_port")?;
         let nodes_dat = read_optional_bytes(&self.state_paths.nodes_dat_path)?;
         let nodes_text = (!config.p2p.kad.bootstrap_nodes.is_empty())
             .then(|| config.p2p.kad.bootstrap_nodes.join("\n"));
@@ -1259,10 +1268,16 @@ impl OverlordAgentEmule {
                 .with_providers(built_in_upnp_port_mapping_providers())
                 .build(),
         );
+        let ed2k_listener =
+            Arc::new(TcpListener::bind(ed2k_bind_addr).await.with_context(|| {
+                format!("failed to bind eD2k TCP listener on {ed2k_bind_addr}")
+            })?);
 
         Ok(AgentNetworkRuntime {
             dht,
+            ed2k_listener,
             nat,
+            kad_firewall: Arc::new(Mutex::new(KadFirewallState::default())),
             tasks: Arc::new(Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             passive_result_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2204,17 +2219,139 @@ async fn persist_nodes_dat_for(dht: &DhtNode, state_paths: &AgentStatePaths) -> 
     Ok(())
 }
 
+async fn active_udp_firewall_ports(nat: &NatManager, internal_udp_port: u16) -> Vec<u16> {
+    let status = nat.status().await;
+    let external_udp_port = status
+        .mappings
+        .iter()
+        .find(|mapping| mapping.name == "kad" && mapping.protocol == TransportProtocol::Udp)
+        .map(|mapping| mapping.external_addr.port())
+        .unwrap_or(internal_udp_port);
+
+    let mut ports = vec![internal_udp_port];
+    if external_udp_port != 0 && external_udp_port != internal_udp_port {
+        ports.push(external_udp_port);
+    }
+    ports
+}
+
+async fn select_udp_firewall_helpers(dht: &DhtNode, helper_count: usize) -> Result<Vec<Contact>> {
+    let local_ip = dht.bind_addr()?.ip();
+    let mut contacts = dht
+        .routing_contacts()
+        .await
+        .into_iter()
+        .filter(|contact| {
+            contact.kad_version >= 6
+                && contact.tcp_port != 0
+                && contact.udp_port != 0
+                && IpAddr::V4(contact.ip) != local_ip
+        })
+        .collect::<Vec<_>>();
+    contacts.shuffle(&mut rand::thread_rng());
+
+    let mut selected = Vec::with_capacity(helper_count);
+    let mut seen_ips = std::collections::HashSet::new();
+    for contact in contacts {
+        if seen_ips.insert(contact.ip) {
+            selected.push(contact);
+            if selected.len() >= helper_count {
+                break;
+            }
+        }
+    }
+    Ok(selected)
+}
+
+async fn tcp_firewall_probe(addr: SocketAddr, timeout: Duration) -> Result<()> {
+    let stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr))
+        .await
+        .with_context(|| format!("timed out connecting to TCP firewall probe target {addr}"))??;
+    stream
+        .set_nodelay(true)
+        .with_context(|| format!("failed to enable TCP_NODELAY for probe target {addr}"))?;
+    Ok(())
+}
+
+fn spawn_firewalled_response(dht: DhtNode, from: SocketAddr, tcp_port: u16) {
+    tokio::spawn(async move {
+        let IpAddr::V4(ip) = from.ip() else {
+            return;
+        };
+        let target = SocketAddr::new(IpAddr::V4(ip), tcp_port);
+        if tcp_firewall_probe(
+            target,
+            Duration::from_secs(FIREWALLED_TCP_PROBE_TIMEOUT_SECS),
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
+
+        let _ = dht
+            .send_packet(
+                from,
+                &KadPacket::FirewalledRes(overlord_kad_proto::FirewalledRes {
+                    ip: u32::from_be_bytes(ip.octets()),
+                }),
+            )
+            .await;
+    });
+}
+
+struct UnsolicitedPacketContext<'a> {
+    snoop_queue: &'a Arc<Mutex<SnoopQueue>>,
+    observed_snoop_events: &'a Arc<Mutex<Vec<SnoopObservation>>>,
+    local_store: &'a Arc<Mutex<KadLocalStore>>,
+    harvest_observability: &'a Arc<Mutex<KadHarvestObservability>>,
+    kad_firewall: &'a Arc<Mutex<KadFirewallState>>,
+}
+
 async fn handle_unsolicited_packet(
     dht: &DhtNode,
-    snoop_queue: &Arc<Mutex<SnoopQueue>>,
-    observed_snoop_events: &Arc<Mutex<Vec<SnoopObservation>>>,
-    local_store: &Arc<Mutex<KadLocalStore>>,
-    harvest_observability: &Arc<Mutex<KadHarvestObservability>>,
+    context: UnsolicitedPacketContext<'_>,
     packet: KadPacket,
     from: SocketAddr,
 ) -> Result<()> {
     match packet {
         KadPacket::Ping => dht.send_packet(from, &KadPacket::Pong).await?,
+        KadPacket::FirewalledReq(req) => {
+            spawn_firewalled_response(dht.clone(), from, req.tcp_port);
+        }
+        KadPacket::Firewalled2Req(req) => {
+            spawn_firewalled_response(dht.clone(), from, req.tcp_port);
+        }
+        KadPacket::FirewallUdp(packet) => {
+            let outcome = {
+                let mut firewall = context.kad_firewall.lock().await;
+                firewall.record_firewall_udp_packet(
+                    from.ip(),
+                    packet.error_code,
+                    packet.udp_port,
+                    Utc::now(),
+                )
+            };
+            match outcome {
+                FirewallUdpPacketOutcome::Open(summary) => {
+                    info!(
+                        "kad udp firewall-check open helpers_selected={} helpers_requested={} helpers_succeeded={} helpers_failed={} elapsed_ms={}",
+                        summary.helpers_selected,
+                        summary.helpers_requested,
+                        summary.helpers_succeeded,
+                        summary.helpers_failed,
+                        (summary.completed_at - summary.started_at).num_milliseconds()
+                    );
+                }
+                FirewallUdpPacketOutcome::Recorded => {
+                    debug!(
+                        "recorded kad firewall UDP packet from={} error_code={} reported_port={}",
+                        from, packet.error_code, packet.udp_port
+                    );
+                }
+                FirewallUdpPacketOutcome::Ignored => {}
+            }
+        }
         KadPacket::HelloReq(req) => {
             if let Some(udp_key) = req.udp_key {
                 dht.register_peer_key(from, udp_key);
@@ -2298,15 +2435,15 @@ async fn handle_unsolicited_packet(
         KadPacket::SearchKeyReq(req) => {
             let observed_at = Utc::now();
             record_snoop_entry(
-                snoop_queue,
-                observed_snoop_events,
-                harvest_observability,
+                context.snoop_queue,
+                context.observed_snoop_events,
+                context.harvest_observability,
                 from,
                 build_keyword_snoop_entry(&req, observed_at),
             )
             .await;
             let response = {
-                let mut store = local_store.lock().await;
+                let mut store = context.local_store.lock().await;
                 // Restrictive keyword searches carry opaque payloads which we
                 // do not parse yet, so only non-restrictive queries are served
                 // from the local store in v1.
@@ -2324,15 +2461,15 @@ async fn handle_unsolicited_packet(
         KadPacket::SearchSourceReq(req) => {
             let observed_at = Utc::now();
             record_snoop_entry(
-                snoop_queue,
-                observed_snoop_events,
-                harvest_observability,
+                context.snoop_queue,
+                context.observed_snoop_events,
+                context.harvest_observability,
                 from,
                 build_source_snoop_entry(&req, observed_at),
             )
             .await;
             let response = {
-                let mut store = local_store.lock().await;
+                let mut store = context.local_store.lock().await;
                 store.source_search_response(
                     dht.own_id(),
                     &req,
@@ -2347,15 +2484,15 @@ async fn handle_unsolicited_packet(
         KadPacket::SearchNotesReq(req) => {
             let observed_at = Utc::now();
             record_snoop_entry(
-                snoop_queue,
-                observed_snoop_events,
-                harvest_observability,
+                context.snoop_queue,
+                context.observed_snoop_events,
+                context.harvest_observability,
                 from,
                 build_notes_snoop_entry(&req, observed_at),
             )
             .await;
             let response = {
-                let mut store = local_store.lock().await;
+                let mut store = context.local_store.lock().await;
                 store.notes_search_response(
                     dht.own_id(),
                     &req,
@@ -2370,7 +2507,7 @@ async fn handle_unsolicited_packet(
         KadPacket::PublishKeyReq(req) => {
             let observed_at = Utc::now();
             {
-                let mut store = local_store.lock().await;
+                let mut store = context.local_store.lock().await;
                 store.record_keyword_publish_batch(req.target, &req.entries, observed_at);
             }
             let _ = dht
@@ -2385,7 +2522,7 @@ async fn handle_unsolicited_packet(
         }
         KadPacket::PublishSourceReq(req) => {
             if let IpAddr::V4(ip) = from.ip() {
-                let mut store = local_store.lock().await;
+                let mut store = context.local_store.lock().await;
                 store.record_source_publish(
                     req.target,
                     req.publisher_id,
@@ -2406,7 +2543,7 @@ async fn handle_unsolicited_packet(
         }
         KadPacket::PublishNotesReq(req) => {
             {
-                let mut store = local_store.lock().await;
+                let mut store = context.local_store.lock().await;
                 store.record_notes_publish(req.target, req.note_hash, &req.tags, Utc::now());
             }
             let _ = dht
@@ -2867,6 +3004,7 @@ impl OverlordAgentEmule {
         let observed_snoop_events = Arc::clone(&self.observed_snoop_events);
         let local_store = Arc::clone(&self.local_store);
         let harvest_observability = Arc::clone(&self.harvest_observability);
+        let kad_firewall = Arc::clone(&runtime.kad_firewall);
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             let mut packets = dht.subscribe_packets();
             while !shutdown.load(Ordering::Relaxed) {
@@ -2874,10 +3012,13 @@ impl OverlordAgentEmule {
                     Ok((packet, from)) => {
                         if let Err(error) = handle_unsolicited_packet(
                             &dht,
-                            &snoop_queue,
-                            &observed_snoop_events,
-                            &local_store,
-                            &harvest_observability,
+                            UnsolicitedPacketContext {
+                                snoop_queue: &snoop_queue,
+                                observed_snoop_events: &observed_snoop_events,
+                                local_store: &local_store,
+                                harvest_observability: &harvest_observability,
+                                kad_firewall: &kad_firewall,
+                            },
                             packet,
                             from,
                         )
@@ -2889,6 +3030,139 @@ impl OverlordAgentEmule {
                     Err(error) => {
                         debug!("packet subscription closed: {error}");
                         break;
+                    }
+                }
+            }
+        }));
+
+        let dht = runtime.dht.clone();
+        let ed2k_listener = Arc::clone(&runtime.ed2k_listener);
+        let shutdown = Arc::clone(&runtime.shutdown);
+        runtime.tasks.lock().await.push(tokio::spawn(async move {
+            run_ed2k_listener(ed2k_listener, dht, shutdown).await;
+        }));
+
+        let dht = runtime.dht.clone();
+        let nat = Arc::clone(&runtime.nat);
+        let shutdown = Arc::clone(&runtime.shutdown);
+        let kad_firewall = Arc::clone(&runtime.kad_firewall);
+        let udp_firewall_check_enabled = config.p2p.kad.udp_firewall_check_enabled;
+        let udp_firewall_recheck_interval =
+            Duration::from_secs(config.p2p.kad.udp_firewall_recheck_interval_secs.max(1));
+        let udp_firewall_check_timeout =
+            Duration::from_secs(config.p2p.kad.udp_firewall_check_timeout_secs.max(1));
+        let udp_firewall_check_contact_count = config.p2p.kad.udp_firewall_check_contact_count;
+        runtime.tasks.lock().await.push(tokio::spawn(async move {
+            if !udp_firewall_check_enabled {
+                return;
+            }
+
+            let mut next_delay = Duration::ZERO;
+            while !shutdown.load(Ordering::Relaxed) {
+                tokio::time::sleep(next_delay).await;
+                next_delay = udp_firewall_recheck_interval;
+                if shutdown.load(Ordering::Relaxed) || !dht.is_bootstrapped() {
+                    continue;
+                }
+
+                let bind_addr = match dht.bind_addr() {
+                    Ok(bind_addr) => bind_addr,
+                    Err(error) => {
+                        debug!("kad firewall-check skipped: failed to resolve bind addr: {error}");
+                        continue;
+                    }
+                };
+                let helper_contacts =
+                    match select_udp_firewall_helpers(&dht, udp_firewall_check_contact_count).await
+                    {
+                        Ok(contacts) => contacts,
+                        Err(error) => {
+                            debug!("kad firewall-check helper selection failed: {error}");
+                            continue;
+                        }
+                    };
+                if helper_contacts.is_empty() {
+                    debug!("kad firewall-check skipped: no helper contacts available");
+                    continue;
+                }
+
+                let expected_ports = active_udp_firewall_ports(&nat, bind_addr.port()).await;
+                let started_at = Utc::now();
+                {
+                    let mut firewall = kad_firewall.lock().await;
+                    if !firewall.begin_udp_check(
+                        helper_contacts.iter().map(|contact| IpAddr::V4(contact.ip)),
+                        expected_ports.iter().copied(),
+                        started_at,
+                    ) {
+                        continue;
+                    }
+                }
+
+                let request = FirewallCheckUdpRequest {
+                    internal_udp_port: bind_addr.port(),
+                    external_udp_port: *expected_ports.last().unwrap_or(&bind_addr.port()),
+                    sender_udp_key: dht.udp_key(),
+                };
+                info!(
+                    "starting kad udp firewall-check helpers={} internal_port={} external_port={}",
+                    helper_contacts.len(),
+                    request.internal_udp_port,
+                    request.external_udp_port
+                );
+
+                let mut request_tasks = Vec::with_capacity(helper_contacts.len());
+                for contact in helper_contacts {
+                    let helper_addr = SocketAddr::new(IpAddr::V4(contact.ip), contact.tcp_port);
+                    let helper_ip = IpAddr::V4(contact.ip);
+                    request_tasks.push(tokio::spawn(async move {
+                        let result =
+                            request_udp_firewall_check(helper_addr, request, udp_firewall_check_timeout)
+                                .await;
+                        (helper_ip, helper_addr, result)
+                    }));
+                }
+
+                for task in request_tasks {
+                    match task.await {
+                        Ok((_helper_ip, helper_addr, Ok(()))) => {
+                            debug!("sent OP_FWCHECKUDPREQ to helper {helper_addr}");
+                        }
+                        Ok((helper_ip, helper_addr, Err(error))) => {
+                            let mut firewall = kad_firewall.lock().await;
+                            firewall.record_helper_request_failed(helper_ip, &error.to_string());
+                            debug!("failed to send OP_FWCHECKUDPREQ to helper {helper_addr}: {error}");
+                        }
+                        Err(error) => {
+                            debug!("UDP firewall-check helper task failed: {error}");
+                        }
+                    }
+                }
+
+                tokio::time::sleep(udp_firewall_check_timeout).await;
+                let summary = {
+                    let mut firewall = kad_firewall.lock().await;
+                    firewall.finish_udp_check(Utc::now())
+                };
+                if let Some(summary) = summary {
+                    if summary.open {
+                        info!(
+                            "kad udp firewall-check completed open helpers_selected={} helpers_requested={} helpers_succeeded={} helpers_failed={} elapsed_ms={}",
+                            summary.helpers_selected,
+                            summary.helpers_requested,
+                            summary.helpers_succeeded,
+                            summary.helpers_failed,
+                            (summary.completed_at - summary.started_at).num_milliseconds()
+                        );
+                    } else {
+                        warn!(
+                            "kad udp firewall-check completed firewalled helpers_selected={} helpers_requested={} helpers_succeeded={} helpers_failed={} elapsed_ms={}",
+                            summary.helpers_selected,
+                            summary.helpers_requested,
+                            summary.helpers_succeeded,
+                            summary.helpers_failed,
+                            (summary.completed_at - summary.started_at).num_milliseconds()
+                        );
                     }
                 }
             }

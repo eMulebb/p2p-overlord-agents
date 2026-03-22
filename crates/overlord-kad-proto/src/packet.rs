@@ -286,6 +286,17 @@ pub struct FirewalledReq {
     pub tcp_port: u16,
 }
 
+// ── Firewalled2Req ───────────────────────────────────────────────────────────
+
+/// Extended TCP firewall-check request used by Kad version 7+ peers.
+#[derive(BinRead, BinWrite, Debug, Clone, PartialEq)]
+#[brw(little)]
+pub struct Firewalled2Req {
+    pub tcp_port: u16,
+    pub user_hash: Ed2kHash,
+    pub connect_options: u8,
+}
+
 // ── FirewalledRes ────────────────────────────────────────────────────────────
 
 #[derive(BinRead, BinWrite, Debug, Clone, PartialEq)]
@@ -341,6 +352,7 @@ pub enum KadPacket {
     PublishRes(PublishRes),
     PublishResAck,
     FirewalledReq(FirewalledReq),
+    Firewalled2Req(Firewalled2Req),
     FirewalledRes(FirewalledRes),
     FirewalledAckRes,
     FirewallUdp(FirewallUdp),
@@ -443,6 +455,10 @@ impl KadPacket {
                 let p = cursor.read_le::<FirewalledReq>()?;
                 KadPacket::FirewalledReq(p)
             }
+            opcode::FIREWALLED2_REQ => {
+                let p = cursor.read_le::<Firewalled2Req>()?;
+                KadPacket::Firewalled2Req(p)
+            }
             opcode::FIREWALLED_RES => {
                 let p = cursor.read_le::<FirewalledRes>()?;
                 KadPacket::FirewalledRes(p)
@@ -489,6 +505,7 @@ impl KadPacket {
             KadPacket::PublishNotesReq(p) => buf.write_le(p)?,
             KadPacket::PublishRes(p) => buf.write_le(p)?,
             KadPacket::FirewalledReq(p) => buf.write_le(p)?,
+            KadPacket::Firewalled2Req(p) => buf.write_le(p)?,
             KadPacket::FirewalledRes(p) => buf.write_le(p)?,
             KadPacket::FirewallUdp(p) => buf.write_le(p)?,
             KadPacket::BootstrapReq
@@ -526,6 +543,7 @@ impl KadPacket {
             KadPacket::PublishRes(_) => opcode::PUBLISH_RES,
             KadPacket::PublishResAck => opcode::PUBLISH_RES_ACK,
             KadPacket::FirewalledReq(_) => opcode::FIREWALLED_REQ,
+            KadPacket::Firewalled2Req(_) => opcode::FIREWALLED2_REQ,
             KadPacket::FirewalledRes(_) => opcode::FIREWALLED_RES,
             KadPacket::FirewalledAckRes => opcode::FIREWALLED_ACK_RES,
             KadPacket::FirewallUdp(_) => opcode::FIREWALLUDP,
@@ -836,6 +854,23 @@ mod tests {
         let pkt2 = roundtrip(&pkt);
         if let KadPacket::FirewalledReq(f) = pkt2 {
             assert_eq!(f.tcp_port, 4662);
+        } else {
+            panic!("wrong type");
+        }
+    }
+
+    #[test]
+    fn test_firewalled2_req_roundtrip() {
+        let pkt = KadPacket::Firewalled2Req(Firewalled2Req {
+            tcp_port: 4662,
+            user_hash: Ed2kHash::from_bytes([0x11; 16]),
+            connect_options: 0x07,
+        });
+        let pkt2 = roundtrip(&pkt);
+        if let KadPacket::Firewalled2Req(f) = pkt2 {
+            assert_eq!(f.tcp_port, 4662);
+            assert_eq!(f.user_hash, Ed2kHash::from_bytes([0x11; 16]));
+            assert_eq!(f.connect_options, 0x07);
         } else {
             panic!("wrong type");
         }

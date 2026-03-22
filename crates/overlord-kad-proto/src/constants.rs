@@ -51,6 +51,7 @@ pub mod opcode {
     pub const PUBLISH_RES: u8 = 0x4B;
     pub const PUBLISH_RES_ACK: u8 = 0x4C;
     pub const FIREWALLED_REQ: u8 = 0x50;
+    pub const FIREWALLED2_REQ: u8 = 0x53;
     pub const FIREWALLED_RES: u8 = 0x58;
     pub const FIREWALLED_ACK_RES: u8 = 0x59;
     pub const FIREWALLUDP: u8 = 0x62;
