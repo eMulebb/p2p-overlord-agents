@@ -14,10 +14,11 @@ pub use overlord_agent_nat::{
 pub use server::{IndexerServer, RunningIndexerServer};
 pub use service::IndexerService;
 pub use types::{
-    AgentInterfacesView, AgentLogFileStatus, ConfigUpdate, ContentType, FileRecord, HashType,
-    IndexerRegistration, IndexerStats, KadHarvestFamilyObservability, KadHarvestObservability,
-    KadPassiveReplayObservability, KadPublishObservability, PopularHash, Protocol,
-    PublishBatchSummary, PublishCounters, PublishSeedSource, RegisterRequest, RegistrationResponse,
-    ResultBatch, SearchCancelRequest, SearchEvent, SearchEventStatus, SearchJob, SearchKind,
-    SnoopEntry, Source, TagEntry,
+    AgentInterfacesView, AgentLogFileStatus, ConfigUpdate, ContentType, FileRecord, HarvestFamily,
+    HarvestReplayContext, HarvestReplayRecord, HashType, IndexerRegistration, IndexerStats,
+    KadHarvestFamilyObservability, KadHarvestObservability, KadPassiveReplayObservability,
+    KadPublishObservability, PopularHash, Protocol, PublishBatchSummary, PublishCounters,
+    PublishSeedSource, RegisterRequest, RegistrationResponse, ResultBatch, SearchCancelRequest,
+    SearchEvent, SearchEventStatus, SearchJob, SearchKind, SnoopEntry, SnoopObservation, Source,
+    TagEntry,
 };

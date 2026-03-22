@@ -33,11 +33,12 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use overlord_agent_common::{
-    AgentInterfacesView, ConfigUpdate, ContentType, CoordinatorClient, FileRecord, HashType,
-    IndexerServer, IndexerService, IndexerStats, KadHarvestFamilyObservability,
-    KadHarvestObservability, KadPublishObservability, PopularHash, Protocol, PublishBatchSummary,
-    PublishCounters, PublishSeedSource, RegisterRequest, ResultBatch, RunningIndexerServer,
-    SearchEvent, SearchEventStatus, SearchJob, SearchKind, SnoopEntry, Source, TagEntry,
+    AgentInterfacesView, ConfigUpdate, ContentType, CoordinatorClient, FileRecord, HarvestFamily,
+    HarvestReplayContext, HarvestReplayRecord, HashType, IndexerServer, IndexerService,
+    IndexerStats, KadHarvestFamilyObservability, KadHarvestObservability, KadPublishObservability,
+    PopularHash, Protocol, PublishBatchSummary, PublishCounters, PublishSeedSource,
+    RegisterRequest, ResultBatch, RunningIndexerServer, SearchEvent, SearchEventStatus, SearchJob,
+    SearchKind, SnoopEntry, SnoopObservation, Source, TagEntry,
 };
 use overlord_kad_dht::{
     DhtConfig, DhtNode, PublishAttemptStats, SearchResult, SourceResult,
@@ -576,6 +577,7 @@ pub struct OverlordAgentEmule {
     started_at: Instant,
     state_paths: AgentStatePaths,
     snoop_queue: Arc<Mutex<SnoopQueue>>,
+    observed_snoop_events: Arc<Mutex<Vec<SnoopObservation>>>,
     local_store: Arc<Mutex<KadLocalStore>>,
     publish_observability: Arc<Mutex<KadPublishObservability>>,
     harvest_observability: Arc<Mutex<KadHarvestObservability>>,
@@ -625,6 +627,7 @@ impl OverlordAgentEmule {
             started_at: Instant::now(),
             state_paths,
             snoop_queue: Arc::new(Mutex::new(SnoopQueue::new(snoop_queue_config))),
+            observed_snoop_events: Arc::new(Mutex::new(Vec::new())),
             local_store: Arc::new(Mutex::new(local_store)),
             publish_observability: Arc::new(Mutex::new(KadPublishObservability::default())),
             harvest_observability: Arc::new(Mutex::new(KadHarvestObservability::default())),
@@ -1310,6 +1313,7 @@ async fn post_search_batch(
             job_id: Some(job_id),
             indexer_id,
             protocol: Protocol::Kad2,
+            harvest_context: None,
             files,
         })
         .await?;
@@ -1752,19 +1756,38 @@ async fn flush_snoop_queue(
     coordinator: &CoordinatorClient,
     indexer_id: Uuid,
     snoop_queue: &Arc<Mutex<SnoopQueue>>,
+    observed_snoop_events: &Arc<Mutex<Vec<SnoopObservation>>>,
 ) -> Result<()> {
     let (entries, counts) = {
         let queue = snoop_queue.lock().await;
         (queue.snapshot(), queue.family_counts())
     };
+    let observations = {
+        let mut observed = observed_snoop_events.lock().await;
+        std::mem::take(&mut *observed)
+    };
     info!(
-        "kad snoop flush keyword={} source={} notes={} total={}",
+        "kad snoop flush keyword={} source={} notes={} total={} observations={}",
         counts.keyword,
         counts.source,
         counts.notes,
-        entries.len()
+        entries.len(),
+        observations.len()
     );
-    coordinator.flush_snoop(indexer_id, &entries).await
+    match coordinator
+        .flush_snoop(indexer_id, &entries, &observations)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let mut observed = observed_snoop_events.lock().await;
+            observations
+                .into_iter()
+                .rev()
+                .for_each(|event| observed.insert(0, event));
+            Err(error)
+        }
+    }
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<()> {
@@ -1974,20 +1997,39 @@ fn map_search_result_for(dht: &DhtNode, result: &SearchResult) -> Result<FileRec
     })
 }
 
+fn keyword_logical_key(req: &SearchKeyReq) -> String {
+    let payload_hex = if req.restrictive_payload.is_empty() {
+        None
+    } else {
+        Some(hex::encode(&req.restrictive_payload))
+    };
+    format!(
+        "keyword:{}:{:04x}:{}",
+        req.target,
+        req.start_position,
+        payload_hex.as_deref().unwrap_or_default()
+    )
+}
+
+fn source_logical_key(req: &SearchSourceReq) -> String {
+    format!(
+        "source:{}:{:04x}:{}",
+        req.target, req.start_position, req.size
+    )
+}
+
+fn notes_logical_key(req: &SearchNotesReq) -> String {
+    format!("notes:{}:{}", req.target, req.size)
+}
+
 fn build_keyword_snoop_entry(req: &SearchKeyReq, now: chrono::DateTime<Utc>) -> SnoopEntry {
     let payload_hex = if req.restrictive_payload.is_empty() {
         None
     } else {
         Some(hex::encode(&req.restrictive_payload))
     };
-    let logical_key = format!(
-        "keyword:{}:{:04x}:{}",
-        req.target,
-        req.start_position,
-        payload_hex.as_deref().unwrap_or_default()
-    );
     SnoopEntry::Keyword {
-        logical_key,
+        logical_key: keyword_logical_key(req),
         target: req.target.to_string(),
         start_position: req.start_position,
         restrictive_payload_hex: payload_hex,
@@ -2000,10 +2042,7 @@ fn build_keyword_snoop_entry(req: &SearchKeyReq, now: chrono::DateTime<Utc>) -> 
 
 fn build_source_snoop_entry(req: &SearchSourceReq, now: chrono::DateTime<Utc>) -> SnoopEntry {
     SnoopEntry::Source {
-        logical_key: format!(
-            "source:{}:{:04x}:{}",
-            req.target, req.start_position, req.size
-        ),
+        logical_key: source_logical_key(req),
         target: req.target.to_string(),
         start_position: req.start_position,
         size: req.size,
@@ -2016,7 +2055,7 @@ fn build_source_snoop_entry(req: &SearchSourceReq, now: chrono::DateTime<Utc>) -
 
 fn build_notes_snoop_entry(req: &SearchNotesReq, now: chrono::DateTime<Utc>) -> SnoopEntry {
     SnoopEntry::Notes {
-        logical_key: format!("notes:{}:{}", req.target, req.size),
+        logical_key: notes_logical_key(req),
         target: req.target.to_string(),
         size: req.size,
         hit_count: 1,
@@ -2028,6 +2067,7 @@ fn build_notes_snoop_entry(req: &SearchNotesReq, now: chrono::DateTime<Utc>) -> 
 
 async fn record_snoop_entry(
     snoop_queue: &Arc<Mutex<SnoopQueue>>,
+    observed_snoop_events: &Arc<Mutex<Vec<SnoopObservation>>>,
     harvest_observability: &Arc<Mutex<KadHarvestObservability>>,
     from: SocketAddr,
     entry: SnoopEntry,
@@ -2084,6 +2124,55 @@ async fn record_snoop_entry(
             observed_at
         );
     }
+    observed_snoop_events.lock().await.push(match entry {
+        SnoopEntry::Keyword {
+            logical_key,
+            target,
+            start_position,
+            restrictive_payload_hex,
+            last_seen,
+            ..
+        } => SnoopObservation {
+            family: HarvestFamily::Keyword,
+            logical_key,
+            target,
+            start_position: Some(start_position),
+            size: None,
+            restrictive_payload_hex,
+            observed_at: last_seen,
+        },
+        SnoopEntry::Source {
+            logical_key,
+            target,
+            start_position,
+            size,
+            last_seen,
+            ..
+        } => SnoopObservation {
+            family: HarvestFamily::Source,
+            logical_key,
+            target,
+            start_position: Some(start_position),
+            size: Some(size),
+            restrictive_payload_hex: None,
+            observed_at: last_seen,
+        },
+        SnoopEntry::Notes {
+            logical_key,
+            target,
+            size,
+            last_seen,
+            ..
+        } => SnoopObservation {
+            family: HarvestFamily::Notes,
+            logical_key,
+            target,
+            start_position: None,
+            size: Some(size),
+            restrictive_payload_hex: None,
+            observed_at: last_seen,
+        },
+    });
 }
 
 async fn next_passive_keyword_request(
@@ -2118,6 +2207,7 @@ async fn persist_nodes_dat_for(dht: &DhtNode, state_paths: &AgentStatePaths) -> 
 async fn handle_unsolicited_packet(
     dht: &DhtNode,
     snoop_queue: &Arc<Mutex<SnoopQueue>>,
+    observed_snoop_events: &Arc<Mutex<Vec<SnoopObservation>>>,
     local_store: &Arc<Mutex<KadLocalStore>>,
     harvest_observability: &Arc<Mutex<KadHarvestObservability>>,
     packet: KadPacket,
@@ -2209,6 +2299,7 @@ async fn handle_unsolicited_packet(
             let observed_at = Utc::now();
             record_snoop_entry(
                 snoop_queue,
+                observed_snoop_events,
                 harvest_observability,
                 from,
                 build_keyword_snoop_entry(&req, observed_at),
@@ -2234,6 +2325,7 @@ async fn handle_unsolicited_packet(
             let observed_at = Utc::now();
             record_snoop_entry(
                 snoop_queue,
+                observed_snoop_events,
                 harvest_observability,
                 from,
                 build_source_snoop_entry(&req, observed_at),
@@ -2256,6 +2348,7 @@ async fn handle_unsolicited_packet(
             let observed_at = Utc::now();
             record_snoop_entry(
                 snoop_queue,
+                observed_snoop_events,
                 harvest_observability,
                 from,
                 build_notes_snoop_entry(&req, observed_at),
@@ -2496,8 +2589,13 @@ impl IndexerService for OverlordAgentEmule {
 
     async fn stop(&self) -> Result<()> {
         self.stop_runtime().await?;
-        if let Err(error) =
-            flush_snoop_queue(&self.coordinator, self.indexer_id, &self.snoop_queue).await
+        if let Err(error) = flush_snoop_queue(
+            &self.coordinator,
+            self.indexer_id,
+            &self.snoop_queue,
+            &self.observed_snoop_events,
+        )
+        .await
         {
             warn!("failed to flush snoop queue during shutdown: {error}");
         }
@@ -2766,6 +2864,7 @@ impl OverlordAgentEmule {
         let dht = runtime.dht.clone();
         let shutdown = Arc::clone(&runtime.shutdown);
         let snoop_queue = Arc::clone(&self.snoop_queue);
+        let observed_snoop_events = Arc::clone(&self.observed_snoop_events);
         let local_store = Arc::clone(&self.local_store);
         let harvest_observability = Arc::clone(&self.harvest_observability);
         runtime.tasks.lock().await.push(tokio::spawn(async move {
@@ -2776,6 +2875,7 @@ impl OverlordAgentEmule {
                         if let Err(error) = handle_unsolicited_packet(
                             &dht,
                             &snoop_queue,
+                            &observed_snoop_events,
                             &local_store,
                             &harvest_observability,
                             packet,
@@ -2812,9 +2912,24 @@ impl OverlordAgentEmule {
                     record_passive_keyword_replay_idle(&mut observability, Utc::now());
                     continue;
                 };
+                let replay_started_at = Utc::now();
+                let replay_context = HarvestReplayContext {
+                    replay_id: Uuid::new_v4(),
+                    family: HarvestFamily::Keyword,
+                    logical_key: keyword_logical_key(&request),
+                    target: request.target.to_string(),
+                    start_position: Some(request.start_position),
+                    size: None,
+                    restrictive_payload_hex: (!request.restrictive_payload.is_empty())
+                        .then(|| hex::encode(&request.restrictive_payload)),
+                };
                 {
                     let mut observability = harvest_observability.lock().await;
-                    record_passive_keyword_replay_start(&mut observability, &request, Utc::now());
+                    record_passive_keyword_replay_start(
+                        &mut observability,
+                        &request,
+                        replay_started_at,
+                    );
                 }
                 info!(
                     "kad passive replay start target={} start_position={} restrictive_bytes={}",
@@ -2826,6 +2941,7 @@ impl OverlordAgentEmule {
                 let mut files = Vec::new();
                 let mut replayed_results = 0usize;
                 let mut batches_posted = 0usize;
+                let mut last_post_error: Option<String> = None;
                 while let Some(result) = stream.next().await {
                     if let Ok(file) = map_search_result_for(&dht, &result) {
                         passive_result_count.fetch_add(1, Ordering::Relaxed);
@@ -2836,15 +2952,17 @@ impl OverlordAgentEmule {
                                 job_id: None,
                                 indexer_id,
                                 protocol: Protocol::Kad2,
+                                harvest_context: Some(replay_context.clone()),
                                 files: std::mem::take(&mut files),
                             };
                             if let Err(error) = coordinator.post_results(&payload).await {
                                 warn!("failed to post passive result batch: {error}");
+                                last_post_error = Some(error.to_string());
                                 let mut observability = harvest_observability.lock().await;
                                 record_passive_keyword_post_failure(
                                     &mut observability,
                                     Utc::now(),
-                                    &error.to_string(),
+                                    last_post_error.as_deref().unwrap_or("post failed"),
                                 );
                             } else {
                                 batches_posted += 1;
@@ -2857,28 +2975,51 @@ impl OverlordAgentEmule {
                         job_id: None,
                         indexer_id,
                         protocol: Protocol::Kad2,
+                        harvest_context: Some(replay_context.clone()),
                         files,
                     };
                     if let Err(error) = coordinator.post_results(&payload).await {
                         warn!("failed to post passive result batch: {error}");
+                        last_post_error = Some(error.to_string());
                         let mut observability = harvest_observability.lock().await;
                         record_passive_keyword_post_failure(
                             &mut observability,
                             Utc::now(),
-                            &error.to_string(),
+                            last_post_error.as_deref().unwrap_or("post failed"),
                         );
                     } else {
                         batches_posted += 1;
                     }
                 }
+                let replay_completed_at = Utc::now();
                 {
                     let mut observability = harvest_observability.lock().await;
                     record_passive_keyword_replay_complete(
                         &mut observability,
-                        Utc::now(),
+                        replay_completed_at,
                         replayed_results,
                         batches_posted,
                     );
+                }
+                if let Err(error) = coordinator
+                    .post_harvest_replay(&HarvestReplayRecord {
+                        replay_id: replay_context.replay_id,
+                        indexer_id,
+                        family: replay_context.family,
+                        logical_key: replay_context.logical_key.clone(),
+                        target: replay_context.target.clone(),
+                        start_position: replay_context.start_position,
+                        size: replay_context.size,
+                        restrictive_payload_hex: replay_context.restrictive_payload_hex.clone(),
+                        started_at: replay_started_at,
+                        completed_at: replay_completed_at,
+                        result_count: replayed_results as u32,
+                        batch_count: batches_posted as u32,
+                        error: last_post_error.clone(),
+                    })
+                    .await
+                {
+                    debug!("failed to post harvest replay summary: {error}");
                 }
                 info!(
                     "kad passive replay done results={} batches_posted={}",
@@ -2890,6 +3031,7 @@ impl OverlordAgentEmule {
         let coordinator = self.coordinator.clone();
         let shutdown = Arc::clone(&runtime.shutdown);
         let snoop_queue = Arc::clone(&self.snoop_queue);
+        let observed_snoop_events = Arc::clone(&self.observed_snoop_events);
         let indexer_id = self.indexer_id;
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             while !shutdown.load(Ordering::Relaxed) {
@@ -2897,7 +3039,13 @@ impl OverlordAgentEmule {
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
-                if let Err(error) = flush_snoop_queue(&coordinator, indexer_id, &snoop_queue).await
+                if let Err(error) = flush_snoop_queue(
+                    &coordinator,
+                    indexer_id,
+                    &snoop_queue,
+                    &observed_snoop_events,
+                )
+                .await
                 {
                     debug!("snoop flush failed: {error}");
                 }
@@ -3419,10 +3567,11 @@ mod tests {
         let (addr, flushed_entries) = spawn_mock_coordinator(vec![restored_entry.clone()]).await;
         let coordinator = CoordinatorClient::new(&format!("http://{addr}")).unwrap();
         let queue = Arc::new(Mutex::new(SnoopQueue::new(SnoopQueueConfig::default())));
+        let observed_snoop_events = Arc::new(Mutex::new(Vec::new()));
         let indexer_id = Uuid::from_u128(0x22222222222222222222222222222222);
 
         restore_snoop_queue(&coordinator, indexer_id, &queue).await;
-        flush_snoop_queue(&coordinator, indexer_id, &queue)
+        flush_snoop_queue(&coordinator, indexer_id, &queue, &observed_snoop_events)
             .await
             .unwrap();
 

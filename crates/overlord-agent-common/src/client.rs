@@ -2,9 +2,10 @@ use anyhow::{Context, Result};
 use reqwest::Url;
 
 use crate::types::{
-    AgentInterfacesView, AgentNetworkReport, ConfigUpdate, IndexerRegistration, IndexerStats,
-    PopularHash, RegisterRequest, RegistrationResponse, ResultBatch, SearchCancelRequest,
-    SearchEvent, SearchJob, SearchKind, SnoopEntry,
+    AgentInterfacesView, AgentNetworkReport, ConfigUpdate, HarvestReplayRecord,
+    IndexerRegistration, IndexerStats, PopularHash, RegisterRequest, RegistrationResponse,
+    ResultBatch, SearchCancelRequest, SearchEvent, SearchJob, SearchKind, SnoopEntry,
+    SnoopObservation,
 };
 
 #[derive(Clone)]
@@ -89,13 +90,19 @@ impl CoordinatorClient {
         Ok(())
     }
 
-    pub async fn flush_snoop(&self, indexer_id: uuid::Uuid, entries: &[SnoopEntry]) -> Result<()> {
+    pub async fn flush_snoop(
+        &self,
+        indexer_id: uuid::Uuid,
+        entries: &[SnoopEntry],
+        observations: &[SnoopObservation],
+    ) -> Result<()> {
         let url = self.base_url.join("/api/internal/snoop-flush")?;
         self.http
             .post(url)
             .json(&serde_json::json!({
                 "indexer_id": indexer_id,
                 "entries": entries,
+                "observations": observations,
             }))
             .send()
             .await?
@@ -127,6 +134,17 @@ impl CoordinatorClient {
             .error_for_status()?
             .json::<Vec<PopularHash>>()
             .await?)
+    }
+
+    pub async fn post_harvest_replay(&self, payload: &HarvestReplayRecord) -> Result<()> {
+        let url = self.base_url.join("/api/internal/harvest-replays")?;
+        self.http
+            .post(url)
+            .json(payload)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 
     pub async fn stats(&self) -> Result<IndexerStats> {

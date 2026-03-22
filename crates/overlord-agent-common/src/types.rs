@@ -104,6 +104,9 @@ pub struct ResultBatch {
     pub job_id: Option<Uuid>,
     pub indexer_id: Uuid,
     pub protocol: Protocol,
+    /// Optional metadata that links a passive replay batch back to the harvested Kad shape that produced it.
+    #[serde(default)]
+    pub harvest_context: Option<HarvestReplayContext>,
     #[serde(default)]
     pub files: Vec<FileRecord>,
 }
@@ -231,6 +234,57 @@ pub struct KadHarvestObservability {
     pub source_requests: KadHarvestFamilyObservability,
     pub notes_requests: KadHarvestFamilyObservability,
     pub passive_keyword_replay: KadPassiveReplayObservability,
+}
+
+/// Kad search-request family observed on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarvestFamily {
+    Keyword,
+    Source,
+    Notes,
+}
+
+/// Stable context that ties passive replay result batches back to one harvested request shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarvestReplayContext {
+    pub replay_id: Uuid,
+    pub family: HarvestFamily,
+    pub logical_key: String,
+    pub target: String,
+    pub start_position: Option<u16>,
+    pub size: Option<u64>,
+    pub restrictive_payload_hex: Option<String>,
+}
+
+/// Summary record for one passive replay cycle, including zero-result replays.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarvestReplayRecord {
+    pub replay_id: Uuid,
+    pub indexer_id: Uuid,
+    pub family: HarvestFamily,
+    pub logical_key: String,
+    pub target: String,
+    pub start_position: Option<u16>,
+    pub size: Option<u64>,
+    pub restrictive_payload_hex: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+    pub result_count: u32,
+    pub batch_count: u32,
+    pub error: Option<String>,
+}
+
+/// Append-only harvested Kad observation captured from unsolicited inbound search traffic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnoopObservation {
+    pub family: HarvestFamily,
+    pub logical_key: String,
+    pub target: String,
+    pub start_position: Option<u16>,
+    pub size: Option<u64>,
+    pub restrictive_payload_hex: Option<String>,
+    pub observed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
