@@ -3057,11 +3057,12 @@ impl OverlordAgentEmule {
                 return;
             }
 
-            let mut next_delay = Duration::ZERO;
             while !shutdown.load(Ordering::Relaxed) {
-                tokio::time::sleep(next_delay).await;
-                next_delay = udp_firewall_recheck_interval;
-                if shutdown.load(Ordering::Relaxed) || !dht.is_bootstrapped() {
+                if !dht.is_bootstrapped() {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
                     continue;
                 }
 
@@ -3165,6 +3166,7 @@ impl OverlordAgentEmule {
                         );
                     }
                 }
+                tokio::time::sleep(udp_firewall_recheck_interval).await;
             }
         }));
 
