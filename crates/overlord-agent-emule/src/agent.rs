@@ -2321,6 +2321,7 @@ async fn build_hello_response(
     dht: &DhtNode,
     ed2k_listener: &TcpListener,
     kad_firewall: &Arc<Mutex<KadFirewallState>>,
+    peer_addr: SocketAddr,
     request_ack: bool,
 ) -> Result<overlord_kad_proto::HelloRes> {
     let bind_addr = dht.bind_addr()?;
@@ -2332,6 +2333,10 @@ async fn build_hello_response(
         .local_addr()
         .context("failed to read eD2k listener address while building hello")?
         .port();
+    let peer_udp_key = match peer_addr.ip() {
+        IpAddr::V4(ip) => Some(dht.verify_key_for_ip(ip)),
+        IpAddr::V6(_) => None,
+    };
     let firewall = kad_firewall.lock().await;
 
     Ok(overlord_kad_proto::HelloRes {
@@ -2339,7 +2344,7 @@ async fn build_hello_response(
         tcp_ip,
         tcp_port,
         version: overlord_kad_proto::KAD_VERSION,
-        udp_key: Some(dht.udp_key()),
+        udp_key: peer_udp_key,
         tags: build_kad_hello_tags(
             bind_addr.port(),
             firewall.udp_verified && !firewall.udp_open,
@@ -2553,6 +2558,7 @@ async fn handle_unsolicited_packet(
                 dht,
                 context.ed2k_listener,
                 context.kad_firewall,
+                from,
                 request_ack,
             )
             .await?;
@@ -3315,22 +3321,24 @@ impl OverlordAgentEmule {
                     }
                 }
 
-                let request = FirewallCheckUdpRequest {
-                    internal_udp_port: bind_addr.port(),
-                    external_udp_port: *expected_ports.last().unwrap_or(&bind_addr.port()),
-                    sender_udp_key: dht.udp_key(),
-                };
+                let internal_udp_port = bind_addr.port();
+                let external_udp_port = *expected_ports.last().unwrap_or(&bind_addr.port());
                 info!(
                     "starting kad udp firewall-check helpers={} internal_port={} external_port={}",
                     helper_contacts.len(),
-                    request.internal_udp_port,
-                    request.external_udp_port
+                    internal_udp_port,
+                    external_udp_port
                 );
 
                 let mut request_tasks = Vec::with_capacity(helper_contacts.len());
                 for contact in helper_contacts {
                     let helper_addr = SocketAddr::new(IpAddr::V4(contact.ip), contact.tcp_port);
                     let helper_ip = IpAddr::V4(contact.ip);
+                    let request = FirewallCheckUdpRequest {
+                        internal_udp_port,
+                        external_udp_port,
+                        sender_udp_key: dht.verify_key_for_ip(contact.ip),
+                    };
                     request_tasks.push(tokio::spawn(async move {
                         let result = request_udp_firewall_check(
                             helper_addr,
@@ -3581,16 +3589,18 @@ mod tests {
     use super::{
         COORDINATOR_RECONNECT_SECS, EMULE_LARGE_FILE_SIZE_THRESHOLD, EmuleAgentConfig,
         OverlordAgentEmule, SYNTHETIC_POPULAR_SEEDS, apply_harvest_record, apply_networking_config,
-        apply_publish_summary, apply_queue_family_counts, build_kad_hello_tags,
-        build_publish_batch_summary, current_tcp_firewalled, empty_networking_config,
-        emule_high_id_source_type, flush_snoop_queue, keyword_target, parse_kad_hello_metadata,
-        record_passive_keyword_post_failure, record_passive_keyword_replay_complete,
-        record_passive_keyword_replay_idle, record_passive_keyword_replay_start,
-        restore_snoop_queue, select_popular_hashes_for_seeding, significant_keyword_words,
-        synthetic_file_hash, synthetic_popular_hashes,
+        apply_publish_summary, apply_queue_family_counts, build_hello_response,
+        build_kad_hello_tags, build_publish_batch_summary, current_tcp_firewalled,
+        empty_networking_config, emule_high_id_source_type, flush_snoop_queue, keyword_target,
+        parse_kad_hello_metadata, record_passive_keyword_post_failure,
+        record_passive_keyword_replay_complete, record_passive_keyword_replay_idle,
+        record_passive_keyword_replay_start, restore_snoop_queue,
+        select_popular_hashes_for_seeding, significant_keyword_words, synthetic_file_hash,
+        synthetic_popular_hashes,
     };
     use crate::{
         config::SnoopQueueConfig,
+        kad_firewall::KadFirewallState,
         paths::unique_test_dir,
         snoop_queue::{SnoopQueue, SnoopQueueFamilyCounts},
     };
@@ -3606,8 +3616,8 @@ mod tests {
         PublishSeedSource, RegisterRequest, RegistrationResponse, SnoopEntry,
     };
     use overlord_agent_nat::{UPNP_MINIUPNPC_BACKEND, UPNP_RUPNP_BACKEND};
-    use overlord_kad_dht::PublishAttemptStats;
-    use overlord_kad_proto::{SearchKeyReq, Tag, TagValue, tag_name};
+    use overlord_kad_dht::{DhtConfig, DhtNode, PublishAttemptStats};
+    use overlord_kad_proto::{NodeId, SearchKeyReq, Tag, TagValue, tag_name};
     use std::{
         collections::HashSet,
         fs,
@@ -4288,5 +4298,29 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 
         assert!(!current_tcp_firewalled(&listener));
+    }
+
+    #[tokio::test]
+    async fn hello_response_uses_peer_specific_udp_verify_key() {
+        let dht = DhtNode::new(DhtConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            node_id: NodeId::from_bytes([0x33; 16]),
+            udp_key: 0x1122_3344,
+            ..DhtConfig::default()
+        })
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let kad_firewall = Arc::new(Mutex::new(KadFirewallState::default()));
+        let peer_addr: SocketAddr = "1.2.3.4:4672".parse().unwrap();
+
+        let hello = build_hello_response(&dht, &listener, &kad_firewall, peer_addr, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            hello.udp_key,
+            Some(dht.verify_key_for_ip("1.2.3.4".parse().unwrap()))
+        );
     }
 }

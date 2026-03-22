@@ -49,7 +49,7 @@ pub struct FirewallCheckUdpRequest {
     pub internal_udp_port: u16,
     /// UDP port observed/mapped externally for the requester.
     pub external_udp_port: u16,
-    /// Kad UDP verify key used to obfuscate the helper's reply.
+    /// Per-helper Kad UDP verify key used to obfuscate the helper's reply.
     pub sender_udp_key: u32,
 }
 

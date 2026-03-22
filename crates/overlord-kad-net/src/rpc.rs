@@ -5,7 +5,7 @@ use crate::tracker::PacketTracker;
 use crate::transport::Transport;
 use overlord_kad_proto::{KadPacket, constants::opcode};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -335,9 +335,15 @@ impl RpcManager {
         self.inner.transport.local_addr().map_err(NetError::Io)
     }
 
-    /// Register a peer's UDP key after a successful HELLO exchange.
+    /// Register a peer's announced receiver verify key for obfuscated replies.
     pub fn register_peer_key(&self, addr: SocketAddr, key: u32) {
         self.inner.obfuscation.register_peer_key(addr, key);
+    }
+
+    /// Derive the verify key we should announce to a specific IPv4 peer.
+    #[must_use]
+    pub fn verify_key_for_ip(&self, ip: Ipv4Addr) -> u32 {
+        self.inner.obfuscation.verify_key_for_ip(ip)
     }
 
     /// Register a peer's Kad node ID for NodeID-based request obfuscation.

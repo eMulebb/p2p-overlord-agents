@@ -7,7 +7,7 @@ use overlord_kad_proto::{
     Ed2kHash, KadPacket, KadUdpKey, NodeId, SearchKeyReq, Tag, constants::K, opcode,
 };
 use overlord_kad_routing::{Contact, RoutingTable};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -160,6 +160,11 @@ impl DhtNode {
         self.inner.config.udp_key
     }
 
+    /// Derive the Kad UDP verify key we should announce to a specific peer IP.
+    pub fn verify_key_for_ip(&self, ip: Ipv4Addr) -> u32 {
+        self.inner.rpc.verify_key_for_ip(ip)
+    }
+
     /// Actual UDP bind address.
     pub fn bind_addr(&self) -> Result<SocketAddr, DhtError> {
         Ok(self.inner.rpc.local_addr()?)
@@ -218,7 +223,7 @@ impl DhtNode {
         Ok(())
     }
 
-    /// Register a peer's UDP key for obfuscated replies.
+    /// Register a peer's announced receiver verify key for obfuscated replies.
     pub fn register_peer_key(&self, addr: SocketAddr, udp_key: u32) {
         self.inner.rpc.register_peer_key(addr, udp_key);
     }
