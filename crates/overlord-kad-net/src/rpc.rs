@@ -385,8 +385,8 @@ mod tests {
     use super::*;
     use crate::obfuscation::ObfuscationLayer;
     use crate::transport::MockTransport;
-    use overlord_kad_proto::KadPacket;
     use overlord_kad_proto::constants::opcode;
+    use overlord_kad_proto::{KadPacket, NodeId};
 
     fn make_local_addr() -> SocketAddr {
         "127.0.0.1:0".parse().unwrap()
@@ -465,7 +465,10 @@ mod tests {
         // Inject a HelloResAck (no pending request for it)
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            let hello = KadPacket::HelloResAck;
+            let hello = KadPacket::HelloResAck(overlord_kad_proto::HelloResAck {
+                node_id: NodeId::from_bytes([0x44; 16]),
+                tags: Vec::new(),
+            });
             let encoded = hello.encode().unwrap();
             let _ = inject_tx.send((encoded, peer_addr)).await;
         });
@@ -473,7 +476,7 @@ mod tests {
         let received = tokio::time::timeout(Duration::from_secs(2), subscriber.recv()).await;
         assert!(received.is_ok(), "timed out waiting for broadcast");
         let (pkt, addr) = received.unwrap().unwrap();
-        assert!(matches!(pkt, KadPacket::HelloResAck));
+        assert!(matches!(pkt, KadPacket::HelloResAck(_)));
         assert_eq!(addr, peer_addr);
     }
 

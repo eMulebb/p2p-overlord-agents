@@ -96,9 +96,20 @@ pub struct HelloRes {
 
 // ── HelloResAck ──────────────────────────────────────────────────────────────
 
-#[derive(BinRead, BinWrite, Debug, Clone, PartialEq)]
+/// Kad hello acknowledgment payload used by the three-way hello handshake.
+#[binrw]
 #[brw(little)]
-pub struct HelloResAck;
+#[derive(Debug, Clone, PartialEq)]
+pub struct HelloResAck {
+    /// Node ID that confirms the ACK sender's identity.
+    pub node_id: NodeId,
+    #[br(temp)]
+    #[bw(calc = u8::try_from(tags.len()).expect("tag count exceeds u8"))]
+    tag_count: u8,
+    /// Reserved tag list. eMule currently sends an empty list here.
+    #[br(count = tag_count)]
+    pub tags: Vec<Tag>,
+}
 
 // ── Req ──────────────────────────────────────────────────────────────────────
 //
@@ -339,7 +350,7 @@ pub enum KadPacket {
     BootstrapRes(BootstrapRes),
     HelloReq(HelloReq),
     HelloRes(HelloRes),
-    HelloResAck,
+    HelloResAck(HelloResAck),
     Req(Req),
     Res(Res),
     SearchKeyReq(SearchKeyReq),
@@ -409,7 +420,10 @@ impl KadPacket {
                 let p = cursor.read_le::<HelloRes>()?;
                 KadPacket::HelloRes(p)
             }
-            opcode::HELLO_RES_ACK => KadPacket::HelloResAck,
+            opcode::HELLO_RES_ACK => {
+                let p = cursor.read_le::<HelloResAck>()?;
+                KadPacket::HelloResAck(p)
+            }
             opcode::REQ => {
                 let p = cursor.read_le::<Req>()?;
                 KadPacket::Req(p)
@@ -494,6 +508,7 @@ impl KadPacket {
             KadPacket::BootstrapRes(p) => buf.write_le(p)?,
             KadPacket::HelloReq(p) => buf.write_le(p)?,
             KadPacket::HelloRes(p) => buf.write_le(p)?,
+            KadPacket::HelloResAck(p) => buf.write_le(p)?,
             KadPacket::Req(p) => buf.write_le(p)?,
             KadPacket::Res(p) => buf.write_le(p)?,
             KadPacket::SearchKeyReq(p) => write_search_key_req(&mut buf, p)?,
@@ -509,7 +524,6 @@ impl KadPacket {
             KadPacket::FirewalledRes(p) => buf.write_le(p)?,
             KadPacket::FirewallUdp(p) => buf.write_le(p)?,
             KadPacket::BootstrapReq
-            | KadPacket::HelloResAck
             | KadPacket::PublishResAck
             | KadPacket::FirewalledAckRes
             | KadPacket::Ping
@@ -530,7 +544,7 @@ impl KadPacket {
             KadPacket::BootstrapRes(_) => opcode::BOOTSTRAP_RES,
             KadPacket::HelloReq(_) => opcode::HELLO_REQ,
             KadPacket::HelloRes(_) => opcode::HELLO_RES,
-            KadPacket::HelloResAck => opcode::HELLO_RES_ACK,
+            KadPacket::HelloResAck(_) => opcode::HELLO_RES_ACK,
             KadPacket::Req(_) => opcode::REQ,
             KadPacket::Res(_) => opcode::RES,
             KadPacket::SearchKeyReq(_) => opcode::SEARCH_KEY_REQ,
@@ -617,6 +631,7 @@ fn write_search_key_req(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TagValue;
     use crate::tag::Tag;
 
     fn roundtrip(pkt: &KadPacket) -> KadPacket {
@@ -736,6 +751,25 @@ mod tests {
             assert_eq!(req.udp_key, None);
         } else {
             panic!("wrong type");
+        }
+    }
+
+    #[test]
+    fn test_hello_res_ack_roundtrip() {
+        let pkt = KadPacket::HelloResAck(HelloResAck {
+            node_id: NodeId::from_bytes([0xCC; 16]),
+            tags: vec![Tag::new_short(
+                crate::constants::tag_name::KADMISCOPTIONS,
+                TagValue::U8(4),
+            )],
+        });
+        let bytes = pkt.encode().unwrap();
+        let pkt2 = KadPacket::decode(&bytes).unwrap();
+        if let KadPacket::HelloResAck(ack) = pkt2 {
+            assert_eq!(ack.node_id, NodeId::from_bytes([0xCC; 16]));
+            assert_eq!(ack.tags.len(), 1);
+        } else {
+            panic!("wrong packet type");
         }
     }
 

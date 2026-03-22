@@ -23,6 +23,14 @@ pub struct Contact {
     pub tcp_port: u16,
     pub kad_version: u8,
     pub udp_key: KadUdpKey,
+    /// Peer-advertised Kad UDP port from `TAG_SOURCEUPORT`, if provided.
+    pub hello_source_udp_port: Option<u16>,
+    /// Whether the peer announced itself as UDP firewalled in hello metadata.
+    pub udp_firewalled: bool,
+    /// Whether the peer announced itself as TCP firewalled in hello metadata.
+    pub tcp_firewalled: bool,
+    /// Whether the peer requested a `HELLO_RES_ACK` packet.
+    pub requests_hello_res_ack: bool,
     pub verified: bool,
     pub contact_type: ContactType,
     pub last_seen: SystemTime,
@@ -40,6 +48,10 @@ impl Contact {
             tcp_port,
             kad_version,
             udp_key: KadUdpKey::ZERO,
+            hello_source_udp_port: None,
+            udp_firewalled: false,
+            tcp_firewalled: false,
+            requests_hello_res_ack: false,
             verified: false,
             contact_type: ContactType::Inactive,
             last_seen: now,
@@ -110,6 +122,10 @@ mod tests {
         let c = Contact::new(id, ip, 4672, 4662, 9);
         assert_eq!(c.contact_type, ContactType::Inactive);
         assert!(!c.verified);
+        assert_eq!(c.hello_source_udp_port, None);
+        assert!(!c.udp_firewalled);
+        assert!(!c.tcp_firewalled);
+        assert!(!c.requests_hello_res_ack);
     }
 
     #[test]

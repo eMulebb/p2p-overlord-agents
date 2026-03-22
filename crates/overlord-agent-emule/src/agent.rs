@@ -2237,6 +2237,185 @@ async fn active_udp_firewall_ports(nat: &NatManager, internal_udp_port: u16) -> 
     ports
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct KadHelloPeerMetadata {
+    hello_source_udp_port: Option<u16>,
+    udp_firewalled: bool,
+    tcp_firewalled: bool,
+    requests_hello_res_ack: bool,
+}
+
+fn read_u16_tag_value(value: &TagValue) -> Option<u16> {
+    match value {
+        TagValue::U16(port) => Some(*port),
+        TagValue::U32(port) => u16::try_from(*port).ok(),
+        TagValue::U8(port) => Some(u16::from(*port)),
+        TagValue::UInt(port) => u16::try_from(*port).ok(),
+        _ => None,
+    }
+}
+
+fn read_u8_tag_value(value: &TagValue) -> Option<u8> {
+    match value {
+        TagValue::U8(bits) => Some(*bits),
+        TagValue::U16(bits) => u8::try_from(*bits).ok(),
+        TagValue::U32(bits) => u8::try_from(*bits).ok(),
+        TagValue::UInt(bits) => u8::try_from(*bits).ok(),
+        _ => None,
+    }
+}
+
+fn parse_kad_hello_metadata(tags: &[Tag]) -> KadHelloPeerMetadata {
+    let mut metadata = KadHelloPeerMetadata::default();
+
+    for tag in tags {
+        match &tag.name {
+            TagName::Short(name) if *name == tag_name::SOURCEUPORT => {
+                metadata.hello_source_udp_port =
+                    read_u16_tag_value(&tag.value).filter(|port| *port != 0);
+            }
+            TagName::Short(name) if *name == tag_name::KADMISCOPTIONS => {
+                let Some(bits) = read_u8_tag_value(&tag.value) else {
+                    continue;
+                };
+                metadata.udp_firewalled = (bits & 0x01) != 0;
+                metadata.tcp_firewalled = (bits & 0x02) != 0;
+                metadata.requests_hello_res_ack = (bits & 0x04) != 0;
+            }
+            _ => {}
+        }
+    }
+
+    metadata
+}
+
+fn current_tcp_firewalled(ed2k_listener: &TcpListener) -> bool {
+    // Until the agent has a full eD2k server session and callback verifier,
+    // a bound listener is the best local signal we have that TCP is reachable.
+    ed2k_listener
+        .local_addr()
+        .map(|addr| addr.port() == 0)
+        .unwrap_or(true)
+}
+
+fn build_kad_hello_tags(
+    kad_udp_port: u16,
+    udp_firewalled: bool,
+    tcp_firewalled: bool,
+    request_ack: bool,
+) -> Vec<Tag> {
+    let mut tags = vec![Tag::new_short(
+        tag_name::SOURCEUPORT,
+        TagValue::U16(kad_udp_port),
+    )];
+    let misc_options =
+        u8::from(udp_firewalled) | (u8::from(tcp_firewalled) << 1) | (u8::from(request_ack) << 2);
+    tags.push(Tag::new_short(
+        tag_name::KADMISCOPTIONS,
+        TagValue::U8(misc_options),
+    ));
+    tags
+}
+
+async fn build_hello_response(
+    dht: &DhtNode,
+    ed2k_listener: &TcpListener,
+    kad_firewall: &Arc<Mutex<KadFirewallState>>,
+    request_ack: bool,
+) -> Result<overlord_kad_proto::HelloRes> {
+    let bind_addr = dht.bind_addr()?;
+    let tcp_ip = match bind_addr.ip() {
+        std::net::IpAddr::V4(ip) => u32::from_be_bytes(ip.octets()),
+        std::net::IpAddr::V6(_) => 0,
+    };
+    let tcp_port = ed2k_listener
+        .local_addr()
+        .context("failed to read eD2k listener address while building hello")?
+        .port();
+    let firewall = kad_firewall.lock().await;
+
+    Ok(overlord_kad_proto::HelloRes {
+        node_id: dht.own_id(),
+        tcp_ip,
+        tcp_port,
+        version: overlord_kad_proto::KAD_VERSION,
+        udp_key: Some(dht.udp_key()),
+        tags: build_kad_hello_tags(
+            bind_addr.port(),
+            firewall.udp_verified && !firewall.udp_open,
+            current_tcp_firewalled(ed2k_listener),
+            request_ack,
+        ),
+    })
+}
+
+async fn add_contact_from_hello(
+    dht: &DhtNode,
+    from: SocketAddr,
+    node_id: NodeId,
+    tcp_port: u16,
+    version: u8,
+    udp_key: Option<u32>,
+    tags: &[Tag],
+) -> Option<KadHelloPeerMetadata> {
+    let mut metadata = parse_kad_hello_metadata(tags);
+    if version < 8 {
+        metadata.requests_hello_res_ack = false;
+    }
+
+    let std::net::IpAddr::V4(ip) = from.ip() else {
+        return Some(metadata);
+    };
+
+    let mut contact = Contact::new(
+        node_id,
+        ip,
+        metadata.hello_source_udp_port.unwrap_or(from.port()),
+        tcp_port,
+        version,
+    );
+    let routed_udp_port = contact.udp_port;
+    contact.hello_source_udp_port = metadata.hello_source_udp_port;
+    contact.udp_firewalled = metadata.udp_firewalled;
+    contact.tcp_firewalled = metadata.tcp_firewalled;
+    contact.requests_hello_res_ack = metadata.requests_hello_res_ack;
+    if let Some(udp_key) = udp_key {
+        contact.udp_key = KadUdpKey::new(udp_key);
+    }
+
+    if metadata.udp_firewalled {
+        debug!(
+            "skipping UDP-firewalled hello contact node_id={} from={} routed_udp_port={} source_uport={:?} tcp_firewalled={} requests_ack={}",
+            node_id,
+            from,
+            routed_udp_port,
+            metadata.hello_source_udp_port,
+            metadata.tcp_firewalled,
+            metadata.requests_hello_res_ack
+        );
+        return Some(metadata);
+    }
+
+    match dht.add_contact(contact).await {
+        Ok(()) => {
+            debug!(
+                "accepted hello contact node_id={} from={} routed_udp_port={} source_uport={:?} tcp_firewalled={} requests_ack={}",
+                node_id,
+                from,
+                routed_udp_port,
+                metadata.hello_source_udp_port,
+                metadata.tcp_firewalled,
+                metadata.requests_hello_res_ack
+            );
+        }
+        Err(error) => {
+            debug!("failed to add hello contact from {from}: {error}");
+        }
+    }
+
+    Some(metadata)
+}
+
 async fn select_udp_firewall_helpers(dht: &DhtNode, helper_count: usize) -> Result<Vec<Contact>> {
     let local_ip = dht.bind_addr()?.ip();
     let mut contacts = dht
@@ -2308,6 +2487,7 @@ struct UnsolicitedPacketContext<'a> {
     local_store: &'a Arc<Mutex<KadLocalStore>>,
     harvest_observability: &'a Arc<Mutex<KadHarvestObservability>>,
     kad_firewall: &'a Arc<Mutex<KadFirewallState>>,
+    ed2k_listener: &'a Arc<TcpListener>,
 }
 
 async fn handle_unsolicited_packet(
@@ -2358,47 +2538,74 @@ async fn handle_unsolicited_packet(
             if let Some(udp_key) = req.udp_key {
                 dht.register_peer_key(from, udp_key);
             }
-            if let std::net::IpAddr::V4(ip) = from.ip() {
-                let mut contact =
-                    Contact::new(req.node_id, ip, from.port(), req.tcp_port, req.version);
-                if let Some(udp_key) = req.udp_key {
-                    contact.udp_key = KadUdpKey::new(udp_key);
-                }
-                let _ = dht.add_contact(contact).await;
-            }
-            let bind_addr = dht.bind_addr()?;
-            let tcp_ip = match bind_addr.ip() {
-                std::net::IpAddr::V4(ip) => u32::from_be_bytes(ip.octets()),
-                std::net::IpAddr::V6(_) => 0,
-            };
-            let _ = dht
-                .send_packet(
-                    from,
-                    &KadPacket::HelloRes(overlord_kad_proto::HelloRes {
-                        node_id: dht.own_id(),
-                        tcp_ip,
-                        tcp_port: bind_addr.port(),
-                        version: overlord_kad_proto::KAD_VERSION,
-                        udp_key: Some(dht.udp_key()),
-                        tags: Vec::new(),
-                    }),
-                )
-                .await;
+            let peer_metadata = add_contact_from_hello(
+                dht,
+                from,
+                req.node_id,
+                req.tcp_port,
+                req.version,
+                req.udp_key,
+                &req.tags,
+            )
+            .await;
+            let request_ack = req.version >= 8 && req.udp_key.is_some();
+            let hello_res = build_hello_response(
+                dht,
+                context.ed2k_listener,
+                context.kad_firewall,
+                request_ack,
+            )
+            .await?;
+            let peer_metadata = peer_metadata.unwrap_or_default();
+            debug!(
+                "sending Kad hello response to={} request_ack={} peer_udp_firewalled={} peer_tcp_firewalled={} peer_requests_ack={}",
+                from,
+                request_ack,
+                peer_metadata.udp_firewalled,
+                peer_metadata.tcp_firewalled,
+                peer_metadata.requests_hello_res_ack
+            );
+            let _ = dht.send_packet(from, &KadPacket::HelloRes(hello_res)).await;
         }
         KadPacket::HelloRes(res) => {
             if let Some(udp_key) = res.udp_key {
                 dht.register_peer_key(from, udp_key);
             }
-            if let std::net::IpAddr::V4(ip) = from.ip() {
-                let mut contact =
-                    Contact::new(res.node_id, ip, from.port(), res.tcp_port, res.version);
-                if let Some(udp_key) = res.udp_key {
-                    contact.udp_key = KadUdpKey::new(udp_key);
+            let peer_metadata = add_contact_from_hello(
+                dht,
+                from,
+                res.node_id,
+                res.tcp_port,
+                res.version,
+                res.udp_key,
+                &res.tags,
+            )
+            .await
+            .unwrap_or_default();
+            if peer_metadata.requests_hello_res_ack {
+                if res.udp_key.is_none() {
+                    warn!(
+                        "peer requested HELLO_RES_ACK without a UDP key from={}",
+                        from
+                    );
+                } else {
+                    debug!(
+                        "sending Kad hello response ACK to={} peer_udp_firewalled={} peer_tcp_firewalled={}",
+                        from, peer_metadata.udp_firewalled, peer_metadata.tcp_firewalled
+                    );
+                    let _ = dht
+                        .send_packet(
+                            from,
+                            &KadPacket::HelloResAck(overlord_kad_proto::HelloResAck {
+                                node_id: dht.own_id(),
+                                tags: Vec::new(),
+                            }),
+                        )
+                        .await;
                 }
-                let _ = dht.add_contact(contact).await;
             }
-            let _ = dht.send_packet(from, &KadPacket::HelloResAck).await;
         }
+        KadPacket::HelloResAck(_ack) => {}
         KadPacket::BootstrapReq => {
             let bind_addr = dht.bind_addr()?;
             let contacts = dht
@@ -3007,6 +3214,7 @@ impl OverlordAgentEmule {
         let local_store = Arc::clone(&self.local_store);
         let harvest_observability = Arc::clone(&self.harvest_observability);
         let kad_firewall = Arc::clone(&runtime.kad_firewall);
+        let ed2k_listener = Arc::clone(&runtime.ed2k_listener);
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             let mut packets = dht.subscribe_packets();
             while !shutdown.load(Ordering::Relaxed) {
@@ -3020,6 +3228,7 @@ impl OverlordAgentEmule {
                                 local_store: &local_store,
                                 harvest_observability: &harvest_observability,
                                 kad_firewall: &kad_firewall,
+                                ed2k_listener: &ed2k_listener,
                             },
                             packet,
                             from,
@@ -3372,8 +3581,9 @@ mod tests {
     use super::{
         COORDINATOR_RECONNECT_SECS, EMULE_LARGE_FILE_SIZE_THRESHOLD, EmuleAgentConfig,
         OverlordAgentEmule, SYNTHETIC_POPULAR_SEEDS, apply_harvest_record, apply_networking_config,
-        apply_publish_summary, apply_queue_family_counts, build_publish_batch_summary,
-        empty_networking_config, emule_high_id_source_type, flush_snoop_queue, keyword_target,
+        apply_publish_summary, apply_queue_family_counts, build_kad_hello_tags,
+        build_publish_batch_summary, current_tcp_firewalled, empty_networking_config,
+        emule_high_id_source_type, flush_snoop_queue, keyword_target, parse_kad_hello_metadata,
         record_passive_keyword_post_failure, record_passive_keyword_replay_complete,
         record_passive_keyword_replay_idle, record_passive_keyword_replay_start,
         restore_snoop_queue, select_popular_hashes_for_seeding, significant_keyword_words,
@@ -3397,7 +3607,7 @@ mod tests {
     };
     use overlord_agent_nat::{UPNP_MINIUPNPC_BACKEND, UPNP_RUPNP_BACKEND};
     use overlord_kad_dht::PublishAttemptStats;
-    use overlord_kad_proto::SearchKeyReq;
+    use overlord_kad_proto::{SearchKeyReq, Tag, TagValue, tag_name};
     use std::{
         collections::HashSet,
         fs,
@@ -4045,5 +4255,38 @@ mod tests {
         agent.stop().await.unwrap();
 
         fs::remove_dir_all(&temp_root).unwrap();
+    }
+
+    #[test]
+    fn kad_hello_metadata_parses_misc_bits_and_source_uport() {
+        let metadata = parse_kad_hello_metadata(&[
+            Tag::new_short(tag_name::SOURCEUPORT, TagValue::U16(41000)),
+            Tag::new_short(tag_name::KADMISCOPTIONS, TagValue::U8(0x07)),
+        ]);
+
+        assert_eq!(metadata.hello_source_udp_port, Some(41000));
+        assert!(metadata.udp_firewalled);
+        assert!(metadata.tcp_firewalled);
+        assert!(metadata.requests_hello_res_ack);
+    }
+
+    #[test]
+    fn kad_hello_tags_encode_expected_misc_bits() {
+        let tags = build_kad_hello_tags(41000, true, false, true);
+
+        assert_eq!(
+            tags,
+            vec![
+                Tag::new_short(tag_name::SOURCEUPORT, TagValue::U16(41000)),
+                Tag::new_short(tag_name::KADMISCOPTIONS, TagValue::U8(0x05)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_ed2k_listener_is_treated_as_tcp_open() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+        assert!(!current_tcp_firewalled(&listener));
     }
 }
