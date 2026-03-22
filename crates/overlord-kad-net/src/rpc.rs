@@ -3,7 +3,7 @@ use crate::obfuscation::{DecryptResult, ObfuscationLayer};
 use crate::rate_limit::RateLimiter;
 use crate::tracker::PacketTracker;
 use crate::transport::Transport;
-use overlord_kad_proto::KadPacket;
+use overlord_kad_proto::{KadPacket, constants::opcode};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, oneshot};
 use tokio::time::timeout;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// Configuration for RpcManager.
 pub struct RpcConfig {
@@ -38,6 +38,7 @@ impl Default for RpcConfig {
 
 struct PendingEntry {
     remote_addr: SocketAddr,
+    request_opcode: u8,
     expected_opcode: u8,
     tx: oneshot::Sender<KadPacket>,
     created_at: std::time::Instant,
@@ -143,19 +144,48 @@ impl RpcManager {
 
                             if let Some(id) = match_id {
                                 let entry = pending.remove(&id).unwrap();
+                                let age_ms = entry.created_at.elapsed().as_millis();
                                 debug!(
                                     "matched pending response: opcode=0x{:02X} from={}",
                                     response_opcode, from
                                 );
+                                if is_publish_opcode(entry.request_opcode)
+                                    || is_publish_opcode(response_opcode)
+                                {
+                                    info!(
+                                        "kad publish pending match pending_id={} request_opcode={} response_opcode={} from={} age_ms={}",
+                                        id,
+                                        opcode_name(entry.request_opcode),
+                                        opcode_name(response_opcode),
+                                        from,
+                                        age_ms,
+                                    );
+                                }
                                 let _ = entry.tx.send(packet.clone());
-                                true
+                                Some((id, age_ms, entry.request_opcode))
                             } else {
-                                false
+                                None
                             }
                         };
 
+                        if is_publish_opcode(response_opcode) {
+                            info!(
+                                "kad publish recv opcode={} from={} matched_pending={} matched_pending_id={} matched_age_ms={} matched_request_opcode={} obfuscated={} sender_verify_key={}",
+                                opcode_name(response_opcode),
+                                from,
+                                matched.is_some(),
+                                matched.map(|(id, _, _)| id).unwrap_or_default(),
+                                matched.map(|(_, age_ms, _)| age_ms).unwrap_or_default(),
+                                matched
+                                    .map(|(_, _, request_opcode)| opcode_name(request_opcode))
+                                    .unwrap_or("-"),
+                                was_obfuscated,
+                                sender_verify_key.unwrap_or_default(),
+                            );
+                        }
+
                         // 5. If unmatched: broadcast
-                        if !matched {
+                        if matched.is_none() {
                             debug!(
                                 "unsolicited packet: opcode=0x{:02X} from={}",
                                 response_opcode, from
@@ -201,10 +231,22 @@ impl RpcManager {
                 id,
                 PendingEntry {
                     remote_addr: addr,
+                    request_opcode: packet.opcode(),
                     expected_opcode,
                     tx,
                     created_at: std::time::Instant::now(),
                 },
+            );
+        }
+
+        if is_publish_opcode(packet.opcode()) || is_publish_opcode(expected_opcode) {
+            info!(
+                "kad publish pending add pending_id={} request_opcode={} expected_opcode={} to={} timeout_ms={}",
+                id,
+                opcode_name(packet.opcode()),
+                opcode_name(expected_opcode),
+                addr,
+                timeout_duration.as_millis(),
             );
         }
 
@@ -228,7 +270,24 @@ impl RpcManager {
             }
             Err(_) => {
                 // Timeout
-                self.inner.pending.lock().unwrap().remove(&id);
+                let elapsed_ms = self
+                    .inner
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .remove(&id)
+                    .map(|entry| entry.created_at.elapsed().as_millis())
+                    .unwrap_or_default();
+                if is_publish_opcode(packet.opcode()) || is_publish_opcode(expected_opcode) {
+                    info!(
+                        "kad publish pending timeout pending_id={} request_opcode={} expected_opcode={} to={} age_ms={}",
+                        id,
+                        opcode_name(packet.opcode()),
+                        opcode_name(expected_opcode),
+                        addr,
+                        elapsed_ms,
+                    );
+                }
                 let secs = timeout_duration.as_secs();
                 Err(NetError::Timeout { addr, secs })
             }
@@ -240,10 +299,28 @@ impl RpcManager {
     pub async fn send(&self, addr: SocketAddr, packet: &KadPacket) -> Result<(), NetError> {
         self.inner.rate_limiter.acquire().await;
         let encoded = packet.encode()?;
+        let outbound = self.inner.obfuscation.inspect_outbound(addr);
         let wire = self
             .inner
             .obfuscation
             .encrypt(addr, packet.opcode(), &encoded);
+        if is_publish_opcode(packet.opcode()) {
+            let crypt_target = outbound
+                .peer_node_id
+                .map(|node_id| node_id.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            info!(
+                "kad publish send opcode={} to={} payload_len={} wire_len={} mode={} receiver_verify_key={} sender_verify_key={} crypt_target={}",
+                opcode_name(packet.opcode()),
+                addr,
+                encoded.len(),
+                wire.len(),
+                outbound.mode.as_str(),
+                outbound.receiver_verify_key.unwrap_or_default(),
+                outbound.sender_verify_key.unwrap_or_default(),
+                crypt_target,
+            );
+        }
         self.inner.transport.send_raw(addr, &wire).await
     }
 
@@ -266,6 +343,28 @@ impl RpcManager {
     /// Register a peer's Kad node ID for NodeID-based request obfuscation.
     pub fn register_peer_identity(&self, addr: SocketAddr, node_id: overlord_kad_proto::NodeId) {
         self.inner.obfuscation.register_peer_identity(addr, node_id);
+    }
+}
+
+fn is_publish_opcode(opcode_value: u8) -> bool {
+    matches!(
+        opcode_value,
+        opcode::PUBLISH_KEY_REQ
+            | opcode::PUBLISH_SOURCE_REQ
+            | opcode::PUBLISH_NOTES_REQ
+            | opcode::PUBLISH_RES
+            | opcode::PUBLISH_RES_ACK
+    )
+}
+
+fn opcode_name(opcode_value: u8) -> &'static str {
+    match opcode_value {
+        opcode::PUBLISH_KEY_REQ => "KADEMLIA2_PUBLISH_KEY_REQ",
+        opcode::PUBLISH_SOURCE_REQ => "KADEMLIA2_PUBLISH_SOURCE_REQ",
+        opcode::PUBLISH_NOTES_REQ => "KADEMLIA2_PUBLISH_NOTES_REQ",
+        opcode::PUBLISH_RES => "KADEMLIA2_PUBLISH_RES",
+        opcode::PUBLISH_RES_ACK => "KADEMLIA2_PUBLISH_RES_ACK",
+        _ => "UNKNOWN",
     }
 }
 

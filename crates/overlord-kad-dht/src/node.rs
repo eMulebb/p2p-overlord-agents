@@ -521,12 +521,13 @@ impl DhtNode {
     pub async fn publish_source(
         &self,
         file_hash: Ed2kHash,
+        publisher_id: NodeId,
         tags: Vec<Tag>,
     ) -> Result<crate::publish::PublishAttemptStats, DhtError> {
         crate::publish::publish_source(
             &self.inner.rpc,
             &self.inner.routing_table,
-            self.own_id(),
+            publisher_id,
             file_hash,
             tags,
         )

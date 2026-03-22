@@ -394,6 +394,36 @@ async fn record_publish_summaries(
     apply_publish_summary(&mut observability.source_counters, &source_summary);
 }
 
+/// Refreshes the live publish snapshot while a long seed batch is still running.
+///
+/// The cumulative counters are only committed once the whole batch completes, but
+/// the latest batch snapshots are updated continuously so operators can tell that
+/// startup seeding is still making progress.
+async fn update_publish_progress(
+    publish_observability: &Arc<Mutex<KadPublishObservability>>,
+    seed_source: PublishSeedSource,
+    processed_items: usize,
+    keyword_stats: PublishAttemptStats,
+    source_stats: PublishAttemptStats,
+    observed_at: DateTime<Utc>,
+) {
+    let mut observability = publish_observability.lock().await;
+    observability.last_seed_source = Some(seed_source);
+    observability.last_seed_at = Some(observed_at);
+    observability.latest_keyword_batch = Some(build_publish_batch_summary(
+        seed_source,
+        processed_items,
+        keyword_stats,
+        observed_at,
+    ));
+    observability.latest_source_batch = Some(build_publish_batch_summary(
+        seed_source,
+        processed_items,
+        source_stats,
+        observed_at,
+    ));
+}
+
 #[derive(Clone)]
 struct AgentStatePaths {
     node_id_path: PathBuf,
@@ -1348,6 +1378,7 @@ async fn fetch_popular_hashes_for_seeding(
 /// Publishes one seeding batch and logs which source produced it.
 async fn seed_popular_from_source(
     dht: &DhtNode,
+    source_publish_identity: NodeId,
     source: PublishSeedSource,
     hashes: Vec<PopularHash>,
     publish_observability: &Arc<Mutex<KadPublishObservability>>,
@@ -1357,20 +1388,35 @@ async fn seed_popular_from_source(
         source.label(),
         hashes.len()
     );
-    seed_popular_impl(dht, source, hashes, publish_observability).await
+    seed_popular_impl(
+        dht,
+        source_publish_identity,
+        source,
+        hashes,
+        publish_observability,
+    )
+    .await
 }
 
 async fn seed_popular_from_coordinator_or_fallback(
     dht: &DhtNode,
+    source_publish_identity: NodeId,
     coordinator: &CoordinatorClient,
     publish_observability: &Arc<Mutex<KadPublishObservability>>,
 ) -> Result<()> {
     let (source, hashes) = fetch_popular_hashes_for_seeding(coordinator).await?;
-    seed_popular_from_source(dht, source, hashes, publish_observability).await
+    seed_popular_from_source(
+        dht,
+        source_publish_identity,
+        source,
+        hashes,
+        publish_observability,
+    )
+    .await
 }
 
 /// Returns the eMule high-ID source type used for source publishes in the non-firewalled case.
-fn emule_high_id_source_type(file_size: u64) -> u8 {
+fn emule_high_id_source_type(file_size: u64) -> u32 {
     if file_size > EMULE_LARGE_FILE_SIZE_THRESHOLD {
         4
     } else {
@@ -1378,8 +1424,25 @@ fn emule_high_id_source_type(file_size: u64) -> u8 {
     }
 }
 
+/// Derive a stable 16-byte source-publish identity from the persisted indexer UUID.
+///
+/// The oracle source-publish path sends the eMule client hash rather than the Kad node ID in the
+/// second `KADEMLIA2_PUBLISH_SOURCE_REQ` field. We do not yet persist a separate client hash, so
+/// we reuse the stable indexer UUID bytes to keep the identity fixed across restarts.
+fn source_publish_client_hash(indexer_id: Uuid) -> NodeId {
+    NodeId::from_bytes(*indexer_id.as_bytes())
+}
+
+/// Return the eMule-style `TAG_ENCRYPTION` bits for the current non-firewalled agent.
+///
+/// At the moment the agent only models "crypt layer supported", so the other eMule bits remain 0.
+fn emule_source_encryption_options() -> u8 {
+    0x01
+}
+
 async fn seed_popular_impl(
     dht: &DhtNode,
+    source_publish_identity: NodeId,
     seed_source: PublishSeedSource,
     hashes: Vec<PopularHash>,
     publish_observability: &Arc<Mutex<KadPublishObservability>>,
@@ -1392,11 +1455,22 @@ async fn seed_popular_impl(
     let mut keyword_totals = PublishAttemptStats::default();
     let mut source_totals = PublishAttemptStats::default();
     let published_items = hashes.len();
-    for hash in hashes {
+    update_publish_progress(
+        publish_observability,
+        seed_source,
+        0,
+        keyword_totals,
+        source_totals,
+        Utc::now(),
+    )
+    .await;
+
+    for (index, hash) in hashes.into_iter().enumerate() {
         let HashType::Ed2k(raw_hash) = hash.hash;
         let file_hash = Ed2kHash::from_str(&raw_hash)
             .with_context(|| format!("invalid Ed2k hash {raw_hash}"))?;
         let keyword_hash = keyword_target(&hash.canonical_name);
+        let item_no = index + 1;
         // Keep synthetic seed publishes indistinguishable from normal eMule-style content
         // publishes: filename/filesize/source count on the keyword publish and the normal
         // high-ID source port/type tags on the source publish.
@@ -1405,6 +1479,14 @@ async fn seed_popular_impl(
             Tag::filesize(hash.size),
             Tag::sources(hash.source_count),
         ];
+        info!(
+            "kad publish start family=keyword seed_source={} item={}/{} target={} hash={}",
+            seed_source.label(),
+            item_no,
+            published_items,
+            keyword_hash,
+            raw_hash
+        );
         match dht
             .publish_keyword(keyword_hash, file_hash, keyword_tags)
             .await
@@ -1423,15 +1505,33 @@ async fn seed_popular_impl(
             }
         }
         let source_tags = vec![
-            Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(bind_addr.port())),
-            Tag::new_short(tag_name::SOURCEUPORT, TagValue::U16(bind_addr.port())),
             Tag::new_short(
                 tag_name::SOURCETYPE,
-                TagValue::U8(emule_high_id_source_type(hash.size)),
+                TagValue::UInt(u64::from(emule_high_id_source_type(hash.size))),
             ),
+            Tag::new_short(
+                tag_name::SOURCEPORT,
+                TagValue::UInt(u64::from(bind_addr.port())),
+            ),
+            Tag::new_short(tag_name::SOURCEUPORT, TagValue::U16(bind_addr.port())),
             Tag::filesize(hash.size),
+            Tag::new_short(
+                tag_name::ENCRYPTION,
+                TagValue::U8(emule_source_encryption_options()),
+            ),
         ];
-        match dht.publish_source(file_hash, source_tags).await {
+        info!(
+            "kad publish start family=source seed_source={} item={}/{} target={} hash={}",
+            seed_source.label(),
+            item_no,
+            published_items,
+            file_hash,
+            raw_hash
+        );
+        match dht
+            .publish_source(file_hash, source_publish_identity, source_tags)
+            .await
+        {
             Ok(stats) => {
                 source_totals.closest_contacts_considered += stats.closest_contacts_considered;
                 source_totals.attempted_contacts += stats.attempted_contacts;
@@ -1442,6 +1542,26 @@ async fn seed_popular_impl(
                 debug!("source publish failed for hash={}: {error}", raw_hash);
             }
         }
+        let observed_at = Utc::now();
+        update_publish_progress(
+            publish_observability,
+            seed_source,
+            item_no,
+            keyword_totals,
+            source_totals,
+            observed_at,
+        )
+        .await;
+        info!(
+            "kad publish progress seed_source={} items_done={}/{} keyword_attempted={} keyword_acked={} source_attempted={} source_acked={}",
+            seed_source.label(),
+            item_no,
+            published_items,
+            keyword_totals.attempted_contacts,
+            keyword_totals.acked_contacts,
+            source_totals.attempted_contacts,
+            source_totals.acked_contacts
+        );
     }
 
     record_publish_summaries(
@@ -1652,6 +1772,7 @@ fn tag_to_entry(tag: &Tag) -> TagEntry {
     let value = match &tag.value {
         TagValue::Hash(value) => serde_json::json!(value.to_string()),
         TagValue::String(value) => serde_json::json!(value),
+        TagValue::UInt(value) => serde_json::json!(value),
         TagValue::U64(value) => serde_json::json!(value),
         TagValue::U32(value) => serde_json::json!(value),
         TagValue::U16(value) => serde_json::json!(value),
@@ -1733,9 +1854,54 @@ fn build_notes_snoop_entry(req: &SearchNotesReq, now: chrono::DateTime<Utc>) -> 
     }
 }
 
-async fn record_snoop_entry(snoop_queue: &Arc<Mutex<SnoopQueue>>, entry: SnoopEntry) {
+async fn record_snoop_entry(
+    snoop_queue: &Arc<Mutex<SnoopQueue>>,
+    from: SocketAddr,
+    entry: SnoopEntry,
+) {
+    let (family, target, detail) = match &entry {
+        SnoopEntry::Keyword {
+            target,
+            start_position,
+            restrictive_payload_hex,
+            ..
+        } => (
+            "keyword",
+            target.clone(),
+            format!(
+                "start_position={start_position} restrictive_bytes={}",
+                restrictive_payload_hex
+                    .as_ref()
+                    .map(|payload| payload.len() / 2)
+                    .unwrap_or(0)
+            ),
+        ),
+        SnoopEntry::Source {
+            target,
+            start_position,
+            size,
+            ..
+        } => (
+            "source",
+            target.clone(),
+            format!("start_position={start_position} size={size}"),
+        ),
+        SnoopEntry::Notes { target, size, .. } => ("notes", target.clone(), format!("size={size}")),
+    };
     let mut queue = snoop_queue.lock().await;
-    queue.record(entry);
+    let outcome = queue.record(entry);
+    if outcome.is_new || outcome.hit_count <= 3 || outcome.hit_count % 10 == 0 {
+        info!(
+            "kad snoop family={} from={} target={} {} queue_depth={} hit_count={} state={}",
+            family,
+            from,
+            target,
+            detail,
+            outcome.queue_depth,
+            outcome.hit_count,
+            if outcome.is_new { "new" } else { "repeat" }
+        );
+    }
 }
 
 async fn next_passive_keyword_request(
@@ -1856,13 +2022,23 @@ async fn handle_unsolicited_packet(
             .await?;
         }
         KadPacket::SearchKeyReq(req) => {
-            record_snoop_entry(snoop_queue, build_keyword_snoop_entry(&req, Utc::now())).await
+            record_snoop_entry(
+                snoop_queue,
+                from,
+                build_keyword_snoop_entry(&req, Utc::now()),
+            )
+            .await
         }
         KadPacket::SearchSourceReq(req) => {
-            record_snoop_entry(snoop_queue, build_source_snoop_entry(&req, Utc::now())).await
+            record_snoop_entry(
+                snoop_queue,
+                from,
+                build_source_snoop_entry(&req, Utc::now()),
+            )
+            .await
         }
         KadPacket::SearchNotesReq(req) => {
-            record_snoop_entry(snoop_queue, build_notes_snoop_entry(&req, Utc::now())).await
+            record_snoop_entry(snoop_queue, from, build_notes_snoop_entry(&req, Utc::now())).await
         }
         KadPacket::PublishKeyReq(req) => {
             let _ = dht
@@ -2221,8 +2397,10 @@ impl IndexerService for OverlordAgentEmule {
         let Some(runtime) = runtime else {
             anyhow::bail!("agent networking is waiting for interface selection");
         };
+        let source_publish_identity = source_publish_client_hash(self.indexer_id);
         seed_popular_impl(
             &runtime.dht,
+            source_publish_identity,
             PublishSeedSource::ManualApi,
             hashes,
             &self.publish_observability,
@@ -2250,6 +2428,7 @@ impl OverlordAgentEmule {
         let state_paths = self.state_paths.clone();
         let coordinator = self.coordinator.clone();
         let publish_observability = Arc::clone(&self.publish_observability);
+        let source_publish_identity = source_publish_client_hash(self.indexer_id);
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             while !shutdown.load(Ordering::Relaxed) && !dht.is_bootstrapped() {
                 match dht.bootstrap().await {
@@ -2259,6 +2438,7 @@ impl OverlordAgentEmule {
                         }
                         if let Err(error) = seed_popular_from_coordinator_or_fallback(
                             &dht,
+                            source_publish_identity,
                             &coordinator,
                             &publish_observability,
                         )
@@ -2311,11 +2491,20 @@ impl OverlordAgentEmule {
                 let Some(request) = next_passive_keyword_request(&snoop_queue).await else {
                     continue;
                 };
+                info!(
+                    "kad passive replay start target={} start_position={} restrictive_bytes={}",
+                    request.target,
+                    request.start_position,
+                    request.restrictive_payload.len()
+                );
                 let mut stream = dht.search_keyword_request(request);
                 let mut files = Vec::new();
+                let mut replayed_results = 0usize;
+                let mut batches_posted = 0usize;
                 while let Some(result) = stream.next().await {
                     if let Ok(file) = map_search_result_for(&dht, &result) {
                         passive_result_count.fetch_add(1, Ordering::Relaxed);
+                        replayed_results += 1;
                         files.push(file);
                         if files.len() >= PASSIVE_BATCH_SIZE {
                             let payload = ResultBatch {
@@ -2326,6 +2515,8 @@ impl OverlordAgentEmule {
                             };
                             if let Err(error) = coordinator.post_results(&payload).await {
                                 warn!("failed to post passive result batch: {error}");
+                            } else {
+                                batches_posted += 1;
                             }
                         }
                     }
@@ -2339,8 +2530,14 @@ impl OverlordAgentEmule {
                     };
                     if let Err(error) = coordinator.post_results(&payload).await {
                         warn!("failed to post passive result batch: {error}");
+                    } else {
+                        batches_posted += 1;
                     }
                 }
+                info!(
+                    "kad passive replay done results={} batches_posted={}",
+                    replayed_results, batches_posted
+                );
             }
         }));
 
@@ -2366,6 +2563,7 @@ impl OverlordAgentEmule {
         let shutdown = Arc::clone(&runtime.shutdown);
         let republish_secs = config.p2p.kad.republish_interval_secs;
         let publish_observability = Arc::clone(&self.publish_observability);
+        let source_publish_identity = source_publish_client_hash(self.indexer_id);
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             while !shutdown.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_secs(republish_secs)).await;
@@ -2374,6 +2572,7 @@ impl OverlordAgentEmule {
                 }
                 if let Err(error) = seed_popular_from_coordinator_or_fallback(
                     &dht,
+                    source_publish_identity,
                     &coordinator,
                     &publish_observability,
                 )

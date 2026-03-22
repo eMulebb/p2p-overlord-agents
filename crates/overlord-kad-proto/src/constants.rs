@@ -78,6 +78,7 @@ pub mod tag_name {
     pub const MEDIA_LENGTH: u8 = 0xD3;
     pub const MEDIA_BITRATE: u8 = 0xD4;
     pub const MEDIA_CODEC: u8 = 0xD5;
+    pub const ENCRYPTION: u8 = 0xF3;
     pub const FILERATING: u8 = 0xF7;
     pub const SOURCEUPORT: u8 = 0xFC;
     pub const SOURCEPORT: u8 = 0xFD;

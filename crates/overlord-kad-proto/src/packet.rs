@@ -213,8 +213,8 @@ pub struct SearchRes {
 pub struct PublishEntry {
     pub hash: Ed2kHash,
     #[br(temp)]
-    #[bw(calc = u16::try_from(tags.len()).expect("tag count exceeds u16"))]
-    tag_count: u16,
+    #[bw(calc = u8::try_from(tags.len()).expect("tag count exceeds u8"))]
+    tag_count: u8,
     #[br(count = tag_count)]
     pub tags: Vec<Tag>,
 }
@@ -242,8 +242,8 @@ pub struct PublishSourceReq {
     pub target: NodeId,
     pub publisher_id: NodeId,
     #[br(temp)]
-    #[bw(calc = u16::try_from(tags.len()).expect("tag count exceeds u16"))]
-    tag_count: u16,
+    #[bw(calc = u8::try_from(tags.len()).expect("tag count exceeds u8"))]
+    tag_count: u8,
     #[br(count = tag_count)]
     pub tags: Vec<Tag>,
 }
@@ -257,8 +257,8 @@ pub struct PublishNotesReq {
     pub target: NodeId,
     pub note_hash: Ed2kHash,
     #[br(temp)]
-    #[bw(calc = u16::try_from(tags.len()).expect("tag count exceeds u16"))]
-    tag_count: u16,
+    #[bw(calc = u8::try_from(tags.len()).expect("tag count exceeds u8"))]
+    tag_count: u8,
     #[br(count = tag_count)]
     pub tags: Vec<Tag>,
 }
@@ -856,6 +856,37 @@ mod tests {
         } else {
             panic!("wrong type");
         }
+    }
+
+    #[test]
+    fn test_publish_source_req_uses_u8_tag_count_on_wire() {
+        let pkt = KadPacket::PublishSourceReq(PublishSourceReq {
+            target: NodeId::from_bytes([0x44; 16]),
+            publisher_id: NodeId::from_bytes([0x55; 16]),
+            tags: vec![Tag::sources(10), Tag::filesize(1234)],
+        });
+
+        let encoded = pkt.encode().unwrap();
+        assert_eq!(encoded[0], OP_KADEMLIAHEADER);
+        assert_eq!(encoded[1], opcode::PUBLISH_SOURCE_REQ);
+        assert_eq!(encoded[34], 2, "source publish tag count must be u8");
+    }
+
+    #[test]
+    fn test_publish_key_req_entry_uses_u8_tag_count_on_wire() {
+        let pkt = KadPacket::PublishKeyReq(PublishKeyReq {
+            target: NodeId::from_bytes([0x22; 16]),
+            entries: vec![PublishEntry {
+                hash: Ed2kHash([0x33; 16]),
+                tags: vec![Tag::filename("ubuntu linux"), Tag::sources(10)],
+            }],
+        });
+
+        let encoded = pkt.encode().unwrap();
+        assert_eq!(encoded[0], OP_KADEMLIAHEADER);
+        assert_eq!(encoded[1], opcode::PUBLISH_KEY_REQ);
+        // 2-byte Kad header + 16-byte target + 2-byte entry count + 16-byte file hash.
+        assert_eq!(encoded[36], 2, "keyword publish tag count must be u8");
     }
 
     #[test]

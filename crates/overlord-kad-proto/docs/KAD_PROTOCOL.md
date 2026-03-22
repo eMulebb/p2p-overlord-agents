@@ -314,7 +314,7 @@ Publish entry layout:
 | Field | Size | Meaning |
 |---|---:|---|
 | `hash` | 16 | published file hash |
-| `tag_count` | 2 | number of tags |
+| `tag_count` | 1 | number of tags |
 | `tags[tag_count]` | variable | file metadata tags |
 
 ### `KADEMLIA2_PUBLISH_SOURCE_REQ` (`0x44`)
@@ -328,7 +328,7 @@ Verified wire shape in this repo and eMule send path:
 |---|---:|---|
 | `target` | 16 | file hash target |
 | `publisher_id` | 16 | publisher client hash / source identifier |
-| `tag_count` | 2 | number of tags |
+| `tag_count` | 1 | number of tags |
 | `tags[tag_count]` | variable | source metadata tags |
 
 Important caution:
@@ -348,7 +348,7 @@ Verified wire shape in this repo and eMule send path:
 |---|---:|---|
 | `target` | 16 | file hash target |
 | `author_id` | 16 | publisher Kad ID |
-| `tag_count` | 2 | number of tags |
+| `tag_count` | 1 | number of tags |
 | `tags[tag_count]` | variable | note tags |
 
 Important caution:

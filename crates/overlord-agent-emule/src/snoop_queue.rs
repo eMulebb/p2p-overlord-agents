@@ -15,6 +15,14 @@ pub struct SnoopQueue {
     recent_drains: VecDeque<DateTime<Utc>>,
 }
 
+/// Outcome of recording one harvested search shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnoopRecordOutcome {
+    pub is_new: bool,
+    pub hit_count: u32,
+    pub queue_depth: usize,
+}
+
 impl SnoopQueue {
     /// Creates an empty snoop queue with the provided scheduling settings.
     pub fn new(config: SnoopQueueConfig) -> Self {
@@ -45,8 +53,13 @@ impl SnoopQueue {
     }
 
     /// Records a harvested search request occurrence.
-    pub fn record(&mut self, entry: SnoopEntry) {
-        self.merge_entry(entry);
+    pub fn record(&mut self, entry: SnoopEntry) -> SnoopRecordOutcome {
+        let (is_new, hit_count) = self.merge_entry(entry);
+        SnoopRecordOutcome {
+            is_new,
+            hit_count,
+            queue_depth: self.entries.len(),
+        }
     }
 
     /// Selects the next keyword request eligible for passive drain and marks it as drained.
@@ -97,10 +110,11 @@ impl SnoopQueue {
         Some(selected.0)
     }
 
-    fn merge_entry(&mut self, entry: SnoopEntry) {
+    fn merge_entry(&mut self, entry: SnoopEntry) -> (bool, u32) {
         let logical_key = entry.logical_key().to_string();
         if let Some(existing) = self.entries.get_mut(&logical_key) {
-            existing.set_hit_count(existing.hit_count().saturating_add(entry.hit_count()));
+            let next_hit_count = existing.hit_count().saturating_add(entry.hit_count());
+            existing.set_hit_count(next_hit_count);
             existing.set_last_seen(existing.last_seen().max(entry.last_seen()));
             existing.set_first_seen(existing.first_seen().min(entry.first_seen()));
             existing.set_last_drained_at(
@@ -110,9 +124,10 @@ impl SnoopQueue {
                     (None, right) => right,
                 },
             );
-            return;
+            return (false, next_hit_count);
         }
         self.entries.insert(logical_key, entry);
+        (true, 1)
     }
 
     fn prune_recent_drains(&mut self, now: DateTime<Utc>) {

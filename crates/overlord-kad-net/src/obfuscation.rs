@@ -42,6 +42,42 @@ enum KadKeyMode {
     ReceiverVerifyKey,
 }
 
+/// Outbound Kad UDP encryption mode chosen for a packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundKadEncryptionMode {
+    /// No Kad UDP obfuscation will be applied.
+    Plaintext,
+    /// NodeID-based Kad obfuscation will be used.
+    NodeId,
+    /// Receiver verify-key Kad obfuscation will be used.
+    ReceiverVerifyKey,
+}
+
+impl OutboundKadEncryptionMode {
+    /// Stable string form used by wire-observability logs.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Plaintext => "plaintext",
+            Self::NodeId => "node_id",
+            Self::ReceiverVerifyKey => "receiver_verify_key",
+        }
+    }
+}
+
+/// Snapshot of the peer crypto context used to decide outbound Kad UDP transport shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboundKadEncryptionInfo {
+    /// Final encryption mode the runtime will use for this destination.
+    pub mode: OutboundKadEncryptionMode,
+    /// Known Kad node ID for the peer, when available.
+    pub peer_node_id: Option<NodeId>,
+    /// Latest receiver verify key learned from this peer, when available.
+    pub receiver_verify_key: Option<u32>,
+    /// Verify key this node would announce to the destination peer.
+    pub sender_verify_key: Option<u32>,
+}
+
 fn rc4(key: &[u8], data: &mut [u8]) {
     if key.is_empty() || data.is_empty() {
         return;
@@ -85,10 +121,15 @@ fn derive_kad_receiver_key(receiver_verify_key: u32, random_key_part: u16) -> [u
 }
 
 fn derive_udp_verify_key(our_udp_key: u32, target_ip: Ipv4Addr) -> u32 {
-    // This mirrors eMule `CPrefs::GetUDPVerifyKey` on Windows: the 64-bit value
-    // is laid out in native little-endian memory before hashing.
-    let packed = ((our_udp_key as u64) << 32) | u64::from(u32::from_be_bytes(target_ip.octets()));
-    let digest = md5_key_material(&packed.to_le_bytes());
+    // eMule hashes the native in-memory bytes of:
+    //   (<our Kad UDP key> << 32) | sockAddr.sin_addr.s_addr
+    // On little-endian Windows, `sin_addr.s_addr` is already stored with the
+    // IPv4 octets in network order in memory, so the hashed 8-byte buffer is:
+    //   <ipv4 octets as seen on the wire><our_udp_key little-endian>
+    let mut key_data = [0u8; 8];
+    key_data[..4].copy_from_slice(&target_ip.octets());
+    key_data[4..8].copy_from_slice(&our_udp_key.to_le_bytes());
+    let digest = md5_key_material(&key_data);
     let folded = u32::from_le_bytes(digest[0..4].try_into().unwrap())
         ^ u32::from_le_bytes(digest[4..8].try_into().unwrap())
         ^ u32::from_le_bytes(digest[8..12].try_into().unwrap())
@@ -173,6 +214,39 @@ impl ObfuscationLayer {
         derive_udp_verify_key(self.our_udp_key, ip)
     }
 
+    /// Describe the outbound Kad UDP transport shape currently selected for a peer.
+    #[must_use]
+    pub fn inspect_outbound(&self, addr: SocketAddr) -> OutboundKadEncryptionInfo {
+        let peer = self
+            .peers
+            .lock()
+            .unwrap()
+            .get(&addr)
+            .cloned()
+            .unwrap_or_default();
+        let mode = if !self.enabled {
+            OutboundKadEncryptionMode::Plaintext
+        } else if peer.node_id.is_some() {
+            OutboundKadEncryptionMode::NodeId
+        } else if peer.receiver_verify_key.is_some() {
+            OutboundKadEncryptionMode::ReceiverVerifyKey
+        } else {
+            OutboundKadEncryptionMode::Plaintext
+        };
+        let sender_verify_key = match (mode, addr.ip()) {
+            (OutboundKadEncryptionMode::Plaintext, _) => None,
+            (_, IpAddr::V4(ip)) => Some(self.verify_key_for_ip(ip)),
+            (_, IpAddr::V6(_)) => None,
+        };
+
+        OutboundKadEncryptionInfo {
+            mode,
+            peer_node_id: peer.node_id,
+            receiver_verify_key: peer.receiver_verify_key,
+            sender_verify_key,
+        }
+    }
+
     /// Encrypt a Kad packet for sending to `addr`.
     ///
     /// The caller still passes the opcode for tracing/call-site symmetry, but
@@ -180,7 +254,8 @@ impl ObfuscationLayer {
     /// use the peer Kad ID when we know it, otherwise fall back to the receiver
     /// verify key.
     pub fn encrypt(&self, addr: SocketAddr, _opcode: u8, plaintext: &[u8]) -> Vec<u8> {
-        if !self.enabled {
+        let outbound = self.inspect_outbound(addr);
+        if matches!(outbound.mode, OutboundKadEncryptionMode::Plaintext) {
             return plaintext.to_vec();
         }
 
@@ -191,12 +266,10 @@ impl ObfuscationLayer {
             .get(&addr)
             .cloned()
             .unwrap_or_default();
-        let preferred_mode = if peer.node_id.is_some() {
-            Some(KadKeyMode::NodeId)
-        } else if peer.receiver_verify_key.is_some() {
-            Some(KadKeyMode::ReceiverVerifyKey)
-        } else {
-            None
+        let preferred_mode = match outbound.mode {
+            OutboundKadEncryptionMode::Plaintext => None,
+            OutboundKadEncryptionMode::NodeId => Some(KadKeyMode::NodeId),
+            OutboundKadEncryptionMode::ReceiverVerifyKey => Some(KadKeyMode::ReceiverVerifyKey),
         };
 
         let Some(mode) = preferred_mode else {
@@ -333,6 +406,25 @@ mod tests {
         let ip: Ipv4Addr = "5.6.7.8".parse().unwrap();
         assert_eq!(layer.verify_key_for_ip(ip), layer.verify_key_for_ip(ip));
         assert_ne!(layer.verify_key_for_ip(ip), 0);
+    }
+
+    #[test]
+    fn test_verify_key_derivation_matches_emule_memory_layout() {
+        let ip: Ipv4Addr = "1.2.3.4".parse().unwrap();
+        let our_udp_key: u32 = 0xA1B2_C3D4;
+
+        let mut emule_key_data = [0u8; 8];
+        emule_key_data[..4].copy_from_slice(&[1, 2, 3, 4]);
+        emule_key_data[4..8].copy_from_slice(&our_udp_key.to_le_bytes());
+        let digest = md5_key_material(&emule_key_data);
+        let expected = (u32::from_le_bytes(digest[0..4].try_into().unwrap())
+            ^ u32::from_le_bytes(digest[4..8].try_into().unwrap())
+            ^ u32::from_le_bytes(digest[8..12].try_into().unwrap())
+            ^ u32::from_le_bytes(digest[12..16].try_into().unwrap()))
+            % 0xFFFF_FFFE
+            + 1;
+
+        assert_eq!(derive_udp_verify_key(our_udp_key, ip), expected);
     }
 
     #[test]

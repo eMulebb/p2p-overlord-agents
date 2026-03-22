@@ -1,7 +1,9 @@
 use overlord_kad_net::RpcManager;
 use overlord_kad_proto::{
     Ed2kHash, KadPacket, NodeId, Tag,
-    constants::{ALPHA, K, KADEMLIA_FIND_NODE, KADEMLIA_FIND_VALUE, SEARCHTOLERANCE},
+    constants::{
+        ALPHA, K, KADEMLIA_FIND_NODE, KADEMLIA_FIND_VALUE, KADEMLIA_STORE, SEARCHTOLERANCE,
+    },
     opcode,
     packet::{ContactEntry, Req, SearchKeyReq, SearchNotesReq, SearchSourceReq},
 };
@@ -39,6 +41,8 @@ pub struct TraversalCandidate {
 pub enum TraversalKind {
     /// Pure node lookup — just find close nodes.
     FindNode,
+    /// Store lookup — publish preparation should request the store fanout like the oracle.
+    Store,
     /// Keyword search — after traversal, send SearchKeyReq to close nodes.
     Keyword { request: SearchKeyReq },
     /// Source search — after traversal, send SearchSourceReq to close nodes.
@@ -100,6 +104,7 @@ pub async fn run_traversal(
     // Determine the count byte for Req based on search kind.
     let req_count = match search_kind {
         TraversalKind::FindNode => KADEMLIA_FIND_NODE,
+        TraversalKind::Store => KADEMLIA_STORE,
         _ => KADEMLIA_FIND_VALUE,
     };
 
@@ -254,6 +259,12 @@ pub async fn run_traversal(
             }
         }
 
+        if matches!(search_kind, TraversalKind::FindNode | TraversalKind::Store)
+            && find_node_lookup_converged(&candidates)
+        {
+            break;
+        }
+
         // Termination: K closest all done?
         let k_closest_done = candidates
             .iter()
@@ -297,6 +308,7 @@ pub async fn run_traversal(
 
     let search_entries = match search_kind {
         TraversalKind::FindNode => vec![],
+        TraversalKind::Store => vec![],
         kind => {
             run_search_phase(
                 rpc,
@@ -371,6 +383,7 @@ async fn run_search_phase(
                 KadPacket::SearchNotesReq(SearchNotesReq { target, size })
             }
             TraversalKind::FindNode => unreachable!(),
+            TraversalKind::Store => unreachable!(),
         };
 
         if let Err(err) = rpc.send(contact.addr, &packet).await {
@@ -470,6 +483,32 @@ fn select_phase2_contacts(
         .filter(|contact| passes_search_tolerance(target, contact))
         .take(phase2_fanout)
         .collect()
+}
+
+/// Returns true once a pure node lookup has already locked in its closest `K` responders.
+///
+/// `FindNode`-driven publish fanout only needs the nearest `K` contacts. After those
+/// positions are occupied by responders and every unfinished candidate is farther away
+/// than the current `K`th responder, the remaining walk cannot improve the publish set.
+fn find_node_lookup_converged(candidates: &[TraversalCandidate]) -> bool {
+    let closest_responded = candidates
+        .iter()
+        .filter(|candidate| candidate.state == CandidateState::Responded)
+        .take(K)
+        .collect::<Vec<_>>();
+    let Some(threshold) = closest_responded.last().map(|candidate| candidate.distance) else {
+        return false;
+    };
+    if closest_responded.len() < K {
+        return false;
+    }
+
+    !candidates.iter().any(|candidate| {
+        matches!(
+            candidate.state,
+            CandidateState::Pending | CandidateState::Inflight
+        ) && candidate.distance <= threshold
+    })
 }
 
 fn sanitize_res_contacts(
@@ -664,6 +703,62 @@ mod tests {
             version: 9,
         };
         assert!(!passes_search_tolerance(target, &contact));
+    }
+
+    #[test]
+    fn test_find_node_lookup_converged_ignores_farther_unfinished_candidates() {
+        let mut candidates = (0u8..K as u8)
+            .map(|n| TraversalCandidate {
+                contact: TraversalContact {
+                    id: NodeId::from_bytes([n; 16]),
+                    addr: format!("127.0.0.1:{}", 4600 + u16::from(n))
+                        .parse()
+                        .unwrap(),
+                    version: 9,
+                },
+                state: CandidateState::Responded,
+                distance: NodeId::from_bytes([n; 16]),
+            })
+            .collect::<Vec<_>>();
+        candidates.push(TraversalCandidate {
+            contact: TraversalContact {
+                id: NodeId::from_bytes([0xFF; 16]),
+                addr: "127.0.0.1:4700".parse().unwrap(),
+                version: 9,
+            },
+            state: CandidateState::Pending,
+            distance: NodeId::from_bytes([0xFF; 16]),
+        });
+
+        assert!(find_node_lookup_converged(&candidates));
+    }
+
+    #[test]
+    fn test_find_node_lookup_converged_waits_for_unfinished_closer_candidate() {
+        let mut candidates = (1u8..=K as u8)
+            .map(|n| TraversalCandidate {
+                contact: TraversalContact {
+                    id: NodeId::from_bytes([n; 16]),
+                    addr: format!("127.0.0.1:{}", 4600 + u16::from(n))
+                        .parse()
+                        .unwrap(),
+                    version: 9,
+                },
+                state: CandidateState::Responded,
+                distance: NodeId::from_bytes([n; 16]),
+            })
+            .collect::<Vec<_>>();
+        candidates.push(TraversalCandidate {
+            contact: TraversalContact {
+                id: NodeId::from_bytes([0; 16]),
+                addr: "127.0.0.1:4701".parse().unwrap(),
+                version: 9,
+            },
+            state: CandidateState::Inflight,
+            distance: NodeId::from_bytes([0; 16]),
+        });
+
+        assert!(!find_node_lookup_converged(&candidates));
     }
 
     #[test]

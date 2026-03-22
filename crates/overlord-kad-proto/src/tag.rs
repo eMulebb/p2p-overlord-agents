@@ -17,6 +17,7 @@ pub enum TagName {
 pub enum TagValue {
     Hash(Ed2kHash),
     String(String),
+    UInt(u64),
     U64(u64),
     U32(u32),
     U16(u16),
@@ -119,7 +120,7 @@ impl Tag {
 
     #[must_use]
     pub fn filesize(size: u64) -> Self {
-        Tag::new_short(tag_name::FILESIZE, TagValue::U64(size))
+        Tag::new_short(tag_name::FILESIZE, TagValue::UInt(size))
     }
 
     #[must_use]
@@ -129,7 +130,7 @@ impl Tag {
 
     #[must_use]
     pub fn sources(n: u32) -> Self {
-        Tag::new_short(tag_name::SOURCES, TagValue::U32(n))
+        Tag::new_short(tag_name::SOURCES, TagValue::UInt(u64::from(n)))
     }
 }
 
@@ -138,6 +139,17 @@ fn value_type_byte(v: &TagValue) -> u8 {
     match v {
         TagValue::Hash(_) => 0x01,
         TagValue::String(_) => 0x02,
+        TagValue::UInt(value) => {
+            if *value <= u64::from(u8::MAX) {
+                0x09
+            } else if *value <= u64::from(u16::MAX) {
+                0x08
+            } else if *value <= u64::from(u32::MAX) {
+                0x03
+            } else {
+                0x0B
+            }
+        }
         TagValue::U32(_) => 0x03,
         TagValue::Float(_) => 0x04,
         TagValue::Bool(_) => 0x05,
@@ -274,14 +286,16 @@ impl BinWrite for Tag {
         endian: Endian,
         _args: (),
     ) -> BinResult<()> {
-        let raw_type = value_type_byte(&self.value);
-        let short = matches!(&self.name, TagName::Short(_));
-        let type_byte: u8 = if short { raw_type | 0x80 } else { raw_type };
+        // Kad tags always encode the tag name as a u16 length followed by the
+        // raw bytes. eMule does not use the eD2k short-name marker bit here.
+        let type_byte: u8 = value_type_byte(&self.value);
 
         writer.write_type(&type_byte, endian)?;
 
         match &self.name {
             TagName::Short(b) => {
+                let len: u16 = 1;
+                writer.write_type(&len, endian)?;
                 writer.write_type(b, endian)?;
             }
             TagName::Long(s) => {
@@ -301,6 +315,17 @@ impl BinWrite for Tag {
                 let len = u16::try_from(bytes.len()).expect("string tag length exceeds u16");
                 writer.write_type(&len, endian)?;
                 writer.write_all(bytes).map_err(binrw::Error::Io)?;
+            }
+            TagValue::UInt(v) => {
+                if *v <= u64::from(u8::MAX) {
+                    writer.write_type(&u8::try_from(*v).expect("value fits into u8"), endian)?;
+                } else if *v <= u64::from(u16::MAX) {
+                    writer.write_type(&u16::try_from(*v).expect("value fits into u16"), endian)?;
+                } else if *v <= u64::from(u32::MAX) {
+                    writer.write_type(&u32::try_from(*v).expect("value fits into u32"), endian)?;
+                } else {
+                    writer.write_type(v, endian)?;
+                }
             }
             TagValue::U32(v) => {
                 writer.write_type(v, endian)?;
@@ -346,24 +371,36 @@ mod tests {
     }
 
     #[test]
-    fn test_short_name_string() {
+    fn test_single_byte_name_string_roundtrip() {
         let t = Tag::filename("hello.txt");
-        let t2 = roundtrip(&t);
-        assert_eq!(t, t2);
+        let mut buf = Cursor::new(Vec::new());
+        t.write_le(&mut buf).unwrap();
+        assert_eq!(
+            &buf.into_inner()[..5],
+            &[0x02, 0x01, 0x00, tag_name::FILENAME, 0x09]
+        );
     }
 
     #[test]
-    fn test_short_name_u64() {
+    fn test_filesize_uses_dynamic_integer_width_on_wire() {
         let t = Tag::filesize(1_234_567_890);
-        let t2 = roundtrip(&t);
-        assert_eq!(t, t2);
+        let mut buf = Cursor::new(Vec::new());
+        t.write_le(&mut buf).unwrap();
+        assert_eq!(
+            &buf.into_inner()[..4],
+            &[0x03, 0x01, 0x00, tag_name::FILESIZE]
+        );
     }
 
     #[test]
-    fn test_short_name_u32() {
+    fn test_sources_uses_dynamic_integer_width_on_wire() {
         let t = Tag::sources(42);
-        let t2 = roundtrip(&t);
-        assert_eq!(t, t2);
+        let mut buf = Cursor::new(Vec::new());
+        t.write_le(&mut buf).unwrap();
+        assert_eq!(
+            &buf.into_inner()[..5],
+            &[0x09, 0x01, 0x00, tag_name::SOURCES, 42]
+        );
     }
 
     #[test]
@@ -434,5 +471,12 @@ mod tests {
         let t = Tag::new_long("filesize", TagValue::U64(u64::MAX));
         let t2 = roundtrip(&t);
         assert_eq!(t, t2);
+    }
+
+    #[test]
+    fn test_reader_accepts_legacy_short_name_marker() {
+        let mut buf = Cursor::new(vec![0x89, tag_name::SOURCES, 0x07]);
+        let tag = Tag::read_le(&mut buf).unwrap();
+        assert_eq!(tag, Tag::new_short(tag_name::SOURCES, TagValue::U8(7)));
     }
 }
