@@ -120,6 +120,7 @@ pub struct IndexerStats {
     pub nat: Option<NatStatusSnapshot>,
     pub interface_report: Option<AgentNetworkReport>,
     pub publish_observability: Option<KadPublishObservability>,
+    pub harvest_observability: Option<KadHarvestObservability>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +187,50 @@ pub struct KadPublishObservability {
     #[serde(default)]
     pub source_counters: PublishCounters,
     pub log_file: Option<AgentLogFileStatus>,
+}
+
+/// Per-family harvested Kad search-request telemetry for the current agent process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct KadHarvestFamilyObservability {
+    pub observed_requests: u64,
+    pub unique_shapes_observed: u64,
+    pub queued_entries: u32,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub last_from: Option<String>,
+    pub last_target: Option<String>,
+    pub last_start_position: Option<u16>,
+    pub last_size: Option<u64>,
+    pub last_restrictive_bytes: Option<u32>,
+}
+
+/// Passive replay telemetry for harvested keyword searches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct KadPassiveReplayObservability {
+    pub started_cycles: u64,
+    pub completed_cycles: u64,
+    pub idle_cycles: u64,
+    pub emitted_results: u64,
+    pub posted_batches: u64,
+    pub post_failures: u64,
+    pub last_started_at: Option<DateTime<Utc>>,
+    pub last_completed_at: Option<DateTime<Utc>>,
+    pub last_idle_at: Option<DateTime<Utc>>,
+    pub last_error_at: Option<DateTime<Utc>>,
+    pub last_target: Option<String>,
+    pub last_start_position: Option<u16>,
+    pub last_restrictive_bytes: Option<u32>,
+    pub last_result_count: u32,
+    pub last_batches_posted: u32,
+    pub last_error: Option<String>,
+}
+
+/// Kad harvest telemetry that complements publish observability during live runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct KadHarvestObservability {
+    pub keyword_requests: KadHarvestFamilyObservability,
+    pub source_requests: KadHarvestFamilyObservability,
+    pub notes_requests: KadHarvestFamilyObservability,
+    pub passive_keyword_replay: KadPassiveReplayObservability,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -379,5 +424,6 @@ pub struct AgentInterfacesView {
     pub config: AgentNetworkingConfig,
     pub nat: Option<NatStatusSnapshot>,
     pub publish_observability: Option<KadPublishObservability>,
+    pub harvest_observability: Option<KadHarvestObservability>,
     pub last_error: Option<String>,
 }

@@ -309,6 +309,7 @@ mod tests {
                 nat: None,
                 interface_report: None,
                 publish_observability: None,
+                harvest_observability: None,
             })
         }
 

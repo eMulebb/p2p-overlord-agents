@@ -21,6 +21,15 @@ pub struct SnoopRecordOutcome {
     pub is_new: bool,
     pub hit_count: u32,
     pub queue_depth: usize,
+    pub family_queue_depth: usize,
+}
+
+/// Current queue depth by harvested Kad search family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SnoopQueueFamilyCounts {
+    pub keyword: usize,
+    pub source: usize,
+    pub notes: usize,
 }
 
 impl SnoopQueue {
@@ -54,12 +63,27 @@ impl SnoopQueue {
 
     /// Records a harvested search request occurrence.
     pub fn record(&mut self, entry: SnoopEntry) -> SnoopRecordOutcome {
+        let family = entry_family(&entry);
         let (is_new, hit_count) = self.merge_entry(entry);
         SnoopRecordOutcome {
             is_new,
             hit_count,
             queue_depth: self.entries.len(),
+            family_queue_depth: self.family_count(family),
         }
+    }
+
+    /// Returns the current queue depth for each harvested search family.
+    pub fn family_counts(&self) -> SnoopQueueFamilyCounts {
+        let mut counts = SnoopQueueFamilyCounts::default();
+        for entry in self.entries.values() {
+            match entry_family(entry) {
+                SnoopFamily::Keyword => counts.keyword += 1,
+                SnoopFamily::Source => counts.source += 1,
+                SnoopFamily::Notes => counts.notes += 1,
+            }
+        }
+        counts
     }
 
     /// Selects the next keyword request eligible for passive drain and marks it as drained.
@@ -140,6 +164,28 @@ impl SnoopQueue {
             self.recent_drains.pop_front();
         }
     }
+
+    fn family_count(&self, family: SnoopFamily) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| entry_family(entry) == family)
+            .count()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnoopFamily {
+    Keyword,
+    Source,
+    Notes,
+}
+
+fn entry_family(entry: &SnoopEntry) -> SnoopFamily {
+    match entry {
+        SnoopEntry::Keyword { .. } => SnoopFamily::Keyword,
+        SnoopEntry::Source { .. } => SnoopFamily::Source,
+        SnoopEntry::Notes { .. } => SnoopFamily::Notes,
+    }
 }
 
 fn keyword_request(entry: &SnoopEntry) -> Option<SearchKeyReq> {
@@ -187,7 +233,7 @@ mod tests {
     use overlord_agent_common::SnoopEntry;
     use overlord_kad_proto::SearchKeyReq;
 
-    use super::SnoopQueue;
+    use super::{SnoopQueue, SnoopQueueFamilyCounts};
     use crate::config::SnoopQueueConfig;
 
     fn queue() -> SnoopQueue {
@@ -400,6 +446,40 @@ mod tests {
                 target: "00112233445566778899aabbccddeeff".parse().unwrap(),
                 start_position: 0x8000,
                 restrictive_payload: vec![0xAA, 0xBB],
+            }
+        );
+    }
+
+    #[test]
+    fn family_counts_report_each_variant_depth() {
+        let mut queue = queue();
+        queue.record(keyword_entry(
+            "keyword:00112233445566778899aabbccddeeff:0000",
+            "00112233445566778899aabbccddeeff",
+            0,
+            None,
+            100,
+        ));
+        queue.record(source_entry(
+            "source:00112233445566778899aabbccddeeff:0000:4096",
+            "00112233445566778899aabbccddeeff",
+            0,
+            4096,
+            110,
+        ));
+        queue.record(notes_entry(
+            "notes:00112233445566778899aabbccddeeff:4096",
+            "00112233445566778899aabbccddeeff",
+            4096,
+            120,
+        ));
+
+        assert_eq!(
+            queue.family_counts(),
+            SnoopQueueFamilyCounts {
+                keyword: 1,
+                source: 1,
+                notes: 1,
             }
         );
     }

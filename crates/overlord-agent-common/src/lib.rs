@@ -15,7 +15,8 @@ pub use server::{IndexerServer, RunningIndexerServer};
 pub use service::IndexerService;
 pub use types::{
     AgentInterfacesView, AgentLogFileStatus, ConfigUpdate, ContentType, FileRecord, HashType,
-    IndexerRegistration, IndexerStats, KadPublishObservability, PopularHash, Protocol,
+    IndexerRegistration, IndexerStats, KadHarvestFamilyObservability, KadHarvestObservability,
+    KadPassiveReplayObservability, KadPublishObservability, PopularHash, Protocol,
     PublishBatchSummary, PublishCounters, PublishSeedSource, RegisterRequest, RegistrationResponse,
     ResultBatch, SearchCancelRequest, SearchEvent, SearchEventStatus, SearchJob, SearchKind,
     SnoopEntry, Source, TagEntry,

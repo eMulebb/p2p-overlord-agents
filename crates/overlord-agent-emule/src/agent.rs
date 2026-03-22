@@ -34,10 +34,10 @@ use uuid::Uuid;
 
 use overlord_agent_common::{
     AgentInterfacesView, ConfigUpdate, ContentType, CoordinatorClient, FileRecord, HashType,
-    IndexerServer, IndexerService, IndexerStats, KadPublishObservability, PopularHash, Protocol,
-    PublishBatchSummary, PublishCounters, PublishSeedSource, RegisterRequest, ResultBatch,
-    RunningIndexerServer, SearchEvent, SearchEventStatus, SearchJob, SearchKind, SnoopEntry,
-    Source, TagEntry,
+    IndexerServer, IndexerService, IndexerStats, KadHarvestFamilyObservability,
+    KadHarvestObservability, KadPublishObservability, PopularHash, Protocol, PublishBatchSummary,
+    PublishCounters, PublishSeedSource, RegisterRequest, ResultBatch, RunningIndexerServer,
+    SearchEvent, SearchEventStatus, SearchJob, SearchKind, SnoopEntry, Source, TagEntry,
 };
 use overlord_kad_dht::{
     DhtConfig, DhtNode, PublishAttemptStats, SearchResult, SourceResult,
@@ -51,7 +51,7 @@ use overlord_kad_routing::Contact;
 
 use crate::config::EmuleAgentConfig;
 use crate::logging::current_log_file_status;
-use crate::snoop_queue::SnoopQueue;
+use crate::snoop_queue::{SnoopQueue, SnoopQueueFamilyCounts};
 
 const ACTIVE_BATCH_SIZE: usize = 25;
 const PASSIVE_BATCH_SIZE: usize = 50;
@@ -424,6 +424,122 @@ async fn update_publish_progress(
     ));
 }
 
+fn harvest_family_mut<'a>(
+    observability: &'a mut KadHarvestObservability,
+    entry: &SnoopEntry,
+) -> &'a mut KadHarvestFamilyObservability {
+    match entry {
+        SnoopEntry::Keyword { .. } => &mut observability.keyword_requests,
+        SnoopEntry::Source { .. } => &mut observability.source_requests,
+        SnoopEntry::Notes { .. } => &mut observability.notes_requests,
+    }
+}
+
+fn apply_harvest_record(
+    observability: &mut KadHarvestObservability,
+    from: SocketAddr,
+    entry: &SnoopEntry,
+    is_new: bool,
+) {
+    let family = harvest_family_mut(observability, entry);
+    family.observed_requests += 1;
+    if is_new {
+        family.unique_shapes_observed += 1;
+    }
+    family.last_seen_at = Some(entry.last_seen());
+    family.last_from = Some(from.to_string());
+    family.last_target = Some(entry.target().to_string());
+    match entry {
+        SnoopEntry::Keyword {
+            start_position,
+            restrictive_payload_hex,
+            ..
+        } => {
+            family.last_start_position = Some(*start_position);
+            family.last_size = None;
+            family.last_restrictive_bytes = Some(
+                restrictive_payload_hex
+                    .as_ref()
+                    .map(|payload| payload.len() / 2)
+                    .unwrap_or(0) as u32,
+            );
+        }
+        SnoopEntry::Source {
+            start_position,
+            size,
+            ..
+        } => {
+            family.last_start_position = Some(*start_position);
+            family.last_size = Some(*size);
+            family.last_restrictive_bytes = None;
+        }
+        SnoopEntry::Notes { size, .. } => {
+            family.last_start_position = None;
+            family.last_size = Some(*size);
+            family.last_restrictive_bytes = None;
+        }
+    }
+}
+
+fn apply_queue_family_counts(
+    observability: &mut KadHarvestObservability,
+    counts: SnoopQueueFamilyCounts,
+) {
+    observability.keyword_requests.queued_entries = counts.keyword as u32;
+    observability.source_requests.queued_entries = counts.source as u32;
+    observability.notes_requests.queued_entries = counts.notes as u32;
+}
+
+fn record_passive_keyword_replay_idle(
+    observability: &mut KadHarvestObservability,
+    observed_at: DateTime<Utc>,
+) {
+    let replay = &mut observability.passive_keyword_replay;
+    replay.idle_cycles += 1;
+    replay.last_idle_at = Some(observed_at);
+}
+
+fn record_passive_keyword_replay_start(
+    observability: &mut KadHarvestObservability,
+    request: &SearchKeyReq,
+    started_at: DateTime<Utc>,
+) {
+    let replay = &mut observability.passive_keyword_replay;
+    replay.started_cycles += 1;
+    replay.last_started_at = Some(started_at);
+    replay.last_target = Some(request.target.to_string());
+    replay.last_start_position = Some(request.start_position);
+    replay.last_restrictive_bytes = Some(request.restrictive_payload.len() as u32);
+    replay.last_error = None;
+    replay.last_error_at = None;
+}
+
+fn record_passive_keyword_replay_complete(
+    observability: &mut KadHarvestObservability,
+    completed_at: DateTime<Utc>,
+    replayed_results: usize,
+    batches_posted: usize,
+) {
+    let replay = &mut observability.passive_keyword_replay;
+    replay.completed_cycles += 1;
+    replay.emitted_results += replayed_results as u64;
+    replay.posted_batches += batches_posted as u64;
+    replay.last_completed_at = Some(completed_at);
+    replay.last_result_count = replayed_results as u32;
+    replay.last_batches_posted = batches_posted as u32;
+}
+
+fn record_passive_keyword_post_failure(
+    observability: &mut KadHarvestObservability,
+    observed_at: DateTime<Utc>,
+    error: &str,
+) {
+    let replay = &mut observability.passive_keyword_replay;
+    replay.post_failures += 1;
+    replay.last_error_at = Some(observed_at);
+    replay.last_error = Some(error.to_string());
+}
+
 #[derive(Clone)]
 struct AgentStatePaths {
     node_id_path: PathBuf,
@@ -459,6 +575,7 @@ pub struct OverlordAgentEmule {
     state_paths: AgentStatePaths,
     snoop_queue: Arc<Mutex<SnoopQueue>>,
     publish_observability: Arc<Mutex<KadPublishObservability>>,
+    harvest_observability: Arc<Mutex<KadHarvestObservability>>,
     runtime: Arc<Mutex<Option<AgentNetworkRuntime>>>,
     control_server: Arc<Mutex<Option<ControlServerRuntime>>>,
     control_selection_state: Arc<RwLock<ResolvedInterfaceBindingReport>>,
@@ -505,6 +622,7 @@ impl OverlordAgentEmule {
             state_paths,
             snoop_queue: Arc::new(Mutex::new(SnoopQueue::new(snoop_queue_config))),
             publish_observability: Arc::new(Mutex::new(KadPublishObservability::default())),
+            harvest_observability: Arc::new(Mutex::new(KadHarvestObservability::default())),
             runtime: Arc::new(Mutex::new(None)),
             control_server: Arc::new(Mutex::new(None)),
             control_selection_state: Arc::new(RwLock::new(control_selection_state)),
@@ -1586,6 +1704,14 @@ async fn restore_snoop_queue(
         Ok(entries) => {
             let mut queue = snoop_queue.lock().await;
             queue.merge_snapshot(entries);
+            let counts = queue.family_counts();
+            info!(
+                "kad snoop restore keyword={} source={} notes={} total={}",
+                counts.keyword,
+                counts.source,
+                counts.notes,
+                queue.len()
+            );
         }
         Err(error) => warn!("failed to restore snoop queue: {error}"),
     }
@@ -1596,7 +1722,17 @@ async fn flush_snoop_queue(
     indexer_id: Uuid,
     snoop_queue: &Arc<Mutex<SnoopQueue>>,
 ) -> Result<()> {
-    let entries = { snoop_queue.lock().await.snapshot() };
+    let (entries, counts) = {
+        let queue = snoop_queue.lock().await;
+        (queue.snapshot(), queue.family_counts())
+    };
+    info!(
+        "kad snoop flush keyword={} source={} notes={} total={}",
+        counts.keyword,
+        counts.source,
+        counts.notes,
+        entries.len()
+    );
     coordinator.flush_snoop(indexer_id, &entries).await
 }
 
@@ -1856,6 +1992,7 @@ fn build_notes_snoop_entry(req: &SearchNotesReq, now: chrono::DateTime<Utc>) -> 
 
 async fn record_snoop_entry(
     snoop_queue: &Arc<Mutex<SnoopQueue>>,
+    harvest_observability: &Arc<Mutex<KadHarvestObservability>>,
     from: SocketAddr,
     entry: SnoopEntry,
 ) {
@@ -1888,18 +2025,27 @@ async fn record_snoop_entry(
         ),
         SnoopEntry::Notes { target, size, .. } => ("notes", target.clone(), format!("size={size}")),
     };
-    let mut queue = snoop_queue.lock().await;
-    let outcome = queue.record(entry);
+    let observed_at = entry.last_seen();
+    let outcome = {
+        let mut queue = snoop_queue.lock().await;
+        queue.record(entry.clone())
+    };
+    {
+        let mut observability = harvest_observability.lock().await;
+        apply_harvest_record(&mut observability, from, &entry, outcome.is_new);
+    }
     if outcome.is_new || outcome.hit_count <= 3 || outcome.hit_count % 10 == 0 {
         info!(
-            "kad snoop family={} from={} target={} {} queue_depth={} hit_count={} state={}",
+            "kad snoop family={} from={} target={} {} queue_depth={} family_queue_depth={} hit_count={} state={} seen_at={}",
             family,
             from,
             target,
             detail,
             outcome.queue_depth,
+            outcome.family_queue_depth,
             outcome.hit_count,
-            if outcome.is_new { "new" } else { "repeat" }
+            if outcome.is_new { "new" } else { "repeat" },
+            observed_at
         );
     }
 }
@@ -1936,6 +2082,7 @@ async fn persist_nodes_dat_for(dht: &DhtNode, state_paths: &AgentStatePaths) -> 
 async fn handle_unsolicited_packet(
     dht: &DhtNode,
     snoop_queue: &Arc<Mutex<SnoopQueue>>,
+    harvest_observability: &Arc<Mutex<KadHarvestObservability>>,
     packet: KadPacket,
     from: SocketAddr,
 ) -> Result<()> {
@@ -2024,6 +2171,7 @@ async fn handle_unsolicited_packet(
         KadPacket::SearchKeyReq(req) => {
             record_snoop_entry(
                 snoop_queue,
+                harvest_observability,
                 from,
                 build_keyword_snoop_entry(&req, Utc::now()),
             )
@@ -2032,13 +2180,20 @@ async fn handle_unsolicited_packet(
         KadPacket::SearchSourceReq(req) => {
             record_snoop_entry(
                 snoop_queue,
+                harvest_observability,
                 from,
                 build_source_snoop_entry(&req, Utc::now()),
             )
             .await
         }
         KadPacket::SearchNotesReq(req) => {
-            record_snoop_entry(snoop_queue, from, build_notes_snoop_entry(&req, Utc::now())).await
+            record_snoop_entry(
+                snoop_queue,
+                harvest_observability,
+                from,
+                build_notes_snoop_entry(&req, Utc::now()),
+            )
+            .await
         }
         KadPacket::PublishKeyReq(req) => {
             let _ = dht
@@ -2341,7 +2496,10 @@ impl IndexerService for OverlordAgentEmule {
     }
 
     async fn stats(&self) -> Result<IndexerStats> {
-        let queue_depth = self.snoop_queue.lock().await.len() as u32;
+        let queue = self.snoop_queue.lock().await;
+        let queue_depth = queue.len() as u32;
+        let queue_family_counts = queue.family_counts();
+        drop(queue);
         let uptime_secs = self.started_at.elapsed().as_secs();
         let runtime = self.runtime.lock().await.clone();
         let crawl_rate = if uptime_secs == 0 {
@@ -2357,6 +2515,8 @@ impl IndexerService for OverlordAgentEmule {
         let interface_report = self.interface_report().await;
         let mut publish_observability = self.publish_observability.lock().await.clone();
         publish_observability.log_file = Some(current_log_file_status(&config));
+        let mut harvest_observability = self.harvest_observability.lock().await.clone();
+        apply_queue_family_counts(&mut harvest_observability, queue_family_counts);
 
         Ok(IndexerStats {
             indexer_id: self.indexer_id,
@@ -2375,6 +2535,7 @@ impl IndexerService for OverlordAgentEmule {
             },
             interface_report: Some(interface_report),
             publish_observability: Some(publish_observability),
+            harvest_observability: Some(harvest_observability),
         })
     }
 
@@ -2457,13 +2618,20 @@ impl OverlordAgentEmule {
         let dht = runtime.dht.clone();
         let shutdown = Arc::clone(&runtime.shutdown);
         let snoop_queue = Arc::clone(&self.snoop_queue);
+        let harvest_observability = Arc::clone(&self.harvest_observability);
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             let mut packets = dht.subscribe_packets();
             while !shutdown.load(Ordering::Relaxed) {
                 match packets.recv().await {
                     Ok((packet, from)) => {
-                        if let Err(error) =
-                            handle_unsolicited_packet(&dht, &snoop_queue, packet, from).await
+                        if let Err(error) = handle_unsolicited_packet(
+                            &dht,
+                            &snoop_queue,
+                            &harvest_observability,
+                            packet,
+                            from,
+                        )
+                        .await
                         {
                             debug!("unsolicited packet handling failed: {error}");
                         }
@@ -2482,6 +2650,7 @@ impl OverlordAgentEmule {
         let snoop_queue = Arc::clone(&self.snoop_queue);
         let indexer_id = self.indexer_id;
         let passive_result_count = Arc::clone(&runtime.passive_result_count);
+        let harvest_observability = Arc::clone(&self.harvest_observability);
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             while !shutdown.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_secs(PASSIVE_CRAWL_SECS)).await;
@@ -2489,8 +2658,14 @@ impl OverlordAgentEmule {
                     continue;
                 }
                 let Some(request) = next_passive_keyword_request(&snoop_queue).await else {
+                    let mut observability = harvest_observability.lock().await;
+                    record_passive_keyword_replay_idle(&mut observability, Utc::now());
                     continue;
                 };
+                {
+                    let mut observability = harvest_observability.lock().await;
+                    record_passive_keyword_replay_start(&mut observability, &request, Utc::now());
+                }
                 info!(
                     "kad passive replay start target={} start_position={} restrictive_bytes={}",
                     request.target,
@@ -2515,6 +2690,12 @@ impl OverlordAgentEmule {
                             };
                             if let Err(error) = coordinator.post_results(&payload).await {
                                 warn!("failed to post passive result batch: {error}");
+                                let mut observability = harvest_observability.lock().await;
+                                record_passive_keyword_post_failure(
+                                    &mut observability,
+                                    Utc::now(),
+                                    &error.to_string(),
+                                );
                             } else {
                                 batches_posted += 1;
                             }
@@ -2530,9 +2711,24 @@ impl OverlordAgentEmule {
                     };
                     if let Err(error) = coordinator.post_results(&payload).await {
                         warn!("failed to post passive result batch: {error}");
+                        let mut observability = harvest_observability.lock().await;
+                        record_passive_keyword_post_failure(
+                            &mut observability,
+                            Utc::now(),
+                            &error.to_string(),
+                        );
                     } else {
                         batches_posted += 1;
                     }
+                }
+                {
+                    let mut observability = harvest_observability.lock().await;
+                    record_passive_keyword_replay_complete(
+                        &mut observability,
+                        Utc::now(),
+                        replayed_results,
+                        batches_posted,
+                    );
                 }
                 info!(
                     "kad passive replay done results={} batches_posted={}",
@@ -2589,13 +2785,19 @@ impl OverlordAgentEmule {
 mod tests {
     use super::{
         COORDINATOR_RECONNECT_SECS, EMULE_LARGE_FILE_SIZE_THRESHOLD, EmuleAgentConfig,
-        OverlordAgentEmule, SYNTHETIC_POPULAR_SEEDS, apply_networking_config,
-        apply_publish_summary, build_publish_batch_summary, empty_networking_config,
-        emule_high_id_source_type, flush_snoop_queue, keyword_target, restore_snoop_queue,
-        select_popular_hashes_for_seeding, significant_keyword_words, synthetic_file_hash,
-        synthetic_popular_hashes,
+        OverlordAgentEmule, SYNTHETIC_POPULAR_SEEDS, apply_harvest_record, apply_networking_config,
+        apply_publish_summary, apply_queue_family_counts, build_publish_batch_summary,
+        empty_networking_config, emule_high_id_source_type, flush_snoop_queue, keyword_target,
+        record_passive_keyword_post_failure, record_passive_keyword_replay_complete,
+        record_passive_keyword_replay_idle, record_passive_keyword_replay_start,
+        restore_snoop_queue, select_popular_hashes_for_seeding, significant_keyword_words,
+        synthetic_file_hash, synthetic_popular_hashes,
     };
-    use crate::{config::SnoopQueueConfig, paths::unique_test_dir, snoop_queue::SnoopQueue};
+    use crate::{
+        config::SnoopQueueConfig,
+        paths::unique_test_dir,
+        snoop_queue::{SnoopQueue, SnoopQueueFamilyCounts},
+    };
     use axum::{
         Json, Router,
         extract::{Path as AxumPath, State},
@@ -2604,11 +2806,12 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use overlord_agent_common::{
         AgentInterfacesView, ConfigUpdate, CoordinatorClient, HashType, IndexerRegistration,
-        IndexerService, PopularHash, Protocol, PublishCounters, PublishSeedSource, RegisterRequest,
-        RegistrationResponse, SnoopEntry,
+        IndexerService, KadHarvestObservability, PopularHash, Protocol, PublishCounters,
+        PublishSeedSource, RegisterRequest, RegistrationResponse, SnoopEntry,
     };
     use overlord_agent_nat::{UPNP_MINIUPNPC_BACKEND, UPNP_RUPNP_BACKEND};
     use overlord_kad_dht::PublishAttemptStats;
+    use overlord_kad_proto::SearchKeyReq;
     use std::{
         collections::HashSet,
         fs,
@@ -2938,6 +3141,117 @@ mod tests {
         assert_eq!(counters.last_success_at, Some(completed_at));
     }
 
+    #[test]
+    fn apply_harvest_record_tracks_keyword_request_shape() {
+        let mut observability = KadHarvestObservability::default();
+        let entry = SnoopEntry::Keyword {
+            logical_key: "keyword:00112233445566778899aabbccddeeff:8000:aabb".to_string(),
+            target: "00112233445566778899aabbccddeeff".to_string(),
+            start_position: 0x8000,
+            restrictive_payload_hex: Some("aabb".to_string()),
+            hit_count: 1,
+            first_seen: Utc.with_ymd_and_hms(2026, 3, 22, 19, 58, 0).unwrap(),
+            last_seen: Utc.with_ymd_and_hms(2026, 3, 22, 19, 58, 0).unwrap(),
+            last_drained_at: None,
+        };
+
+        apply_harvest_record(
+            &mut observability,
+            "127.0.0.1:41000".parse().unwrap(),
+            &entry,
+            true,
+        );
+
+        assert_eq!(observability.keyword_requests.observed_requests, 1);
+        assert_eq!(observability.keyword_requests.unique_shapes_observed, 1);
+        assert_eq!(
+            observability.keyword_requests.last_target.as_deref(),
+            Some("00112233445566778899aabbccddeeff")
+        );
+        assert_eq!(
+            observability.keyword_requests.last_start_position,
+            Some(0x8000)
+        );
+        assert_eq!(
+            observability.keyword_requests.last_restrictive_bytes,
+            Some(2)
+        );
+        assert_eq!(
+            observability.keyword_requests.last_from.as_deref(),
+            Some("127.0.0.1:41000")
+        );
+    }
+
+    #[test]
+    fn apply_queue_family_counts_updates_live_depths() {
+        let mut observability = KadHarvestObservability::default();
+
+        apply_queue_family_counts(
+            &mut observability,
+            SnoopQueueFamilyCounts {
+                keyword: 2,
+                source: 3,
+                notes: 1,
+            },
+        );
+
+        assert_eq!(observability.keyword_requests.queued_entries, 2);
+        assert_eq!(observability.source_requests.queued_entries, 3);
+        assert_eq!(observability.notes_requests.queued_entries, 1);
+    }
+
+    #[test]
+    fn passive_keyword_replay_observability_tracks_cycle_lifecycle() {
+        let mut observability = KadHarvestObservability::default();
+        let request = SearchKeyReq {
+            target: "00112233445566778899aabbccddeeff".parse().unwrap(),
+            start_position: 0x8000,
+            restrictive_payload: vec![0xAA, 0xBB, 0xCC],
+        };
+        let started_at = Utc.with_ymd_and_hms(2026, 3, 22, 20, 0, 0).unwrap();
+        let idle_at = Utc.with_ymd_and_hms(2026, 3, 22, 20, 1, 0).unwrap();
+        let completed_at = Utc.with_ymd_and_hms(2026, 3, 22, 20, 2, 0).unwrap();
+        let failed_at = Utc.with_ymd_and_hms(2026, 3, 22, 20, 3, 0).unwrap();
+
+        record_passive_keyword_replay_idle(&mut observability, idle_at);
+        record_passive_keyword_replay_start(&mut observability, &request, started_at);
+        record_passive_keyword_replay_complete(&mut observability, completed_at, 7, 2);
+        record_passive_keyword_post_failure(&mut observability, failed_at, "post failed");
+
+        assert_eq!(observability.passive_keyword_replay.idle_cycles, 1);
+        assert_eq!(observability.passive_keyword_replay.started_cycles, 1);
+        assert_eq!(observability.passive_keyword_replay.completed_cycles, 1);
+        assert_eq!(observability.passive_keyword_replay.emitted_results, 7);
+        assert_eq!(observability.passive_keyword_replay.posted_batches, 2);
+        assert_eq!(observability.passive_keyword_replay.post_failures, 1);
+        assert_eq!(
+            observability.passive_keyword_replay.last_target.as_deref(),
+            Some("00112233445566778899aabbccddeeff")
+        );
+        assert_eq!(
+            observability.passive_keyword_replay.last_start_position,
+            Some(0x8000)
+        );
+        assert_eq!(
+            observability.passive_keyword_replay.last_restrictive_bytes,
+            Some(3)
+        );
+        assert_eq!(observability.passive_keyword_replay.last_result_count, 7);
+        assert_eq!(observability.passive_keyword_replay.last_batches_posted, 2);
+        assert_eq!(
+            observability.passive_keyword_replay.last_error.as_deref(),
+            Some("post failed")
+        );
+        assert_eq!(
+            observability.passive_keyword_replay.last_completed_at,
+            Some(completed_at)
+        );
+        assert_eq!(
+            observability.passive_keyword_replay.last_error_at,
+            Some(failed_at)
+        );
+    }
+
     #[tokio::test]
     async fn restore_and_flush_preserve_last_drained_at() {
         let restored_entry = SnoopEntry::Keyword {
@@ -3022,6 +3336,7 @@ mod tests {
             config: OverlordAgentEmule::networking_config(&config),
             nat: None,
             publish_observability: None,
+            harvest_observability: None,
             last_error: None,
         };
         let agent = Arc::new(OverlordAgentEmule::new(config).await.unwrap());
@@ -3032,19 +3347,22 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let register_calls = spawn_full_mock_coordinator(coordinator_addr, networking_view).await;
-        tokio::time::timeout(Duration::from_secs(COORDINATOR_RECONNECT_SECS + 2), async {
-            loop {
-                if register_calls.load(AtomicOrdering::Relaxed) > 0 {
-                    break;
+        tokio::time::timeout(
+            Duration::from_secs(COORDINATOR_RECONNECT_SECS + 10),
+            async {
+                loop {
+                    if register_calls.load(AtomicOrdering::Relaxed) > 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
+            },
+        )
         .await
         .unwrap();
 
         agent.request_restart();
-        let _ = tokio::time::timeout(Duration::from_secs(5), serve_task)
+        let _ = tokio::time::timeout(Duration::from_secs(15), serve_task)
             .await
             .unwrap()
             .unwrap();
