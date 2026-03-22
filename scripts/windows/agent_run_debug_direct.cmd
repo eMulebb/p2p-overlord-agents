@@ -18,4 +18,4 @@ IF ERRORLEVEL 1 EXIT /B %ERRORLEVEL%
 
 SET RUST_BACKTRACE=1
 
-START "" target\debug\overlord-agent-emule.exe --config %OVERLORD_TMP_DIR%\agent-real-miniupnpc.toml
+START "" /MIN target\debug\overlord-agent-emule.exe --config %OVERLORD_TMP_DIR%\agent-real-miniupnpc.toml
