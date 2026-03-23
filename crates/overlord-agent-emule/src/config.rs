@@ -111,7 +111,13 @@ pub struct KadConfig {
 pub struct Ed2kConfig {
     /// Local ED2K peer TCP listener port.
     pub listen_port: u16,
+    /// Ordered ED2K server bootstrap entries mirrored from `server.met`.
+    pub server_entries: Vec<Ed2kServerEntry>,
     /// Ordered ED2K server bootstrap endpoints in `host:port` form.
+    ///
+    /// This legacy flattened list is still accepted so existing runtime config
+    /// files keep working while parity helpers migrate to metadata-rich
+    /// `server_entries`.
     pub server_endpoints: Vec<String>,
     /// Whether the agent should advertise and use eD2k TCP obfuscation.
     pub obfuscation_enabled: bool,
@@ -128,6 +134,31 @@ pub struct Ed2kConfig {
     /// A value of `0` disables proactive rotation and keeps the current session
     /// alive until the remote side disconnects or the agent shuts down.
     pub session_rotation_secs: u64,
+}
+
+/// Metadata-rich ED2K server bootstrap entry mirrored from eMule's
+/// `server.met` format.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Ed2kServerEntry {
+    /// DNS hostname or IPv4 address used for the base ED2K TCP connection.
+    pub host: String,
+    /// Base ED2K TCP port.
+    pub port: u16,
+    /// Optional human-readable server name.
+    pub name: Option<String>,
+    /// Optional human-readable server description.
+    pub description: Option<String>,
+    /// Server UDP capability flags mirrored from `ST_UDPFLAGS`.
+    pub udp_flags: u32,
+    /// Server UDP verify key mirrored from `ST_UDPKEY`.
+    pub udp_key: u32,
+    /// IP affinity for `udp_key`, mirrored from `ST_UDPKEYIP`.
+    pub udp_key_ip: u32,
+    /// Alternate TCP port used for obfuscated ED2K server sessions.
+    pub obfuscation_port_tcp: u16,
+    /// Alternate UDP port used for obfuscated ED2K server UDP traffic.
+    pub obfuscation_port_udp: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,6 +287,7 @@ impl Default for Ed2kConfig {
     fn default() -> Self {
         Self {
             listen_port: 41_001,
+            server_entries: Vec::new(),
             server_endpoints: Vec::new(),
             obfuscation_enabled: true,
             probe_search_term: None,

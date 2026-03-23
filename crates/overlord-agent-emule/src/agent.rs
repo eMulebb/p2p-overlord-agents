@@ -3356,6 +3356,7 @@ impl OverlordAgentEmule {
         let dht = runtime.dht.clone();
         let ed2k_listener = Arc::clone(&runtime.ed2k_listener);
         let ed2k_server_state = Arc::clone(&runtime.ed2k_server_state);
+        let kad_firewall = Arc::clone(&runtime.kad_firewall);
         let ed2k_secure_ident = Arc::clone(&runtime.ed2k_secure_ident);
         let shutdown = Arc::clone(&runtime.shutdown);
         let ed2k_hello_identity = Ed2kHelloIdentity {
@@ -3366,12 +3367,14 @@ impl OverlordAgentEmule {
             server_ip: 0,
             server_port: 0,
             connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
+            direct_udp_callback: false,
         };
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             run_ed2k_listener(
                 ed2k_listener,
                 dht,
                 ed2k_server_state,
+                kad_firewall,
                 ed2k_secure_ident,
                 ed2k_hello_identity,
                 shutdown,
@@ -3383,6 +3386,7 @@ impl OverlordAgentEmule {
         let nat = Arc::clone(&runtime.nat);
         let shutdown = Arc::clone(&runtime.shutdown);
         let ed2k_server_state = Arc::clone(&runtime.ed2k_server_state);
+        let kad_firewall = Arc::clone(&runtime.kad_firewall);
         let ed2k_server_config = config.p2p.ed2k.clone();
         let ed2k_hello_identity = Ed2kHelloIdentity {
             user_hash: source_publish_client_hash(self.indexer_id).0,
@@ -3392,6 +3396,7 @@ impl OverlordAgentEmule {
             server_ip: 0,
             server_port: 0,
             connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
+            direct_udp_callback: false,
         };
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             run_ed2k_server_loop(
@@ -3400,6 +3405,7 @@ impl OverlordAgentEmule {
                 ed2k_server_config,
                 ed2k_hello_identity,
                 ed2k_server_state,
+                kad_firewall,
                 shutdown,
             )
             .await;
@@ -3423,6 +3429,7 @@ impl OverlordAgentEmule {
             server_ip: 0,
             server_port: 0,
             connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
+            direct_udp_callback: false,
         };
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             if !udp_firewall_check_enabled {

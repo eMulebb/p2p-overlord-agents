@@ -28,7 +28,7 @@ use rand::{Rng, RngCore};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpSocket, TcpStream, lookup_host},
-    sync::RwLock,
+    sync::{Mutex, RwLock},
     time::Instant as TokioInstant,
 };
 use tracing::{debug, info, warn};
@@ -36,8 +36,9 @@ use tracing::{debug, info, warn};
 use overlord_agent_nat::NatManager;
 
 use crate::{
-    config::Ed2kConfig,
-    ed2k_tcp::{Ed2kHelloIdentity, apply_server_state, connect_callback_peer},
+    config::{Ed2kConfig, Ed2kServerEntry},
+    ed2k_tcp::{Ed2kHelloIdentity, connect_callback_peer, enrich_hello_identity},
+    kad_firewall::KadFirewallState,
 };
 
 const OP_EDONKEYPROT: u8 = 0xE3;
@@ -98,6 +99,8 @@ const SERVER_TCP_FLAG_RELATEDSEARCH: u32 = 0x0000_0040;
 const SERVER_TCP_FLAG_TYPETAGINTEGER: u32 = 0x0000_0080;
 const SERVER_TCP_FLAG_LARGEFILES: u32 = 0x0000_0100;
 const SERVER_TCP_FLAG_TCPOBFUSCATION: u32 = 0x0000_0400;
+const SERVER_UDP_FLAG_UDPOBFUSCATION: u32 = 0x0000_0200;
+const SERVER_UDP_FLAG_TCPOBFUSCATION: u32 = 0x0000_0400;
 
 const ST_SERVERNAME: u8 = 0x01;
 const ST_DESCRIPTION: u8 = 0x0B;
@@ -208,10 +211,95 @@ struct ServerSessionContext {
     hello_identity: Ed2kHelloIdentity,
     probe_search_term: Option<String>,
     state: Arc<RwLock<Ed2kServerState>>,
+    kad_firewall: Arc<Mutex<KadFirewallState>>,
     keepalive_interval: Duration,
     connect_timeout: Duration,
     rotation_interval: Option<Duration>,
     shutdown: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfiguredServerEntry {
+    host: String,
+    port: u16,
+    name: Option<String>,
+    description: Option<String>,
+    udp_flags: u32,
+    udp_key: u32,
+    udp_key_ip: u32,
+    obfuscation_port_tcp: u16,
+    obfuscation_port_udp: u16,
+}
+
+impl ConfiguredServerEntry {
+    fn from_endpoint_text(endpoint_text: &str) -> Result<Self> {
+        let endpoint = endpoint_text
+            .parse::<SocketAddr>()
+            .with_context(|| format!("invalid ED2K server endpoint {endpoint_text}"))?;
+        Ok(Self {
+            host: endpoint.ip().to_string(),
+            port: endpoint.port(),
+            name: None,
+            description: None,
+            udp_flags: 0,
+            udp_key: 0,
+            udp_key_ip: 0,
+            obfuscation_port_tcp: 0,
+            obfuscation_port_udp: 0,
+        })
+    }
+
+    fn from_metadata(entry: &Ed2kServerEntry) -> Result<Self> {
+        if entry.host.trim().is_empty() || entry.port == 0 {
+            anyhow::bail!("ED2K server entry requires a non-empty host and non-zero port");
+        }
+        Ok(Self {
+            host: entry.host.clone(),
+            port: entry.port,
+            name: entry.name.clone(),
+            description: entry.description.clone(),
+            udp_flags: entry.udp_flags,
+            udp_key: entry.udp_key,
+            udp_key_ip: entry.udp_key_ip,
+            obfuscation_port_tcp: entry.obfuscation_port_tcp,
+            obfuscation_port_udp: entry.obfuscation_port_udp,
+        })
+    }
+
+    fn display_name(&self) -> &str {
+        self.name.as_deref().unwrap_or("-")
+    }
+
+    fn base_endpoint_text(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+
+    fn supports_obfuscation_tcp(&self) -> bool {
+        self.obfuscation_port_tcp != 0
+            && (self.udp_flags & (SERVER_UDP_FLAG_UDPOBFUSCATION | SERVER_UDP_FLAG_TCPOBFUSCATION))
+                != 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedServerEntry {
+    entry: ConfiguredServerEntry,
+    ip: Ipv4Addr,
+}
+
+impl ResolvedServerEntry {
+    fn base_endpoint(&self) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(self.ip), self.entry.port)
+    }
+
+    fn transport_endpoint(&self, use_obfuscation: bool) -> SocketAddr {
+        let chosen_port = if use_obfuscation && self.entry.obfuscation_port_tcp != 0 {
+            self.entry.obfuscation_port_tcp
+        } else {
+            self.entry.port
+        };
+        SocketAddr::new(IpAddr::V4(self.ip), chosen_port)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,17 +318,11 @@ struct SearchResultSummary {
 /// Returns whether the agent should start an ED2K server session with TCP
 /// obfuscation.
 ///
-/// The oracle only chooses an obfuscated server TCP connect when it has
-/// positive server metadata such as `ST_TCPPORTOBFUSCATION` and the related
-/// capability flags. Our current agent config only accepts raw `host:port`
-/// endpoints, so those `server.met` hints are absent. To stay aligned with the
-/// oracle's behavior in that metadata-poor case, the agent starts with a
-/// plaintext server session instead of guessing an obfuscated path.
-fn should_use_server_obfuscation(
-    connect_options: u8,
-    has_server_obfuscation_metadata: bool,
-) -> bool {
-    connect_options != 0 && has_server_obfuscation_metadata
+/// The oracle only chooses an obfuscated server TCP connect when the server
+/// advertises the needed metadata, primarily `ST_TCPPORTOBFUSCATION` plus the
+/// UDP capability bits which signal TCP obfuscation support.
+fn should_use_server_obfuscation(connect_options: u8, server: &ResolvedServerEntry) -> bool {
+    connect_options != 0 && server.entry.supports_obfuscation_tcp()
 }
 
 impl ServerSession {
@@ -442,6 +524,7 @@ pub async fn run_ed2k_server_loop(
     config: Ed2kConfig,
     hello_identity: Ed2kHelloIdentity,
     state: Arc<RwLock<Ed2kServerState>>,
+    kad_firewall: Arc<Mutex<KadFirewallState>>,
     shutdown: Arc<AtomicBool>,
 ) {
     let reconnect_delay = Duration::from_secs(config.reconnect_interval_secs.max(1));
@@ -451,6 +534,7 @@ pub async fn run_ed2k_server_loop(
         hello_identity,
         probe_search_term: config.probe_search_term.clone(),
         state: Arc::clone(&state),
+        kad_firewall,
         keepalive_interval: Duration::from_secs(config.keepalive_secs.max(1)),
         connect_timeout: Duration::from_secs(config.connect_timeout_secs.max(1)),
         rotation_interval: (config.session_rotation_secs > 0)
@@ -458,27 +542,44 @@ pub async fn run_ed2k_server_loop(
         shutdown: Arc::clone(&shutdown),
     };
 
-    if config.server_endpoints.is_empty() {
-        info!("ED2K server session disabled: no p2p.ed2k.server_endpoints configured");
+    let configured_servers = match configured_server_entries(&config) {
+        Ok(entries) => entries,
+        Err(error) => {
+            warn!("ED2K server session disabled: invalid server configuration: {error}");
+            return;
+        }
+    };
+    if configured_servers.is_empty() {
+        info!(
+            "ED2K server session disabled: no p2p.ed2k.server_entries or p2p.ed2k.server_endpoints configured"
+        );
         return;
     }
 
     while !shutdown.load(Ordering::Relaxed) {
         let mut attempted_any = false;
-        for endpoint_text in &config.server_endpoints {
+        for configured_server in &configured_servers {
             if shutdown.load(Ordering::Relaxed) {
                 break;
             }
             attempted_any = true;
-            match resolve_server_endpoint(endpoint_text).await {
-                Ok(endpoint) => {
-                    if let Err(error) = run_one_server_session(endpoint, &session_context).await {
+            match resolve_server_entry(configured_server).await {
+                Ok(server) => {
+                    if let Err(error) = run_one_server_session(&server, &session_context).await {
                         clear_server_connection_state(&state).await;
-                        warn!("ED2K server session ended for {endpoint}: {error}");
+                        warn!(
+                            "ED2K server session ended for {} name={}: {error}",
+                            server.base_endpoint(),
+                            server.entry.display_name()
+                        );
                     }
                 }
                 Err(error) => {
-                    warn!("failed to resolve ED2K server endpoint {endpoint_text}: {error}");
+                    warn!(
+                        "failed to resolve ED2K server endpoint {} name={}: {error}",
+                        configured_server.base_endpoint_text(),
+                        configured_server.display_name()
+                    );
                 }
             }
 
@@ -494,19 +595,22 @@ pub async fn run_ed2k_server_loop(
 }
 
 async fn run_one_server_session(
-    endpoint: SocketAddr,
+    server: &ResolvedServerEntry,
     context: &ServerSessionContext,
 ) -> Result<()> {
+    let use_server_obfuscation =
+        should_use_server_obfuscation(context.hello_identity.connect_options, server);
+    let transport_endpoint = server.transport_endpoint(use_server_obfuscation);
     let mut session = ServerSession::connect(
         context.bind_ip,
-        endpoint,
+        transport_endpoint,
         Arc::clone(&context.state),
         context.connect_timeout,
     )
     .await?;
     {
         let mut guard = context.state.write().await;
-        guard.endpoint = Some(endpoint);
+        guard.endpoint = Some(server.base_endpoint());
         guard.connected = false;
         guard.client_id = None;
         guard.server_flags = None;
@@ -515,14 +619,10 @@ async fn run_one_server_session(
     let nat_status = context.nat.status().await;
     let observed_external_ip = nat_status.observed_external_addresses.first().cloned();
     let login_payload = encode_login_request(context.hello_identity);
-    let has_server_obfuscation_metadata = false;
-    let use_server_obfuscation = should_use_server_obfuscation(
-        context.hello_identity.connect_options,
-        has_server_obfuscation_metadata,
-    );
     info!(
-        "connected to ED2K server {} bind_ip={} observed_external_ip={} transport={} connect_options={} server_obfuscation_metadata={}",
-        endpoint,
+        "connected to ED2K server {} name={} bind_ip={} observed_external_ip={} transport={} connect_options={} supports_obf_tcp={} obf_port={} udp_flags=0x{:08X} udp_key_present={} chosen_port={}",
+        server.base_endpoint(),
+        server.entry.display_name(),
         context.bind_ip,
         observed_external_ip.as_deref().unwrap_or("unknown"),
         if use_server_obfuscation {
@@ -531,7 +631,11 @@ async fn run_one_server_session(
             "plaintext"
         },
         format_connect_options(context.hello_identity.connect_options),
-        has_server_obfuscation_metadata
+        server.entry.supports_obfuscation_tcp(),
+        server.entry.obfuscation_port_tcp,
+        server.entry.udp_flags,
+        server.entry.udp_key != 0,
+        transport_endpoint.port(),
     );
     if use_server_obfuscation {
         session
@@ -561,7 +665,7 @@ async fn run_one_server_session(
             } => {
                 info!(
                     "rotating ED2K server session from {} after {:?}",
-                    endpoint,
+                    server.base_endpoint(),
                     context.rotation_interval.expect("rotation interval is set"),
                 );
                 clear_server_connection_state(&context.state).await;
@@ -569,14 +673,17 @@ async fn run_one_server_session(
             }
             packet = session.read_packet() => {
                 let Some(packet) = packet? else {
-                    anyhow::bail!("ED2K server {} closed the connection", endpoint);
+                    anyhow::bail!(
+                        "ED2K server {} closed the connection",
+                        server.base_endpoint()
+                    );
                 };
                 handle_server_packet(&mut session, packet, context).await?;
             }
             _ = tokio::time::sleep(context.keepalive_interval) => {
                 if session.last_tx.elapsed() >= context.keepalive_interval {
                     session.send_packet(OP_OFFERFILES, &0u32.to_le_bytes()).await?;
-                    debug!("sent ED2K server keepalive to {}", endpoint);
+                    debug!("sent ED2K server keepalive to {}", server.base_endpoint());
                 }
             }
         }
@@ -703,10 +810,12 @@ async fn handle_server_packet(
                     packet.payload.len()
                 );
                 let bind_ip = context.bind_ip;
-                let hello_identity = {
-                    let state = context.state.read().await;
-                    apply_server_state(context.hello_identity, &state)
-                };
+                let hello_identity = enrich_hello_identity(
+                    context.hello_identity,
+                    &context.state,
+                    &context.kad_firewall,
+                )
+                .await;
                 let connect_timeout = context.connect_timeout;
                 tokio::spawn(async move {
                     match connect_callback_peer(
@@ -784,15 +893,40 @@ async fn clear_server_connection_state(state: &Arc<RwLock<Ed2kServerState>>) {
     guard.server_flags = None;
 }
 
-async fn resolve_server_endpoint(endpoint_text: &str) -> Result<SocketAddr> {
-    if let Ok(endpoint) = endpoint_text.parse::<SocketAddr>() {
-        return Ok(endpoint);
+fn configured_server_entries(config: &Ed2kConfig) -> Result<Vec<ConfiguredServerEntry>> {
+    if !config.server_entries.is_empty() {
+        return config
+            .server_entries
+            .iter()
+            .map(ConfiguredServerEntry::from_metadata)
+            .collect();
     }
-    lookup_host(endpoint_text)
-        .await
-        .with_context(|| format!("failed to resolve {endpoint_text}"))?
-        .find(SocketAddr::is_ipv4)
-        .ok_or_else(|| anyhow::anyhow!("no IPv4 address resolved for {endpoint_text}"))
+
+    config
+        .server_endpoints
+        .iter()
+        .map(|endpoint_text| ConfiguredServerEntry::from_endpoint_text(endpoint_text))
+        .collect()
+}
+
+async fn resolve_server_entry(entry: &ConfiguredServerEntry) -> Result<ResolvedServerEntry> {
+    let lookup = format!("{}:{}", entry.host, entry.port);
+    let ip = if let Ok(parsed_ip) = entry.host.parse::<Ipv4Addr>() {
+        parsed_ip
+    } else {
+        lookup_host(&lookup)
+            .await
+            .with_context(|| format!("failed to resolve {lookup}"))?
+            .find_map(|endpoint| match endpoint {
+                SocketAddr::V4(endpoint) => Some(*endpoint.ip()),
+                SocketAddr::V6(_) => None,
+            })
+            .ok_or_else(|| anyhow::anyhow!("no IPv4 address resolved for {lookup}"))?
+    };
+    Ok(ResolvedServerEntry {
+        entry: entry.clone(),
+        ip,
+    })
 }
 
 fn encode_login_request(identity: Ed2kHelloIdentity) -> Vec<u8> {
@@ -1225,17 +1359,17 @@ fn is_low_id(client_id: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CT_EMULE_VERSION, CT_NAME, CT_SERVER_FLAGS, CT_VERSION, EDONKEY_VERSION,
-        EMULE_ENCRYPTION_METHOD_OBFUSCATION, EMULE_TCP_CRYPT_MAGIC_REQUESTER,
+        CT_EMULE_VERSION, CT_NAME, CT_SERVER_FLAGS, CT_VERSION, ConfiguredServerEntry,
+        EDONKEY_VERSION, EMULE_ENCRYPTION_METHOD_OBFUSCATION, EMULE_TCP_CRYPT_MAGIC_REQUESTER,
         EMULE_TCP_CRYPT_MAGIC_SERVER, EMULE_TCP_CRYPT_MAGIC_SYNC, EMULE_VERSION_MAJOR,
         EMULE_VERSION_MINOR, EMULE_VERSION_UPDATE, Ed2kServerState, FT_FILENAME, HELLO_NICKNAME,
-        OP_EDONKEYPROT, OP_GETSERVERLIST, OP_LOGINREQUEST, OP_PACKEDPROT,
+        OP_EDONKEYPROT, OP_GETSERVERLIST, OP_LOGINREQUEST, OP_PACKEDPROT, ResolvedServerEntry,
         SERVER_OBFUSCATION_PRIME_BYTES, SERVER_OBFUSCATION_PUBLIC_KEY_LEN,
-        SERVER_TCP_FLAG_COMPRESSION, SERVER_TCP_FLAG_LARGEFILES, ST_DESCRIPTION, ST_SERVERNAME,
-        ServerSession, TAG_SHORT_NAME_MASK, TAGTYPE_UINT32, biguint_to_fixed_be,
-        decode_search_results, decode_server_ident, decode_server_payload, derive_server_cipher,
-        encode_login_request, encode_packet, encode_search_request, format_server_flags,
-        server_capabilities, should_use_server_obfuscation,
+        SERVER_TCP_FLAG_COMPRESSION, SERVER_TCP_FLAG_LARGEFILES, SERVER_UDP_FLAG_UDPOBFUSCATION,
+        ST_DESCRIPTION, ST_SERVERNAME, ServerSession, TAG_SHORT_NAME_MASK, TAGTYPE_UINT32,
+        biguint_to_fixed_be, decode_search_results, decode_server_ident, decode_server_payload,
+        derive_server_cipher, encode_login_request, encode_packet, encode_search_request,
+        format_server_flags, server_capabilities, should_use_server_obfuscation,
     };
     use crate::ed2k_tcp::{Ed2kHelloIdentity, emule_connect_options};
     use flate2::{Compression, write::ZlibEncoder};
@@ -1248,6 +1382,23 @@ mod tests {
         sync::RwLock,
     };
 
+    fn test_server(obfuscation_port_tcp: u16, udp_flags: u32) -> ResolvedServerEntry {
+        ResolvedServerEntry {
+            entry: ConfiguredServerEntry {
+                host: "127.0.0.1".to_string(),
+                port: 4661,
+                name: Some("test".to_string()),
+                description: None,
+                udp_flags,
+                udp_key: 0,
+                udp_key_ip: 0,
+                obfuscation_port_tcp,
+                obfuscation_port_udp: 0,
+            },
+            ip: Ipv4Addr::LOCALHOST,
+        }
+    }
+
     #[test]
     fn login_request_matches_oracle_tag_shape() {
         let payload = encode_login_request(Ed2kHelloIdentity {
@@ -1258,6 +1409,7 @@ mod tests {
             server_ip: 0,
             server_port: 0,
             connect_options: emule_connect_options(true),
+            direct_udp_callback: false,
         });
         let nickname_tag_header = [super::TAGTYPE_STRING, 0x01, 0x00, CT_NAME];
         let version_tag_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_VERSION];
@@ -1325,6 +1477,7 @@ mod tests {
             server_ip: 0,
             server_port: 0,
             connect_options: emule_connect_options(false),
+            direct_udp_callback: false,
         });
 
         assert!(payload.windows(4).any(
@@ -1351,6 +1504,7 @@ mod tests {
                 server_ip: 0,
                 server_port: 0,
                 connect_options: emule_connect_options(false),
+                direct_udp_callback: false,
             }),
         );
 
@@ -1377,6 +1531,7 @@ mod tests {
                 server_ip: 0,
                 server_port: 0,
                 connect_options: emule_connect_options(true),
+                direct_udp_callback: false,
             }),
         );
 
@@ -1392,7 +1547,7 @@ mod tests {
     fn metadata_poor_server_defaults_to_plaintext_even_if_client_supports_crypt() {
         assert!(!should_use_server_obfuscation(
             emule_connect_options(true),
-            false
+            &test_server(0, 0)
         ));
     }
 
@@ -1400,7 +1555,7 @@ mod tests {
     fn server_obfuscation_requires_positive_server_metadata() {
         assert!(should_use_server_obfuscation(
             emule_connect_options(true),
-            true
+            &test_server(4661, SERVER_UDP_FLAG_UDPOBFUSCATION)
         ));
     }
 
@@ -1523,6 +1678,7 @@ mod tests {
             server_ip: 0,
             server_port: 0,
             connect_options: emule_connect_options(true),
+            direct_udp_callback: false,
         };
         let expected_login = encode_packet(OP_LOGINREQUEST, &encode_login_request(hello_identity));
         let expected_login_for_server = expected_login.clone();

@@ -40,11 +40,12 @@ use sha1::Sha1;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpSocket, TcpStream},
-    sync::RwLock,
+    sync::{Mutex, RwLock},
 };
 use tracing::{debug, warn};
 
 use crate::ed2k_server::Ed2kServerState;
+use crate::kad_firewall::KadFirewallState;
 use overlord_kad_dht::DhtNode;
 use overlord_kad_proto::{FirewallUdp, KadPacket};
 
@@ -173,6 +174,8 @@ pub struct Ed2kHelloIdentity {
     pub server_port: u16,
     /// Local eD2k connect-option bits mirrored from the oracle hello path.
     pub connect_options: u8,
+    /// Whether the node currently advertises direct UDP callback support.
+    pub direct_udp_callback: bool,
 }
 
 /// Persistent RSA identity used for the eMule secure-ident side channel.
@@ -694,9 +697,9 @@ fn emule_misc_options1() -> u32 {
         | preview_supported
 }
 
-fn emule_misc_options2(connect_options: u8) -> u32 {
+fn emule_misc_options2(connect_options: u8, direct_udp_callback: bool) -> u32 {
     let supports_file_identifiers = 1u32;
-    let direct_udp_callback = 0u32;
+    let direct_udp_callback = u32::from(direct_udp_callback);
     let supports_captcha = 1u32;
     let supports_source_exchange2 = 1u32;
     let requires_crypt_layer = 0u32;
@@ -736,7 +739,7 @@ fn append_emule_hello_tags(payload: &mut Vec<u8>, identity: Ed2kHelloIdentity) {
     push_ed2k_u32_tag(
         payload,
         CT_EMULE_MISCOPTIONS2,
-        emule_misc_options2(identity.connect_options),
+        emule_misc_options2(identity.connect_options, identity.direct_udp_callback),
     );
     push_ed2k_u32_tag(payload, CT_EMULE_VERSION, emule_version_tag());
 }
@@ -961,11 +964,31 @@ pub(crate) fn apply_server_state(
     identity
 }
 
+/// Apply the current ED2K server and Kad firewall runtime state to an
+/// outbound or listener hello identity.
+pub(crate) async fn enrich_hello_identity(
+    identity: Ed2kHelloIdentity,
+    server_state: &Arc<RwLock<Ed2kServerState>>,
+    kad_firewall: &Arc<Mutex<KadFirewallState>>,
+) -> Ed2kHelloIdentity {
+    let mut identity = {
+        let state = server_state.read().await;
+        apply_server_state(identity, &state)
+    };
+    let firewall = kad_firewall.lock().await;
+    identity.direct_udp_callback = identity.client_id != 0
+        && identity.client_id < 0x0100_0000
+        && firewall.udp_verified
+        && firewall.udp_open;
+    identity
+}
+
 /// Run the minimal eD2k TCP listener needed for inbound hello parity and firewall checks.
 pub async fn run_ed2k_listener(
     listener: Arc<TcpListener>,
     dht: DhtNode,
     server_state: Arc<RwLock<Ed2kServerState>>,
+    kad_firewall: Arc<Mutex<KadFirewallState>>,
     secure_ident: Arc<Ed2kSecureIdent>,
     hello_identity: Ed2kHelloIdentity,
     shutdown: Arc<AtomicBool>,
@@ -978,6 +1001,7 @@ pub async fn run_ed2k_listener(
                     peer_addr,
                     &dht,
                     &server_state,
+                    &kad_firewall,
                     &secure_ident,
                     hello_identity,
                 )
@@ -1002,6 +1026,7 @@ async fn handle_connection(
     peer_addr: SocketAddr,
     dht: &DhtNode,
     server_state: &Arc<RwLock<Ed2kServerState>>,
+    kad_firewall: &Arc<Mutex<KadFirewallState>>,
     secure_ident: &Arc<Ed2kSecureIdent>,
     hello_identity: Ed2kHelloIdentity,
 ) -> Result<()> {
@@ -1013,10 +1038,8 @@ async fn handle_connection(
         udp_port: kad_udp_port,
         ..hello_identity
     };
-    let response_identity = {
-        let state = server_state.read().await;
-        apply_server_state(response_identity, &state)
-    };
+    let response_identity =
+        enrich_hello_identity(response_identity, server_state, kad_firewall).await;
     let mut transport = tokio::time::timeout(
         ED2K_CONNECTION_IDLE_TIMEOUT,
         Ed2kTransport::accept(stream, hello_identity.user_hash),
@@ -1500,8 +1523,9 @@ mod tests {
         emule_connect_options, emule_misc_options1, emule_misc_options2, emule_version_tag,
         encode_emule_info_answer, encode_emule_info_request, encode_hello_answer,
         encode_hello_request, encode_incoming_obfuscation_response, encode_packet,
-        encode_secident_state, is_mule_hello,
+        encode_secident_state, enrich_hello_identity, is_mule_hello,
     };
+    use crate::{ed2k_server::Ed2kServerState, kad_firewall::KadFirewallState};
     use hex::decode;
     use rsa::{
         RsaPrivateKey, RsaPublicKey,
@@ -1511,10 +1535,15 @@ mod tests {
         signature::Verifier,
     };
     use sha1::Sha1;
-    use std::{net::Ipv4Addr, time::Duration};
+    use std::{
+        net::{Ipv4Addr, SocketAddr},
+        sync::Arc,
+        time::Duration,
+    };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
+        sync::{Mutex, RwLock},
     };
 
     #[test]
@@ -1612,6 +1641,7 @@ mod tests {
             server_ip: u32::from_le_bytes([176, 123, 2, 239]),
             server_port: 4232,
             connect_options: emule_connect_options(true),
+            direct_udp_callback: false,
         });
 
         assert_eq!(packet[0], OP_EDONKEYPROT);
@@ -1637,6 +1667,7 @@ mod tests {
             server_ip: u32::from_le_bytes([176, 123, 2, 239]),
             server_port: 4232,
             connect_options: emule_connect_options(true),
+            direct_udp_callback: false,
         });
         let expected_name_header = [TAGTYPE_STRING, 0x01, 0x00, CT_NAME];
         let expected_u32_version_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_VERSION];
@@ -1707,7 +1738,7 @@ mod tests {
                 .any(|window| window == emule_misc_options1().to_le_bytes())
         );
         assert!(packet.windows(4).any(|window| {
-            window == emule_misc_options2(emule_connect_options(true)).to_le_bytes()
+            window == emule_misc_options2(emule_connect_options(true), false).to_le_bytes()
         }));
         assert!(
             packet
@@ -1742,6 +1773,7 @@ mod tests {
             server_ip: u32::from_le_bytes([176, 123, 2, 239]),
             server_port: 4232,
             connect_options: emule_connect_options(false),
+            direct_udp_callback: false,
         });
 
         let expected = decode(
@@ -1790,6 +1822,7 @@ mod tests {
             server_ip: u32::from_le_bytes([176, 123, 2, 239]),
             server_port: 4232,
             connect_options: emule_connect_options(true),
+            direct_udp_callback: false,
         });
 
         assert!(is_mule_hello(&packet[6..]).unwrap());
@@ -1821,6 +1854,7 @@ mod tests {
                 server_ip: u32::from_le_bytes([176, 123, 2, 239]),
                 server_port: 4232,
                 connect_options: emule_connect_options(true),
+                direct_udp_callback: false,
             },
         )
         .unwrap();
@@ -1843,6 +1877,72 @@ mod tests {
     #[test]
     fn connect_options_disable_crypt_layer_when_obfuscation_is_off() {
         assert_eq!(emule_connect_options(false), 0);
+    }
+
+    #[tokio::test]
+    async fn enrich_hello_identity_sets_direct_udp_callback_for_low_id_with_verified_udp() {
+        let server_state = Arc::new(RwLock::new(Ed2kServerState {
+            endpoint: Some(SocketAddr::from((Ipv4Addr::new(185, 237, 185, 226), 31031))),
+            client_id: Some(0x0000_1234),
+            ..Ed2kServerState::default()
+        }));
+        let mut firewall = KadFirewallState::default();
+        firewall.udp_open = true;
+        firewall.udp_verified = true;
+        let kad_firewall = Arc::new(Mutex::new(firewall));
+
+        let identity = enrich_hello_identity(
+            Ed2kHelloIdentity {
+                user_hash: [0xAB; 16],
+                client_id: 0,
+                tcp_port: 41001,
+                udp_port: 41000,
+                server_ip: 0,
+                server_port: 0,
+                connect_options: emule_connect_options(true),
+                direct_udp_callback: false,
+            },
+            &server_state,
+            &kad_firewall,
+        )
+        .await;
+
+        assert!(identity.direct_udp_callback);
+        assert_eq!(identity.client_id, 0x0000_1234);
+        assert_eq!(identity.server_ip, u32::from_le_bytes([185, 237, 185, 226]));
+        assert_eq!(identity.server_port, 31031);
+    }
+
+    #[tokio::test]
+    async fn enrich_hello_identity_keeps_direct_udp_callback_off_for_high_id() {
+        let server_state = Arc::new(RwLock::new(Ed2kServerState {
+            endpoint: Some(SocketAddr::from((Ipv4Addr::new(185, 237, 185, 226), 31031))),
+            client_id: Some(0x521B_5895),
+            ..Ed2kServerState::default()
+        }));
+        let mut firewall = KadFirewallState::default();
+        firewall.udp_open = true;
+        firewall.udp_verified = true;
+        let kad_firewall = Arc::new(Mutex::new(firewall));
+
+        let identity = enrich_hello_identity(
+            Ed2kHelloIdentity {
+                user_hash: [0xCD; 16],
+                client_id: 0,
+                tcp_port: 41001,
+                udp_port: 41000,
+                server_ip: 0,
+                server_port: 0,
+                connect_options: emule_connect_options(true),
+                direct_udp_callback: false,
+            },
+            &server_state,
+            &kad_firewall,
+        )
+        .await;
+
+        assert!(!identity.direct_udp_callback);
+        assert_eq!(identity.client_id, 0x521B_5895);
     }
 
     #[test]
@@ -1929,6 +2029,7 @@ mod tests {
                 server_ip: 0,
                 server_port: 0,
                 connect_options: emule_connect_options(true),
+                direct_udp_callback: false,
             },
             None,
             None,
@@ -1956,6 +2057,7 @@ mod tests {
             server_ip: 0,
             server_port: 0,
             connect_options: emule_connect_options(true),
+            direct_udp_callback: false,
         });
         let expected_hello_for_server = expected_hello.clone();
 
@@ -2016,6 +2118,7 @@ mod tests {
                 server_ip: 0,
                 server_port: 0,
                 connect_options: emule_connect_options(true),
+                direct_udp_callback: false,
             },
             Some(peer_user_hash),
             Some(super::EMULE_CRYPT_SUPPORTS | super::EMULE_CRYPT_REQUESTS),
@@ -2041,6 +2144,7 @@ mod tests {
             server_ip: 0,
             server_port: 0,
             connect_options: emule_connect_options(false),
+            direct_udp_callback: false,
         });
         let expected_hello_for_server = expected_hello.clone();
         let server = tokio::spawn(async move {
@@ -2055,6 +2159,7 @@ mod tests {
                 server_ip: u32::from_le_bytes([176, 123, 2, 239]),
                 server_port: 4232,
                 connect_options: emule_connect_options(false),
+                direct_udp_callback: false,
             });
             stream.write_all(&reply).await.unwrap();
             packet
@@ -2071,6 +2176,7 @@ mod tests {
                 server_ip: 0,
                 server_port: 0,
                 connect_options: emule_connect_options(false),
+                direct_udp_callback: false,
             },
             Some([0x99; 16]),
             Some(super::EMULE_CRYPT_SUPPORTS | super::EMULE_CRYPT_REQUESTS),
