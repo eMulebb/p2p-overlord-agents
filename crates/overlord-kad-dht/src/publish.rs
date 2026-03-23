@@ -326,4 +326,5 @@ fn register_publish_contact(rpc: &RpcManager, contact: &TraversalContact) {
     if contact.id != NodeId::ZERO {
         rpc.register_peer_identity(contact.addr, contact.id);
     }
+    rpc.register_peer_version(contact.addr, contact.version);
 }

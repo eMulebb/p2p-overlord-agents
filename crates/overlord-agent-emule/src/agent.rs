@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
@@ -43,7 +43,7 @@ use overlord_agent_common::{
     SearchKind, SnoopEntry, SnoopObservation, Source, TagEntry,
 };
 use overlord_kad_dht::{
-    DhtConfig, DhtNode, PublishAttemptStats, SearchResult, SourceResult,
+    DhtConfig, DhtNode, PublishAttemptStats, ReceivedKadPacket, SearchResult, SourceResult,
     bootstrap::{BootstrapContact, encode_nodes_dat},
 };
 use overlord_kad_proto::{
@@ -53,8 +53,10 @@ use overlord_kad_proto::{
 use overlord_kad_routing::Contact;
 
 use crate::config::EmuleAgentConfig;
+use crate::ed2k_server::{Ed2kServerState, run_ed2k_server_loop};
 use crate::ed2k_tcp::{
-    Ed2kHelloIdentity, FirewallCheckUdpRequest, request_udp_firewall_check, run_ed2k_listener,
+    Ed2kHelloIdentity, FirewallCheckUdpRequest, emule_connect_options, request_udp_firewall_check,
+    run_ed2k_listener,
 };
 use crate::kad_firewall::{FirewallUdpPacketOutcome, KadFirewallState};
 use crate::kad_store::{KadLocalStore, KadLocalStoreConfig};
@@ -70,6 +72,8 @@ const COORDINATOR_RECONNECT_SECS: u64 = 30;
 const COORDINATOR_RECONNECT_SECS: u64 = 1;
 const SNOOP_FLUSH_SECS: u64 = 30;
 const PASSIVE_CRAWL_SECS: u64 = 45;
+const KAD_HELLO_INTRO_SECS: u64 = 30;
+const KAD_HELLO_INTRO_FANOUT: usize = 24;
 const EMULE_LARGE_FILE_SIZE_THRESHOLD: u64 = u32::MAX as u64;
 const LOCAL_SEARCH_RESPONSE_LIMIT: usize = 64;
 const FIREWALLED_TCP_PROBE_TIMEOUT_SECS: u64 = 5;
@@ -361,6 +365,45 @@ fn apply_publish_summary(counters: &mut PublishCounters, summary: &PublishBatchS
     }
 }
 
+/// Returns whether the current batch snapshot reflects any observable seeding progress yet.
+fn publish_summary_has_progress(summary: &PublishBatchSummary) -> bool {
+    summary.published_items > 0
+        || summary.closest_contacts_considered > 0
+        || summary.attempted_contacts > 0
+        || summary.acked_contacts > 0
+        || summary.failed_contacts > 0
+        || summary.timed_out_contacts > 0
+}
+
+/// Projects the counters that operators should see right now.
+///
+/// The stored counters only advance once a batch has fully finished. During long live
+/// runs, however, `/api/internal/stats` should still reflect the current in-flight batch
+/// so the roll-up totals stay aligned with the latest per-batch snapshot.
+fn effective_publish_counters(
+    counters: &PublishCounters,
+    latest_batch: Option<&PublishBatchSummary>,
+    last_seed_at: Option<DateTime<Utc>>,
+) -> PublishCounters {
+    let mut effective = counters.clone();
+    let Some(summary) = latest_batch else {
+        return effective;
+    };
+
+    let batch_committed = counters.last_batch_at == Some(summary.completed_at);
+    let batch_in_flight = match (last_seed_at, counters.last_batch_at) {
+        (Some(observed_at), Some(committed_at)) => observed_at > committed_at,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+
+    if batch_in_flight && !batch_committed && publish_summary_has_progress(summary) {
+        apply_publish_summary(&mut effective, summary);
+    }
+
+    effective
+}
+
 fn log_publish_summary(family: &str, summary: &PublishBatchSummary) {
     let other_failures = summary
         .failed_contacts
@@ -560,8 +603,10 @@ struct AgentStatePaths {
 
 #[derive(Clone)]
 struct AgentNetworkRuntime {
+    bind_ip: Ipv4Addr,
     dht: DhtNode,
     ed2k_listener: Arc<TcpListener>,
+    ed2k_server_state: Arc<RwLock<Ed2kServerState>>,
     nat: Arc<NatManager>,
     kad_firewall: Arc<Mutex<KadFirewallState>>,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -1217,6 +1262,9 @@ impl OverlordAgentEmule {
         config: &EmuleAgentConfig,
         bind_ip: &str,
     ) -> Result<AgentNetworkRuntime> {
+        let bind_ipv4 = bind_ip
+            .parse::<Ipv4Addr>()
+            .with_context(|| format!("bind_ip is not a valid IPv4 address: {bind_ip}"))?;
         let node_id = load_or_create_node_id(&self.state_paths.node_id_path)?;
         let udp_key = load_or_create_udp_key(&self.state_paths.udp_key_path)?;
         let bind_addr = resolved_socket_addr(config.p2p.kad.listen_port, Some(bind_ip))
@@ -1276,8 +1324,10 @@ impl OverlordAgentEmule {
             })?);
 
         Ok(AgentNetworkRuntime {
+            bind_ip: bind_ipv4,
             dht,
             ed2k_listener,
+            ed2k_server_state: Arc::new(RwLock::new(Ed2kServerState::default())),
             nat,
             kad_firewall: Arc::new(Mutex::new(KadFirewallState::default())),
             tasks: Arc::new(Mutex::new(Vec::new())),
@@ -1583,9 +1633,9 @@ fn source_publish_client_hash(indexer_id: Uuid) -> NodeId {
 
 /// Return the eMule-style `TAG_ENCRYPTION` bits for the current non-firewalled agent.
 ///
-/// At the moment the agent only models "crypt layer supported", so the other eMule bits remain 0.
+/// This mirrors the oracle `GetMyConnectOptions(true, false)` shape we also expose over TCP hello.
 fn emule_source_encryption_options() -> u8 {
-    0x01
+    emule_connect_options(true)
 }
 
 async fn seed_popular_impl(
@@ -2289,9 +2339,16 @@ fn parse_kad_hello_metadata(tags: &[Tag]) -> KadHelloPeerMetadata {
     metadata
 }
 
-fn current_tcp_firewalled(ed2k_listener: &TcpListener) -> bool {
-    // Until the agent has a full eD2k server session and callback verifier,
-    // a bound listener is the best local signal we have that TCP is reachable.
+async fn current_tcp_firewalled(
+    ed2k_listener: &TcpListener,
+    ed2k_server_state: &Arc<RwLock<Ed2kServerState>>,
+) -> bool {
+    if let Some(tcp_firewalled) = ed2k_server_state.read().await.tcp_firewalled() {
+        return tcp_firewalled;
+    }
+
+    // Before the first ED2K server verdict arrives, a bound listener is still the
+    // best local fallback signal we have.
     ed2k_listener
         .local_addr()
         .map(|addr| addr.port() == 0)
@@ -2320,35 +2377,52 @@ fn build_kad_hello_tags(
 async fn build_hello_response(
     dht: &DhtNode,
     ed2k_listener: &TcpListener,
+    ed2k_server_state: &Arc<RwLock<Ed2kServerState>>,
     kad_firewall: &Arc<Mutex<KadFirewallState>>,
-    peer_addr: SocketAddr,
     request_ack: bool,
 ) -> Result<overlord_kad_proto::HelloRes> {
     let bind_addr = dht.bind_addr()?;
-    let tcp_ip = match bind_addr.ip() {
-        std::net::IpAddr::V4(ip) => u32::from_be_bytes(ip.octets()),
-        std::net::IpAddr::V6(_) => 0,
-    };
     let tcp_port = ed2k_listener
         .local_addr()
         .context("failed to read eD2k listener address while building hello")?
         .port();
-    let peer_udp_key = match peer_addr.ip() {
-        IpAddr::V4(ip) => Some(dht.verify_key_for_ip(ip)),
-        IpAddr::V6(_) => None,
-    };
     let firewall = kad_firewall.lock().await;
 
     Ok(overlord_kad_proto::HelloRes {
         node_id: dht.own_id(),
-        tcp_ip,
         tcp_port,
         version: overlord_kad_proto::KAD_VERSION,
-        udp_key: peer_udp_key,
         tags: build_kad_hello_tags(
             bind_addr.port(),
             firewall.udp_verified && !firewall.udp_open,
-            current_tcp_firewalled(ed2k_listener),
+            current_tcp_firewalled(ed2k_listener, ed2k_server_state).await,
+            request_ack,
+        ),
+    })
+}
+
+async fn build_hello_request(
+    dht: &DhtNode,
+    ed2k_listener: &TcpListener,
+    ed2k_server_state: &Arc<RwLock<Ed2kServerState>>,
+    kad_firewall: &Arc<Mutex<KadFirewallState>>,
+    request_ack: bool,
+) -> Result<overlord_kad_proto::HelloReq> {
+    let bind_addr = dht.bind_addr()?;
+    let tcp_port = ed2k_listener
+        .local_addr()
+        .context("failed to read eD2k listener address while building hello request")?
+        .port();
+    let firewall = kad_firewall.lock().await;
+
+    Ok(overlord_kad_proto::HelloReq {
+        node_id: dht.own_id(),
+        tcp_port,
+        version: overlord_kad_proto::KAD_VERSION,
+        tags: build_kad_hello_tags(
+            bind_addr.port(),
+            firewall.udp_verified && !firewall.udp_open,
+            current_tcp_firewalled(ed2k_listener, ed2k_server_state).await,
             request_ack,
         ),
     })
@@ -2493,14 +2567,22 @@ struct UnsolicitedPacketContext<'a> {
     harvest_observability: &'a Arc<Mutex<KadHarvestObservability>>,
     kad_firewall: &'a Arc<Mutex<KadFirewallState>>,
     ed2k_listener: &'a Arc<TcpListener>,
+    ed2k_server_state: &'a Arc<RwLock<Ed2kServerState>>,
 }
 
 async fn handle_unsolicited_packet(
     dht: &DhtNode,
     context: UnsolicitedPacketContext<'_>,
-    packet: KadPacket,
-    from: SocketAddr,
+    received: ReceivedKadPacket,
 ) -> Result<()> {
+    let ReceivedKadPacket {
+        packet,
+        from,
+        sender_verify_key,
+        receiver_verify_key_valid,
+        ..
+    } = received;
+
     match packet {
         KadPacket::Ping => dht.send_packet(from, &KadPacket::Pong).await?,
         KadPacket::FirewalledReq(req) => {
@@ -2540,7 +2622,7 @@ async fn handle_unsolicited_packet(
             }
         }
         KadPacket::HelloReq(req) => {
-            if let Some(udp_key) = req.udp_key {
+            if let Some(udp_key) = sender_verify_key {
                 dht.register_peer_key(from, udp_key);
             }
             let peer_metadata = add_contact_from_hello(
@@ -2549,24 +2631,25 @@ async fn handle_unsolicited_packet(
                 req.node_id,
                 req.tcp_port,
                 req.version,
-                req.udp_key,
+                sender_verify_key,
                 &req.tags,
             )
             .await;
-            let request_ack = req.version >= 8 && req.udp_key.is_some();
+            let request_ack = req.version >= 8 && !receiver_verify_key_valid;
             let hello_res = build_hello_response(
                 dht,
                 context.ed2k_listener,
+                context.ed2k_server_state,
                 context.kad_firewall,
-                from,
                 request_ack,
             )
             .await?;
             let peer_metadata = peer_metadata.unwrap_or_default();
             debug!(
-                "sending Kad hello response to={} request_ack={} peer_udp_firewalled={} peer_tcp_firewalled={} peer_requests_ack={}",
+                "sending Kad hello response to={} request_ack={} receiver_key_valid={} peer_udp_firewalled={} peer_tcp_firewalled={} peer_requests_ack={}",
                 from,
                 request_ack,
+                receiver_verify_key_valid,
                 peer_metadata.udp_firewalled,
                 peer_metadata.tcp_firewalled,
                 peer_metadata.requests_hello_res_ack
@@ -2574,7 +2657,7 @@ async fn handle_unsolicited_packet(
             let _ = dht.send_packet(from, &KadPacket::HelloRes(hello_res)).await;
         }
         KadPacket::HelloRes(res) => {
-            if let Some(udp_key) = res.udp_key {
+            if let Some(udp_key) = sender_verify_key {
                 dht.register_peer_key(from, udp_key);
             }
             let peer_metadata = add_contact_from_hello(
@@ -2583,13 +2666,13 @@ async fn handle_unsolicited_packet(
                 res.node_id,
                 res.tcp_port,
                 res.version,
-                res.udp_key,
+                sender_verify_key,
                 &res.tags,
             )
             .await
             .unwrap_or_default();
             if peer_metadata.requests_hello_res_ack {
-                if res.udp_key.is_none() {
+                if sender_verify_key.is_none() {
                     warn!(
                         "peer requested HELLO_RES_ACK without a UDP key from={}",
                         from
@@ -3062,6 +3145,16 @@ impl IndexerService for OverlordAgentEmule {
         let config = self.config.read().await.clone();
         let interface_report = self.interface_report().await;
         let mut publish_observability = self.publish_observability.lock().await.clone();
+        publish_observability.keyword_counters = effective_publish_counters(
+            &publish_observability.keyword_counters,
+            publish_observability.latest_keyword_batch.as_ref(),
+            publish_observability.last_seed_at,
+        );
+        publish_observability.source_counters = effective_publish_counters(
+            &publish_observability.source_counters,
+            publish_observability.latest_source_batch.as_ref(),
+            publish_observability.last_seed_at,
+        );
         publish_observability.log_file = Some(current_log_file_status(&config));
         let mut harvest_observability = self.harvest_observability.lock().await.clone();
         apply_queue_family_counts(&mut harvest_observability, queue_family_counts);
@@ -3221,11 +3314,12 @@ impl OverlordAgentEmule {
         let harvest_observability = Arc::clone(&self.harvest_observability);
         let kad_firewall = Arc::clone(&runtime.kad_firewall);
         let ed2k_listener = Arc::clone(&runtime.ed2k_listener);
+        let ed2k_server_state = Arc::clone(&runtime.ed2k_server_state);
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             let mut packets = dht.subscribe_packets();
             while !shutdown.load(Ordering::Relaxed) {
                 match packets.recv().await {
-                    Ok((packet, from)) => {
+                    Ok(received) => {
                         if let Err(error) = handle_unsolicited_packet(
                             &dht,
                             UnsolicitedPacketContext {
@@ -3235,9 +3329,9 @@ impl OverlordAgentEmule {
                                 harvest_observability: &harvest_observability,
                                 kad_firewall: &kad_firewall,
                                 ed2k_listener: &ed2k_listener,
+                                ed2k_server_state: &ed2k_server_state,
                             },
-                            packet,
-                            from,
+                            received,
                         )
                         .await
                         {
@@ -3255,8 +3349,37 @@ impl OverlordAgentEmule {
         let dht = runtime.dht.clone();
         let ed2k_listener = Arc::clone(&runtime.ed2k_listener);
         let shutdown = Arc::clone(&runtime.shutdown);
+        let ed2k_hello_identity = Ed2kHelloIdentity {
+            user_hash: source_publish_client_hash(self.indexer_id).0,
+            tcp_port: config.p2p.ed2k.listen_port,
+            udp_port: config.p2p.kad.listen_port,
+            connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
+        };
         runtime.tasks.lock().await.push(tokio::spawn(async move {
-            run_ed2k_listener(ed2k_listener, dht, shutdown).await;
+            run_ed2k_listener(ed2k_listener, dht, ed2k_hello_identity, shutdown).await;
+        }));
+
+        let bind_ip = runtime.bind_ip;
+        let nat = Arc::clone(&runtime.nat);
+        let shutdown = Arc::clone(&runtime.shutdown);
+        let ed2k_server_state = Arc::clone(&runtime.ed2k_server_state);
+        let ed2k_server_config = config.p2p.ed2k.clone();
+        let ed2k_hello_identity = Ed2kHelloIdentity {
+            user_hash: source_publish_client_hash(self.indexer_id).0,
+            tcp_port: config.p2p.ed2k.listen_port,
+            udp_port: config.p2p.kad.listen_port,
+            connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
+        };
+        runtime.tasks.lock().await.push(tokio::spawn(async move {
+            run_ed2k_server_loop(
+                bind_ip,
+                nat,
+                ed2k_server_config,
+                ed2k_hello_identity,
+                ed2k_server_state,
+                shutdown,
+            )
+            .await;
         }));
 
         let dht = runtime.dht.clone();
@@ -3272,6 +3395,8 @@ impl OverlordAgentEmule {
         let ed2k_hello_identity = Ed2kHelloIdentity {
             user_hash: source_publish_client_hash(self.indexer_id).0,
             tcp_port: config.p2p.ed2k.listen_port,
+            udp_port: config.p2p.kad.listen_port,
+            connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
         };
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             if !udp_firewall_check_enabled {
@@ -3394,6 +3519,74 @@ impl OverlordAgentEmule {
                     }
                 }
                 tokio::time::sleep(udp_firewall_recheck_interval).await;
+            }
+        }));
+
+        let dht = runtime.dht.clone();
+        let ed2k_listener = Arc::clone(&runtime.ed2k_listener);
+        let ed2k_server_state = Arc::clone(&runtime.ed2k_server_state);
+        let kad_firewall = Arc::clone(&runtime.kad_firewall);
+        let shutdown = Arc::clone(&runtime.shutdown);
+        runtime.tasks.lock().await.push(tokio::spawn(async move {
+            let mut introduced = std::collections::HashSet::new();
+            while !shutdown.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_secs(KAD_HELLO_INTRO_SECS)).await;
+                if shutdown.load(Ordering::Relaxed) || !dht.is_bootstrapped() {
+                    continue;
+                }
+
+                let local_ip = match dht.bind_addr() {
+                    Ok(bind_addr) => bind_addr.ip(),
+                    Err(error) => {
+                        debug!("kad hello intro skipped: failed to resolve bind addr: {error}");
+                        continue;
+                    }
+                };
+                let mut contacts = dht
+                    .routing_contacts()
+                    .await
+                    .into_iter()
+                    .filter_map(|contact| {
+                        let addr = SocketAddr::new(IpAddr::V4(contact.ip), contact.udp_port);
+                        (contact.udp_port != 0
+                            && contact.kad_version >= 6
+                            && IpAddr::V4(contact.ip) != local_ip
+                            && !introduced.contains(&addr))
+                        .then_some((contact, addr))
+                    })
+                    .collect::<Vec<_>>();
+                contacts.shuffle(&mut rand::thread_rng());
+
+                for (contact, addr) in contacts.into_iter().take(KAD_HELLO_INTRO_FANOUT) {
+                    let request_ack = contact.kad_version >= 8;
+                    let hello = match build_hello_request(
+                        &dht,
+                        &ed2k_listener,
+                        &ed2k_server_state,
+                        &kad_firewall,
+                        request_ack,
+                    )
+                    .await
+                    {
+                        Ok(hello) => hello,
+                        Err(error) => {
+                            debug!("failed to build Kad hello request for {addr}: {error}");
+                            continue;
+                        }
+                    };
+                    debug!(
+                        "sending Kad hello request to={} contact_id={} contact_version={} request_ack={}",
+                        addr,
+                        contact.id,
+                        contact.kad_version,
+                        request_ack
+                    );
+                    if let Err(error) = dht.send_packet(addr, &KadPacket::HelloReq(hello)).await {
+                        debug!("failed to send Kad hello request to {addr}: {error}");
+                        continue;
+                    }
+                    introduced.insert(addr);
+                }
             }
         }));
 
@@ -3589,17 +3782,18 @@ mod tests {
     use super::{
         COORDINATOR_RECONNECT_SECS, EMULE_LARGE_FILE_SIZE_THRESHOLD, EmuleAgentConfig,
         OverlordAgentEmule, SYNTHETIC_POPULAR_SEEDS, apply_harvest_record, apply_networking_config,
-        apply_publish_summary, apply_queue_family_counts, build_hello_response,
-        build_kad_hello_tags, build_publish_batch_summary, current_tcp_firewalled,
-        empty_networking_config, emule_high_id_source_type, flush_snoop_queue, keyword_target,
-        parse_kad_hello_metadata, record_passive_keyword_post_failure,
-        record_passive_keyword_replay_complete, record_passive_keyword_replay_idle,
-        record_passive_keyword_replay_start, restore_snoop_queue,
-        select_popular_hashes_for_seeding, significant_keyword_words, synthetic_file_hash,
-        synthetic_popular_hashes,
+        apply_publish_summary, apply_queue_family_counts, build_hello_request,
+        build_hello_response, build_kad_hello_tags, build_publish_batch_summary,
+        current_tcp_firewalled, effective_publish_counters, empty_networking_config,
+        emule_high_id_source_type, flush_snoop_queue, keyword_target, parse_kad_hello_metadata,
+        record_passive_keyword_post_failure, record_passive_keyword_replay_complete,
+        record_passive_keyword_replay_idle, record_passive_keyword_replay_start,
+        restore_snoop_queue, select_popular_hashes_for_seeding, significant_keyword_words,
+        synthetic_file_hash, synthetic_popular_hashes,
     };
     use crate::{
         config::SnoopQueueConfig,
+        ed2k_server::Ed2kServerState,
         kad_firewall::KadFirewallState,
         paths::unique_test_dir,
         snoop_queue::{SnoopQueue, SnoopQueueFamilyCounts},
@@ -3617,7 +3811,7 @@ mod tests {
     };
     use overlord_agent_nat::{UPNP_MINIUPNPC_BACKEND, UPNP_RUPNP_BACKEND};
     use overlord_kad_dht::{DhtConfig, DhtNode, PublishAttemptStats};
-    use overlord_kad_proto::{NodeId, SearchKeyReq, Tag, TagValue, tag_name};
+    use overlord_kad_proto::{NodeId, SearchKeyReq, Tag, TagName, TagValue, tag_name};
     use std::{
         collections::HashSet,
         fs,
@@ -3629,7 +3823,7 @@ mod tests {
         },
         time::Duration,
     };
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, RwLock};
     use uuid::Uuid;
 
     #[derive(Clone)]
@@ -3945,6 +4139,93 @@ mod tests {
         assert_eq!(counters.timed_out_contacts, 2);
         assert_eq!(counters.last_batch_at, Some(completed_at));
         assert_eq!(counters.last_success_at, Some(completed_at));
+    }
+
+    #[test]
+    fn effective_publish_counters_include_in_flight_batch_progress() {
+        let previous_completed_at = Utc.with_ymd_and_hms(2026, 3, 21, 11, 5, 0).unwrap();
+        let live_observed_at = Utc.with_ymd_and_hms(2026, 3, 21, 11, 10, 0).unwrap();
+        let committed_summary = build_publish_batch_summary(
+            PublishSeedSource::Coordinator,
+            10,
+            PublishAttemptStats {
+                closest_contacts_considered: 6,
+                attempted_contacts: 6,
+                acked_contacts: 4,
+                timed_out_contacts: 1,
+            },
+            previous_completed_at,
+        );
+        let live_summary = build_publish_batch_summary(
+            PublishSeedSource::SyntheticFallback,
+            7,
+            PublishAttemptStats {
+                closest_contacts_considered: 5,
+                attempted_contacts: 5,
+                acked_contacts: 2,
+                timed_out_contacts: 2,
+            },
+            live_observed_at,
+        );
+        let mut committed_counters = PublishCounters::default();
+        apply_publish_summary(&mut committed_counters, &committed_summary);
+
+        let effective = effective_publish_counters(
+            &committed_counters,
+            Some(&live_summary),
+            Some(live_observed_at),
+        );
+
+        assert_eq!(effective.batches, 2);
+        assert_eq!(effective.published_items, 17);
+        assert_eq!(effective.closest_contacts_considered, 11);
+        assert_eq!(effective.attempted_contacts, 11);
+        assert_eq!(effective.acked_contacts, 6);
+        assert_eq!(effective.failed_contacts, 5);
+        assert_eq!(effective.timed_out_contacts, 3);
+        assert_eq!(effective.last_batch_at, Some(live_observed_at));
+        assert_eq!(effective.last_success_at, Some(live_observed_at));
+    }
+
+    #[test]
+    fn effective_publish_counters_do_not_double_count_committed_batch() {
+        let completed_at = Utc.with_ymd_and_hms(2026, 3, 21, 11, 5, 0).unwrap();
+        let summary = build_publish_batch_summary(
+            PublishSeedSource::SyntheticFallback,
+            40,
+            PublishAttemptStats {
+                closest_contacts_considered: 8,
+                attempted_contacts: 8,
+                acked_contacts: 5,
+                timed_out_contacts: 2,
+            },
+            completed_at,
+        );
+        let mut counters = PublishCounters::default();
+        apply_publish_summary(&mut counters, &summary);
+
+        let effective = effective_publish_counters(&counters, Some(&summary), Some(completed_at));
+
+        assert_eq!(effective, counters);
+    }
+
+    #[test]
+    fn effective_publish_counters_ignore_empty_initial_snapshot() {
+        let observed_at = Utc.with_ymd_and_hms(2026, 3, 21, 11, 0, 0).unwrap();
+        let empty_summary = build_publish_batch_summary(
+            PublishSeedSource::Coordinator,
+            0,
+            PublishAttemptStats::default(),
+            observed_at,
+        );
+
+        let effective = effective_publish_counters(
+            &PublishCounters::default(),
+            Some(&empty_summary),
+            Some(observed_at),
+        );
+
+        assert_eq!(effective, PublishCounters::default());
     }
 
     #[test]
@@ -4296,12 +4577,24 @@ mod tests {
     #[tokio::test]
     async fn bound_ed2k_listener_is_treated_as_tcp_open() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ed2k_server_state = Arc::new(RwLock::new(Ed2kServerState::default()));
 
-        assert!(!current_tcp_firewalled(&listener));
+        assert!(!current_tcp_firewalled(&listener, &ed2k_server_state).await);
     }
 
     #[tokio::test]
-    async fn hello_response_uses_peer_specific_udp_verify_key() {
+    async fn low_id_server_verdict_marks_tcp_as_firewalled() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ed2k_server_state = Arc::new(RwLock::new(Ed2kServerState {
+            client_id: Some(0x0000_2222),
+            ..Ed2kServerState::default()
+        }));
+
+        assert!(current_tcp_firewalled(&listener, &ed2k_server_state).await);
+    }
+
+    #[tokio::test]
+    async fn hello_response_uses_oracle_hello_shape() {
         let dht = DhtNode::new(DhtConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             node_id: NodeId::from_bytes([0x33; 16]),
@@ -4311,16 +4604,44 @@ mod tests {
         .await
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ed2k_server_state = Arc::new(RwLock::new(Ed2kServerState::default()));
         let kad_firewall = Arc::new(Mutex::new(KadFirewallState::default()));
-        let peer_addr: SocketAddr = "1.2.3.4:4672".parse().unwrap();
 
-        let hello = build_hello_response(&dht, &listener, &kad_firewall, peer_addr, true)
+        let hello = build_hello_response(&dht, &listener, &ed2k_server_state, &kad_firewall, true)
             .await
             .unwrap();
 
-        assert_eq!(
-            hello.udp_key,
-            Some(dht.verify_key_for_ip("1.2.3.4".parse().unwrap()))
-        );
+        assert_eq!(hello.node_id, dht.own_id());
+        assert!(hello.tags.iter().any(|tag| matches!(
+            (&tag.name, &tag.value),
+            (TagName::Short(name), TagValue::U16(_))
+                if *name == tag_name::SOURCEUPORT
+        )));
+    }
+
+    #[tokio::test]
+    async fn hello_request_uses_oracle_hello_shape() {
+        let dht = DhtNode::new(DhtConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            node_id: NodeId::from_bytes([0x44; 16]),
+            udp_key: 0x5566_7788,
+            ..DhtConfig::default()
+        })
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ed2k_server_state = Arc::new(RwLock::new(Ed2kServerState::default()));
+        let kad_firewall = Arc::new(Mutex::new(KadFirewallState::default()));
+
+        let hello = build_hello_request(&dht, &listener, &ed2k_server_state, &kad_firewall, true)
+            .await
+            .unwrap();
+
+        assert_eq!(hello.node_id, dht.own_id());
+        assert!(hello.tags.iter().any(|tag| matches!(
+            (&tag.name, &tag.value),
+            (TagName::Short(name), TagValue::U8(bits))
+                if *name == tag_name::KADMISCOPTIONS && (*bits & 0x04) != 0
+        )));
     }
 }

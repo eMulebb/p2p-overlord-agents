@@ -109,7 +109,20 @@ pub struct KadConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Ed2kConfig {
+    /// Local ED2K peer TCP listener port.
     pub listen_port: u16,
+    /// Ordered ED2K server bootstrap endpoints in `host:port` form.
+    pub server_endpoints: Vec<String>,
+    /// Whether the agent should advertise and use eD2k TCP obfuscation.
+    pub obfuscation_enabled: bool,
+    /// Optional one-shot ED2K server search probe term used for parity runs.
+    pub probe_search_term: Option<String>,
+    /// Timeout for one outbound ED2K server connection attempt.
+    pub connect_timeout_secs: u64,
+    /// Delay before retrying the next ED2K server endpoint.
+    pub reconnect_interval_secs: u64,
+    /// Idle interval before the client refreshes the ED2K server session.
+    pub keepalive_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,6 +251,12 @@ impl Default for Ed2kConfig {
     fn default() -> Self {
         Self {
             listen_port: 41_001,
+            server_endpoints: Vec::new(),
+            obfuscation_enabled: true,
+            probe_search_term: None,
+            connect_timeout_secs: 15,
+            reconnect_interval_secs: 30,
+            keepalive_secs: 60,
         }
     }
 }

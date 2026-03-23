@@ -8,6 +8,6 @@ pub mod transport;
 pub use error::NetError;
 pub use obfuscation::ObfuscationLayer;
 pub use rate_limit::RateLimiter;
-pub use rpc::{RpcConfig, RpcManager};
+pub use rpc::{ReceivedKadPacket, RpcConfig, RpcManager};
 pub use tracker::PacketTracker;
 pub use transport::{MockTransport, Transport, UdpTransport};

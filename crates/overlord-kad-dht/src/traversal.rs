@@ -407,7 +407,11 @@ async fn run_search_phase(
             _ = cancel.cancelled() => break,
             result = tokio::time::timeout(remaining, unsolicited.recv()) => result,
         } {
-            Ok(Ok((KadPacket::SearchRes(sr), from))) => {
+            Ok(Ok(overlord_kad_net::ReceivedKadPacket {
+                packet: KadPacket::SearchRes(sr),
+                from,
+                ..
+            })) => {
                 if !queried_addrs.contains(&from) {
                     trace!("ignoring SEARCH_RES from unqueried sender {}", from);
                     continue;
@@ -432,7 +436,11 @@ async fn run_search_phase(
                     search_entries.push((entry.hash, entry.tags));
                 }
             }
-            Ok(Ok((other, from))) => {
+            Ok(Ok(overlord_kad_net::ReceivedKadPacket {
+                packet: other,
+                from,
+                ..
+            })) => {
                 if queried_addrs.contains(&from) {
                     trace!(
                         "search phase unexpected packet opcode=0x{:02X} from {}",
@@ -460,7 +468,7 @@ async fn run_search_phase(
     search_entries
 }
 
-/// Register traversal contact identity with the RPC layer before sending.
+/// Register traversal contact metadata with the RPC layer before sending.
 ///
 /// Traversal frequently queries freshly discovered contacts before they are persisted in the
 /// routing table, so the traversal itself must seed the RPC obfuscation cache with their Kad IDs.
@@ -468,6 +476,7 @@ fn register_traversal_identity(rpc: &RpcManager, contact: &TraversalContact) {
     if contact.id != NodeId::ZERO {
         rpc.register_peer_identity(contact.addr, contact.id);
     }
+    rpc.register_peer_version(contact.addr, contact.version);
 }
 
 fn select_phase2_contacts(

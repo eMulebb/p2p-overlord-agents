@@ -8,5 +8,6 @@ pub mod types;
 
 pub use error::DhtError;
 pub use node::{DhtConfig, DhtNode};
+pub use overlord_kad_net::ReceivedKadPacket;
 pub use publish::PublishAttemptStats;
 pub use types::{NoteResult, SearchResult, SourceResult};

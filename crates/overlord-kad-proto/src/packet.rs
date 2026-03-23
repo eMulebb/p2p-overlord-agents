@@ -58,16 +58,23 @@ pub struct BootstrapRes {
 
 // ── HelloReq ─────────────────────────────────────────────────────────────────
 
+/// Real on-wire format (from eMule source `CKademliaUDPListener::SendMyDetails`):
+///   `node_id` (`NodeId`, 16 bytes)
+///   `tcp_port` (`u16`, 2 bytes)
+///   `version` (`u8`, 1 byte)
+///   `tag_count` (`u8`, 1 byte)
+///   `tags` (`tag_count × variable`)
+///
+/// Kad2 HELLO packets do not carry an explicit TCP IP nor a UDP verify key in
+/// the payload. The sender verify key is recovered from the Kad UDP
+/// obfuscation trailer instead.
 #[binrw]
 #[brw(little)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct HelloReq {
     pub node_id: NodeId,
-    pub tcp_ip: u32,
     pub tcp_port: u16,
     pub version: u8,
-    #[br(if(version >= 6))]
-    pub udp_key: Option<u32>,
     #[br(temp)]
     #[bw(calc = u8::try_from(tags.len()).expect("tag count exceeds u8"))]
     tag_count: u8,
@@ -77,16 +84,14 @@ pub struct HelloReq {
 
 // ── HelloRes ─────────────────────────────────────────────────────────────────
 
+/// Real on-wire format matches [`HelloReq`].
 #[binrw]
 #[brw(little)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct HelloRes {
     pub node_id: NodeId,
-    pub tcp_ip: u32,
     pub tcp_port: u16,
     pub version: u8,
-    #[br(if(version >= 6))]
-    pub udp_key: Option<u32>,
     #[br(temp)]
     #[bw(calc = u8::try_from(tags.len()).expect("tag count exceeds u8"))]
     tag_count: u8,
@@ -717,17 +722,14 @@ mod tests {
     fn test_hello_req_v9_with_tags_roundtrip() {
         let pkt = KadPacket::HelloReq(HelloReq {
             node_id: NodeId::from_bytes([0xAA; 16]),
-            tcp_ip: 0xC0A8_0101,
             tcp_port: 4662,
             version: 9,
-            udp_key: Some(0xDEAD_BEEF),
             tags: vec![Tag::filename("test.txt"), Tag::filesize(12345)],
         });
         let bytes = pkt.encode().unwrap();
         let pkt2 = KadPacket::decode(&bytes).unwrap();
         if let KadPacket::HelloReq(req) = pkt2 {
             assert_eq!(req.version, 9);
-            assert_eq!(req.udp_key, Some(0xDEAD_BEEF));
             assert_eq!(req.tags.len(), 2);
         } else {
             panic!("wrong packet type");
@@ -735,23 +737,44 @@ mod tests {
     }
 
     #[test]
-    fn test_hello_req_v4_no_udp_key() {
+    fn test_hello_req_v4_roundtrip_without_optional_fields() {
         let pkt = KadPacket::HelloReq(HelloReq {
             node_id: NodeId::from_bytes([0xBB; 16]),
-            tcp_ip: 0xC0A8_0102,
             tcp_port: 4662,
             version: 4,
-            udp_key: None,
             tags: vec![],
         });
         let bytes = pkt.encode().unwrap();
         let pkt2 = KadPacket::decode(&bytes).unwrap();
         if let KadPacket::HelloReq(req) = pkt2 {
             assert_eq!(req.version, 4);
-            assert_eq!(req.udp_key, None);
+            assert!(req.tags.is_empty());
         } else {
             panic!("wrong type");
         }
+    }
+
+    #[test]
+    fn test_hello_req_wire_shape_matches_oracle_layout() {
+        let node_id = NodeId::from_bytes([0xDD; 16]);
+        let pkt = KadPacket::HelloReq(HelloReq {
+            node_id,
+            tcp_port: 4662,
+            version: 9,
+            tags: vec![Tag::new_short(
+                crate::constants::tag_name::SOURCEUPORT,
+                TagValue::U16(41000),
+            )],
+        });
+
+        let bytes = pkt.encode().unwrap();
+
+        assert_eq!(bytes[0], crate::constants::OP_KADEMLIAHEADER);
+        assert_eq!(bytes[1], crate::constants::opcode::HELLO_REQ);
+        assert_eq!(&bytes[2..18], &node_id.0);
+        assert_eq!(u16::from_le_bytes([bytes[18], bytes[19]]), 4662);
+        assert_eq!(bytes[20], 9);
+        assert_eq!(bytes[21], 1);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod config;
+mod ed2k_server;
 mod ed2k_tcp;
 mod kad_firewall;
 mod kad_store;

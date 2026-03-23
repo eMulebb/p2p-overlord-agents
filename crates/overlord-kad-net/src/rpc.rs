@@ -44,6 +44,23 @@ struct PendingEntry {
     created_at: std::time::Instant,
 }
 
+/// Unsolicited Kad packet plus the transport metadata the oracle uses for
+/// HELLO verification and reply shaping.
+#[derive(Debug, Clone)]
+pub struct ReceivedKadPacket {
+    /// Decoded Kad payload.
+    pub packet: KadPacket,
+    /// Remote endpoint that sent the packet.
+    pub from: SocketAddr,
+    /// Whether the packet arrived through Kad UDP obfuscation.
+    pub was_obfuscated: bool,
+    /// Sender verify key recovered from the encrypted trailer, when present.
+    pub sender_verify_key: Option<u32>,
+    /// Whether the sender proved our receiver verify key instead of using
+    /// NodeID-mode request obfuscation.
+    pub receiver_verify_key_valid: bool,
+}
+
 struct RpcInner {
     transport: Arc<dyn Transport>,
     obfuscation: ObfuscationLayer,
@@ -51,7 +68,7 @@ struct RpcInner {
     tracker: Mutex<PacketTracker>,
     pending: Mutex<HashMap<u64, PendingEntry>>,
     next_id: AtomicU64,
-    unsolicited_tx: broadcast::Sender<(KadPacket, SocketAddr)>,
+    unsolicited_tx: broadcast::Sender<ReceivedKadPacket>,
 }
 
 pub struct RpcManager {
@@ -109,6 +126,7 @@ impl RpcManager {
                             data: plain,
                             was_obfuscated,
                             sender_verify_key,
+                            receiver_verify_key_valid,
                         } = inner.obfuscation.decrypt(from, &data);
                         if let Some(sender_verify_key) = sender_verify_key {
                             inner.obfuscation.register_peer_key(from, sender_verify_key);
@@ -119,6 +137,16 @@ impl RpcManager {
                         let packet = match KadPacket::decode(&plain) {
                             Ok(p) => p,
                             Err(e) => {
+                                info!(
+                                    "kad recv decode-failed from={} obfuscated={} raw_len={} plain_len={} raw_prefix={} plain_prefix={} error={}",
+                                    from,
+                                    was_obfuscated,
+                                    data.len(),
+                                    plain.len(),
+                                    hex_prefix(&data, 16),
+                                    hex_prefix(&plain, 16),
+                                    e,
+                                );
                                 debug!("failed to decode packet from {}: {}", from, e);
                                 continue;
                             }
@@ -186,11 +214,26 @@ impl RpcManager {
 
                         // 5. If unmatched: broadcast
                         if matched.is_none() {
+                            if should_log_unsolicited_opcode(response_opcode) {
+                                info!(
+                                    "kad recv unsolicited opcode={} from={} obfuscated={} sender_verify_key={}",
+                                    opcode_name(response_opcode),
+                                    from,
+                                    was_obfuscated,
+                                    sender_verify_key.unwrap_or_default(),
+                                );
+                            }
                             debug!(
                                 "unsolicited packet: opcode=0x{:02X} from={}",
                                 response_opcode, from
                             );
-                            let _ = inner.unsolicited_tx.send((packet, from));
+                            let _ = inner.unsolicited_tx.send(ReceivedKadPacket {
+                                packet,
+                                from,
+                                was_obfuscated,
+                                sender_verify_key,
+                                receiver_verify_key_valid,
+                            });
                         }
                     }
                     Err(e) => {
@@ -299,7 +342,10 @@ impl RpcManager {
     pub async fn send(&self, addr: SocketAddr, packet: &KadPacket) -> Result<(), NetError> {
         self.inner.rate_limiter.acquire().await;
         let encoded = packet.encode()?;
-        let outbound = self.inner.obfuscation.inspect_outbound(addr);
+        let outbound = self
+            .inner
+            .obfuscation
+            .inspect_outbound(addr, packet.opcode());
         let wire = self
             .inner
             .obfuscation
@@ -326,7 +372,7 @@ impl RpcManager {
 
     /// Subscribe to unsolicited incoming packets (HELLOs, PINGs, search requests, etc.)
     /// Packets that match a pending request are NOT broadcast here.
-    pub fn subscribe(&self) -> broadcast::Receiver<(KadPacket, SocketAddr)> {
+    pub fn subscribe(&self) -> broadcast::Receiver<ReceivedKadPacket> {
         self.inner.unsolicited_tx.subscribe()
     }
 
@@ -350,6 +396,13 @@ impl RpcManager {
     pub fn register_peer_identity(&self, addr: SocketAddr, node_id: overlord_kad_proto::NodeId) {
         self.inner.obfuscation.register_peer_identity(addr, node_id);
     }
+
+    /// Register the peer Kad version so outbound transport shape can match the oracle gates.
+    pub fn register_peer_version(&self, addr: SocketAddr, kad_version: u8) {
+        self.inner
+            .obfuscation
+            .register_peer_version(addr, kad_version);
+    }
 }
 
 fn is_publish_opcode(opcode_value: u8) -> bool {
@@ -363,15 +416,78 @@ fn is_publish_opcode(opcode_value: u8) -> bool {
     )
 }
 
+fn should_log_unsolicited_opcode(opcode_value: u8) -> bool {
+    matches!(
+        opcode_value,
+        opcode::BOOTSTRAP_REQ
+            | opcode::BOOTSTRAP_RES
+            | opcode::HELLO_REQ
+            | opcode::HELLO_RES
+            | opcode::HELLO_RES_ACK
+            | opcode::REQ
+            | opcode::RES
+            | opcode::SEARCH_KEY_REQ
+            | opcode::SEARCH_SOURCE_REQ
+            | opcode::SEARCH_NOTES_REQ
+            | opcode::SEARCH_RES
+            | opcode::PUBLISH_KEY_REQ
+            | opcode::PUBLISH_SOURCE_REQ
+            | opcode::PUBLISH_NOTES_REQ
+            | opcode::PUBLISH_RES
+            | opcode::PUBLISH_RES_ACK
+            | opcode::FIREWALLED_REQ
+            | opcode::FIREWALLED2_REQ
+            | opcode::FIREWALLED_RES
+            | opcode::FIREWALLED_ACK_RES
+            | opcode::FIREWALLUDP
+            | opcode::FINDBUDDY_REQ
+            | opcode::FINDBUDDY_RES
+            | opcode::CALLBACK_REQ
+            | opcode::PING
+            | opcode::PONG
+    )
+}
+
 fn opcode_name(opcode_value: u8) -> &'static str {
     match opcode_value {
+        opcode::BOOTSTRAP_REQ => "KADEMLIA2_BOOTSTRAP_REQ",
+        opcode::BOOTSTRAP_RES => "KADEMLIA2_BOOTSTRAP_RES",
+        opcode::HELLO_REQ => "KADEMLIA2_HELLO_REQ",
+        opcode::HELLO_RES => "KADEMLIA2_HELLO_RES",
+        opcode::HELLO_RES_ACK => "KADEMLIA2_HELLO_RES_ACK",
+        opcode::REQ => "KADEMLIA2_REQ",
+        opcode::RES => "KADEMLIA2_RES",
+        opcode::SEARCH_KEY_REQ => "KADEMLIA2_SEARCH_KEY_REQ",
+        opcode::SEARCH_SOURCE_REQ => "KADEMLIA2_SEARCH_SOURCE_REQ",
+        opcode::SEARCH_NOTES_REQ => "KADEMLIA2_SEARCH_NOTES_REQ",
+        opcode::SEARCH_RES => "KADEMLIA2_SEARCH_RES",
         opcode::PUBLISH_KEY_REQ => "KADEMLIA2_PUBLISH_KEY_REQ",
         opcode::PUBLISH_SOURCE_REQ => "KADEMLIA2_PUBLISH_SOURCE_REQ",
         opcode::PUBLISH_NOTES_REQ => "KADEMLIA2_PUBLISH_NOTES_REQ",
         opcode::PUBLISH_RES => "KADEMLIA2_PUBLISH_RES",
         opcode::PUBLISH_RES_ACK => "KADEMLIA2_PUBLISH_RES_ACK",
+        opcode::FIREWALLED_REQ => "KADEMLIA_FIREWALLED_REQ",
+        opcode::FIREWALLED2_REQ => "KADEMLIA2_FIREWALLED2_REQ",
+        opcode::FIREWALLED_RES => "KADEMLIA2_FIREWALLED_RES",
+        opcode::FIREWALLED_ACK_RES => "KADEMLIA2_FIREWALLED_ACK_RES",
+        opcode::FIREWALLUDP => "KADEMLIA2_FIREWALLUDP",
+        opcode::FINDBUDDY_REQ => "KADEMLIA_FINDBUDDY_REQ",
+        opcode::FINDBUDDY_RES => "KADEMLIA_FINDBUDDY_RES",
+        opcode::CALLBACK_REQ => "KADEMLIA_CALLBACK_REQ",
+        opcode::PING => "KADEMLIA2_PING",
+        opcode::PONG => "KADEMLIA2_PONG",
         _ => "UNKNOWN",
     }
+}
+
+fn hex_prefix(bytes: &[u8], max_bytes: usize) -> String {
+    let prefix_len = bytes.len().min(max_bytes);
+    let mut out = String::with_capacity(prefix_len.saturating_mul(2));
+    for byte in &bytes[..prefix_len] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 fn peer_identity_from_packet(packet: &KadPacket) -> Option<overlord_kad_proto::NodeId> {
@@ -481,9 +597,12 @@ mod tests {
 
         let received = tokio::time::timeout(Duration::from_secs(2), subscriber.recv()).await;
         assert!(received.is_ok(), "timed out waiting for broadcast");
-        let (pkt, addr) = received.unwrap().unwrap();
-        assert!(matches!(pkt, KadPacket::HelloResAck(_)));
-        assert_eq!(addr, peer_addr);
+        let received = received.unwrap().unwrap();
+        assert!(matches!(received.packet, KadPacket::HelloResAck(_)));
+        assert_eq!(received.from, peer_addr);
+        assert!(!received.was_obfuscated);
+        assert_eq!(received.sender_verify_key, None);
+        assert!(!received.receiver_verify_key_valid);
     }
 
     #[tokio::test]

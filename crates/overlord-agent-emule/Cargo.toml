@@ -9,8 +9,11 @@ description = "Overlord Kad2/ED2K agent scaffold"
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
+flate2 = "1"
 hex = "0.4"
 md4 = "0.10"
+md5 = "0.7"
+num-bigint = "0.4"
 overlord-agent-common = { path = "../overlord-agent-common" }
 overlord-agent-nat = { path = "../overlord-agent-nat" }
 overlord-kad-dht = { path = "../overlord-kad-dht" }

@@ -2,7 +2,7 @@ use crate::bootstrap::{BootstrapContact, hardcoded_bootstrap, parse_nodes_dat, p
 use crate::error::DhtError;
 use crate::traversal::{TraversalConfig, TraversalContact, TraversalKind, run_traversal};
 use crate::types::{NoteResult, SearchResult, SourceResult};
-use overlord_kad_net::{ObfuscationLayer, RpcConfig, RpcManager, UdpTransport};
+use overlord_kad_net::{ObfuscationLayer, ReceivedKadPacket, RpcConfig, RpcManager, UdpTransport};
 use overlord_kad_proto::{
     Ed2kHash, KadPacket, KadUdpKey, NodeId, SearchKeyReq, Tag, constants::K, opcode,
 };
@@ -186,7 +186,7 @@ impl DhtNode {
     }
 
     /// Subscribe to unsolicited incoming Kad packets.
-    pub fn subscribe_packets(&self) -> broadcast::Receiver<(KadPacket, SocketAddr)> {
+    pub fn subscribe_packets(&self) -> broadcast::Receiver<ReceivedKadPacket> {
         self.inner.rpc.subscribe()
     }
 
@@ -199,6 +199,9 @@ impl DhtNode {
     pub async fn add_contact(&self, contact: Contact) -> Result<(), DhtError> {
         let addr = addr_from_contact(&contact);
         self.inner.rpc.register_peer_identity(addr, contact.id);
+        self.inner
+            .rpc
+            .register_peer_version(addr, contact.kad_version);
         if contact.udp_key != KadUdpKey::ZERO {
             self.inner
                 .rpc
@@ -246,6 +249,7 @@ impl DhtNode {
             if bc.node_id != NodeId::ZERO {
                 self.inner.rpc.register_peer_identity(addr, bc.node_id);
             }
+            self.inner.rpc.register_peer_version(addr, bc.version);
             if bc.udp_key != KadUdpKey::ZERO {
                 self.inner.rpc.register_peer_key(addr, bc.udp_key.value());
             }
@@ -279,6 +283,10 @@ impl DhtNode {
                         self.inner
                             .rpc
                             .register_peer_identity(addr_from_contact(&contact), contact.id);
+                        self.inner.rpc.register_peer_version(
+                            addr_from_contact(&contact),
+                            contact.kad_version,
+                        );
                         let _ = rt.add_contact(contact);
                     }
                     info!(
