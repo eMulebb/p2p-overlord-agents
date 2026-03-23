@@ -3348,15 +3348,26 @@ impl OverlordAgentEmule {
 
         let dht = runtime.dht.clone();
         let ed2k_listener = Arc::clone(&runtime.ed2k_listener);
+        let ed2k_server_state = Arc::clone(&runtime.ed2k_server_state);
         let shutdown = Arc::clone(&runtime.shutdown);
         let ed2k_hello_identity = Ed2kHelloIdentity {
             user_hash: source_publish_client_hash(self.indexer_id).0,
+            client_id: 0,
             tcp_port: config.p2p.ed2k.listen_port,
             udp_port: config.p2p.kad.listen_port,
+            server_ip: 0,
+            server_port: 0,
             connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
         };
         runtime.tasks.lock().await.push(tokio::spawn(async move {
-            run_ed2k_listener(ed2k_listener, dht, ed2k_hello_identity, shutdown).await;
+            run_ed2k_listener(
+                ed2k_listener,
+                dht,
+                ed2k_server_state,
+                ed2k_hello_identity,
+                shutdown,
+            )
+            .await;
         }));
 
         let bind_ip = runtime.bind_ip;
@@ -3366,8 +3377,11 @@ impl OverlordAgentEmule {
         let ed2k_server_config = config.p2p.ed2k.clone();
         let ed2k_hello_identity = Ed2kHelloIdentity {
             user_hash: source_publish_client_hash(self.indexer_id).0,
+            client_id: 0,
             tcp_port: config.p2p.ed2k.listen_port,
             udp_port: config.p2p.kad.listen_port,
+            server_ip: 0,
+            server_port: 0,
             connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
         };
         runtime.tasks.lock().await.push(tokio::spawn(async move {
@@ -3394,8 +3408,11 @@ impl OverlordAgentEmule {
         let udp_firewall_check_contact_count = config.p2p.kad.udp_firewall_check_contact_count;
         let ed2k_hello_identity = Ed2kHelloIdentity {
             user_hash: source_publish_client_hash(self.indexer_id).0,
+            client_id: 0,
             tcp_port: config.p2p.ed2k.listen_port,
             udp_port: config.p2p.kad.listen_port,
+            server_ip: 0,
+            server_port: 0,
             connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
         };
         runtime.tasks.lock().await.push(tokio::spawn(async move {

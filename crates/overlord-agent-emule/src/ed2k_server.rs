@@ -36,7 +36,7 @@ use overlord_agent_nat::NatManager;
 
 use crate::{
     config::Ed2kConfig,
-    ed2k_tcp::{Ed2kHelloIdentity, connect_callback_peer},
+    ed2k_tcp::{Ed2kHelloIdentity, apply_server_state, connect_callback_peer},
 };
 
 const OP_EDONKEYPROT: u8 = 0xE3;
@@ -62,7 +62,7 @@ const EDONKEY_VERSION: u32 = 0x3C;
 const EMULE_VERSION_MAJOR: u32 = 0;
 const EMULE_VERSION_MINOR: u32 = 60;
 const EMULE_VERSION_UPDATE: u32 = 3;
-const HELLO_NICKNAME: &str = "overlord-agent";
+const HELLO_NICKNAME: &str = "https://emule-project.net";
 
 const TAGTYPE_HASH: u8 = 0x01;
 const TAGTYPE_STRING: u8 = 0x02;
@@ -680,7 +680,10 @@ async fn handle_server_packet(
                     packet.payload.len()
                 );
                 let bind_ip = context.bind_ip;
-                let hello_identity = context.hello_identity;
+                let hello_identity = {
+                    let state = context.state.read().await;
+                    apply_server_state(context.hello_identity, &state)
+                };
                 let connect_timeout = context.connect_timeout;
                 tokio::spawn(async move {
                     match connect_callback_peer(
@@ -1213,6 +1216,7 @@ mod tests {
     };
     use crate::ed2k_tcp::{Ed2kHelloIdentity, emule_connect_options};
     use flate2::{Compression, write::ZlibEncoder};
+    use hex::decode;
     use num_bigint::BigUint;
     use std::{io::Write, net::Ipv4Addr, sync::Arc, time::Duration};
     use tokio::{
@@ -1225,16 +1229,14 @@ mod tests {
     fn login_request_matches_oracle_tag_shape() {
         let payload = encode_login_request(Ed2kHelloIdentity {
             user_hash: [0x11; 16],
+            client_id: 0,
             tcp_port: 41001,
             udp_port: 41000,
+            server_ip: 0,
+            server_port: 0,
             connect_options: emule_connect_options(true),
         });
-        let nickname_tag_header = [
-            super::TAGTYPE_STR1 + u8::try_from(HELLO_NICKNAME.len() - 1).unwrap(),
-            0x01,
-            0x00,
-            CT_NAME,
-        ];
+        let nickname_tag_header = [super::TAGTYPE_STRING, 0x01, 0x00, CT_NAME];
         let version_tag_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_VERSION];
         let server_flags_tag_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_SERVER_FLAGS];
         let emule_version_tag_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_EMULE_VERSION];
@@ -1294,8 +1296,11 @@ mod tests {
     fn login_request_omits_crypt_flags_when_obfuscation_is_off() {
         let payload = encode_login_request(Ed2kHelloIdentity {
             user_hash: [0x22; 16],
+            client_id: 0,
             tcp_port: 41001,
             udp_port: 41000,
+            server_ip: 0,
+            server_port: 0,
             connect_options: emule_connect_options(false),
         });
 
@@ -1306,6 +1311,58 @@ mod tests {
             server_capabilities(emule_connect_options(false)) & 0x0E00,
             0
         );
+    }
+
+    #[test]
+    fn login_request_matches_oracle_plaintext_sample() {
+        let packet = encode_packet(
+            OP_LOGINREQUEST,
+            &encode_login_request(Ed2kHelloIdentity {
+                user_hash: [
+                    0x73, 0xBE, 0xC5, 0x66, 0x14, 0x0E, 0x7E, 0x60, 0x83, 0xC4, 0x50, 0xC9, 0xAF,
+                    0x02, 0x6F, 0x83,
+                ],
+                client_id: 0,
+                tcp_port: 46671,
+                udp_port: 0,
+                server_ip: 0,
+                server_port: 0,
+                connect_options: emule_connect_options(false),
+            }),
+        );
+
+        let expected = decode(
+            "e3520000000173bec566140e7e6083c450c9af026f83000000004fb60400000002010001190068747470733a2f2f656d756c652d70726f6a6563742e6e6574030100113c0000000301002019010000030100fb80f10000",
+        )
+        .unwrap();
+
+        assert_eq!(packet, expected);
+    }
+
+    #[test]
+    fn login_request_matches_oracle_obfuscated_preference_sample() {
+        let packet = encode_packet(
+            OP_LOGINREQUEST,
+            &encode_login_request(Ed2kHelloIdentity {
+                user_hash: [
+                    0x73, 0xBE, 0xC5, 0x66, 0x14, 0x0E, 0x7E, 0x60, 0x83, 0xC4, 0x50, 0xC9, 0xAF,
+                    0x02, 0x6F, 0x83,
+                ],
+                client_id: 0,
+                tcp_port: 46671,
+                udp_port: 0,
+                server_ip: 0,
+                server_port: 0,
+                connect_options: emule_connect_options(true),
+            }),
+        );
+
+        let expected = decode(
+            "e3520000000173bec566140e7e6083c450c9af026f83000000004fb60400000002010001190068747470733a2f2f656d756c652d70726f6a6563742e6e6574030100113c0000000301002019070000030100fb80f10000",
+        )
+        .unwrap();
+
+        assert_eq!(packet, expected);
     }
 
     #[test]
@@ -1437,8 +1494,11 @@ mod tests {
         let endpoint = listener.local_addr().unwrap();
         let hello_identity = Ed2kHelloIdentity {
             user_hash: [0x11; 16],
+            client_id: 0,
             tcp_port: 41001,
             udp_port: 41000,
+            server_ip: 0,
+            server_port: 0,
             connect_options: emule_connect_options(true),
         };
         let expected_login = encode_packet(OP_LOGINREQUEST, &encode_login_request(hello_identity));

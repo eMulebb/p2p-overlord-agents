@@ -31,9 +31,11 @@ use rand::Rng;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpSocket, TcpStream},
+    sync::RwLock,
 };
 use tracing::{debug, warn};
 
+use crate::ed2k_server::Ed2kServerState;
 use overlord_kad_dht::DhtNode;
 use overlord_kad_proto::{FirewallUdp, KadPacket};
 
@@ -54,6 +56,9 @@ const EMULE_VERSION_MAJOR: u32 = 0;
 const EMULE_VERSION_MINOR: u32 = 60;
 const EMULE_VERSION_UPDATE: u32 = 3;
 const EMULE_VERSION_SHORT: u8 = EMULE_VERSION_MINOR as u8;
+const EMULE_SECURE_IDENT_VERSION: u32 = 3;
+const EMULE_INFO_FEATURES: u32 = 3;
+const EMULE_ADVERTISED_KAD_VERSION: u32 = 10;
 
 const TAGTYPE_STRING: u8 = 0x02;
 const TAGTYPE_UINT32: u8 = 0x03;
@@ -83,7 +88,7 @@ const EMULE_TCP_CRYPT_MAGIC_SERVER: u8 = 203;
 const EMULE_TCP_CRYPT_MAGIC_SYNC: u32 = 0x835E_6FC4;
 const EMULE_TCP_CRYPT_DISCARD_LEN: usize = 1024;
 
-const HELLO_NICKNAME: &str = "overlord-agent";
+const HELLO_NICKNAME: &str = "https://emule-project.net";
 
 /// One decoded eD2k TCP packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,10 +138,16 @@ impl FirewallCheckUdpRequest {
 pub struct Ed2kHelloIdentity {
     /// Stable 16-byte user hash / client hash.
     pub user_hash: [u8; 16],
+    /// Server-assigned HighID or LowID when known.
+    pub client_id: u32,
     /// TCP port advertised in the hello packet.
     pub tcp_port: u16,
     /// UDP port advertised in the hello packet.
     pub udp_port: u16,
+    /// Current ED2K server IPv4 address in the oracle hello trailer format.
+    pub server_ip: u32,
+    /// Current ED2K server TCP port in the oracle hello trailer format.
+    pub server_port: u16,
     /// Local eD2k connect-option bits mirrored from the oracle hello path.
     pub connect_options: u8,
 }
@@ -514,11 +525,11 @@ fn encode_hello_request(identity: Ed2kHelloIdentity) -> Vec<u8> {
 fn encode_hello_type_payload(identity: Ed2kHelloIdentity) -> Vec<u8> {
     let mut payload = Vec::with_capacity(96);
     payload.extend_from_slice(&identity.user_hash);
-    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&identity.client_id.to_le_bytes());
     payload.extend_from_slice(&identity.tcp_port.to_le_bytes());
     append_emule_hello_tags(&mut payload, identity);
-    payload.extend_from_slice(&0u32.to_le_bytes());
-    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&identity.server_ip.to_le_bytes());
+    payload.extend_from_slice(&identity.server_port.to_le_bytes());
     payload
 }
 
@@ -556,7 +567,7 @@ fn emule_misc_options1() -> u32 {
     let supports_unicode = 1u32;
     let udp_version = 4u32;
     let data_compression_version = 1u32;
-    let secure_ident_version = 0u32;
+    let secure_ident_version = EMULE_SECURE_IDENT_VERSION;
     let source_exchange_version = 4u32;
     let extended_requests_version = 2u32;
     let comments_version = 1u32;
@@ -588,7 +599,7 @@ fn emule_misc_options2(connect_options: u8) -> u32 {
     let supports_crypt_layer = u32::from((connect_options & EMULE_CRYPT_SUPPORTS) != 0);
     let ext_multipacket = 1u32;
     let supports_large_files = 1u32;
-    let kad_version = u32::from(overlord_kad_proto::KAD_VERSION);
+    let kad_version = EMULE_ADVERTISED_KAD_VERSION;
     (supports_file_identifiers << 13)
         | (direct_udp_callback << 12)
         | (supports_captcha << 11)
@@ -644,21 +655,37 @@ fn encode_emule_info_answer(kad_udp_port: u16) -> Vec<u8> {
     push_ed2k_u32_tag(&mut payload, ET_SOURCEEXCHANGE, 3);
     push_ed2k_u32_tag(&mut payload, ET_COMMENTS, 1);
     push_ed2k_u32_tag(&mut payload, ET_EXTENDEDREQUEST, 2);
-    push_ed2k_u32_tag(&mut payload, ET_FEATURES, 0);
+    push_ed2k_u32_tag(&mut payload, ET_FEATURES, EMULE_INFO_FEATURES);
     encode_packet(OP_EMULEPROT, OP_EMULEINFOANSWER, &payload)
+}
+
+pub(crate) fn apply_server_state(
+    mut identity: Ed2kHelloIdentity,
+    state: &Ed2kServerState,
+) -> Ed2kHelloIdentity {
+    if let Some(client_id) = state.client_id {
+        identity.client_id = client_id;
+    }
+    if let Some(SocketAddr::V4(endpoint)) = state.endpoint {
+        identity.server_ip = u32::from_le_bytes(endpoint.ip().octets());
+        identity.server_port = endpoint.port();
+    }
+    identity
 }
 
 /// Run the minimal eD2k TCP listener needed for inbound hello parity and firewall checks.
 pub async fn run_ed2k_listener(
     listener: Arc<TcpListener>,
     dht: DhtNode,
+    server_state: Arc<RwLock<Ed2kServerState>>,
     hello_identity: Ed2kHelloIdentity,
     shutdown: Arc<AtomicBool>,
 ) {
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
-                if let Err(error) = handle_connection(stream, peer_addr, &dht, hello_identity).await
+                if let Err(error) =
+                    handle_connection(stream, peer_addr, &dht, &server_state, hello_identity).await
                 {
                     debug!("eD2k connection handling failed from {peer_addr}: {error}");
                 }
@@ -678,6 +705,7 @@ async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
     dht: &DhtNode,
+    server_state: &Arc<RwLock<Ed2kServerState>>,
     hello_identity: Ed2kHelloIdentity,
 ) -> Result<()> {
     let kad_udp_port = dht
@@ -687,6 +715,10 @@ async fn handle_connection(
     let response_identity = Ed2kHelloIdentity {
         udp_port: kad_udp_port,
         ..hello_identity
+    };
+    let response_identity = {
+        let state = server_state.read().await;
+        apply_server_state(response_identity, &state)
     };
     let mut transport = tokio::time::timeout(
         ED2K_CONNECTION_IDLE_TIMEOUT,
@@ -1040,12 +1072,13 @@ mod tests {
         EMULE_TCP_CRYPT_MAGIC_REQUESTER, EMULE_TCP_CRYPT_MAGIC_SERVER, EMULE_TCP_CRYPT_MAGIC_SYNC,
         EMULE_VERSION_SHORT, Ed2kHelloIdentity, Ed2kPeerConnectMode, FirewallCheckUdpRequest,
         HELLO_NICKNAME, OP_EDONKEYPROT, OP_EMULEINFOANSWER, OP_EMULEPROT, OP_FWCHECKUDPREQ,
-        OP_HELLO, OP_HELLOANSWER, TAGTYPE_STR1, TAGTYPE_UINT32, connect_callback_peer,
+        OP_HELLO, OP_HELLOANSWER, TAGTYPE_STRING, TAGTYPE_UINT32, connect_callback_peer,
         decode_incoming_obfuscation_header, derive_obfuscation_key, emule_connect_options,
         emule_misc_options1, emule_misc_options2, emule_version_tag, encode_emule_info_answer,
         encode_hello_answer, encode_hello_request, encode_incoming_obfuscation_response,
         encode_packet,
     };
+    use hex::decode;
     use std::{net::Ipv4Addr, time::Duration};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1083,8 +1116,11 @@ mod tests {
     fn hello_request_encoding_matches_ed2k_framing() {
         let packet = encode_hello_request(Ed2kHelloIdentity {
             user_hash: [0x11; 16],
+            client_id: 0x521B_5895,
             tcp_port: 41001,
             udp_port: 41000,
+            server_ip: u32::from_le_bytes([176, 123, 2, 239]),
+            server_port: 4232,
             connect_options: emule_connect_options(true),
         });
 
@@ -1105,16 +1141,14 @@ mod tests {
     fn hello_answer_advertises_emule_style_tags() {
         let packet = encode_hello_answer(Ed2kHelloIdentity {
             user_hash: [0x22; 16],
+            client_id: 0x521B_5895,
             tcp_port: 41001,
             udp_port: 41000,
+            server_ip: u32::from_le_bytes([176, 123, 2, 239]),
+            server_port: 4232,
             connect_options: emule_connect_options(true),
         });
-        let expected_name_header = [
-            TAGTYPE_STR1 + u8::try_from(HELLO_NICKNAME.len() - 1).unwrap(),
-            0x01,
-            0x00,
-            CT_NAME,
-        ];
+        let expected_name_header = [TAGTYPE_STRING, 0x01, 0x00, CT_NAME];
         let expected_u32_version_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_VERSION];
         let expected_udp_ports_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_EMULE_UDPPORTS];
         let expected_misc1_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_EMULE_MISCOPTIONS1];
@@ -1124,6 +1158,10 @@ mod tests {
         assert_eq!(packet[0], OP_EDONKEYPROT);
         assert_eq!(packet[5], OP_HELLOANSWER);
         assert_eq!(&packet[6..22], &[0x22; 16]);
+        assert_eq!(
+            u32::from_le_bytes([packet[22], packet[23], packet[24], packet[25]]),
+            0x521B_5895
+        );
         assert_eq!(
             u32::from_le_bytes([packet[28], packet[29], packet[30], packet[31]]),
             6
@@ -1186,6 +1224,42 @@ mod tests {
                 .windows(4)
                 .any(|window| window == emule_version_tag().to_le_bytes())
         );
+        assert_eq!(
+            u32::from_le_bytes([
+                packet[packet.len() - 6],
+                packet[packet.len() - 5],
+                packet[packet.len() - 4],
+                packet[packet.len() - 3]
+            ]),
+            u32::from_le_bytes([176, 123, 2, 239])
+        );
+        assert_eq!(
+            u16::from_le_bytes([packet[packet.len() - 2], packet[packet.len() - 1]]),
+            4232
+        );
+    }
+
+    #[test]
+    fn hello_answer_matches_oracle_plaintext_sample() {
+        let packet = encode_hello_answer(Ed2kHelloIdentity {
+            user_hash: [
+                0x73, 0xBE, 0xC5, 0x66, 0x14, 0x0E, 0x7E, 0x60, 0x83, 0xC4, 0x50, 0xC9, 0xAF, 0x02,
+                0x6F, 0x83,
+            ],
+            client_id: 0x521B_5895,
+            tcp_port: 46671,
+            udp_port: 46673,
+            server_ip: u32::from_le_bytes([176, 123, 2, 239]),
+            server_port: 4232,
+            connect_options: emule_connect_options(false),
+        });
+
+        let expected = decode(
+            "e3680000004c73bec566140e7e6083c450c9af026f8395581b524fb60600000002010001190068747470733a2f2f656d756c652d70726f6a6563742e6e6574030100113c000000030100f951b651b6030100fa1e421334030100fe3a2c0000030100fb80f10000b07b02ef8810",
+        )
+        .unwrap();
+
+        assert_eq!(packet, expected);
     }
 
     #[test]
@@ -1293,8 +1367,11 @@ mod tests {
             peer_addr,
             Ed2kHelloIdentity {
                 user_hash: [0x55; 16],
+                client_id: 0,
                 tcp_port: 41001,
                 udp_port: 41000,
+                server_ip: 0,
+                server_port: 0,
                 connect_options: emule_connect_options(true),
             },
             None,
@@ -1317,8 +1394,11 @@ mod tests {
         let peer_user_hash = [0x66; 16];
         let expected_hello = encode_hello_request(Ed2kHelloIdentity {
             user_hash: [0x77; 16],
+            client_id: 0,
             tcp_port: 41001,
             udp_port: 41000,
+            server_ip: 0,
+            server_port: 0,
             connect_options: emule_connect_options(true),
         });
         let expected_hello_for_server = expected_hello.clone();
@@ -1374,8 +1454,11 @@ mod tests {
             peer_addr,
             Ed2kHelloIdentity {
                 user_hash: [0x77; 16],
+                client_id: 0,
                 tcp_port: 41001,
                 udp_port: 41000,
+                server_ip: 0,
+                server_port: 0,
                 connect_options: emule_connect_options(true),
             },
             Some(peer_user_hash),
@@ -1396,8 +1479,11 @@ mod tests {
         let peer_addr = listener.local_addr().unwrap();
         let expected_hello = encode_hello_request(Ed2kHelloIdentity {
             user_hash: [0x88; 16],
+            client_id: 0,
             tcp_port: 41001,
             udp_port: 41000,
+            server_ip: 0,
+            server_port: 0,
             connect_options: emule_connect_options(false),
         });
         let expected_hello_for_server = expected_hello.clone();
@@ -1407,8 +1493,11 @@ mod tests {
             stream.read_exact(&mut packet).await.unwrap();
             let reply = encode_hello_answer(Ed2kHelloIdentity {
                 user_hash: [0xAA; 16],
+                client_id: 0x521B_5895,
                 tcp_port: 46671,
                 udp_port: 46673,
+                server_ip: u32::from_le_bytes([176, 123, 2, 239]),
+                server_port: 4232,
                 connect_options: emule_connect_options(false),
             });
             stream.write_all(&reply).await.unwrap();
@@ -1420,8 +1509,11 @@ mod tests {
             peer_addr,
             Ed2kHelloIdentity {
                 user_hash: [0x88; 16],
+                client_id: 0,
                 tcp_port: 41001,
                 udp_port: 41000,
+                server_ip: 0,
+                server_port: 0,
                 connect_options: emule_connect_options(false),
             },
             Some([0x99; 16]),
