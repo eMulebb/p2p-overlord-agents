@@ -29,6 +29,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpSocket, TcpStream, lookup_host},
     sync::RwLock,
+    time::Instant as TokioInstant,
 };
 use tracing::{debug, info, warn};
 
@@ -209,6 +210,7 @@ struct ServerSessionContext {
     state: Arc<RwLock<Ed2kServerState>>,
     keepalive_interval: Duration,
     connect_timeout: Duration,
+    rotation_interval: Option<Duration>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -451,6 +453,8 @@ pub async fn run_ed2k_server_loop(
         state: Arc::clone(&state),
         keepalive_interval: Duration::from_secs(config.keepalive_secs.max(1)),
         connect_timeout: Duration::from_secs(config.connect_timeout_secs.max(1)),
+        rotation_interval: (config.session_rotation_secs > 0)
+            .then(|| Duration::from_secs(config.session_rotation_secs)),
         shutdown: Arc::clone(&shutdown),
     };
 
@@ -537,6 +541,10 @@ async fn run_one_server_session(
         session.send_packet(OP_LOGINREQUEST, &login_payload).await?;
     }
 
+    let rotation_deadline = context
+        .rotation_interval
+        .map(|interval| TokioInstant::now() + interval);
+
     loop {
         if context.shutdown.load(Ordering::Relaxed) {
             clear_server_connection_state(&context.state).await;
@@ -544,6 +552,21 @@ async fn run_one_server_session(
         }
 
         tokio::select! {
+            _ = async {
+                if let Some(deadline) = rotation_deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                info!(
+                    "rotating ED2K server session from {} after {:?}",
+                    endpoint,
+                    context.rotation_interval.expect("rotation interval is set"),
+                );
+                clear_server_connection_state(&context.state).await;
+                return Ok(());
+            }
             packet = session.read_packet() => {
                 let Some(packet) = packet? else {
                     anyhow::bail!("ED2K server {} closed the connection", endpoint);

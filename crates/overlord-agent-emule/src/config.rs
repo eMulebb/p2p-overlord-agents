@@ -123,6 +123,11 @@ pub struct Ed2kConfig {
     pub reconnect_interval_secs: u64,
     /// Idle interval before the client refreshes the ED2K server session.
     pub keepalive_secs: u64,
+    /// Maximum lifetime of one ED2K server session before rotating to the next endpoint.
+    ///
+    /// A value of `0` disables proactive rotation and keeps the current session
+    /// alive until the remote side disconnects or the agent shuts down.
+    pub session_rotation_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,6 +262,7 @@ impl Default for Ed2kConfig {
             connect_timeout_secs: 15,
             reconnect_interval_secs: 30,
             keepalive_secs: 60,
+            session_rotation_secs: 0,
         }
     }
 }

@@ -55,8 +55,8 @@ use overlord_kad_routing::Contact;
 use crate::config::EmuleAgentConfig;
 use crate::ed2k_server::{Ed2kServerState, run_ed2k_server_loop};
 use crate::ed2k_tcp::{
-    Ed2kHelloIdentity, FirewallCheckUdpRequest, emule_connect_options, request_udp_firewall_check,
-    run_ed2k_listener,
+    Ed2kHelloIdentity, Ed2kSecureIdent, FirewallCheckUdpRequest, emule_connect_options,
+    request_udp_firewall_check, run_ed2k_listener,
 };
 use crate::kad_firewall::{FirewallUdpPacketOutcome, KadFirewallState};
 use crate::kad_store::{KadLocalStore, KadLocalStoreConfig};
@@ -597,6 +597,7 @@ fn record_passive_keyword_post_failure(
 struct AgentStatePaths {
     node_id_path: PathBuf,
     udp_key_path: PathBuf,
+    ed2k_secure_ident_path: PathBuf,
     nodes_dat_path: PathBuf,
     networking_config_path: PathBuf,
 }
@@ -607,6 +608,7 @@ struct AgentNetworkRuntime {
     dht: DhtNode,
     ed2k_listener: Arc<TcpListener>,
     ed2k_server_state: Arc<RwLock<Ed2kServerState>>,
+    ed2k_secure_ident: Arc<Ed2kSecureIdent>,
     nat: Arc<NatManager>,
     kad_firewall: Arc<Mutex<KadFirewallState>>,
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -664,6 +666,7 @@ impl OverlordAgentEmule {
         let state_paths = AgentStatePaths::from_config(&config);
         ensure_parent_dir(&state_paths.node_id_path)?;
         ensure_parent_dir(&state_paths.udp_key_path)?;
+        ensure_parent_dir(&state_paths.ed2k_secure_ident_path)?;
         ensure_parent_dir(&state_paths.nodes_dat_path)?;
         ensure_parent_dir(&state_paths.networking_config_path)?;
         let interfaces = detect_interfaces().unwrap_or_default();
@@ -1267,6 +1270,8 @@ impl OverlordAgentEmule {
             .with_context(|| format!("bind_ip is not a valid IPv4 address: {bind_ip}"))?;
         let node_id = load_or_create_node_id(&self.state_paths.node_id_path)?;
         let udp_key = load_or_create_udp_key(&self.state_paths.udp_key_path)?;
+        let ed2k_secure_ident =
+            Ed2kSecureIdent::load_or_create(&self.state_paths.ed2k_secure_ident_path)?;
         let bind_addr = resolved_socket_addr(config.p2p.kad.listen_port, Some(bind_ip))
             .context("invalid p2p.kad.listen_port")?;
         let ed2k_bind_addr = resolved_socket_addr(config.p2p.ed2k.listen_port, Some(bind_ip))
@@ -1328,6 +1333,7 @@ impl OverlordAgentEmule {
             dht,
             ed2k_listener,
             ed2k_server_state: Arc::new(RwLock::new(Ed2kServerState::default())),
+            ed2k_secure_ident: Arc::new(ed2k_secure_ident),
             nat,
             kad_firewall: Arc::new(Mutex::new(KadFirewallState::default())),
             tasks: Arc::new(Mutex::new(Vec::new())),
@@ -2880,6 +2886,7 @@ impl AgentStatePaths {
         Self {
             node_id_path: state_dir.join("overlord-kad.node-id"),
             udp_key_path: state_dir.join("overlord-kad.udp-key"),
+            ed2k_secure_ident_path: state_dir.join("overlord-ed2k.secident.pkcs8.der"),
             nodes_dat_path,
             networking_config_path: state_dir.join("overlord-agent.networking.json"),
         }
@@ -3349,6 +3356,7 @@ impl OverlordAgentEmule {
         let dht = runtime.dht.clone();
         let ed2k_listener = Arc::clone(&runtime.ed2k_listener);
         let ed2k_server_state = Arc::clone(&runtime.ed2k_server_state);
+        let ed2k_secure_ident = Arc::clone(&runtime.ed2k_secure_ident);
         let shutdown = Arc::clone(&runtime.shutdown);
         let ed2k_hello_identity = Ed2kHelloIdentity {
             user_hash: source_publish_client_hash(self.indexer_id).0,
@@ -3364,6 +3372,7 @@ impl OverlordAgentEmule {
                 ed2k_listener,
                 dht,
                 ed2k_server_state,
+                ed2k_secure_ident,
                 ed2k_hello_identity,
                 shutdown,
             )

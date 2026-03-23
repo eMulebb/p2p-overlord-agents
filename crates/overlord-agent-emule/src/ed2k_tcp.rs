@@ -16,8 +16,9 @@
 
 use std::{
     collections::VecDeque,
-    io,
+    fs, io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -28,6 +29,14 @@ use std::{
 use anyhow::{Context, Result};
 use md5::compute as md5_compute;
 use rand::Rng;
+use rsa::{
+    RsaPrivateKey, RsaPublicKey,
+    pkcs1v15::SigningKey,
+    pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey},
+    rand_core::OsRng,
+    signature::{RandomizedSigner, SignatureEncoding},
+};
+use sha1::Sha1;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpSocket, TcpStream},
@@ -46,6 +55,9 @@ const OP_HELLO: u8 = 0x01;
 const OP_HELLOANSWER: u8 = 0x4C;
 const OP_EMULEINFO: u8 = 0x01;
 const OP_EMULEINFOANSWER: u8 = 0x02;
+const OP_PUBLICKEY: u8 = 0x85;
+const OP_SIGNATURE: u8 = 0x86;
+const OP_SECIDENTSTATE: u8 = 0x87;
 const OP_FWCHECKUDPREQ: u8 = 0xA7;
 const TCP_PACKET_HEADER_LEN: usize = 6;
 const ED2K_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -62,7 +74,15 @@ const EMULE_ADVERTISED_KAD_VERSION: u32 = 10;
 
 const TAGTYPE_STRING: u8 = 0x02;
 const TAGTYPE_UINT32: u8 = 0x03;
+const TAGTYPE_FLOAT32: u8 = 0x04;
+const TAGTYPE_BOOL: u8 = 0x05;
+const TAGTYPE_BOOLARRAY: u8 = 0x06;
+const TAGTYPE_BLOB: u8 = 0x07;
+const TAGTYPE_UINT16: u8 = 0x08;
+const TAGTYPE_UINT8: u8 = 0x09;
+const TAGTYPE_UINT64: u8 = 0x0B;
 const TAGTYPE_STR1: u8 = 0x11;
+const TAG_SHORT_NAME_MASK: u8 = 0x80;
 
 const CT_NAME: u8 = 0x01;
 const CT_VERSION: u8 = 0x11;
@@ -87,6 +107,9 @@ const EMULE_TCP_CRYPT_MAGIC_REQUESTER: u8 = 34;
 const EMULE_TCP_CRYPT_MAGIC_SERVER: u8 = 203;
 const EMULE_TCP_CRYPT_MAGIC_SYNC: u32 = 0x835E_6FC4;
 const EMULE_TCP_CRYPT_DISCARD_LEN: usize = 1024;
+const ED2K_SECURE_IDENT_KEY_BITS: usize = 384;
+const ED2K_SECURE_IDENT_SIGNATURE_NEEDED: u8 = 1;
+const ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED: u8 = 2;
 
 const HELLO_NICKNAME: &str = "https://emule-project.net";
 
@@ -150,6 +173,87 @@ pub struct Ed2kHelloIdentity {
     pub server_port: u16,
     /// Local eD2k connect-option bits mirrored from the oracle hello path.
     pub connect_options: u8,
+}
+
+/// Persistent RSA identity used for the eMule secure-ident side channel.
+#[derive(Debug)]
+pub struct Ed2kSecureIdent {
+    private_key: RsaPrivateKey,
+    public_key_der: Vec<u8>,
+}
+
+impl Ed2kSecureIdent {
+    /// Load the oracle-compatible ED2K secure-ident keypair from disk or create it on first use.
+    pub fn load_or_create(path: &Path) -> Result<Self> {
+        if path.exists() {
+            let bytes =
+                fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+            let private_key = RsaPrivateKey::from_pkcs8_der(&bytes).with_context(|| {
+                format!("invalid PKCS#8 ED2K secure-ident key at {}", path.display())
+            })?;
+            return Self::from_private_key(private_key);
+        }
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+
+        let private_key = RsaPrivateKey::new(&mut OsRng, ED2K_SECURE_IDENT_KEY_BITS)
+            .context("failed to generate ED2K secure-ident RSA keypair")?;
+        let encoded = private_key
+            .to_pkcs8_der()
+            .context("failed to encode ED2K secure-ident private key")?;
+        fs::write(path, encoded.as_bytes())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        Self::from_private_key(private_key)
+    }
+
+    fn from_private_key(private_key: RsaPrivateKey) -> Result<Self> {
+        let public_key_der = RsaPublicKey::from(&private_key)
+            .to_public_key_der()
+            .context("failed to encode ED2K secure-ident public key")?
+            .as_bytes()
+            .to_vec();
+        Ok(Self {
+            private_key,
+            public_key_der,
+        })
+    }
+
+    fn public_key_payload(&self) -> Result<Vec<u8>> {
+        let key_len = u8::try_from(self.public_key_der.len())
+            .context("ED2K secure-ident public key exceeds u8 length")?;
+        let mut payload = Vec::with_capacity(1 + self.public_key_der.len());
+        payload.push(key_len);
+        payload.extend_from_slice(&self.public_key_der);
+        Ok(payload)
+    }
+
+    fn signature_payload(&self, peer_public_key: &[u8], challenge: u32) -> Result<Vec<u8>> {
+        let mut message = Vec::with_capacity(peer_public_key.len() + 4);
+        message.extend_from_slice(peer_public_key);
+        message.extend_from_slice(&challenge.to_le_bytes());
+
+        let signing_key = SigningKey::<Sha1>::new(self.private_key.clone());
+        let signature = signing_key.sign_with_rng(&mut OsRng, &message);
+        let signature_bytes = signature.to_bytes();
+        let sig_len = u8::try_from(signature_bytes.len())
+            .context("ED2K secure-ident signature exceeds u8 length")?;
+        let mut payload = Vec::with_capacity(1 + signature_bytes.len());
+        payload.push(sig_len);
+        payload.extend_from_slice(signature_bytes.as_ref());
+        Ok(payload)
+    }
+}
+
+#[derive(Debug, Default)]
+struct Ed2kPeerSecureIdentState {
+    peer_public_key: Option<Vec<u8>>,
+    peer_challenge_from: Option<u32>,
+    challenge_for: Option<u32>,
+    pending_signature: bool,
+    requested_peer_key: bool,
 }
 
 #[derive(Debug)]
@@ -307,11 +411,12 @@ pub(crate) async fn connect_callback_peer(
         };
         match (packet.protocol, packet.opcode) {
             (OP_EDONKEYPROT, OP_HELLO) => {
-                let reply = encode_hello_answer(hello_identity);
-                transport
-                    .write_all(&reply)
-                    .await
-                    .with_context(|| format!("failed to send OP_HELLOANSWER to {peer_addr}"))?;
+                for reply in build_hello_responses(&packet.payload, hello_identity)? {
+                    transport
+                        .write_all(&reply)
+                        .await
+                        .with_context(|| format!("failed to reply to OP_HELLO from {peer_addr}"))?;
+                }
             }
             (OP_EDONKEYPROT, OP_HELLOANSWER)
             | (OP_EMULEPROT, OP_EMULEINFOANSWER)
@@ -644,7 +749,7 @@ fn encode_hello_answer(identity: Ed2kHelloIdentity) -> Vec<u8> {
     )
 }
 
-fn encode_emule_info_answer(kad_udp_port: u16) -> Vec<u8> {
+fn encode_emule_info_payload(kad_udp_port: u16) -> Vec<u8> {
     let mut payload = Vec::with_capacity(48);
     payload.push(EMULE_VERSION_SHORT);
     payload.push(EMULE_PROTOCOL_VERSION);
@@ -656,7 +761,190 @@ fn encode_emule_info_answer(kad_udp_port: u16) -> Vec<u8> {
     push_ed2k_u32_tag(&mut payload, ET_COMMENTS, 1);
     push_ed2k_u32_tag(&mut payload, ET_EXTENDEDREQUEST, 2);
     push_ed2k_u32_tag(&mut payload, ET_FEATURES, EMULE_INFO_FEATURES);
-    encode_packet(OP_EMULEPROT, OP_EMULEINFOANSWER, &payload)
+    payload
+}
+
+fn encode_emule_info_request(kad_udp_port: u16) -> Vec<u8> {
+    encode_packet(
+        OP_EMULEPROT,
+        OP_EMULEINFO,
+        &encode_emule_info_payload(kad_udp_port),
+    )
+}
+
+fn encode_emule_info_answer(kad_udp_port: u16) -> Vec<u8> {
+    encode_packet(
+        OP_EMULEPROT,
+        OP_EMULEINFOANSWER,
+        &encode_emule_info_payload(kad_udp_port),
+    )
+}
+
+fn decode_hello_tag(mut bytes: &[u8]) -> Result<(Option<u8>, &[u8])> {
+    if bytes.len() < 2 {
+        anyhow::bail!("short eD2k hello tag header");
+    }
+    let type_byte = bytes[0];
+    let short_name = (type_byte & TAG_SHORT_NAME_MASK) != 0;
+    let base_type = type_byte & !TAG_SHORT_NAME_MASK;
+    bytes = &bytes[1..];
+
+    let tag_name = if short_name {
+        let name = bytes[0];
+        bytes = &bytes[1..];
+        Some(name)
+    } else {
+        if bytes.len() < 2 {
+            anyhow::bail!("short eD2k hello long-name length");
+        }
+        let name_len = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
+        bytes = &bytes[2..];
+        if bytes.len() < name_len {
+            anyhow::bail!("short eD2k hello long-name bytes");
+        }
+        let name = if name_len == 1 { Some(bytes[0]) } else { None };
+        bytes = &bytes[name_len..];
+        name
+    };
+
+    let remaining = match base_type {
+        TAGTYPE_STRING => {
+            if bytes.len() < 2 {
+                anyhow::bail!("short eD2k hello string tag length");
+            }
+            let len = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
+            if bytes.len() < 2 + len {
+                anyhow::bail!("short eD2k hello string tag value");
+            }
+            &bytes[2 + len..]
+        }
+        TAGTYPE_STR1..=0x20 => {
+            let len = usize::from(base_type - TAGTYPE_STR1 + 1);
+            if bytes.len() < len {
+                anyhow::bail!("short eD2k hello compact string tag value");
+            }
+            &bytes[len..]
+        }
+        TAGTYPE_UINT32 | TAGTYPE_FLOAT32 => {
+            if bytes.len() < 4 {
+                anyhow::bail!("short eD2k hello 32-bit tag value");
+            }
+            &bytes[4..]
+        }
+        TAGTYPE_UINT64 => {
+            if bytes.len() < 8 {
+                anyhow::bail!("short eD2k hello uint64 tag value");
+            }
+            &bytes[8..]
+        }
+        TAGTYPE_UINT16 => {
+            if bytes.len() < 2 {
+                anyhow::bail!("short eD2k hello uint16 tag value");
+            }
+            &bytes[2..]
+        }
+        TAGTYPE_UINT8 | TAGTYPE_BOOL => {
+            if bytes.is_empty() {
+                anyhow::bail!("short eD2k hello uint8/bool tag value");
+            }
+            &bytes[1..]
+        }
+        TAGTYPE_BOOLARRAY => {
+            if bytes.len() < 2 {
+                anyhow::bail!("short eD2k hello bool-array tag length");
+            }
+            let bit_len = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
+            let byte_len = (bit_len / 8).saturating_add(1);
+            if bytes.len() < 2 + byte_len {
+                anyhow::bail!("short eD2k hello bool-array tag value");
+            }
+            &bytes[2 + byte_len..]
+        }
+        TAGTYPE_BLOB => {
+            if bytes.len() < 4 {
+                anyhow::bail!("short eD2k hello blob tag length");
+            }
+            let blob_len = usize::try_from(u32::from_le_bytes(bytes[..4].try_into().unwrap()))
+                .context("eD2k hello blob length overflow")?;
+            if bytes.len() < 4 + blob_len {
+                anyhow::bail!("short eD2k hello blob tag value");
+            }
+            &bytes[4 + blob_len..]
+        }
+        0x01 => {
+            if bytes.len() < 16 {
+                anyhow::bail!("short eD2k hello hash tag value");
+            }
+            &bytes[16..]
+        }
+        _ => anyhow::bail!("unsupported eD2k hello tag type 0x{base_type:02X}"),
+    };
+
+    Ok((tag_name, remaining))
+}
+
+fn is_mule_hello(payload: &[u8]) -> Result<bool> {
+    if payload.len() < 1 + 16 + 4 + 2 + 4 {
+        anyhow::bail!("short eD2k OP_HELLO payload");
+    }
+    let mut cursor = &payload[1 + 16 + 4 + 2..];
+    let tag_count = usize::try_from(u32::from_le_bytes(cursor[..4].try_into().unwrap()))
+        .context("eD2k hello tag count overflow")?;
+    cursor = &cursor[4..];
+
+    for _ in 0..tag_count {
+        let (tag_name, rest) = decode_hello_tag(cursor)?;
+        if tag_name == Some(CT_EMULE_VERSION) {
+            return Ok(true);
+        }
+        cursor = rest;
+    }
+
+    Ok(false)
+}
+
+fn build_hello_responses(
+    incoming_payload: &[u8],
+    response_identity: Ed2kHelloIdentity,
+) -> Result<Vec<Vec<u8>>> {
+    let is_mule_hello = is_mule_hello(incoming_payload)?;
+    let mut replies = Vec::with_capacity(2);
+    if !is_mule_hello {
+        replies.push(encode_emule_info_request(response_identity.udp_port));
+    }
+    replies.push(encode_hello_answer(response_identity));
+    Ok(replies)
+}
+
+fn encode_secident_state(state: u8, challenge: u32) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(5);
+    payload.push(state);
+    payload.extend_from_slice(&challenge.to_le_bytes());
+    encode_packet(OP_EMULEPROT, OP_SECIDENTSTATE, &payload)
+}
+
+fn decode_secident_state(payload: &[u8]) -> Result<(u8, u32)> {
+    if payload.len() != 5 {
+        anyhow::bail!("invalid OP_SECIDENTSTATE payload size {}", payload.len());
+    }
+    Ok((
+        payload[0],
+        u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]),
+    ))
+}
+
+fn decode_public_key_payload(payload: &[u8]) -> Result<Vec<u8>> {
+    let Some((&key_len, key_bytes)) = payload.split_first() else {
+        anyhow::bail!("empty OP_PUBLICKEY payload");
+    };
+    if usize::from(key_len) != key_bytes.len() {
+        anyhow::bail!(
+            "invalid OP_PUBLICKEY length prefix {} for payload size {}",
+            key_len,
+            key_bytes.len()
+        );
+    }
+    Ok(key_bytes.to_vec())
 }
 
 pub(crate) fn apply_server_state(
@@ -678,14 +966,22 @@ pub async fn run_ed2k_listener(
     listener: Arc<TcpListener>,
     dht: DhtNode,
     server_state: Arc<RwLock<Ed2kServerState>>,
+    secure_ident: Arc<Ed2kSecureIdent>,
     hello_identity: Ed2kHelloIdentity,
     shutdown: Arc<AtomicBool>,
 ) {
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
-                if let Err(error) =
-                    handle_connection(stream, peer_addr, &dht, &server_state, hello_identity).await
+                if let Err(error) = handle_connection(
+                    stream,
+                    peer_addr,
+                    &dht,
+                    &server_state,
+                    &secure_ident,
+                    hello_identity,
+                )
+                .await
                 {
                     debug!("eD2k connection handling failed from {peer_addr}: {error}");
                 }
@@ -706,6 +1002,7 @@ async fn handle_connection(
     peer_addr: SocketAddr,
     dht: &DhtNode,
     server_state: &Arc<RwLock<Ed2kServerState>>,
+    secure_ident: &Arc<Ed2kSecureIdent>,
     hello_identity: Ed2kHelloIdentity,
 ) -> Result<()> {
     let kad_udp_port = dht
@@ -734,6 +1031,7 @@ async fn handle_connection(
         "accepted eD2k TCP peer from {peer_addr} transport={}",
         transport.mode.as_str()
     );
+    let mut peer_secure_ident = Ed2kPeerSecureIdentState::default();
 
     loop {
         let packet =
@@ -749,15 +1047,23 @@ async fn handle_connection(
 
         match (packet.protocol, packet.opcode) {
             (OP_EDONKEYPROT, OP_HELLO) => {
+                let is_mule_hello = is_mule_hello(&packet.payload)?;
                 debug!(
-                    "received eD2k OP_HELLO from {peer_addr} transport={}",
-                    transport.mode.as_str()
+                    "received eD2k OP_HELLO from {peer_addr} transport={} mule_hello={is_mule_hello}",
+                    transport.mode.as_str(),
                 );
-                let reply = encode_hello_answer(response_identity);
-                transport
-                    .write_all(&reply)
-                    .await
-                    .with_context(|| format!("failed to send OP_HELLOANSWER to {peer_addr}"))?;
+                for reply in build_hello_responses(&packet.payload, response_identity)? {
+                    transport
+                        .write_all(&reply)
+                        .await
+                        .with_context(|| format!("failed to reply to OP_HELLO from {peer_addr}"))?;
+                }
+                if is_mule_hello && !peer_secure_ident.requested_peer_key {
+                    let request = begin_secure_ident_probe(&mut peer_secure_ident);
+                    transport.write_all(&request).await.with_context(|| {
+                        format!("failed to send OP_SECIDENTSTATE to {peer_addr}")
+                    })?;
+                }
             }
             (OP_EDONKEYPROT, OP_HELLOANSWER) => {
                 debug!(
@@ -782,6 +1088,77 @@ async fn handle_connection(
                     transport.mode.as_str()
                 );
             }
+            (OP_EMULEPROT, OP_SECIDENTSTATE) => {
+                let (state, challenge) = decode_secident_state(&packet.payload)?;
+                debug!(
+                    "received eMule OP_SECIDENTSTATE from {peer_addr} transport={} state={} challenge={challenge}",
+                    transport.mode.as_str(),
+                    state
+                );
+                peer_secure_ident.peer_challenge_from = Some(challenge);
+                if state != 0 {
+                    peer_secure_ident.pending_signature = true;
+                }
+                if state == ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED {
+                    let public_key = encode_packet(
+                        OP_EMULEPROT,
+                        OP_PUBLICKEY,
+                        &secure_ident.public_key_payload()?,
+                    );
+                    transport
+                        .write_all(&public_key)
+                        .await
+                        .with_context(|| format!("failed to send OP_PUBLICKEY to {peer_addr}"))?;
+                }
+                if !try_send_secure_ident_signature(
+                    &mut transport,
+                    peer_addr,
+                    secure_ident,
+                    &mut peer_secure_ident,
+                )
+                .await?
+                    && state == ED2K_SECURE_IDENT_SIGNATURE_NEEDED
+                    && !peer_secure_ident.requested_peer_key
+                {
+                    let challenge_for = random_nonzero_u32();
+                    peer_secure_ident.challenge_for = Some(challenge_for);
+                    peer_secure_ident.pending_signature = true;
+                    peer_secure_ident.requested_peer_key = true;
+                    let request = encode_secident_state(
+                        ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED,
+                        challenge_for,
+                    );
+                    transport.write_all(&request).await.with_context(|| {
+                        format!("failed to send fallback OP_SECIDENTSTATE to {peer_addr}")
+                    })?;
+                }
+            }
+            (OP_EMULEPROT, OP_PUBLICKEY) => {
+                peer_secure_ident.peer_public_key =
+                    Some(decode_public_key_payload(&packet.payload)?);
+                debug!(
+                    "received eMule OP_PUBLICKEY from {peer_addr} transport={} key_len={}",
+                    transport.mode.as_str(),
+                    peer_secure_ident
+                        .peer_public_key
+                        .as_ref()
+                        .map_or(0, Vec::len)
+                );
+                let _ = try_send_secure_ident_signature(
+                    &mut transport,
+                    peer_addr,
+                    secure_ident,
+                    &mut peer_secure_ident,
+                )
+                .await?;
+            }
+            (OP_EMULEPROT, OP_SIGNATURE) => {
+                debug!(
+                    "received eMule OP_SIGNATURE from {peer_addr} transport={} payload_len={}",
+                    transport.mode.as_str(),
+                    packet.payload.len()
+                );
+            }
             (OP_EMULEPROT, OP_FWCHECKUDPREQ) => {
                 debug!(
                     "received eMule OP_FWCHECKUDPREQ from {peer_addr} transport={}",
@@ -799,6 +1176,50 @@ async fn handle_connection(
             }
         }
     }
+}
+
+fn random_nonzero_u32() -> u32 {
+    loop {
+        let value: u32 = rand::random();
+        if value != 0 {
+            return value;
+        }
+    }
+}
+
+fn begin_secure_ident_probe(peer_state: &mut Ed2kPeerSecureIdentState) -> Vec<u8> {
+    let challenge_for = random_nonzero_u32();
+    peer_state.challenge_for = Some(challenge_for);
+    peer_state.requested_peer_key = true;
+    encode_secident_state(ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, challenge_for)
+}
+
+async fn try_send_secure_ident_signature(
+    transport: &mut Ed2kTransport,
+    peer_addr: SocketAddr,
+    secure_ident: &Ed2kSecureIdent,
+    peer_state: &mut Ed2kPeerSecureIdentState,
+) -> Result<bool> {
+    let Some(peer_public_key) = peer_state.peer_public_key.as_deref() else {
+        return Ok(false);
+    };
+    let Some(challenge) = peer_state.peer_challenge_from else {
+        return Ok(false);
+    };
+    if !peer_state.pending_signature {
+        return Ok(false);
+    }
+    let signature = encode_packet(
+        OP_EMULEPROT,
+        OP_SIGNATURE,
+        &secure_ident.signature_payload(peer_public_key, challenge)?,
+    );
+    transport
+        .write_all(&signature)
+        .await
+        .with_context(|| format!("failed to send OP_SIGNATURE to {peer_addr}"))?;
+    peer_state.pending_signature = false;
+    Ok(true)
 }
 
 async fn reply_with_firewall_udp(
@@ -1067,18 +1488,29 @@ fn is_connection_shutdown_error(error: &anyhow::Error) -> bool {
 mod tests {
     use super::{
         CT_EMULE_MISCOPTIONS1, CT_EMULE_MISCOPTIONS2, CT_EMULE_UDPPORTS, CT_EMULE_VERSION, CT_NAME,
-        CT_VERSION, EDONKEY_VERSION, EMULE_CRYPT_REQUESTS, EMULE_CRYPT_SUPPORTS,
-        EMULE_ENCRYPTION_METHOD_OBFUSCATION, EMULE_PROTOCOL_VERSION,
-        EMULE_TCP_CRYPT_MAGIC_REQUESTER, EMULE_TCP_CRYPT_MAGIC_SERVER, EMULE_TCP_CRYPT_MAGIC_SYNC,
-        EMULE_VERSION_SHORT, Ed2kHelloIdentity, Ed2kPeerConnectMode, FirewallCheckUdpRequest,
-        HELLO_NICKNAME, OP_EDONKEYPROT, OP_EMULEINFOANSWER, OP_EMULEPROT, OP_FWCHECKUDPREQ,
-        OP_HELLO, OP_HELLOANSWER, TAGTYPE_STRING, TAGTYPE_UINT32, connect_callback_peer,
-        decode_incoming_obfuscation_header, derive_obfuscation_key, emule_connect_options,
-        emule_misc_options1, emule_misc_options2, emule_version_tag, encode_emule_info_answer,
-        encode_hello_answer, encode_hello_request, encode_incoming_obfuscation_response,
-        encode_packet,
+        CT_VERSION, ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, EDONKEY_VERSION,
+        EMULE_CRYPT_REQUESTS, EMULE_CRYPT_SUPPORTS, EMULE_ENCRYPTION_METHOD_OBFUSCATION,
+        EMULE_PROTOCOL_VERSION, EMULE_TCP_CRYPT_MAGIC_REQUESTER, EMULE_TCP_CRYPT_MAGIC_SERVER,
+        EMULE_TCP_CRYPT_MAGIC_SYNC, EMULE_VERSION_SHORT, Ed2kHelloIdentity, Ed2kPeerConnectMode,
+        Ed2kPeerSecureIdentState, Ed2kSecureIdent, FirewallCheckUdpRequest, HELLO_NICKNAME,
+        OP_EDONKEYPROT, OP_EMULEINFO, OP_EMULEINFOANSWER, OP_EMULEPROT, OP_FWCHECKUDPREQ, OP_HELLO,
+        OP_HELLOANSWER, OP_SECIDENTSTATE, TAGTYPE_STRING, TAGTYPE_UINT32, begin_secure_ident_probe,
+        build_hello_responses, connect_callback_peer, decode_incoming_obfuscation_header,
+        decode_public_key_payload, decode_secident_state, derive_obfuscation_key,
+        emule_connect_options, emule_misc_options1, emule_misc_options2, emule_version_tag,
+        encode_emule_info_answer, encode_emule_info_request, encode_hello_answer,
+        encode_hello_request, encode_incoming_obfuscation_response, encode_packet,
+        encode_secident_state, is_mule_hello,
     };
     use hex::decode;
+    use rsa::{
+        RsaPrivateKey, RsaPublicKey,
+        pkcs1v15::{Signature, VerifyingKey},
+        pkcs8::EncodePublicKey,
+        rand_core::OsRng,
+        signature::Verifier,
+    };
+    use sha1::Sha1;
     use std::{net::Ipv4Addr, time::Duration};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1097,6 +1529,64 @@ mod tests {
         let decoded = FirewallCheckUdpRequest::decode(&encoded).expect("decode");
 
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn secident_state_roundtrip_matches_wire_shape() {
+        let packet = encode_secident_state(ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, 0x4436EEAC);
+
+        assert_eq!(packet[0], OP_EMULEPROT);
+        assert_eq!(packet[5], OP_SECIDENTSTATE);
+        assert_eq!(
+            decode_secident_state(&packet[6..]).unwrap(),
+            (ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, 0x4436EEAC)
+        );
+    }
+
+    #[test]
+    fn public_key_payload_rejects_mismatched_length_prefix() {
+        assert!(decode_public_key_payload(&[5, 1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn secure_ident_probe_requests_key_and_signature() {
+        let mut state = Ed2kPeerSecureIdentState::default();
+        let packet = begin_secure_ident_probe(&mut state);
+        let (request_state, challenge) = decode_secident_state(&packet[6..]).unwrap();
+
+        assert_eq!(packet[0], OP_EMULEPROT);
+        assert_eq!(packet[5], OP_SECIDENTSTATE);
+        assert_eq!(request_state, ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED);
+        assert_ne!(challenge, 0);
+        assert_eq!(state.challenge_for, Some(challenge));
+        assert!(state.requested_peer_key);
+    }
+
+    #[test]
+    fn secure_ident_signature_matches_oracle_message_shape() {
+        let identity =
+            Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+                .unwrap();
+        let peer_public_key = RsaPublicKey::from(&RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let challenge = 0x4436EEAC;
+
+        let payload = identity
+            .signature_payload(&peer_public_key, challenge)
+            .unwrap();
+        let signature = Signature::try_from(&payload[1..]).unwrap();
+        let mut message = peer_public_key.clone();
+        message.extend_from_slice(&challenge.to_le_bytes());
+
+        assert_eq!(usize::from(payload[0]), payload.len() - 1);
+        assert!(
+            VerifyingKey::<Sha1>::new(RsaPublicKey::from(&identity.private_key))
+                .verify(&message, &signature)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1263,6 +1753,20 @@ mod tests {
     }
 
     #[test]
+    fn emule_info_request_uses_expected_protocol_and_tag_count() {
+        let packet = encode_emule_info_request(41000);
+
+        assert_eq!(packet[0], OP_EMULEPROT);
+        assert_eq!(packet[5], OP_EMULEINFO);
+        assert_eq!(packet[6], EMULE_VERSION_SHORT);
+        assert_eq!(packet[7], EMULE_PROTOCOL_VERSION);
+        assert_eq!(
+            u32::from_le_bytes([packet[8], packet[9], packet[10], packet[11]]),
+            7
+        );
+    }
+
+    #[test]
     fn emule_info_answer_uses_expected_protocol_and_tag_count() {
         let packet = encode_emule_info_answer(41000);
 
@@ -1274,6 +1778,58 @@ mod tests {
             u32::from_le_bytes([packet[8], packet[9], packet[10], packet[11]]),
             7
         );
+    }
+
+    #[test]
+    fn encoded_hello_request_is_detected_as_mule_hello() {
+        let packet = encode_hello_request(Ed2kHelloIdentity {
+            user_hash: [0x11; 16],
+            client_id: 0x521B_5895,
+            tcp_port: 41001,
+            udp_port: 41000,
+            server_ip: u32::from_le_bytes([176, 123, 2, 239]),
+            server_port: 4232,
+            connect_options: emule_connect_options(true),
+        });
+
+        assert!(is_mule_hello(&packet[6..]).unwrap());
+    }
+
+    #[test]
+    fn oracle_server_callback_hello_is_detected_as_non_mule() {
+        let payload = decode(
+            "105d0e3efaf60e650d1f6f873e19326f635e67bc8236120200000097016553657276657289113c000000000000",
+        )
+        .unwrap();
+
+        assert!(!is_mule_hello(&payload).unwrap());
+    }
+
+    #[test]
+    fn non_mule_hello_replies_with_emule_info_then_helloanswer() {
+        let payload = decode(
+            "105d0e3efaf60e650d1f6f873e19326f635e67bc8236120200000097016553657276657289113c000000000000",
+        )
+        .unwrap();
+        let replies = build_hello_responses(
+            &payload,
+            Ed2kHelloIdentity {
+                user_hash: [0x22; 16],
+                client_id: 0x521B_5895,
+                tcp_port: 41001,
+                udp_port: 41000,
+                server_ip: u32::from_le_bytes([176, 123, 2, 239]),
+                server_port: 4232,
+                connect_options: emule_connect_options(true),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0][0], OP_EMULEPROT);
+        assert_eq!(replies[0][5], OP_EMULEINFO);
+        assert_eq!(replies[1][0], OP_EDONKEYPROT);
+        assert_eq!(replies[1][5], OP_HELLOANSWER);
     }
 
     #[test]
