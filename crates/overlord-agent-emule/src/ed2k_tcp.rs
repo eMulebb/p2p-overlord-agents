@@ -58,7 +58,6 @@ const EMULE_VERSION_SHORT: u8 = EMULE_VERSION_MINOR as u8;
 const TAGTYPE_STRING: u8 = 0x02;
 const TAGTYPE_UINT32: u8 = 0x03;
 const TAGTYPE_STR1: u8 = 0x11;
-const TAG_SHORT_NAME_MASK: u8 = 0x80;
 
 const CT_NAME: u8 = 0x01;
 const CT_VERSION: u8 = 0x11;
@@ -524,7 +523,8 @@ fn encode_hello_type_payload(identity: Ed2kHelloIdentity) -> Vec<u8> {
 }
 
 fn encode_ed2k_short_tag_header(payload: &mut Vec<u8>, type_byte: u8, name: u8) {
-    payload.push(type_byte | TAG_SHORT_NAME_MASK);
+    payload.push(type_byte);
+    payload.extend_from_slice(&1u16.to_le_bytes());
     payload.push(name);
 }
 
@@ -1040,7 +1040,7 @@ mod tests {
         EMULE_TCP_CRYPT_MAGIC_REQUESTER, EMULE_TCP_CRYPT_MAGIC_SERVER, EMULE_TCP_CRYPT_MAGIC_SYNC,
         EMULE_VERSION_SHORT, Ed2kHelloIdentity, Ed2kPeerConnectMode, FirewallCheckUdpRequest,
         HELLO_NICKNAME, OP_EDONKEYPROT, OP_EMULEINFOANSWER, OP_EMULEPROT, OP_FWCHECKUDPREQ,
-        OP_HELLO, OP_HELLOANSWER, TAG_SHORT_NAME_MASK, TAGTYPE_STR1, connect_callback_peer,
+        OP_HELLO, OP_HELLOANSWER, TAGTYPE_STR1, TAGTYPE_UINT32, connect_callback_peer,
         decode_incoming_obfuscation_header, derive_obfuscation_key, emule_connect_options,
         emule_misc_options1, emule_misc_options2, emule_version_tag, encode_emule_info_answer,
         encode_hello_answer, encode_hello_request, encode_incoming_obfuscation_response,
@@ -1109,8 +1109,17 @@ mod tests {
             udp_port: 41000,
             connect_options: emule_connect_options(true),
         });
-        let expected_name_type =
-            TAG_SHORT_NAME_MASK | (TAGTYPE_STR1 + u8::try_from(HELLO_NICKNAME.len() - 1).unwrap());
+        let expected_name_header = [
+            TAGTYPE_STR1 + u8::try_from(HELLO_NICKNAME.len() - 1).unwrap(),
+            0x01,
+            0x00,
+            CT_NAME,
+        ];
+        let expected_u32_version_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_VERSION];
+        let expected_udp_ports_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_EMULE_UDPPORTS];
+        let expected_misc1_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_EMULE_MISCOPTIONS1];
+        let expected_misc2_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_EMULE_MISCOPTIONS2];
+        let expected_emule_version_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_EMULE_VERSION];
 
         assert_eq!(packet[0], OP_EDONKEYPROT);
         assert_eq!(packet[5], OP_HELLOANSWER);
@@ -1121,29 +1130,33 @@ mod tests {
         );
         assert!(
             packet
-                .windows(2)
-                .any(|window| window == [expected_name_type, CT_NAME])
-        );
-        assert!(packet.windows(2).any(|window| window == [0x83, CT_VERSION]));
-        assert!(
-            packet
-                .windows(2)
-                .any(|window| window == [0x83, CT_EMULE_UDPPORTS])
+                .windows(expected_name_header.len())
+                .any(|window| window == expected_name_header)
         );
         assert!(
             packet
-                .windows(2)
-                .any(|window| window == [0x83, CT_EMULE_MISCOPTIONS1])
+                .windows(expected_u32_version_header.len())
+                .any(|window| window == expected_u32_version_header)
         );
         assert!(
             packet
-                .windows(2)
-                .any(|window| window == [0x83, CT_EMULE_MISCOPTIONS2])
+                .windows(expected_udp_ports_header.len())
+                .any(|window| window == expected_udp_ports_header)
         );
         assert!(
             packet
-                .windows(2)
-                .any(|window| window == [0x83, CT_EMULE_VERSION])
+                .windows(expected_misc1_header.len())
+                .any(|window| window == expected_misc1_header)
+        );
+        assert!(
+            packet
+                .windows(expected_misc2_header.len())
+                .any(|window| window == expected_misc2_header)
+        );
+        assert!(
+            packet
+                .windows(expected_emule_version_header.len())
+                .any(|window| window == expected_emule_version_header)
         );
         assert!(
             packet

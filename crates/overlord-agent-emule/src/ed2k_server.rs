@@ -225,6 +225,22 @@ struct SearchResultSummary {
     sample_names: Vec<String>,
 }
 
+/// Returns whether the agent should start an ED2K server session with TCP
+/// obfuscation.
+///
+/// The oracle only chooses an obfuscated server TCP connect when it has
+/// positive server metadata such as `ST_TCPPORTOBFUSCATION` and the related
+/// capability flags. Our current agent config only accepts raw `host:port`
+/// endpoints, so those `server.met` hints are absent. To stay aligned with the
+/// oracle's behavior in that metadata-poor case, the agent starts with a
+/// plaintext server session instead of guessing an obfuscated path.
+fn should_use_server_obfuscation(
+    connect_options: u8,
+    has_server_obfuscation_metadata: bool,
+) -> bool {
+    connect_options != 0 && has_server_obfuscation_metadata
+}
+
 impl ServerSession {
     async fn connect(
         bind_ip: Ipv4Addr,
@@ -495,24 +511,30 @@ async fn run_one_server_session(
     let nat_status = context.nat.status().await;
     let observed_external_ip = nat_status.observed_external_addresses.first().cloned();
     let login_payload = encode_login_request(context.hello_identity);
+    let has_server_obfuscation_metadata = false;
+    let use_server_obfuscation = should_use_server_obfuscation(
+        context.hello_identity.connect_options,
+        has_server_obfuscation_metadata,
+    );
     info!(
-        "connected to ED2K server {} bind_ip={} observed_external_ip={} transport={} connect_options={}",
+        "connected to ED2K server {} bind_ip={} observed_external_ip={} transport={} connect_options={} server_obfuscation_metadata={}",
         endpoint,
         context.bind_ip,
         observed_external_ip.as_deref().unwrap_or("unknown"),
-        if context.hello_identity.connect_options == 0 {
-            "plaintext"
-        } else {
+        if use_server_obfuscation {
             "obfuscated"
+        } else {
+            "plaintext"
         },
-        format_connect_options(context.hello_identity.connect_options)
+        format_connect_options(context.hello_identity.connect_options),
+        has_server_obfuscation_metadata
     );
-    if context.hello_identity.connect_options == 0 {
-        session.send_packet(OP_LOGINREQUEST, &login_payload).await?;
-    } else {
+    if use_server_obfuscation {
         session
             .negotiate_obfuscation_and_send(&encode_packet(OP_LOGINREQUEST, &login_payload))
             .await?;
+    } else {
+        session.send_packet(OP_LOGINREQUEST, &login_payload).await?;
     }
 
     loop {
@@ -822,7 +844,8 @@ fn emule_version_tag() -> u32 {
 }
 
 fn push_u32_tag(payload: &mut Vec<u8>, name: u8, value: u32) {
-    payload.push(TAGTYPE_UINT32 | TAG_SHORT_NAME_MASK);
+    payload.push(TAGTYPE_UINT32);
+    payload.extend_from_slice(&1u16.to_le_bytes());
     payload.push(name);
     payload.extend_from_slice(&value.to_le_bytes());
 }
@@ -834,7 +857,8 @@ fn push_string_tag(payload: &mut Vec<u8>, name: u8, value: &str) {
     } else {
         TAGTYPE_STRING
     };
-    payload.push(type_byte | TAG_SHORT_NAME_MASK);
+    payload.push(type_byte);
+    payload.extend_from_slice(&1u16.to_le_bytes());
     payload.push(name);
     if type_byte == TAGTYPE_STRING {
         payload.extend_from_slice(
@@ -1185,7 +1209,7 @@ mod tests {
         ServerSession, TAG_SHORT_NAME_MASK, TAGTYPE_UINT32, biguint_to_fixed_be,
         decode_search_results, decode_server_ident, decode_server_payload, derive_server_cipher,
         encode_login_request, encode_packet, encode_search_request, format_server_flags,
-        server_capabilities,
+        server_capabilities, should_use_server_obfuscation,
     };
     use crate::ed2k_tcp::{Ed2kHelloIdentity, emule_connect_options};
     use flate2::{Compression, write::ZlibEncoder};
@@ -1205,8 +1229,15 @@ mod tests {
             udp_port: 41000,
             connect_options: emule_connect_options(true),
         });
-        let nickname_tag_type = TAG_SHORT_NAME_MASK
-            + (super::TAGTYPE_STR1 + u8::try_from(HELLO_NICKNAME.len() - 1).unwrap());
+        let nickname_tag_header = [
+            super::TAGTYPE_STR1 + u8::try_from(HELLO_NICKNAME.len() - 1).unwrap(),
+            0x01,
+            0x00,
+            CT_NAME,
+        ];
+        let version_tag_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_VERSION];
+        let server_flags_tag_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_SERVER_FLAGS];
+        let emule_version_tag_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_EMULE_VERSION];
 
         assert_eq!(&payload[..16], &[0x11; 16]);
         assert_eq!(u16::from_le_bytes([payload[20], payload[21]]), 41001);
@@ -1216,23 +1247,23 @@ mod tests {
         );
         assert!(
             payload
-                .windows(2)
-                .any(|window| window == [nickname_tag_type, CT_NAME])
+                .windows(nickname_tag_header.len())
+                .any(|window| window == nickname_tag_header)
         );
         assert!(
             payload
-                .windows(2)
-                .any(|window| window == [0x83, CT_VERSION])
+                .windows(version_tag_header.len())
+                .any(|window| window == version_tag_header)
         );
         assert!(
             payload
-                .windows(2)
-                .any(|window| window == [0x83, CT_SERVER_FLAGS])
+                .windows(server_flags_tag_header.len())
+                .any(|window| window == server_flags_tag_header)
         );
         assert!(
             payload
-                .windows(2)
-                .any(|window| window == [0x83, CT_EMULE_VERSION])
+                .windows(emule_version_tag_header.len())
+                .any(|window| window == emule_version_tag_header)
         );
         assert!(
             payload
@@ -1275,6 +1306,22 @@ mod tests {
             server_capabilities(emule_connect_options(false)) & 0x0E00,
             0
         );
+    }
+
+    #[test]
+    fn metadata_poor_server_defaults_to_plaintext_even_if_client_supports_crypt() {
+        assert!(!should_use_server_obfuscation(
+            emule_connect_options(true),
+            false
+        ));
+    }
+
+    #[test]
+    fn server_obfuscation_requires_positive_server_metadata() {
+        assert!(should_use_server_obfuscation(
+            emule_connect_options(true),
+            true
+        ));
     }
 
     #[test]
