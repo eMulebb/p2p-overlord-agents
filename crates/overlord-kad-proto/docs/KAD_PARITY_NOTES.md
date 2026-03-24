@@ -26,3 +26,8 @@ Running note for Kad oracle-parity findings that affect live behavior.
   - overlap was a real confounder, but not the only reason source replay can come back empty
 - Remaining live gap:
   - source replay still alternates between non-zero and zero-result runs, so packet cadence/order is closer but not fully equivalent yet
+- Live observation after adaptive widening landed:
+  - passive source replay now widens as intended from `K` to `2K` to the configured harvest ceiling
+  - internal stats now expose tier-by-tier replay telemetry for both passive source and passive keyword loops
+  - widening alone is not enough; some source replays still finish `0/0/0` across all widened tiers
+  - the next harvest optimization should focus on queue choice and replay backoff, not only on increasing traversal radius
