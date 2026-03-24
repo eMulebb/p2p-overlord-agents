@@ -16,5 +16,9 @@ Running note for Kad oracle-parity findings that affect live behavior.
   - phase-2 fanout is capped at the oracle's closest `K`
   - zero-sized snooped source requests are skipped instead of replayed
   - phase-2 now uses a jump-start style walk instead of evenly slicing the timeout budget across all contacts
+- Live observation after the jump-start change:
+  - source replay still sometimes returns `0` results
+  - keyword replay and source replay can overlap because they are separate background loops
+  - that overlap is not oracle-like for our harvesting scenario and should be serialized
 - Remaining live gap:
   - source replay still alternates between non-zero and zero-result runs, so packet cadence/order is closer but not fully equivalent yet

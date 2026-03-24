@@ -23,10 +23,10 @@ use overlord_agent_nat::{
     TransportProtocol, build_interface_binding_report, built_in_upnp_port_mapping_providers,
     default_upnp_backend_order, detect_interfaces, recommend_interface, resolve_bind_ip,
 };
-use rand::seq::SliceRandom;
+use rand::{RngCore, seq::SliceRandom};
 use tokio::{
     net::TcpListener,
-    sync::{Mutex, Notify, RwLock},
+    sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore},
     task::JoinHandle,
 };
 use tokio_stream::StreamExt;
@@ -53,7 +53,10 @@ use overlord_kad_proto::{
 use overlord_kad_routing::Contact;
 
 use crate::config::EmuleAgentConfig;
-use crate::ed2k_server::{Ed2kServerState, run_ed2k_server_loop};
+use crate::ed2k_server::{
+    Ed2kSearchFile, Ed2kServerSearchHandle, Ed2kServerState, new_ed2k_server_search_channel,
+    run_ed2k_server_loop, search_keyword_servers, search_keyword_via_background_session,
+};
 use crate::ed2k_tcp::{
     Ed2kHelloIdentity, Ed2kSecureIdent, FirewallCheckUdpRequest, emule_connect_options,
     request_udp_firewall_check, run_ed2k_listener,
@@ -77,6 +80,8 @@ const KAD_HELLO_INTRO_FANOUT: usize = 24;
 const EMULE_LARGE_FILE_SIZE_THRESHOLD: u64 = u32::MAX as u64;
 const LOCAL_SEARCH_RESPONSE_LIMIT: usize = 64;
 const FIREWALLED_TCP_PROBE_TIMEOUT_SECS: u64 = 5;
+const ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS: usize = 3;
+const ED2K_BACKGROUND_SEARCH_QUEUE_CAPACITY: usize = 4;
 
 async fn wait_for_shutdown_signal() -> Result<&'static str> {
     #[cfg(windows)]
@@ -597,6 +602,7 @@ fn record_passive_keyword_post_failure(
 struct AgentStatePaths {
     node_id_path: PathBuf,
     udp_key_path: PathBuf,
+    ed2k_user_hash_path: PathBuf,
     ed2k_secure_ident_path: PathBuf,
     nodes_dat_path: PathBuf,
     networking_config_path: PathBuf,
@@ -607,6 +613,8 @@ struct AgentNetworkRuntime {
     bind_ip: Ipv4Addr,
     dht: DhtNode,
     ed2k_listener: Arc<TcpListener>,
+    ed2k_server_search: Ed2kServerSearchHandle,
+    ed2k_server_search_inbox: Arc<Mutex<Option<crate::ed2k_server::Ed2kServerSearchInbox>>>,
     ed2k_server_state: Arc<RwLock<Ed2kServerState>>,
     ed2k_secure_ident: Arc<Ed2kSecureIdent>,
     nat: Arc<NatManager>,
@@ -614,6 +622,7 @@ struct AgentNetworkRuntime {
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     shutdown: Arc<AtomicBool>,
     passive_result_count: Arc<std::sync::atomic::AtomicU64>,
+    passive_replay_gate: Arc<Semaphore>,
 }
 
 struct ControlServerRuntime {
@@ -630,6 +639,7 @@ pub struct OverlordAgentEmule {
     config: Arc<RwLock<EmuleAgentConfig>>,
     coordinator: CoordinatorClient,
     indexer_id: Uuid,
+    ed2k_user_hash: [u8; 16],
     started_at: Instant,
     state_paths: AgentStatePaths,
     snoop_queue: Arc<Mutex<SnoopQueue>>,
@@ -666,9 +676,11 @@ impl OverlordAgentEmule {
         let state_paths = AgentStatePaths::from_config(&config);
         ensure_parent_dir(&state_paths.node_id_path)?;
         ensure_parent_dir(&state_paths.udp_key_path)?;
+        ensure_parent_dir(&state_paths.ed2k_user_hash_path)?;
         ensure_parent_dir(&state_paths.ed2k_secure_ident_path)?;
         ensure_parent_dir(&state_paths.nodes_dat_path)?;
         ensure_parent_dir(&state_paths.networking_config_path)?;
+        let ed2k_user_hash = load_or_create_ed2k_user_hash(&state_paths.ed2k_user_hash_path)?;
         let interfaces = detect_interfaces().unwrap_or_default();
         let control_selection_state =
             Self::resolve_control_selection_state(&config, &interfaces, None, false, false);
@@ -681,6 +693,7 @@ impl OverlordAgentEmule {
             config: Arc::new(RwLock::new(config)),
             coordinator,
             indexer_id,
+            ed2k_user_hash,
             started_at: Instant::now(),
             state_paths,
             snoop_queue: Arc::new(Mutex::new(SnoopQueue::new(snoop_queue_config))),
@@ -1327,11 +1340,15 @@ impl OverlordAgentEmule {
             Arc::new(TcpListener::bind(ed2k_bind_addr).await.with_context(|| {
                 format!("failed to bind eD2k TCP listener on {ed2k_bind_addr}")
             })?);
+        let (ed2k_server_search, ed2k_server_search_inbox) =
+            new_ed2k_server_search_channel(ED2K_BACKGROUND_SEARCH_QUEUE_CAPACITY);
 
         Ok(AgentNetworkRuntime {
             bind_ip: bind_ipv4,
             dht,
             ed2k_listener,
+            ed2k_server_search,
+            ed2k_server_search_inbox: Arc::new(Mutex::new(Some(ed2k_server_search_inbox))),
             ed2k_server_state: Arc::new(RwLock::new(Ed2kServerState::default())),
             ed2k_secure_ident: Arc::new(ed2k_secure_ident),
             nat,
@@ -1339,6 +1356,7 @@ impl OverlordAgentEmule {
             tasks: Arc::new(Mutex::new(Vec::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             passive_result_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            passive_replay_gate: Arc::new(Semaphore::new(1)),
         })
     }
 }
@@ -1373,6 +1391,7 @@ async fn post_search_batch(
     callback_client: &CoordinatorClient,
     job_id: Uuid,
     indexer_id: Uuid,
+    protocol: Protocol,
     files: Vec<FileRecord>,
     stats: &mut SearchRunStats,
 ) -> Result<()> {
@@ -1385,7 +1404,7 @@ async fn post_search_batch(
         .post_results(&ResultBatch {
             job_id: Some(job_id),
             indexer_id,
-            protocol: Protocol::Kad2,
+            protocol,
             harvest_context: None,
             files,
         })
@@ -1443,7 +1462,7 @@ async fn do_active_keyword_search(
     dht: &DhtNode,
     indexer_id: Uuid,
     job: &SearchJob,
-    config: Arc<RwLock<EmuleAgentConfig>>,
+    enable_mock_results: bool,
     cancel: CancellationToken,
 ) -> Result<SearchRunStats> {
     let target = keyword_target(search_query(job)?);
@@ -1461,6 +1480,7 @@ async fn do_active_keyword_search(
                 &callback_client,
                 job.job_id,
                 indexer_id,
+                Protocol::Kad2,
                 std::mem::take(&mut files),
                 &mut stats,
             )
@@ -1468,13 +1488,22 @@ async fn do_active_keyword_search(
         }
     }
 
-    post_search_batch(&callback_client, job.job_id, indexer_id, files, &mut stats).await?;
+    post_search_batch(
+        &callback_client,
+        job.job_id,
+        indexer_id,
+        Protocol::Kad2,
+        files,
+        &mut stats,
+    )
+    .await?;
 
-    if seen == 0 && !cancel.is_cancelled() && config.read().await.p2p.kad.enable_mock_results {
+    if seen == 0 && !cancel.is_cancelled() && enable_mock_results {
         post_search_batch(
             &callback_client,
             job.job_id,
             indexer_id,
+            Protocol::Kad2,
             vec![mock_file_record(
                 search_query(job)?,
                 dht.bind_addr()?.to_string(),
@@ -1507,6 +1536,7 @@ async fn do_active_source_search(
                 &callback_client,
                 job.job_id,
                 indexer_id,
+                Protocol::Kad2,
                 std::mem::take(&mut files),
                 &mut stats,
             )
@@ -1514,7 +1544,163 @@ async fn do_active_source_search(
         }
     }
 
-    post_search_batch(&callback_client, job.job_id, indexer_id, files, &mut stats).await?;
+    post_search_batch(
+        &callback_client,
+        job.job_id,
+        indexer_id,
+        Protocol::Kad2,
+        files,
+        &mut stats,
+    )
+    .await?;
+    Ok(stats)
+}
+
+fn ed2k_content_type(file_type: Option<&str>) -> Option<ContentType> {
+    match file_type {
+        Some("Video") => Some(ContentType::Video),
+        Some("Audio") => Some(ContentType::Audio),
+        Some("Doc") => Some(ContentType::Document),
+        Some("Pro") | Some("EmuleCollection") => Some(ContentType::Software),
+        Some(_) => Some(ContentType::Unknown),
+        None => None,
+    }
+}
+
+fn map_ed2k_keyword_result(result: &Ed2kSearchFile) -> FileRecord {
+    let mut tags = Vec::new();
+    if let Some(file_type) = result.file_type.as_deref() {
+        tags.push(TagEntry {
+            key: "ed2k_file_type".to_string(),
+            value: serde_json::json!(file_type),
+        });
+    }
+    if let Some(source_count) = result.source_count {
+        tags.push(TagEntry {
+            key: "ed2k_source_count".to_string(),
+            value: serde_json::json!(source_count),
+        });
+    }
+
+    FileRecord {
+        hashes: vec![HashType::Ed2k(result.file_hash.to_string())],
+        names: result.file_name.iter().cloned().collect(),
+        size: result.file_size,
+        content_type: ed2k_content_type(result.file_type.as_deref()),
+        tags,
+        sources: Vec::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn do_active_ed2k_keyword_search(
+    bind_ip: Ipv4Addr,
+    indexer_id: Uuid,
+    ed2k_user_hash: [u8; 16],
+    job: &SearchJob,
+    config: &EmuleAgentConfig,
+    background_search: Option<Ed2kServerSearchHandle>,
+    preferred_endpoint: Option<SocketAddr>,
+    cancel: CancellationToken,
+) -> Result<SearchRunStats> {
+    let callback_client = CoordinatorClient::new(&job.callback_url)?;
+    let hello_identity = Ed2kHelloIdentity {
+        user_hash: ed2k_user_hash,
+        client_id: 0,
+        tcp_port: config.p2p.ed2k.listen_port,
+        udp_port: config.p2p.kad.listen_port,
+        server_ip: 0,
+        server_port: 0,
+        connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
+        direct_udp_callback: false,
+    };
+    let query = search_query(job)?;
+    let search_timeout = Duration::from_secs(config.p2p.ed2k.connect_timeout_secs.max(5));
+    let files = if let Some(background_search) = background_search {
+        match search_keyword_via_background_session(
+            &background_search,
+            query,
+            search_timeout,
+            &cancel,
+        )
+        .await
+        {
+            Ok(results) if !results.is_empty() => {
+                info!(
+                    "ED2K active keyword search used background session endpoint={} query_len={} result_count={}",
+                    preferred_endpoint
+                        .map(|endpoint| endpoint.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    query.len(),
+                    results.len()
+                );
+                results
+                    .into_iter()
+                    .map(|result| map_ed2k_keyword_result(&result))
+                    .collect()
+            }
+            Ok(_) => {
+                warn!(
+                    "ED2K background session search returned no results for query={query:?}; falling back to one-shot search"
+                );
+                search_keyword_servers(
+                    bind_ip,
+                    &config.p2p.ed2k,
+                    hello_identity,
+                    preferred_endpoint,
+                    ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
+                    query,
+                    &cancel,
+                )
+                .await?
+                .into_iter()
+                .map(|result| map_ed2k_keyword_result(&result))
+                .collect()
+            }
+            Err(error) => {
+                warn!(
+                    "ED2K background session search failed for query={query:?}; falling back to one-shot search: {error}"
+                );
+                search_keyword_servers(
+                    bind_ip,
+                    &config.p2p.ed2k,
+                    hello_identity,
+                    preferred_endpoint,
+                    ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
+                    query,
+                    &cancel,
+                )
+                .await?
+                .into_iter()
+                .map(|result| map_ed2k_keyword_result(&result))
+                .collect()
+            }
+        }
+    } else {
+        search_keyword_servers(
+            bind_ip,
+            &config.p2p.ed2k,
+            hello_identity,
+            preferred_endpoint,
+            ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
+            query,
+            &cancel,
+        )
+        .await?
+        .into_iter()
+        .map(|result| map_ed2k_keyword_result(&result))
+        .collect()
+    };
+    let mut stats = SearchRunStats::default();
+    post_search_batch(
+        &callback_client,
+        job.job_id,
+        indexer_id,
+        Protocol::Ed2k,
+        files,
+        &mut stats,
+    )
+    .await?;
     Ok(stats)
 }
 
@@ -1565,14 +1751,28 @@ fn select_popular_hashes_for_seeding(
     }
 }
 
-/// Fetches the current seed set from the coordinator and applies the synthetic fallback only
-/// when the coordinator returned no popular hashes.
+/// Applies the synthetic fallback whenever the coordinator cannot currently provide a seed set.
+fn select_popular_hashes_from_fetch_result(
+    fetch_result: Result<Vec<PopularHash>>,
+) -> (PublishSeedSource, Vec<PopularHash>) {
+    match fetch_result {
+        Ok(hashes) => select_popular_hashes_for_seeding(hashes),
+        Err(error) => {
+            warn!("coordinator popular-hash fetch failed; using synthetic fallback: {error}");
+            (
+                PublishSeedSource::SyntheticFallback,
+                synthetic_popular_hashes(),
+            )
+        }
+    }
+}
+
+/// Fetches the current seed set from the coordinator and degrades to the synthetic fallback
+/// whenever the coordinator is offline or returns no popular hashes.
 async fn fetch_popular_hashes_for_seeding(
     coordinator: &CoordinatorClient,
-) -> Result<(PublishSeedSource, Vec<PopularHash>)> {
-    Ok(select_popular_hashes_for_seeding(
-        coordinator.popular_hashes().await?,
-    ))
+) -> (PublishSeedSource, Vec<PopularHash>) {
+    select_popular_hashes_from_fetch_result(coordinator.popular_hashes().await)
 }
 
 /// Publishes one seeding batch and logs which source produced it.
@@ -1607,7 +1807,7 @@ async fn seed_popular_from_coordinator_or_fallback(
     local_store: &Arc<Mutex<KadLocalStore>>,
     publish_observability: &Arc<Mutex<KadPublishObservability>>,
 ) -> Result<()> {
-    let (source, hashes) = fetch_popular_hashes_for_seeding(coordinator).await?;
+    let (source, hashes) = fetch_popular_hashes_for_seeding(coordinator).await;
     seed_popular_from_source(
         dht,
         source_publish_identity,
@@ -1635,6 +1835,58 @@ fn emule_high_id_source_type(file_size: u64) -> u32 {
 /// we reuse the stable indexer UUID bytes to keep the identity fixed across restarts.
 fn source_publish_client_hash(indexer_id: Uuid) -> NodeId {
     NodeId::from_bytes(*indexer_id.as_bytes())
+}
+
+/// Applies the classic eMule client marker bytes to an ED2K user hash.
+fn normalize_ed2k_user_hash_markers(mut user_hash: [u8; 16]) -> [u8; 16] {
+    user_hash[5] = 0x0E;
+    user_hash[14] = 0x6F;
+    user_hash
+}
+
+/// Mirrors the oracle `isbadhash` check for persisted ED2K user hashes.
+fn ed2k_user_hash_is_bad(user_hash: &[u8; 16]) -> bool {
+    let lo = u64::from_le_bytes(user_hash[..8].try_into().expect("slice has 8 bytes"));
+    let hi = u64::from_le_bytes(user_hash[8..].try_into().expect("slice has 8 bytes"));
+    (lo & 0xffff_00ff_ffff_ffff) == 0 && (hi & 0xff00_ffff_ffff_ffff) == 0
+}
+
+/// Creates a fresh eMule-style ED2K user hash.
+fn create_ed2k_user_hash() -> [u8; 16] {
+    loop {
+        let mut user_hash = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut user_hash);
+        let user_hash = normalize_ed2k_user_hash_markers(user_hash);
+        if !ed2k_user_hash_is_bad(&user_hash) {
+            return user_hash;
+        }
+    }
+}
+
+/// Loads the persisted ED2K user hash, or creates one that mirrors eMule semantics.
+fn load_or_create_ed2k_user_hash(path: &Path) -> Result<[u8; 16]> {
+    if path.exists() {
+        let bytes = fs::read(path)
+            .with_context(|| format!("failed to read ED2K user hash from {}", path.display()))?;
+        if bytes.len() == 16 {
+            let mut user_hash = [0u8; 16];
+            user_hash.copy_from_slice(&bytes);
+            let normalized = normalize_ed2k_user_hash_markers(user_hash);
+            if !ed2k_user_hash_is_bad(&normalized) {
+                if normalized != user_hash {
+                    fs::write(path, normalized).with_context(|| {
+                        format!("failed to normalize ED2K user hash at {}", path.display())
+                    })?;
+                }
+                return Ok(normalized);
+            }
+        }
+    }
+
+    let user_hash = create_ed2k_user_hash();
+    fs::write(path, user_hash)
+        .with_context(|| format!("failed to persist ED2K user hash to {}", path.display()))?;
+    Ok(user_hash)
 }
 
 /// Return the eMule-style `TAG_ENCRYPTION` bits for the current non-firewalled agent.
@@ -2255,6 +2507,33 @@ async fn next_passive_keyword_request(
         .lock()
         .await
         .select_next_keyword_request(Utc::now())
+}
+
+async fn next_passive_source_request(
+    snoop_queue: &Arc<Mutex<SnoopQueue>>,
+) -> Option<SearchSourceReq> {
+    snoop_queue
+        .lock()
+        .await
+        .select_next_source_request(Utc::now())
+}
+
+/// Acquire the single passive replay slot without blocking the background loop.
+///
+/// Passive keyword and passive source replays are an Overlord-only indexing
+/// extension, so we serialize them explicitly to avoid non-oracle overlap on
+/// the live network.
+fn try_acquire_passive_replay_gate(
+    passive_replay_gate: &Arc<Semaphore>,
+    family: &str,
+) -> Option<OwnedSemaphorePermit> {
+    match Arc::clone(passive_replay_gate).try_acquire_owned() {
+        Ok(permit) => Some(permit),
+        Err(_) => {
+            debug!("skipping passive {family} replay because another passive replay is active");
+            None
+        }
+    }
 }
 
 async fn persist_nodes_dat_for(dht: &DhtNode, state_paths: &AgentStatePaths) -> Result<()> {
@@ -2886,6 +3165,7 @@ impl AgentStatePaths {
         Self {
             node_id_path: state_dir.join("overlord-kad.node-id"),
             udp_key_path: state_dir.join("overlord-kad.udp-key"),
+            ed2k_user_hash_path: state_dir.join("overlord-ed2k.user-hash.bin"),
             ed2k_secure_ident_path: state_dir.join("overlord-ed2k.secident.pkcs8.der"),
             nodes_dat_path,
             networking_config_path: state_dir.join("overlord-agent.networking.json"),
@@ -3050,6 +3330,10 @@ impl IndexerService for OverlordAgentEmule {
             anyhow::bail!("agent networking is waiting for interface selection");
         };
         let dht = runtime.dht.clone();
+        let bind_ip = runtime.bind_ip;
+        let ed2k_user_hash = self.ed2k_user_hash;
+        let ed2k_server_search = runtime.ed2k_server_search.clone();
+        let ed2k_server_state = Arc::clone(&runtime.ed2k_server_state);
         let indexer_id = self.indexer_id;
         let config = self.config.clone();
         let callback_client = self.coordinator.clone();
@@ -3082,14 +3366,46 @@ impl IndexerService for OverlordAgentEmule {
                 warn!("failed to report search start: {error}");
             }
 
-            let outcome = match job.kind {
-                SearchKind::Keyword => {
-                    do_active_keyword_search(&dht, indexer_id, &job, config, cancel.clone()).await
+            let config_snapshot = config.read().await.clone();
+            let outcome = match (job.protocol, &job.kind) {
+                (Protocol::Kad2, SearchKind::Keyword) => {
+                    do_active_keyword_search(
+                        &dht,
+                        indexer_id,
+                        &job,
+                        config_snapshot.p2p.kad.enable_mock_results,
+                        cancel.clone(),
+                    )
+                    .await
                 }
-                SearchKind::Source => {
+                (Protocol::Kad2, SearchKind::Source) => {
                     do_active_source_search(&dht, indexer_id, &job, cancel.clone()).await
                 }
-                SearchKind::Notes => Err(anyhow::anyhow!("notes search is not wired yet")),
+                (Protocol::Ed2k, SearchKind::Keyword) => {
+                    let (preferred_endpoint, background_search) = {
+                        let server_state = ed2k_server_state.read().await;
+                        if server_state.connected {
+                            (server_state.endpoint, Some(ed2k_server_search.clone()))
+                        } else {
+                            (None, None)
+                        }
+                    };
+                    do_active_ed2k_keyword_search(
+                        bind_ip,
+                        indexer_id,
+                        ed2k_user_hash,
+                        &job,
+                        &config_snapshot,
+                        background_search,
+                        preferred_endpoint,
+                        cancel.clone(),
+                    )
+                    .await
+                }
+                (Protocol::Ed2k, SearchKind::Source) => {
+                    Err(anyhow::anyhow!("ED2K source search is not wired yet"))
+                }
+                (_, SearchKind::Notes) => Err(anyhow::anyhow!("notes search is not wired yet")),
             };
 
             let final_event = match outcome {
@@ -3359,8 +3675,9 @@ impl OverlordAgentEmule {
         let kad_firewall = Arc::clone(&runtime.kad_firewall);
         let ed2k_secure_ident = Arc::clone(&runtime.ed2k_secure_ident);
         let shutdown = Arc::clone(&runtime.shutdown);
+        let ed2k_user_hash = self.ed2k_user_hash;
         let ed2k_hello_identity = Ed2kHelloIdentity {
-            user_hash: source_publish_client_hash(self.indexer_id).0,
+            user_hash: ed2k_user_hash,
             client_id: 0,
             tcp_port: config.p2p.ed2k.listen_port,
             udp_port: config.p2p.kad.listen_port,
@@ -3386,10 +3703,12 @@ impl OverlordAgentEmule {
         let nat = Arc::clone(&runtime.nat);
         let shutdown = Arc::clone(&runtime.shutdown);
         let ed2k_server_state = Arc::clone(&runtime.ed2k_server_state);
+        let ed2k_server_search_inbox = runtime.ed2k_server_search_inbox.lock().await.take();
         let kad_firewall = Arc::clone(&runtime.kad_firewall);
         let ed2k_server_config = config.p2p.ed2k.clone();
+        let ed2k_user_hash = self.ed2k_user_hash;
         let ed2k_hello_identity = Ed2kHelloIdentity {
-            user_hash: source_publish_client_hash(self.indexer_id).0,
+            user_hash: ed2k_user_hash,
             client_id: 0,
             tcp_port: config.p2p.ed2k.listen_port,
             udp_port: config.p2p.kad.listen_port,
@@ -3398,18 +3717,23 @@ impl OverlordAgentEmule {
             connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
             direct_udp_callback: false,
         };
-        runtime.tasks.lock().await.push(tokio::spawn(async move {
-            run_ed2k_server_loop(
-                bind_ip,
-                nat,
-                ed2k_server_config,
-                ed2k_hello_identity,
-                ed2k_server_state,
-                kad_firewall,
-                shutdown,
-            )
-            .await;
-        }));
+        if let Some(ed2k_server_search_inbox) = ed2k_server_search_inbox {
+            runtime.tasks.lock().await.push(tokio::spawn(async move {
+                run_ed2k_server_loop(
+                    bind_ip,
+                    nat,
+                    ed2k_server_config,
+                    ed2k_hello_identity,
+                    ed2k_server_state,
+                    ed2k_server_search_inbox,
+                    kad_firewall,
+                    shutdown,
+                )
+                .await;
+            }));
+        } else {
+            warn!("ED2K server loop inbox was already taken; skipping ED2K server loop spawn");
+        }
 
         let dht = runtime.dht.clone();
         let nat = Arc::clone(&runtime.nat);
@@ -3421,8 +3745,9 @@ impl OverlordAgentEmule {
         let udp_firewall_check_timeout =
             Duration::from_secs(config.p2p.kad.udp_firewall_check_timeout_secs.max(1));
         let udp_firewall_check_contact_count = config.p2p.kad.udp_firewall_check_contact_count;
+        let ed2k_user_hash = self.ed2k_user_hash;
         let ed2k_hello_identity = Ed2kHelloIdentity {
-            user_hash: source_publish_client_hash(self.indexer_id).0,
+            user_hash: ed2k_user_hash,
             client_id: 0,
             tcp_port: config.p2p.ed2k.listen_port,
             udp_port: config.p2p.kad.listen_port,
@@ -3629,6 +3954,7 @@ impl OverlordAgentEmule {
         let snoop_queue = Arc::clone(&self.snoop_queue);
         let indexer_id = self.indexer_id;
         let passive_result_count = Arc::clone(&runtime.passive_result_count);
+        let passive_replay_gate = Arc::clone(&runtime.passive_replay_gate);
         let harvest_observability = Arc::clone(&self.harvest_observability);
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             while !shutdown.load(Ordering::Relaxed) {
@@ -3636,6 +3962,11 @@ impl OverlordAgentEmule {
                 if shutdown.load(Ordering::Relaxed) || !dht.is_bootstrapped() {
                     continue;
                 }
+                let Some(_replay_permit) =
+                    try_acquire_passive_replay_gate(&passive_replay_gate, "keyword")
+                else {
+                    continue;
+                };
                 let Some(request) = next_passive_keyword_request(&snoop_queue).await else {
                     let mut observability = harvest_observability.lock().await;
                     record_passive_keyword_replay_idle(&mut observability, Utc::now());
@@ -3758,6 +4089,110 @@ impl OverlordAgentEmule {
         }));
 
         let coordinator = self.coordinator.clone();
+        let dht = runtime.dht.clone();
+        let shutdown = Arc::clone(&runtime.shutdown);
+        let snoop_queue = Arc::clone(&self.snoop_queue);
+        let indexer_id = self.indexer_id;
+        let passive_result_count = Arc::clone(&runtime.passive_result_count);
+        let passive_replay_gate = Arc::clone(&runtime.passive_replay_gate);
+        runtime.tasks.lock().await.push(tokio::spawn(async move {
+            while !shutdown.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_secs(PASSIVE_CRAWL_SECS)).await;
+                if shutdown.load(Ordering::Relaxed) || !dht.is_bootstrapped() {
+                    continue;
+                }
+                let Some(_replay_permit) =
+                    try_acquire_passive_replay_gate(&passive_replay_gate, "source")
+                else {
+                    continue;
+                };
+                let Some(request) = next_passive_source_request(&snoop_queue).await else {
+                    continue;
+                };
+                let replay_started_at = Utc::now();
+                let replay_context = HarvestReplayContext {
+                    replay_id: Uuid::new_v4(),
+                    family: HarvestFamily::Source,
+                    logical_key: source_logical_key(&request),
+                    target: request.target.to_string(),
+                    start_position: Some(request.start_position),
+                    size: Some(request.size),
+                    restrictive_payload_hex: None,
+                };
+                info!(
+                    "kad passive source replay start target={} start_position={} size={}",
+                    request.target, request.start_position, request.size
+                );
+                let file_hash = Ed2kHash::from_bytes(request.target.0);
+                let mut stream = dht.search_sources(file_hash, request.size);
+                let mut files = Vec::new();
+                let mut replayed_results = 0usize;
+                let mut batches_posted = 0usize;
+                let mut last_post_error: Option<String> = None;
+                while let Some(result) = stream.next().await {
+                    passive_result_count.fetch_add(1, Ordering::Relaxed);
+                    replayed_results += 1;
+                    files.push(map_source_result(&result, request.size));
+                    if files.len() >= PASSIVE_BATCH_SIZE {
+                        let payload = ResultBatch {
+                            job_id: None,
+                            indexer_id,
+                            protocol: Protocol::Kad2,
+                            harvest_context: Some(replay_context.clone()),
+                            files: std::mem::take(&mut files),
+                        };
+                        if let Err(error) = coordinator.post_results(&payload).await {
+                            warn!("failed to post passive source result batch: {error}");
+                            last_post_error = Some(error.to_string());
+                        } else {
+                            batches_posted += 1;
+                        }
+                    }
+                }
+                if !files.is_empty() {
+                    let payload = ResultBatch {
+                        job_id: None,
+                        indexer_id,
+                        protocol: Protocol::Kad2,
+                        harvest_context: Some(replay_context.clone()),
+                        files,
+                    };
+                    if let Err(error) = coordinator.post_results(&payload).await {
+                        warn!("failed to post passive source result batch: {error}");
+                        last_post_error = Some(error.to_string());
+                    } else {
+                        batches_posted += 1;
+                    }
+                }
+                let replay_completed_at = Utc::now();
+                if let Err(error) = coordinator
+                    .post_harvest_replay(&HarvestReplayRecord {
+                        replay_id: replay_context.replay_id,
+                        indexer_id,
+                        family: replay_context.family,
+                        logical_key: replay_context.logical_key.clone(),
+                        target: replay_context.target.clone(),
+                        start_position: replay_context.start_position,
+                        size: replay_context.size,
+                        restrictive_payload_hex: replay_context.restrictive_payload_hex.clone(),
+                        started_at: replay_started_at,
+                        completed_at: replay_completed_at,
+                        result_count: replayed_results as u32,
+                        batch_count: batches_posted as u32,
+                        error: last_post_error.clone(),
+                    })
+                    .await
+                {
+                    debug!("failed to post source harvest replay summary: {error}");
+                }
+                info!(
+                    "kad passive source replay done results={} batches_posted={}",
+                    replayed_results, batches_posted
+                );
+            }
+        }));
+
+        let coordinator = self.coordinator.clone();
         let shutdown = Arc::clone(&runtime.shutdown);
         let snoop_queue = Arc::clone(&self.snoop_queue);
         let observed_snoop_events = Arc::clone(&self.observed_snoop_events);
@@ -3818,11 +4253,13 @@ mod tests {
         apply_publish_summary, apply_queue_family_counts, build_hello_request,
         build_hello_response, build_kad_hello_tags, build_publish_batch_summary,
         current_tcp_firewalled, effective_publish_counters, empty_networking_config,
-        emule_high_id_source_type, flush_snoop_queue, keyword_target, parse_kad_hello_metadata,
+        emule_high_id_source_type, flush_snoop_queue, keyword_target,
+        normalize_ed2k_user_hash_markers, parse_kad_hello_metadata,
         record_passive_keyword_post_failure, record_passive_keyword_replay_complete,
         record_passive_keyword_replay_idle, record_passive_keyword_replay_start,
-        restore_snoop_queue, select_popular_hashes_for_seeding, significant_keyword_words,
-        synthetic_file_hash, synthetic_popular_hashes,
+        restore_snoop_queue, select_popular_hashes_for_seeding,
+        select_popular_hashes_from_fetch_result, significant_keyword_words, synthetic_file_hash,
+        synthetic_popular_hashes, try_acquire_passive_replay_gate,
     };
     use crate::{
         config::SnoopQueueConfig,
@@ -3856,7 +4293,7 @@ mod tests {
         },
         time::Duration,
     };
-    use tokio::sync::{Mutex, RwLock};
+    use tokio::sync::{Mutex, RwLock, Semaphore};
     use uuid::Uuid;
 
     #[derive(Clone)]
@@ -4018,6 +4455,14 @@ mod tests {
     }
 
     #[test]
+    fn ed2k_user_hash_uses_oracle_emule_markers() {
+        let user_hash = normalize_ed2k_user_hash_markers([0xAA; 16]);
+
+        assert_eq!(user_hash[5], 0x0E);
+        assert_eq!(user_hash[14], 0x6F);
+    }
+
+    #[test]
     fn empty_networking_config_prefers_miniupnpc_only() {
         assert_eq!(
             empty_networking_config().nat.p2p.backend_order,
@@ -4113,6 +4558,15 @@ mod tests {
     #[test]
     fn seeding_falls_back_to_synthetic_hashes_when_empty() {
         let (source, selected) = select_popular_hashes_for_seeding(Vec::new());
+
+        assert_eq!(source, PublishSeedSource::SyntheticFallback);
+        assert_eq!(selected.len(), SYNTHETIC_POPULAR_SEEDS.len());
+    }
+
+    #[test]
+    fn seeding_falls_back_to_synthetic_hashes_when_fetch_fails() {
+        let (source, selected) =
+            select_popular_hashes_from_fetch_result(Err(anyhow::anyhow!("coordinator offline")));
 
         assert_eq!(source, PublishSeedSource::SyntheticFallback);
         assert_eq!(selected.len(), SYNTHETIC_POPULAR_SEEDS.len());
@@ -4397,6 +4851,16 @@ mod tests {
 
         let flushed_entries = flushed_entries.lock().await.clone();
         assert_eq!(flushed_entries, vec![restored_entry]);
+    }
+
+    #[tokio::test]
+    async fn passive_replay_gate_serializes_keyword_and_source_workers() {
+        let gate = Arc::new(Semaphore::new(1));
+        let first = try_acquire_passive_replay_gate(&gate, "keyword");
+        assert!(first.is_some());
+        assert!(try_acquire_passive_replay_gate(&gate, "source").is_none());
+        drop(first);
+        assert!(try_acquire_passive_replay_gate(&gate, "source").is_some());
     }
 
     #[tokio::test]
