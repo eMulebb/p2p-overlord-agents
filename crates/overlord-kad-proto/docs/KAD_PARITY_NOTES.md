@@ -50,3 +50,8 @@ Running note for Kad oracle-parity findings that affect live behavior.
   - passive keyword and passive source replays now keep draining inbound Kad result streams while coordinator `/api/internal/results` callbacks are still in flight
   - the posting queue is intentionally bounded so harvest stays memory-safe even during larger result floods
   - this is an ingestion-only change; it does not widen replay radius, increase replay cadence, or otherwise make outbound Kad traffic less polite
+- Live observation after passive replay family selection started following queue pressure:
+  - passive workers still keep the same replay cadence, but they now choose the heavier backlog first instead of alternating blindly by loop identity
+  - on the live network, the first two passive cycles after restart both selected source replay because the snoop queue stayed overwhelmingly source-heavy
+  - the first completed source-priority pass harvested `2` results in `1` posted batch, and the next passive cycle immediately started on another source target instead of burning a low-pressure keyword slot
+  - this improves harvest yield per outbound replay without increasing replay frequency or widening the Kad walk

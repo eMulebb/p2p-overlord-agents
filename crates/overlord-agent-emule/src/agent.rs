@@ -2796,22 +2796,47 @@ async fn record_snoop_entry(
     });
 }
 
-async fn next_passive_keyword_request(
-    snoop_queue: &Arc<Mutex<SnoopQueue>>,
-) -> Option<ScheduledSnoopRequest<SearchKeyReq>> {
-    snoop_queue
-        .lock()
-        .await
-        .select_next_keyword_request(Utc::now())
+#[derive(Debug)]
+enum PassiveReplaySelection {
+    Keyword(ScheduledSnoopRequest<SearchKeyReq>),
+    Source(ScheduledSnoopRequest<SearchSourceReq>),
 }
 
-async fn next_passive_source_request(
+fn preferred_passive_replay_families(counts: SnoopQueueFamilyCounts) -> [HarvestFamily; 2] {
+    if counts.source > counts.keyword {
+        [HarvestFamily::Source, HarvestFamily::Keyword]
+    } else {
+        [HarvestFamily::Keyword, HarvestFamily::Source]
+    }
+}
+
+fn select_passive_replay_request(
+    queue: &mut SnoopQueue,
+    family: HarvestFamily,
+    now: DateTime<Utc>,
+) -> Option<PassiveReplaySelection> {
+    match family {
+        HarvestFamily::Keyword => queue
+            .select_next_keyword_request(now)
+            .map(PassiveReplaySelection::Keyword),
+        HarvestFamily::Source => queue
+            .select_next_source_request(now)
+            .map(PassiveReplaySelection::Source),
+        HarvestFamily::Notes => None,
+    }
+}
+
+async fn next_passive_replay_request(
     snoop_queue: &Arc<Mutex<SnoopQueue>>,
-) -> Option<ScheduledSnoopRequest<SearchSourceReq>> {
-    snoop_queue
-        .lock()
-        .await
-        .select_next_source_request(Utc::now())
+) -> Option<PassiveReplaySelection> {
+    let mut queue = snoop_queue.lock().await;
+    let now = Utc::now();
+    for family in preferred_passive_replay_families(queue.family_counts()) {
+        if let Some(selection) = select_passive_replay_request(&mut queue, family, now) {
+            return Some(selection);
+        }
+    }
+    None
 }
 
 async fn record_passive_replay_outcome(
@@ -4276,101 +4301,197 @@ impl OverlordAgentEmule {
                 else {
                     continue;
                 };
-                let Some(selected_request) = next_passive_keyword_request(&snoop_queue).await
-                else {
+                let Some(selected_request) = next_passive_replay_request(&snoop_queue).await else {
                     let mut observability = harvest_observability.lock().await;
                     record_passive_replay_idle(
                         &mut observability,
                         HarvestFamily::Keyword,
                         Utc::now(),
                     );
+                    record_passive_replay_idle(
+                        &mut observability,
+                        HarvestFamily::Source,
+                        Utc::now(),
+                    );
                     continue;
                 };
-                let request = selected_request.request;
-                let replay_started_at = Utc::now();
-                let replay_context = HarvestReplayContext {
-                    replay_id: Uuid::new_v4(),
-                    family: HarvestFamily::Keyword,
-                    logical_key: selected_request.logical_key,
-                    target: request.target.to_string(),
-                    start_position: Some(request.start_position),
-                    size: None,
-                    restrictive_payload_hex: (!request.restrictive_payload.is_empty())
-                        .then(|| hex::encode(&request.restrictive_payload)),
-                };
-                {
-                    let mut observability = harvest_observability.lock().await;
-                    record_passive_replay_start(
-                        &mut observability,
-                        HarvestFamily::Keyword,
-                        request.target.to_string(),
-                        Some(request.start_position),
-                        Some(request.restrictive_payload.len() as u32),
-                        replay_started_at,
-                    );
+                match selected_request {
+                    PassiveReplaySelection::Keyword(selected_request) => {
+                        let request = selected_request.request;
+                        let replay_started_at = Utc::now();
+                        let replay_context = HarvestReplayContext {
+                            replay_id: Uuid::new_v4(),
+                            family: HarvestFamily::Keyword,
+                            logical_key: selected_request.logical_key,
+                            target: request.target.to_string(),
+                            start_position: Some(request.start_position),
+                            size: None,
+                            restrictive_payload_hex: (!request.restrictive_payload.is_empty())
+                                .then(|| hex::encode(&request.restrictive_payload)),
+                        };
+                        {
+                            let mut observability = harvest_observability.lock().await;
+                            record_passive_replay_start(
+                                &mut observability,
+                                HarvestFamily::Keyword,
+                                request.target.to_string(),
+                                Some(request.start_position),
+                                Some(request.restrictive_payload.len() as u32),
+                                replay_started_at,
+                            );
+                        }
+                        info!(
+                            "kad passive replay start target={} start_position={} restrictive_bytes={}",
+                            request.target,
+                            request.start_position,
+                            request.restrictive_payload.len()
+                        );
+                        let outcome = run_passive_keyword_replay(
+                            PassiveReplayContext {
+                                dht: &dht,
+                                coordinator: &coordinator,
+                                indexer_id,
+                                replay_context: &replay_context,
+                                max_phase2_fanout: passive_replay_phase2_fanout,
+                                passive_result_count: &passive_result_count,
+                                harvest_observability: &harvest_observability,
+                            },
+                            &request,
+                        )
+                        .await;
+                        let replay_completed_at = Utc::now();
+                        record_passive_replay_outcome(
+                            &snoop_queue,
+                            &replay_context.logical_key,
+                            replay_completed_at,
+                            outcome.result_count,
+                        )
+                        .await;
+                        {
+                            let mut observability = harvest_observability.lock().await;
+                            record_passive_replay_complete(
+                                &mut observability,
+                                HarvestFamily::Keyword,
+                                replay_completed_at,
+                                outcome.result_count,
+                                outcome.batch_count,
+                                outcome.tier_summaries.clone(),
+                            );
+                        }
+                        if let Err(error) = coordinator
+                            .post_harvest_replay(&HarvestReplayRecord {
+                                replay_id: replay_context.replay_id,
+                                indexer_id,
+                                family: replay_context.family,
+                                logical_key: replay_context.logical_key.clone(),
+                                target: replay_context.target.clone(),
+                                start_position: replay_context.start_position,
+                                size: replay_context.size,
+                                restrictive_payload_hex: replay_context
+                                    .restrictive_payload_hex
+                                    .clone(),
+                                started_at: replay_started_at,
+                                completed_at: replay_completed_at,
+                                result_count: outcome.result_count as u32,
+                                batch_count: outcome.batch_count as u32,
+                                error: outcome.last_post_error.clone(),
+                            })
+                            .await
+                        {
+                            debug!("failed to post harvest replay summary: {error}");
+                        }
+                        info!(
+                            "kad passive replay done results={} batches_posted={}",
+                            outcome.result_count, outcome.batch_count
+                        );
+                    }
+                    PassiveReplaySelection::Source(selected_request) => {
+                        let request = selected_request.request;
+                        let replay_started_at = Utc::now();
+                        let replay_context = HarvestReplayContext {
+                            replay_id: Uuid::new_v4(),
+                            family: HarvestFamily::Source,
+                            logical_key: selected_request.logical_key,
+                            target: request.target.to_string(),
+                            start_position: Some(request.start_position),
+                            size: Some(request.size),
+                            restrictive_payload_hex: None,
+                        };
+                        {
+                            let mut observability = harvest_observability.lock().await;
+                            record_passive_replay_start(
+                                &mut observability,
+                                HarvestFamily::Source,
+                                request.target.to_string(),
+                                Some(request.start_position),
+                                None,
+                                replay_started_at,
+                            );
+                        }
+                        info!(
+                            "kad passive source replay start target={} start_position={} size={}",
+                            request.target, request.start_position, request.size
+                        );
+                        let outcome = run_passive_source_replay(
+                            PassiveReplayContext {
+                                dht: &dht,
+                                coordinator: &coordinator,
+                                indexer_id,
+                                replay_context: &replay_context,
+                                max_phase2_fanout: passive_replay_phase2_fanout,
+                                passive_result_count: &passive_result_count,
+                                harvest_observability: &harvest_observability,
+                            },
+                            &request,
+                        )
+                        .await;
+                        let replay_completed_at = Utc::now();
+                        record_passive_replay_outcome(
+                            &snoop_queue,
+                            &replay_context.logical_key,
+                            replay_completed_at,
+                            outcome.result_count,
+                        )
+                        .await;
+                        {
+                            let mut observability = harvest_observability.lock().await;
+                            record_passive_replay_complete(
+                                &mut observability,
+                                HarvestFamily::Source,
+                                replay_completed_at,
+                                outcome.result_count,
+                                outcome.batch_count,
+                                outcome.tier_summaries.clone(),
+                            );
+                        }
+                        if let Err(error) = coordinator
+                            .post_harvest_replay(&HarvestReplayRecord {
+                                replay_id: replay_context.replay_id,
+                                indexer_id,
+                                family: replay_context.family,
+                                logical_key: replay_context.logical_key.clone(),
+                                target: replay_context.target.clone(),
+                                start_position: replay_context.start_position,
+                                size: replay_context.size,
+                                restrictive_payload_hex: replay_context
+                                    .restrictive_payload_hex
+                                    .clone(),
+                                started_at: replay_started_at,
+                                completed_at: replay_completed_at,
+                                result_count: outcome.result_count as u32,
+                                batch_count: outcome.batch_count as u32,
+                                error: outcome.last_post_error.clone(),
+                            })
+                            .await
+                        {
+                            debug!("failed to post source harvest replay summary: {error}");
+                        }
+                        info!(
+                            "kad passive source replay done results={} batches_posted={}",
+                            outcome.result_count, outcome.batch_count
+                        );
+                    }
                 }
-                info!(
-                    "kad passive replay start target={} start_position={} restrictive_bytes={}",
-                    request.target,
-                    request.start_position,
-                    request.restrictive_payload.len()
-                );
-                let outcome = run_passive_keyword_replay(
-                    PassiveReplayContext {
-                        dht: &dht,
-                        coordinator: &coordinator,
-                        indexer_id,
-                        replay_context: &replay_context,
-                        max_phase2_fanout: passive_replay_phase2_fanout,
-                        passive_result_count: &passive_result_count,
-                        harvest_observability: &harvest_observability,
-                    },
-                    &request,
-                )
-                .await;
-                let replay_completed_at = Utc::now();
-                record_passive_replay_outcome(
-                    &snoop_queue,
-                    &replay_context.logical_key,
-                    replay_completed_at,
-                    outcome.result_count,
-                )
-                .await;
-                {
-                    let mut observability = harvest_observability.lock().await;
-                    record_passive_replay_complete(
-                        &mut observability,
-                        HarvestFamily::Keyword,
-                        replay_completed_at,
-                        outcome.result_count,
-                        outcome.batch_count,
-                        outcome.tier_summaries.clone(),
-                    );
-                }
-                if let Err(error) = coordinator
-                    .post_harvest_replay(&HarvestReplayRecord {
-                        replay_id: replay_context.replay_id,
-                        indexer_id,
-                        family: replay_context.family,
-                        logical_key: replay_context.logical_key.clone(),
-                        target: replay_context.target.clone(),
-                        start_position: replay_context.start_position,
-                        size: replay_context.size,
-                        restrictive_payload_hex: replay_context.restrictive_payload_hex.clone(),
-                        started_at: replay_started_at,
-                        completed_at: replay_completed_at,
-                        result_count: outcome.result_count as u32,
-                        batch_count: outcome.batch_count as u32,
-                        error: outcome.last_post_error.clone(),
-                    })
-                    .await
-                {
-                    debug!("failed to post harvest replay summary: {error}");
-                }
-                info!(
-                    "kad passive replay done results={} batches_posted={}",
-                    outcome.result_count, outcome.batch_count
-                );
             }
         }));
 
@@ -4394,8 +4515,13 @@ impl OverlordAgentEmule {
                 else {
                     continue;
                 };
-                let Some(selected_request) = next_passive_source_request(&snoop_queue).await else {
+                let Some(selected_request) = next_passive_replay_request(&snoop_queue).await else {
                     let mut observability = harvest_observability.lock().await;
+                    record_passive_replay_idle(
+                        &mut observability,
+                        HarvestFamily::Keyword,
+                        Utc::now(),
+                    );
                     record_passive_replay_idle(
                         &mut observability,
                         HarvestFamily::Source,
@@ -4403,88 +4529,183 @@ impl OverlordAgentEmule {
                     );
                     continue;
                 };
-                let request = selected_request.request;
-                let replay_started_at = Utc::now();
-                let replay_context = HarvestReplayContext {
-                    replay_id: Uuid::new_v4(),
-                    family: HarvestFamily::Source,
-                    logical_key: selected_request.logical_key,
-                    target: request.target.to_string(),
-                    start_position: Some(request.start_position),
-                    size: Some(request.size),
-                    restrictive_payload_hex: None,
-                };
-                {
-                    let mut observability = harvest_observability.lock().await;
-                    record_passive_replay_start(
-                        &mut observability,
-                        HarvestFamily::Source,
-                        request.target.to_string(),
-                        Some(request.start_position),
-                        None,
-                        replay_started_at,
-                    );
+                match selected_request {
+                    PassiveReplaySelection::Keyword(selected_request) => {
+                        let request = selected_request.request;
+                        let replay_started_at = Utc::now();
+                        let replay_context = HarvestReplayContext {
+                            replay_id: Uuid::new_v4(),
+                            family: HarvestFamily::Keyword,
+                            logical_key: selected_request.logical_key,
+                            target: request.target.to_string(),
+                            start_position: Some(request.start_position),
+                            size: None,
+                            restrictive_payload_hex: (!request.restrictive_payload.is_empty())
+                                .then(|| hex::encode(&request.restrictive_payload)),
+                        };
+                        {
+                            let mut observability = harvest_observability.lock().await;
+                            record_passive_replay_start(
+                                &mut observability,
+                                HarvestFamily::Keyword,
+                                request.target.to_string(),
+                                Some(request.start_position),
+                                Some(request.restrictive_payload.len() as u32),
+                                replay_started_at,
+                            );
+                        }
+                        info!(
+                            "kad passive replay start target={} start_position={} restrictive_bytes={}",
+                            request.target,
+                            request.start_position,
+                            request.restrictive_payload.len()
+                        );
+                        let outcome = run_passive_keyword_replay(
+                            PassiveReplayContext {
+                                dht: &dht,
+                                coordinator: &coordinator,
+                                indexer_id,
+                                replay_context: &replay_context,
+                                max_phase2_fanout: passive_replay_phase2_fanout,
+                                passive_result_count: &passive_result_count,
+                                harvest_observability: &harvest_observability,
+                            },
+                            &request,
+                        )
+                        .await;
+                        let replay_completed_at = Utc::now();
+                        record_passive_replay_outcome(
+                            &snoop_queue,
+                            &replay_context.logical_key,
+                            replay_completed_at,
+                            outcome.result_count,
+                        )
+                        .await;
+                        {
+                            let mut observability = harvest_observability.lock().await;
+                            record_passive_replay_complete(
+                                &mut observability,
+                                HarvestFamily::Keyword,
+                                replay_completed_at,
+                                outcome.result_count,
+                                outcome.batch_count,
+                                outcome.tier_summaries.clone(),
+                            );
+                        }
+                        if let Err(error) = coordinator
+                            .post_harvest_replay(&HarvestReplayRecord {
+                                replay_id: replay_context.replay_id,
+                                indexer_id,
+                                family: replay_context.family,
+                                logical_key: replay_context.logical_key.clone(),
+                                target: replay_context.target.clone(),
+                                start_position: replay_context.start_position,
+                                size: replay_context.size,
+                                restrictive_payload_hex: replay_context
+                                    .restrictive_payload_hex
+                                    .clone(),
+                                started_at: replay_started_at,
+                                completed_at: replay_completed_at,
+                                result_count: outcome.result_count as u32,
+                                batch_count: outcome.batch_count as u32,
+                                error: outcome.last_post_error.clone(),
+                            })
+                            .await
+                        {
+                            debug!("failed to post harvest replay summary: {error}");
+                        }
+                        info!(
+                            "kad passive replay done results={} batches_posted={}",
+                            outcome.result_count, outcome.batch_count
+                        );
+                    }
+                    PassiveReplaySelection::Source(selected_request) => {
+                        let request = selected_request.request;
+                        let replay_started_at = Utc::now();
+                        let replay_context = HarvestReplayContext {
+                            replay_id: Uuid::new_v4(),
+                            family: HarvestFamily::Source,
+                            logical_key: selected_request.logical_key,
+                            target: request.target.to_string(),
+                            start_position: Some(request.start_position),
+                            size: Some(request.size),
+                            restrictive_payload_hex: None,
+                        };
+                        {
+                            let mut observability = harvest_observability.lock().await;
+                            record_passive_replay_start(
+                                &mut observability,
+                                HarvestFamily::Source,
+                                request.target.to_string(),
+                                Some(request.start_position),
+                                None,
+                                replay_started_at,
+                            );
+                        }
+                        info!(
+                            "kad passive source replay start target={} start_position={} size={}",
+                            request.target, request.start_position, request.size
+                        );
+                        let outcome = run_passive_source_replay(
+                            PassiveReplayContext {
+                                dht: &dht,
+                                coordinator: &coordinator,
+                                indexer_id,
+                                replay_context: &replay_context,
+                                max_phase2_fanout: passive_replay_phase2_fanout,
+                                passive_result_count: &passive_result_count,
+                                harvest_observability: &harvest_observability,
+                            },
+                            &request,
+                        )
+                        .await;
+                        let replay_completed_at = Utc::now();
+                        record_passive_replay_outcome(
+                            &snoop_queue,
+                            &replay_context.logical_key,
+                            replay_completed_at,
+                            outcome.result_count,
+                        )
+                        .await;
+                        {
+                            let mut observability = harvest_observability.lock().await;
+                            record_passive_replay_complete(
+                                &mut observability,
+                                HarvestFamily::Source,
+                                replay_completed_at,
+                                outcome.result_count,
+                                outcome.batch_count,
+                                outcome.tier_summaries.clone(),
+                            );
+                        }
+                        if let Err(error) = coordinator
+                            .post_harvest_replay(&HarvestReplayRecord {
+                                replay_id: replay_context.replay_id,
+                                indexer_id,
+                                family: replay_context.family,
+                                logical_key: replay_context.logical_key.clone(),
+                                target: replay_context.target.clone(),
+                                start_position: replay_context.start_position,
+                                size: replay_context.size,
+                                restrictive_payload_hex: replay_context
+                                    .restrictive_payload_hex
+                                    .clone(),
+                                started_at: replay_started_at,
+                                completed_at: replay_completed_at,
+                                result_count: outcome.result_count as u32,
+                                batch_count: outcome.batch_count as u32,
+                                error: outcome.last_post_error.clone(),
+                            })
+                            .await
+                        {
+                            debug!("failed to post source harvest replay summary: {error}");
+                        }
+                        info!(
+                            "kad passive source replay done results={} batches_posted={}",
+                            outcome.result_count, outcome.batch_count
+                        );
+                    }
                 }
-                info!(
-                    "kad passive source replay start target={} start_position={} size={}",
-                    request.target, request.start_position, request.size
-                );
-                let outcome = run_passive_source_replay(
-                    PassiveReplayContext {
-                        dht: &dht,
-                        coordinator: &coordinator,
-                        indexer_id,
-                        replay_context: &replay_context,
-                        max_phase2_fanout: passive_replay_phase2_fanout,
-                        passive_result_count: &passive_result_count,
-                        harvest_observability: &harvest_observability,
-                    },
-                    &request,
-                )
-                .await;
-                let replay_completed_at = Utc::now();
-                record_passive_replay_outcome(
-                    &snoop_queue,
-                    &replay_context.logical_key,
-                    replay_completed_at,
-                    outcome.result_count,
-                )
-                .await;
-                {
-                    let mut observability = harvest_observability.lock().await;
-                    record_passive_replay_complete(
-                        &mut observability,
-                        HarvestFamily::Source,
-                        replay_completed_at,
-                        outcome.result_count,
-                        outcome.batch_count,
-                        outcome.tier_summaries.clone(),
-                    );
-                }
-                if let Err(error) = coordinator
-                    .post_harvest_replay(&HarvestReplayRecord {
-                        replay_id: replay_context.replay_id,
-                        indexer_id,
-                        family: replay_context.family,
-                        logical_key: replay_context.logical_key.clone(),
-                        target: replay_context.target.clone(),
-                        start_position: replay_context.start_position,
-                        size: replay_context.size,
-                        restrictive_payload_hex: replay_context.restrictive_payload_hex.clone(),
-                        started_at: replay_started_at,
-                        completed_at: replay_completed_at,
-                        result_count: outcome.result_count as u32,
-                        batch_count: outcome.batch_count as u32,
-                        error: outcome.last_post_error.clone(),
-                    })
-                    .await
-                {
-                    debug!("failed to post source harvest replay summary: {error}");
-                }
-                info!(
-                    "kad passive source replay done results={} batches_posted={}",
-                    outcome.result_count, outcome.batch_count
-                );
             }
         }));
 
@@ -4545,11 +4766,12 @@ impl OverlordAgentEmule {
 mod tests {
     use super::{
         COORDINATOR_RECONNECT_SECS, EMULE_LARGE_FILE_SIZE_THRESHOLD, EmuleAgentConfig,
-        OverlordAgentEmule, SYNTHETIC_POPULAR_SEEDS, apply_harvest_record, apply_networking_config,
-        apply_publish_summary, apply_queue_family_counts, build_hello_request,
-        build_hello_response, build_kad_hello_tags, build_publish_batch_summary,
-        current_tcp_firewalled, effective_publish_counters, empty_networking_config,
-        emule_high_id_source_type, flush_snoop_queue, keyword_target,
+        OverlordAgentEmule, PassiveReplaySelection, SYNTHETIC_POPULAR_SEEDS, apply_harvest_record,
+        apply_networking_config, apply_publish_summary, apply_queue_family_counts,
+        build_hello_request, build_hello_response, build_kad_hello_tags, build_keyword_snoop_entry,
+        build_publish_batch_summary, build_source_snoop_entry, current_tcp_firewalled,
+        effective_publish_counters, empty_networking_config, emule_high_id_source_type,
+        flush_snoop_queue, keyword_target, next_passive_replay_request,
         normalize_ed2k_user_hash_markers, parse_kad_hello_metadata, record_passive_replay_complete,
         record_passive_replay_idle, record_passive_replay_post_failure,
         record_passive_replay_start, restore_snoop_queue, select_popular_hashes_for_seeding,
@@ -4577,7 +4799,9 @@ mod tests {
     };
     use overlord_agent_nat::{UPNP_MINIUPNPC_BACKEND, UPNP_RUPNP_BACKEND};
     use overlord_kad_dht::{DhtConfig, DhtNode, PublishAttemptStats};
-    use overlord_kad_proto::{NodeId, SearchKeyReq, Tag, TagName, TagValue, tag_name};
+    use overlord_kad_proto::{
+        NodeId, SearchKeyReq, SearchSourceReq, Tag, TagName, TagValue, tag_name,
+    };
     use std::{
         collections::HashSet,
         fs,
@@ -5226,6 +5450,46 @@ mod tests {
             observability.passive_source_replay.last_completed_at,
             Some(completed_at)
         );
+    }
+
+    #[tokio::test]
+    async fn next_passive_replay_request_prefers_source_when_backlog_is_heavier() {
+        let queue = Arc::new(Mutex::new(SnoopQueue::new(SnoopQueueConfig {
+            dedup_window_secs: 60,
+            max_queries_per_600s: 10,
+            drain_cooldown_secs: 30,
+        })));
+        let now = Utc.with_ymd_and_hms(2026, 3, 24, 15, 12, 0).unwrap();
+        {
+            let mut guard = queue.lock().await;
+            guard.record(build_keyword_snoop_entry(
+                &SearchKeyReq {
+                    target: NodeId::from_bytes([0x11; 16]),
+                    start_position: 0,
+                    restrictive_payload: Vec::new(),
+                },
+                now,
+            ));
+            guard.record(build_source_snoop_entry(
+                &SearchSourceReq {
+                    target: NodeId::from_bytes([0x22; 16]),
+                    start_position: 0,
+                    size: 1_024,
+                },
+                now,
+            ));
+            guard.record(build_source_snoop_entry(
+                &SearchSourceReq {
+                    target: NodeId::from_bytes([0x33; 16]),
+                    start_position: 0,
+                    size: 2_048,
+                },
+                now,
+            ));
+        }
+
+        let selected = next_passive_replay_request(&queue).await;
+        assert!(matches!(selected, Some(PassiveReplaySelection::Source(_))));
     }
 
     #[tokio::test]
