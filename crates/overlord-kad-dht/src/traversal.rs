@@ -7,7 +7,7 @@ use overlord_kad_proto::{
     opcode,
     packet::{ContactEntry, Req, SearchKeyReq, SearchNotesReq, SearchSourceReq},
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -81,9 +81,24 @@ struct SearchPhaseConfig<'a> {
     query_timeout: Duration,
     deadline: Instant,
     phase2_fanout: usize,
+    /// Timestamp of the last traversal `RES` response.
+    ///
+    /// eMule only starts `StorePacket()` once the lookup has been idle for a
+    /// few seconds, so phase 2 needs this to mirror the oracle's jump-start
+    /// gate instead of burst-sending immediately.
+    last_lookup_response_at: Option<Instant>,
+    /// Oracle-style idle grace before jump-start emits the first search packet.
+    jumpstart_idle_grace: Duration,
+    /// Oracle-style periodic tick for walking one closest responder at a time.
+    jumpstart_tick: Duration,
     cancel: &'a CancellationToken,
     result_tx: Option<mpsc::Sender<(Ed2kHash, Vec<Tag>)>>,
 }
+
+/// eMule checks stalled searches once per second.
+const SEARCH_JUMPSTART_TICK: Duration = Duration::from_secs(1);
+/// eMule only jump-starts once the last lookup response is at least 3 seconds old.
+const SEARCH_JUMPSTART_IDLE_GRACE: Duration = Duration::from_secs(3);
 
 pub async fn run_traversal(
     rpc: &RpcManager,
@@ -128,6 +143,7 @@ pub async fn run_traversal(
 
     let mut join_set: JoinSet<(NodeId, Result<KadPacket, overlord_kad_net::NetError>)> =
         JoinSet::new();
+    let mut last_lookup_response_at = None;
 
     loop {
         if cancel.is_cancelled() {
@@ -204,6 +220,7 @@ pub async fn run_traversal(
                 }
             }
             Ok(KadPacket::Res(res)) => {
+                last_lookup_response_at = Some(Instant::now());
                 if let Some(idx) = candidate_idx {
                     candidates[idx].state = CandidateState::Responded;
                 }
@@ -319,6 +336,9 @@ pub async fn run_traversal(
                     query_timeout,
                     deadline,
                     phase2_fanout,
+                    last_lookup_response_at,
+                    jumpstart_idle_grace: SEARCH_JUMPSTART_IDLE_GRACE,
+                    jumpstart_tick: SEARCH_JUMPSTART_TICK,
                     cancel: &cancel,
                     result_tx,
                 },
@@ -345,6 +365,9 @@ async fn run_search_phase(
         query_timeout,
         deadline,
         phase2_fanout,
+        last_lookup_response_at,
+        jumpstart_idle_grace,
+        jumpstart_tick,
         cancel,
         result_tx,
     } = config;
@@ -369,11 +392,16 @@ async fn run_search_phase(
 
     let mut unsolicited = rpc.subscribe();
     let mut queried_addrs = HashSet::new();
-    let total_contacts = send_to.len();
+    let mut pending_contacts = send_to.into_iter().collect::<VecDeque<_>>();
     let mut search_entries = Vec::new();
     let result_tx = result_tx;
+    let mut next_emit_at = compute_initial_jumpstart_emit_at(
+        last_lookup_response_at,
+        Instant::now(),
+        jumpstart_idle_grace,
+    );
 
-    for (index, contact) in send_to.into_iter().enumerate() {
+    loop {
         if cancel.is_cancelled() {
             break;
         }
@@ -381,6 +409,33 @@ async fn run_search_phase(
         if now >= phase_deadline {
             break;
         }
+        let receive_until = if pending_contacts.is_empty() {
+            phase_deadline
+        } else {
+            next_emit_at.min(phase_deadline)
+        };
+        collect_search_results_until(
+            &mut unsolicited,
+            cancel,
+            receive_until,
+            target,
+            &queried_addrs,
+            &result_tx,
+            &mut search_entries,
+        )
+        .await;
+
+        let now = Instant::now();
+        if now >= phase_deadline {
+            break;
+        }
+        if pending_contacts.is_empty() || now < next_emit_at {
+            continue;
+        }
+
+        let Some(contact) = pending_contacts.pop_front() else {
+            continue;
+        };
         register_traversal_identity(rpc, contact);
         let packet = match kind {
             TraversalKind::Keyword { ref request } => KadPacket::SearchKeyReq(request.clone()),
@@ -396,87 +451,16 @@ async fn run_search_phase(
             TraversalKind::Store => unreachable!(),
         };
 
+        info!(
+            "traversal phase2: jump-start send to {} remaining_contacts={}",
+            contact.addr,
+            pending_contacts.len()
+        );
         if let Err(err) = rpc.send(contact.addr, &packet).await {
             trace!("search phase send failed for {}: {}", contact.id, err);
         }
         queried_addrs.insert(contact.addr);
-
-        let now = Instant::now();
-        if now >= phase_deadline {
-            break;
-        }
-        let remaining_phase = phase_deadline - now;
-        let remaining_contacts = total_contacts.saturating_sub(index);
-        let step_budget = remaining_phase
-            .checked_div(u32::try_from(remaining_contacts).unwrap_or(u32::MAX))
-            .unwrap_or(remaining_phase);
-        let step_deadline = now + step_budget;
-
-        loop {
-            if cancel.is_cancelled() {
-                break;
-            }
-            let now = Instant::now();
-            if now >= step_deadline {
-                break;
-            }
-            let remaining = step_deadline - now;
-            match tokio::select! {
-                _ = cancel.cancelled() => break,
-                result = tokio::time::timeout(remaining, unsolicited.recv()) => result,
-            } {
-                Ok(Ok(overlord_kad_net::ReceivedKadPacket {
-                    packet: KadPacket::SearchRes(sr),
-                    from,
-                    ..
-                })) => {
-                    if !queried_addrs.contains(&from) {
-                        trace!("ignoring SEARCH_RES from unqueried sender {}", from);
-                        continue;
-                    }
-                    if sr.keyword_id != target {
-                        trace!(
-                            "ignoring SEARCH_RES from {} for mismatched target {}",
-                            from, sr.keyword_id
-                        );
-                        continue;
-                    }
-
-                    info!(
-                        "search phase got SearchRes: {} results from sender {}",
-                        sr.results.len(),
-                        sr.sender_id
-                    );
-                    for entry in sr.results {
-                        if let Some(tx) = result_tx.as_ref() {
-                            let _ = tx.send((entry.hash, entry.tags.clone())).await;
-                        }
-                        search_entries.push((entry.hash, entry.tags));
-                    }
-                }
-                Ok(Ok(overlord_kad_net::ReceivedKadPacket {
-                    packet: other,
-                    from,
-                    ..
-                })) => {
-                    if queried_addrs.contains(&from) {
-                        trace!(
-                            "search phase unexpected packet opcode=0x{:02X} from {}",
-                            other.opcode(),
-                            from
-                        );
-                    }
-                }
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
-                    warn!(
-                        "search phase broadcast receiver lagged; skipped {} packets",
-                        skipped
-                    );
-                }
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
-                Err(_) => break,
-            }
-        }
+        next_emit_at = Instant::now() + jumpstart_tick;
     }
 
     info!(
@@ -485,6 +469,96 @@ async fn run_search_phase(
     );
 
     search_entries
+}
+
+/// Compute when the next phase-2 search packet is allowed to be emitted.
+fn compute_initial_jumpstart_emit_at(
+    last_lookup_response_at: Option<Instant>,
+    now: Instant,
+    jumpstart_idle_grace: Duration,
+) -> Instant {
+    let Some(last_lookup_response_at) = last_lookup_response_at else {
+        return now;
+    };
+    let stalled_at = last_lookup_response_at + jumpstart_idle_grace;
+    stalled_at.max(now)
+}
+
+/// Drain unsolicited packets until the next jump-start emit slot or overall deadline.
+async fn collect_search_results_until(
+    unsolicited: &mut tokio::sync::broadcast::Receiver<overlord_kad_net::ReceivedKadPacket>,
+    cancel: &CancellationToken,
+    receive_until: Instant,
+    target: NodeId,
+    queried_addrs: &HashSet<SocketAddr>,
+    result_tx: &Option<mpsc::Sender<(Ed2kHash, Vec<Tag>)>>,
+    search_entries: &mut Vec<(Ed2kHash, Vec<Tag>)>,
+) {
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let now = Instant::now();
+        if now >= receive_until {
+            break;
+        }
+        let remaining = receive_until - now;
+        match tokio::select! {
+            _ = cancel.cancelled() => break,
+            result = tokio::time::timeout(remaining, unsolicited.recv()) => result,
+        } {
+            Ok(Ok(overlord_kad_net::ReceivedKadPacket {
+                packet: KadPacket::SearchRes(sr),
+                from,
+                ..
+            })) => {
+                if !queried_addrs.contains(&from) {
+                    trace!("ignoring SEARCH_RES from unqueried sender {}", from);
+                    continue;
+                }
+                if sr.keyword_id != target {
+                    trace!(
+                        "ignoring SEARCH_RES from {} for mismatched target {}",
+                        from, sr.keyword_id
+                    );
+                    continue;
+                }
+
+                info!(
+                    "search phase got SearchRes: {} results from sender {}",
+                    sr.results.len(),
+                    sr.sender_id
+                );
+                for entry in sr.results {
+                    if let Some(tx) = result_tx.as_ref() {
+                        let _ = tx.send((entry.hash, entry.tags.clone())).await;
+                    }
+                    search_entries.push((entry.hash, entry.tags));
+                }
+            }
+            Ok(Ok(overlord_kad_net::ReceivedKadPacket {
+                packet: other,
+                from,
+                ..
+            })) => {
+                if queried_addrs.contains(&from) {
+                    trace!(
+                        "search phase unexpected packet opcode=0x{:02X} from {}",
+                        other.opcode(),
+                        from
+                    );
+                }
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
+                warn!(
+                    "search phase broadcast receiver lagged; skipped {} packets",
+                    skipped
+                );
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+            Err(_) => break,
+        }
+    }
 }
 
 /// Register traversal contact metadata with the RPC layer before sending.
@@ -884,6 +958,9 @@ mod tests {
                 query_timeout: Duration::from_millis(100),
                 deadline: Instant::now() + Duration::from_millis(300),
                 phase2_fanout: 10,
+                last_lookup_response_at: None,
+                jumpstart_idle_grace: Duration::ZERO,
+                jumpstart_tick: Duration::from_millis(10),
                 cancel: &CancellationToken::new(),
                 result_tx: Some(result_tx),
             },
@@ -929,6 +1006,9 @@ mod tests {
                 query_timeout: Duration::from_millis(20),
                 deadline: Instant::now() + Duration::from_millis(50),
                 phase2_fanout: 1,
+                last_lookup_response_at: None,
+                jumpstart_idle_grace: Duration::ZERO,
+                jumpstart_tick: Duration::from_millis(10),
                 cancel: &CancellationToken::new(),
                 result_tx: None,
             },
@@ -980,6 +1060,9 @@ mod tests {
                 query_timeout: Duration::from_millis(20),
                 deadline: Instant::now() + Duration::from_millis(50),
                 phase2_fanout: 1,
+                last_lookup_response_at: None,
+                jumpstart_idle_grace: Duration::ZERO,
+                jumpstart_tick: Duration::from_millis(10),
                 cancel: &CancellationToken::new(),
                 result_tx: None,
             },
@@ -994,6 +1077,75 @@ mod tests {
             panic!("expected SearchKeyReq");
         };
         assert_eq!(request, restrictive_request);
+    }
+
+    #[tokio::test]
+    async fn test_run_search_phase_walks_one_contact_per_jumpstart_tick() {
+        let transport = Arc::new(MockTransport::new("127.0.0.1:0".parse().unwrap()));
+        let rpc = RpcManager::new(
+            Arc::clone(&transport),
+            ObfuscationLayer::new(NodeId::ZERO, 0, false),
+            RpcConfig::default(),
+        );
+        let _handle = rpc.start();
+
+        let target = NodeId::from_bytes([0x66; 16]);
+        let contacts = vec![
+            TraversalContact {
+                id: NodeId::from_bytes([0x21; 16]),
+                addr: "192.168.1.31:4672".parse().unwrap(),
+                version: 9,
+            },
+            TraversalContact {
+                id: NodeId::from_bytes([0x22; 16]),
+                addr: "192.168.1.32:4672".parse().unwrap(),
+                version: 9,
+            },
+        ];
+        let first_addr = contacts[0].addr;
+        let second_addr = contacts[1].addr;
+        let test_contacts = contacts.clone();
+
+        let run = tokio::spawn({
+            let rpc = rpc.clone();
+            async move {
+                run_search_phase(
+                    &rpc,
+                    SearchPhaseConfig {
+                        responded: &test_contacts,
+                        kind: TraversalKind::Keyword {
+                            request: SearchKeyReq {
+                                target,
+                                start_position: 0,
+                                restrictive_payload: Vec::new(),
+                            },
+                        },
+                        target,
+                        query_timeout: Duration::from_millis(160),
+                        deadline: Instant::now() + Duration::from_millis(220),
+                        phase2_fanout: 2,
+                        last_lookup_response_at: Some(Instant::now()),
+                        jumpstart_idle_grace: Duration::from_millis(15),
+                        jumpstart_tick: Duration::from_millis(50),
+                        cancel: &CancellationToken::new(),
+                        result_tx: None,
+                    },
+                )
+                .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        let first_wave = transport.drain_outgoing();
+        assert_eq!(first_wave.len(), 1);
+        assert_eq!(first_wave[0].0, first_addr);
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let second_wave = transport.drain_outgoing();
+        assert_eq!(second_wave.len(), 1);
+        assert_eq!(second_wave[0].0, second_addr);
+
+        run.await.unwrap();
     }
 
     #[tokio::test]
