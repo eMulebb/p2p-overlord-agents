@@ -31,3 +31,8 @@ Running note for Kad oracle-parity findings that affect live behavior.
   - internal stats now expose tier-by-tier replay telemetry for both passive source and passive keyword loops
   - widening alone is not enough; some source replays still finish `0/0/0` across all widened tiers
   - the next harvest optimization should focus on queue choice and replay backoff, not only on increasing traversal radius
+- Live observation after zero-yield replay backoff landed:
+  - passive replay selection now rotates away from shapes that already widened and still returned `0` results, unless fresh demand is seen again
+  - on the live network, source replay harvested `12` results on one target and `5` on the next target without needing widened tiers
+  - keyword replay skipped an earlier zero-result shape and the next keyword target completed with `1364` harvested results over `28` posted batches at tier `K`
+  - the next remaining harvest question is result shaping and batching under very large keyword result floods, not basic queue rotation anymore
