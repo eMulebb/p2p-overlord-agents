@@ -20,5 +20,9 @@ Running note for Kad oracle-parity findings that affect live behavior.
   - source replay still sometimes returns `0` results
   - keyword replay and source replay can overlap because they are separate background loops
   - that overlap is not oracle-like for our harvesting scenario and should be serialized
+- Live observation after serializing passive replays:
+  - source replay and keyword replay no longer overlap on the log timeline
+  - isolated source replay still varies by target; observed runs included `results=0` and `results=4`
+  - overlap was a real confounder, but not the only reason source replay can come back empty
 - Remaining live gap:
   - source replay still alternates between non-zero and zero-result runs, so packet cadence/order is closer but not fully equivalent yet
