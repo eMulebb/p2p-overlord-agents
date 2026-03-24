@@ -375,6 +375,7 @@ mod tests {
             ))
             .json(&serde_json::json!({
                 "job_id": Uuid::new_v4(),
+                "protocol": Protocol::Kad2,
                 "kind": SearchKind::Keyword,
                 "query": "test file",
                 "file_hash": null,

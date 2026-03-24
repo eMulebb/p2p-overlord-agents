@@ -44,7 +44,8 @@ use overlord_agent_common::{
     SearchKind, SnoopEntry, SnoopObservation, Source, TagEntry,
 };
 use overlord_kad_dht::{
-    DhtConfig, DhtNode, PublishAttemptStats, ReceivedKadPacket, SearchResult, SourceResult,
+    DhtConfig, DhtNode, NoteResult, PublishAttemptStats, ReceivedKadPacket, SearchResult,
+    SourceResult,
     bootstrap::{BootstrapContact, encode_nodes_dat},
 };
 use overlord_kad_proto::{
@@ -1513,6 +1514,24 @@ fn map_source_result(result: &SourceResult, file_size: u64) -> FileRecord {
     }
 }
 
+fn map_note_result(result: &NoteResult, file_size: u64) -> FileRecord {
+    FileRecord {
+        hashes: vec![HashType::Ed2k(result.file_hash.to_string())],
+        names: Vec::new(),
+        size: Some(file_size),
+        content_type: None,
+        tags: vec![TagEntry {
+            key: "kad_note".to_string(),
+            value: serde_json::json!({
+                "author_id": result.author_id.to_string(),
+                "rating": result.rating,
+                "comment": result.comment,
+            }),
+        }],
+        sources: Vec::new(),
+    }
+}
+
 #[derive(Debug, Default)]
 struct PassiveReplayRunOutcome {
     result_count: usize,
@@ -1827,6 +1846,46 @@ async fn do_active_source_search(
 
     while let Some(result) = stream.next().await {
         files.push(map_source_result(&result, file_size));
+        if files.len() >= ACTIVE_BATCH_SIZE {
+            post_search_batch(
+                &callback_client,
+                job.job_id,
+                indexer_id,
+                Protocol::Kad2,
+                std::mem::take(&mut files),
+                &mut stats,
+            )
+            .await?;
+        }
+    }
+
+    post_search_batch(
+        &callback_client,
+        job.job_id,
+        indexer_id,
+        Protocol::Kad2,
+        files,
+        &mut stats,
+    )
+    .await?;
+    Ok(stats)
+}
+
+async fn do_active_notes_search(
+    dht: &DhtNode,
+    indexer_id: Uuid,
+    job: &SearchJob,
+    cancel: CancellationToken,
+) -> Result<SearchRunStats> {
+    let file_hash = search_file_hash(job)?;
+    let file_size = search_file_size(job)?;
+    let callback_client = CoordinatorClient::new(&job.callback_url)?;
+    let mut stream = dht.search_notes_with_cancel(file_hash, file_size, cancel);
+    let mut files = Vec::new();
+    let mut stats = SearchRunStats::default();
+
+    while let Some(result) = stream.next().await {
+        files.push(map_note_result(&result, file_size));
         if files.len() >= ACTIVE_BATCH_SIZE {
             post_search_batch(
                 &callback_client,
@@ -3714,6 +3773,9 @@ impl IndexerService for OverlordAgentEmule {
                 (Protocol::Kad2, SearchKind::Source) => {
                     do_active_source_search(&dht, indexer_id, &job, cancel.clone()).await
                 }
+                (Protocol::Kad2, SearchKind::Notes) => {
+                    do_active_notes_search(&dht, indexer_id, &job, cancel.clone()).await
+                }
                 (Protocol::Ed2k, SearchKind::Keyword) => {
                     let (preferred_endpoint, background_search) = {
                         let server_state = ed2k_server_state.read().await;
@@ -3738,7 +3800,9 @@ impl IndexerService for OverlordAgentEmule {
                 (Protocol::Ed2k, SearchKind::Source) => {
                     Err(anyhow::anyhow!("ED2K source search is not wired yet"))
                 }
-                (_, SearchKind::Notes) => Err(anyhow::anyhow!("notes search is not wired yet")),
+                (Protocol::Ed2k, SearchKind::Notes) => {
+                    Err(anyhow::anyhow!("ED2K notes search is not wired yet"))
+                }
             };
 
             let final_event = match outcome {

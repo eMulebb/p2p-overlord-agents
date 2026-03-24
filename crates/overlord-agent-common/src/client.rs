@@ -61,18 +61,22 @@ impl CoordinatorClient {
 
     pub async fn dispatch_search(&self, job: &SearchJob) -> Result<()> {
         let url = self.base_url.join("/api/search")?;
-        if job.kind != SearchKind::Keyword {
-            anyhow::bail!(
-                "only keyword searches can be dispatched through the public coordinator api"
-            );
-        }
-        self.http
-            .post(url)
-            .json(&serde_json::json!({
-                "protocol": "kad2",
+        let payload = match job.kind {
+            SearchKind::Keyword => serde_json::json!({
+                "protocol": job.protocol,
                 "kind": "keyword",
                 "query": job.query,
-            }))
+            }),
+            SearchKind::Source | SearchKind::Notes => serde_json::json!({
+                "protocol": job.protocol,
+                "kind": job.kind,
+                "file_hash": job.file_hash,
+                "file_size": job.file_size,
+            }),
+        };
+        self.http
+            .post(url)
+            .json(&payload)
             .send()
             .await?
             .error_for_status()?;

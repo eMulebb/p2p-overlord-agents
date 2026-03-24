@@ -492,28 +492,31 @@ impl DhtNode {
         file_size: u64,
         cancel: CancellationToken,
     ) -> impl tokio_stream::Stream<Item = NoteResult> + Send + 'static {
+        self.search_notes_with_phase2_fanout_and_cancel(
+            file_hash,
+            file_size,
+            self.inner.config.search_phase2_fanout,
+            cancel,
+        )
+    }
+
+    /// Search for notes/ratings with an explicit phase-2 responder ceiling.
+    pub fn search_notes_with_phase2_fanout_and_cancel(
+        &self,
+        file_hash: Ed2kHash,
+        file_size: u64,
+        phase2_fanout: usize,
+        cancel: CancellationToken,
+    ) -> impl tokio_stream::Stream<Item = NoteResult> + Send + 'static {
         let target = NodeId::from_bytes(file_hash.0);
-        let initial = {
-            match self.inner.routing_table.try_lock() {
-                Ok(rt) => rt
-                    .get_closest(&target, K)
-                    .into_iter()
-                    .map(|c| TraversalContact {
-                        id: c.id,
-                        addr: SocketAddr::new(IpAddr::V4(c.ip), c.udp_port),
-                        version: c.kad_version,
-                    })
-                    .collect(),
-                Err(_) => vec![],
-            }
-        };
+        let initial = self.closest_search_contacts(target);
         crate::search::search_notes(
             self.inner.rpc.clone(),
             initial,
             file_hash,
             file_size,
             self.inner.config.notes_result_cap,
-            self.inner.config.search_phase2_fanout,
+            phase2_fanout,
             cancel,
         )
     }
