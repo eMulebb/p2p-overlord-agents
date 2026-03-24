@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use overlord_agent_common::SnoopEntry;
-use overlord_kad_proto::{NodeId, SearchKeyReq, SearchSourceReq};
+use overlord_kad_proto::{NodeId, SearchKeyReq, SearchNotesReq, SearchSourceReq};
 
 use crate::config::SnoopQueueConfig;
 
@@ -257,6 +257,76 @@ impl SnoopQueue {
         Some(selected.scheduled)
     }
 
+    /// Selects the next notes request eligible for passive drain and marks it as drained.
+    pub fn select_next_notes_request(
+        &mut self,
+        now: DateTime<Utc>,
+    ) -> Option<ScheduledSnoopRequest<SearchNotesReq>> {
+        self.prune_recent_drains(now);
+        if self.recent_drains.len() >= self.config.max_queries_per_600s as usize {
+            return None;
+        }
+
+        let dedup_cutoff = now - seconds(self.config.dedup_window_secs);
+        let cooldown_cutoff = now - seconds(self.config.drain_cooldown_secs);
+        let mut recent = Vec::new();
+        let mut stale = Vec::new();
+
+        for entry in self.entries.values() {
+            let Some(request) = notes_request(entry) else {
+                continue;
+            };
+            let logical_key = entry.logical_key().to_string();
+            let feedback = self
+                .replay_feedback
+                .get(&logical_key)
+                .copied()
+                .unwrap_or_default();
+            if entry.last_drained_at().is_some_and(|last_drained_at| {
+                last_drained_at
+                    > replay_cooldown_cutoff(
+                        cooldown_cutoff,
+                        now,
+                        self.config.drain_cooldown_secs,
+                        entry,
+                        feedback,
+                    )
+            }) {
+                continue;
+            }
+            let candidate = ReplayCandidate {
+                scheduled: ScheduledSnoopRequest {
+                    logical_key,
+                    request,
+                },
+                hit_count: entry.hit_count(),
+                last_seen: entry.last_seen(),
+                zero_result_streak: feedback.zero_result_streak,
+                last_result_count: feedback.last_result_count,
+                observed_after_outcome: feedback
+                    .last_outcome_at
+                    .is_none_or(|last_outcome_at| entry.last_seen() > last_outcome_at),
+            };
+            if entry.last_seen() >= dedup_cutoff {
+                recent.push(candidate);
+            } else {
+                stale.push(candidate);
+            }
+        }
+
+        recent.sort_by(notes_candidate_cmp);
+        stale.sort_by(notes_candidate_cmp);
+        let selected = recent
+            .into_iter()
+            .next()
+            .or_else(|| stale.into_iter().next())?;
+        if let Some(entry) = self.entries.get_mut(&selected.scheduled.logical_key) {
+            entry.set_last_drained_at(Some(now));
+        }
+        self.recent_drains.push_back(now);
+        Some(selected.scheduled)
+    }
+
     /// Records the result density of one completed passive replay cycle.
     pub fn record_replay_outcome(
         &mut self,
@@ -375,6 +445,19 @@ fn source_request(entry: &SnoopEntry) -> Option<SearchSourceReq> {
     })
 }
 
+fn notes_request(entry: &SnoopEntry) -> Option<SearchNotesReq> {
+    let SnoopEntry::Notes { target, size, .. } = entry else {
+        return None;
+    };
+    if *size == 0 {
+        return None;
+    }
+    Some(SearchNotesReq {
+        target: NodeId::from_str(target).ok()?,
+        size: *size,
+    })
+}
+
 fn seconds(value: u64) -> TimeDelta {
     TimeDelta::seconds(i64::try_from(value).unwrap_or(i64::MAX))
 }
@@ -396,6 +479,20 @@ fn candidate_cmp(
 fn source_candidate_cmp(
     left: &ReplayCandidate<SearchSourceReq>,
     right: &ReplayCandidate<SearchSourceReq>,
+) -> std::cmp::Ordering {
+    right
+        .observed_after_outcome
+        .cmp(&left.observed_after_outcome)
+        .then_with(|| left.zero_result_streak.cmp(&right.zero_result_streak))
+        .then_with(|| right.last_result_count.cmp(&left.last_result_count))
+        .then_with(|| right.hit_count.cmp(&left.hit_count))
+        .then_with(|| right.last_seen.cmp(&left.last_seen))
+        .then_with(|| left.scheduled.logical_key.cmp(&right.scheduled.logical_key))
+}
+
+fn notes_candidate_cmp(
+    left: &ReplayCandidate<SearchNotesReq>,
+    right: &ReplayCandidate<SearchNotesReq>,
 ) -> std::cmp::Ordering {
     right
         .observed_after_outcome
@@ -429,7 +526,7 @@ fn replay_cooldown_cutoff(
 mod tests {
     use chrono::{TimeZone, Utc};
     use overlord_agent_common::SnoopEntry;
-    use overlord_kad_proto::{SearchKeyReq, SearchSourceReq};
+    use overlord_kad_proto::{SearchKeyReq, SearchNotesReq, SearchSourceReq};
 
     use super::{ScheduledSnoopRequest, SnoopQueue, SnoopQueueFamilyCounts};
     use crate::config::SnoopQueueConfig;
@@ -575,6 +672,29 @@ mod tests {
                 request: SearchSourceReq {
                     target: "00112233445566778899aabbccddeeff".parse().unwrap(),
                     start_position: 0x8000,
+                    size: 4096,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn notes_drain_selects_notes_entries_with_size_shape() {
+        let mut queue = queue();
+        queue.record(notes_entry(
+            "notes:00112233445566778899aabbccddeeff:4096",
+            "00112233445566778899aabbccddeeff",
+            4096,
+            110,
+        ));
+
+        let selected = queue.select_next_notes_request(ts(130));
+        assert_eq!(
+            selected,
+            Some(ScheduledSnoopRequest {
+                logical_key: "notes:00112233445566778899aabbccddeeff:4096".to_string(),
+                request: SearchNotesReq {
+                    target: "00112233445566778899aabbccddeeff".parse().unwrap(),
                     size: 4096,
                 },
             })

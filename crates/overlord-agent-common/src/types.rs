@@ -252,6 +252,7 @@ pub struct KadHarvestObservability {
     pub notes_requests: KadHarvestFamilyObservability,
     pub passive_keyword_replay: KadPassiveReplayObservability,
     pub passive_source_replay: KadPassiveReplayObservability,
+    pub passive_notes_replay: KadPassiveReplayObservability,
 }
 
 /// Kad search-request family observed on the wire.
