@@ -68,7 +68,10 @@ use crate::logging::current_log_file_status;
 use crate::snoop_queue::{ScheduledSnoopRequest, SnoopQueue, SnoopQueueFamilyCounts};
 
 const ACTIVE_BATCH_SIZE: usize = 25;
-const PASSIVE_BATCH_SIZE: usize = 50;
+/// Large passive harvest floods should be posted in bigger coordinator batches
+/// than user-facing active searches. This reduces local callback overhead
+/// without changing any Kad outbound behavior.
+const PASSIVE_BATCH_SIZE: usize = 200;
 const BOOTSTRAP_RETRY_SECS: u64 = 30;
 #[cfg(not(test))]
 const COORDINATOR_RECONNECT_SECS: u64 = 30;

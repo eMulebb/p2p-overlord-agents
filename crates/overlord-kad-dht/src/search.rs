@@ -12,6 +12,12 @@ use tokio_util::sync::CancellationToken;
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(SEARCH_TIMEOUT_SECS);
+/// Buffer used between traversal SEARCH_RES ingestion and higher-level search consumers.
+///
+/// Large passive harvest bursts can deliver many consecutive SEARCH_RES pages
+/// from one peer. Keeping this buffer comfortably above one page train avoids
+/// turning inbound harvest volume into backpressure on the traversal loop.
+const SEARCH_RESULT_STREAM_BUFFER: usize = 2048;
 
 /// Run a keyword search. Returns a Stream of results.
 pub fn search_keywords(
@@ -45,9 +51,10 @@ pub fn search_keywords_by_request(
     phase2_fanout: usize,
     cancel: CancellationToken,
 ) -> impl tokio_stream::Stream<Item = SearchResult> + Send + 'static {
-    let (tx, rx) = mpsc::channel::<SearchResult>(256);
+    let (tx, rx) = mpsc::channel::<SearchResult>(SEARCH_RESULT_STREAM_BUFFER);
     tokio::spawn(async move {
-        let (raw_tx, mut raw_rx) = mpsc::channel::<(Ed2kHash, Vec<overlord_kad_proto::Tag>)>(256);
+        let (raw_tx, mut raw_rx) =
+            mpsc::channel::<(Ed2kHash, Vec<overlord_kad_proto::Tag>)>(SEARCH_RESULT_STREAM_BUFFER);
         let config = TraversalConfig {
             target: request.target,
             search_kind: TraversalKind::Keyword { request },
@@ -103,11 +110,12 @@ pub fn search_sources(
     phase2_fanout: usize,
     cancel: CancellationToken,
 ) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
-    let (tx, rx) = mpsc::channel::<SourceResult>(256);
+    let (tx, rx) = mpsc::channel::<SourceResult>(SEARCH_RESULT_STREAM_BUFFER);
     let target = NodeId::from_bytes(file_hash.0);
 
     tokio::spawn(async move {
-        let (raw_tx, mut raw_rx) = mpsc::channel::<(Ed2kHash, Vec<overlord_kad_proto::Tag>)>(256);
+        let (raw_tx, mut raw_rx) =
+            mpsc::channel::<(Ed2kHash, Vec<overlord_kad_proto::Tag>)>(SEARCH_RESULT_STREAM_BUFFER);
         let config = TraversalConfig {
             target,
             search_kind: TraversalKind::Source { size: file_size },
@@ -163,11 +171,12 @@ pub fn search_notes(
     phase2_fanout: usize,
     cancel: CancellationToken,
 ) -> impl tokio_stream::Stream<Item = NoteResult> + Send + 'static {
-    let (tx, rx) = mpsc::channel::<NoteResult>(256);
+    let (tx, rx) = mpsc::channel::<NoteResult>(SEARCH_RESULT_STREAM_BUFFER);
     let target = NodeId::from_bytes(file_hash.0);
 
     tokio::spawn(async move {
-        let (raw_tx, mut raw_rx) = mpsc::channel::<(Ed2kHash, Vec<overlord_kad_proto::Tag>)>(256);
+        let (raw_tx, mut raw_rx) =
+            mpsc::channel::<(Ed2kHash, Vec<overlord_kad_proto::Tag>)>(SEARCH_RESULT_STREAM_BUFFER);
         let config = TraversalConfig {
             target,
             search_kind: TraversalKind::Notes { size: file_size },

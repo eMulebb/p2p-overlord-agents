@@ -69,7 +69,11 @@ pub struct TraversalConfig {
 pub struct TraversalResult {
     /// K closest nodes that responded.
     pub closest: Vec<TraversalContact>,
-    /// Raw SEARCH_RES entries collected (for search operations).
+    /// Raw SEARCH_RES entries collected for non-streaming callers.
+    ///
+    /// Stream-based search APIs consume results directly from `result_tx`, so
+    /// they intentionally leave this buffer empty to avoid duplicating every
+    /// inbound result page in memory.
     pub search_entries: Vec<(Ed2kHash, Vec<overlord_kad_proto::Tag>)>,
 }
 
@@ -394,6 +398,7 @@ async fn run_search_phase(
     let mut queried_addrs = HashSet::new();
     let mut pending_contacts = send_to.into_iter().collect::<VecDeque<_>>();
     let mut search_entries = Vec::new();
+    let should_collect_search_entries = result_tx.is_none();
     let result_tx = result_tx;
     let mut next_emit_at = compute_initial_jumpstart_emit_at(
         last_lookup_response_at,
@@ -421,6 +426,7 @@ async fn run_search_phase(
             target,
             &queried_addrs,
             &result_tx,
+            should_collect_search_entries,
             &mut search_entries,
         )
         .await;
@@ -485,6 +491,7 @@ fn compute_initial_jumpstart_emit_at(
 }
 
 /// Drain unsolicited packets until the next jump-start emit slot or overall deadline.
+#[allow(clippy::too_many_arguments)]
 async fn collect_search_results_until(
     unsolicited: &mut tokio::sync::broadcast::Receiver<overlord_kad_net::ReceivedKadPacket>,
     cancel: &CancellationToken,
@@ -492,6 +499,7 @@ async fn collect_search_results_until(
     target: NodeId,
     queried_addrs: &HashSet<SocketAddr>,
     result_tx: &Option<mpsc::Sender<(Ed2kHash, Vec<Tag>)>>,
+    collect_search_entries: bool,
     search_entries: &mut Vec<(Ed2kHash, Vec<Tag>)>,
 ) {
     loop {
@@ -533,7 +541,9 @@ async fn collect_search_results_until(
                     if let Some(tx) = result_tx.as_ref() {
                         let _ = tx.send((entry.hash, entry.tags.clone())).await;
                     }
-                    search_entries.push((entry.hash, entry.tags));
+                    if collect_search_entries {
+                        search_entries.push((entry.hash, entry.tags));
+                    }
                 }
             }
             Ok(Ok(overlord_kad_net::ReceivedKadPacket {
@@ -967,7 +977,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(search_entries.len(), 2);
+        assert!(
+            search_entries.is_empty(),
+            "streaming searches should not duplicate raw SEARCH_RES storage"
+        );
         let streamed_first = result_rx.recv().await.expect("first streamed result");
         let streamed_second = result_rx.recv().await.expect("second streamed result");
         assert_eq!(streamed_first.0, Ed2kHash::from_bytes([1; 16]));
