@@ -6,6 +6,8 @@
 //! `ServerSocket` flow that matter for parity today:
 //! - connect from the VPN-bound interface to one configured ED2K server
 //! - send an oracle-shaped `OP_LOGINREQUEST`
+//! - advertise one minimal shared file before searching, matching the oracle's
+//!   initial `OP_OFFERFILES` session shape closely enough for parity
 //! - process `OP_IDCHANGE`, `OP_SERVERSTATUS`, and a few informational replies
 //! - keep the TCP session alive with empty `OP_OFFERFILES` packets
 
@@ -15,7 +17,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -28,12 +30,14 @@ use rand::{Rng, RngCore};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpSocket, TcpStream, lookup_host},
-    sync::{Mutex, RwLock},
+    sync::{Mutex, RwLock, mpsc, oneshot},
     time::Instant as TokioInstant,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use overlord_agent_nat::NatManager;
+use overlord_kad_proto::Ed2kHash;
 
 use crate::{
     config::{Ed2kConfig, Ed2kServerEntry},
@@ -45,6 +49,7 @@ const OP_EDONKEYPROT: u8 = 0xE3;
 const OP_EMULEPROT: u8 = 0xC5;
 const OP_LOGINREQUEST: u8 = 0x01;
 const OP_REJECT: u8 = 0x05;
+#[cfg(test)]
 const OP_GETSERVERLIST: u8 = 0x14;
 const OP_OFFERFILES: u8 = 0x15;
 const OP_SEARCHREQUEST: u8 = 0x16;
@@ -105,6 +110,21 @@ const SERVER_UDP_FLAG_TCPOBFUSCATION: u32 = 0x0000_0400;
 const ST_SERVERNAME: u8 = 0x01;
 const ST_DESCRIPTION: u8 = 0x0B;
 const FT_FILENAME: u8 = 0x01;
+const FT_FILESIZE: u8 = 0x02;
+const FT_FILETYPE: u8 = 0x03;
+const FT_SOURCES: u8 = 0x15;
+const FT_FILESIZE_HI: u8 = 0x3A;
+const ED2K_FILETYPE_PROGRAM: u8 = 0x04;
+
+const OFFER_FILE_COMPLETE_SENTINEL_CLIENT_ID: u32 = 0xFBFB_FBFB;
+const OFFER_FILE_COMPLETE_SENTINEL_CLIENT_PORT: u16 = 0xFBFB;
+const OFFER_FILE_SAMPLE_HASH: [u8; 16] = [
+    0x9F, 0x3C, 0x23, 0xDB, 0x76, 0x51, 0xEF, 0xBA, 0xC9, 0xA8, 0x37, 0xA8, 0xA0, 0xAE, 0x3E, 0xD9,
+];
+const OFFER_FILE_SAMPLE_NAME: &str = "ubuntu-linux-oracle-sample.iso";
+const OFFER_FILE_SAMPLE_SIZE: u32 = 0x0020_0000;
+const OFFER_FILE_SEARCH_SETTLE_DELAY: Duration = Duration::from_millis(80);
+static NEXT_SERVER_SESSION_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 
 const EMULE_TCP_CRYPT_MAGIC_REQUESTER: u8 = 34;
 const EMULE_TCP_CRYPT_MAGIC_SERVER: u8 = 203;
@@ -198,10 +218,17 @@ struct ServerSession {
     stream: TcpStream,
     endpoint: SocketAddr,
     state: Arc<RwLock<Ed2kServerState>>,
+    trace_id: u64,
+    trace_role: &'static str,
     last_tx: Instant,
     receive_cipher: Option<Rc4KeyStream>,
     send_cipher: Option<Rc4KeyStream>,
+    login_accepted: bool,
     probe_search_sent: bool,
+    offer_files_sent: bool,
+    offer_files_sent_at: Option<Instant>,
+    assigned_client_id: Option<u32>,
+    server_flags: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -309,10 +336,109 @@ struct CallbackRequest {
     user_hash: Option<[u8; 16]>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SearchResultSummary {
     count: u32,
     sample_names: Vec<String>,
+}
+
+/// One decoded ED2K server search result entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ed2kSearchFile {
+    /// File hash reported by the ED2K server.
+    pub file_hash: Ed2kHash,
+    /// File name tag, when present.
+    pub file_name: Option<String>,
+    /// File size tag, when present.
+    pub file_size: Option<u64>,
+    /// ED2K file-type tag, when present.
+    pub file_type: Option<String>,
+    /// Server-reported source availability, when present.
+    pub source_count: Option<u32>,
+}
+
+type BackgroundKeywordSearchResponse = std::result::Result<Vec<Ed2kSearchFile>, String>;
+
+/// Handle used by active jobs to execute a keyword search through the
+/// long-lived ED2K background session.
+#[derive(Clone)]
+pub struct Ed2kServerSearchHandle {
+    sender: mpsc::Sender<BackgroundKeywordSearchRequest>,
+}
+
+/// Inbox owned by the long-lived ED2K background server task.
+pub struct Ed2kServerSearchInbox {
+    receiver: mpsc::Receiver<BackgroundKeywordSearchRequest>,
+}
+
+#[derive(Debug)]
+struct BackgroundKeywordSearchRequest {
+    query: String,
+    timeout: Duration,
+    response: oneshot::Sender<BackgroundKeywordSearchResponse>,
+}
+
+#[derive(Debug)]
+struct PendingBackgroundKeywordSearch {
+    query: String,
+    deadline: TokioInstant,
+    response: oneshot::Sender<BackgroundKeywordSearchResponse>,
+}
+
+/// Creates a bounded request channel for background-session ED2K keyword searches.
+#[must_use]
+pub fn new_ed2k_server_search_channel(
+    capacity: usize,
+) -> (Ed2kServerSearchHandle, Ed2kServerSearchInbox) {
+    let (sender, receiver) = mpsc::channel(capacity.max(1));
+    (
+        Ed2kServerSearchHandle { sender },
+        Ed2kServerSearchInbox { receiver },
+    )
+}
+
+/// Requests a keyword search on the already-connected ED2K background session.
+///
+/// This keeps active jobs on the same server TCP session shape as the oracle
+/// whenever that long-lived session is healthy.
+pub async fn search_keyword_via_background_session(
+    handle: &Ed2kServerSearchHandle,
+    query: &str,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<Vec<Ed2kSearchFile>> {
+    let (response, receive_response) = oneshot::channel();
+    handle
+        .sender
+        .send(BackgroundKeywordSearchRequest {
+            query: query.to_string(),
+            timeout,
+            response,
+        })
+        .await
+        .context("ED2K background search channel is closed")?;
+
+    tokio::select! {
+        _ = cancel.cancelled() => Ok(Vec::new()),
+        result = tokio::time::timeout(timeout, receive_response) => {
+            let response = result
+                .with_context(|| format!("timed out waiting for ED2K background search response after {timeout:?}"))?
+                .context("ED2K background search responder dropped")?;
+            response.map_err(anyhow::Error::msg)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum DecodedTagValue {
+    String(String),
+    Unsigned(u64),
+    Bool(bool),
+    Float32(f32),
+    Hash([u8; 16]),
+    Blob(Vec<u8>),
+    BoolArray(Vec<u8>),
 }
 
 /// Returns whether the agent should start an ED2K server session with TCP
@@ -330,6 +456,7 @@ impl ServerSession {
         bind_ip: Ipv4Addr,
         endpoint: SocketAddr,
         state: Arc<RwLock<Ed2kServerState>>,
+        trace_role: &'static str,
         timeout: Duration,
     ) -> Result<Self> {
         let socket = TcpSocket::new_v4().context("failed to create ED2K server TCP socket")?;
@@ -342,19 +469,36 @@ impl ServerSession {
         stream
             .set_nodelay(true)
             .with_context(|| format!("failed to enable TCP_NODELAY for ED2K server {endpoint}"))?;
+        let trace_id = NEXT_SERVER_SESSION_TRACE_ID.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             stream,
             endpoint,
             state,
+            trace_id,
+            trace_role,
             last_tx: Instant::now(),
             receive_cipher: None,
             send_cipher: None,
+            login_accepted: false,
             probe_search_sent: false,
+            offer_files_sent: false,
+            offer_files_sent_at: None,
+            assigned_client_id: None,
+            server_flags: None,
         })
     }
 
     async fn send_packet(&mut self, opcode: u8, payload: &[u8]) -> Result<()> {
         let mut packet = encode_packet(opcode, payload);
+        debug!(
+            "ED2K trace id={} role={} dir=tx endpoint={} opcode=0x{:02X} payload_len={} wire_len={}",
+            self.trace_id,
+            self.trace_role,
+            self.endpoint,
+            opcode,
+            payload.len(),
+            packet.len()
+        );
         if let Some(cipher) = self.send_cipher.as_mut() {
             cipher.apply(&mut packet);
         }
@@ -481,7 +625,13 @@ impl ServerSession {
         let mut header = [0u8; TCP_PACKET_HEADER_LEN];
         match self.stream.read_exact(&mut header).await {
             Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                debug!(
+                    "ED2K trace id={} role={} dir=rx endpoint={} eof=true",
+                    self.trace_id, self.trace_role, self.endpoint
+                );
+                return Ok(None);
+            }
             Err(error) => return Err(error.into()),
         }
         if let Some(cipher) = self.receive_cipher.as_mut() {
@@ -510,6 +660,15 @@ impl ServerSession {
         let payload = decode_server_payload(header[0], payload).with_context(|| {
             format!("failed to decode ED2K server packet from {}", self.endpoint)
         })?;
+        debug!(
+            "ED2K trace id={} role={} dir=rx endpoint={} prot=0x{:02X} opcode=0x{:02X} payload_len={}",
+            self.trace_id,
+            self.trace_role,
+            self.endpoint,
+            header[0],
+            header[5],
+            payload.len()
+        );
         Ok(Some(Ed2kPacket {
             opcode: header[5],
             payload,
@@ -518,12 +677,14 @@ impl ServerSession {
 }
 
 /// Runs the minimal oracle-shaped ED2K server session loop for the configured endpoints.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_ed2k_server_loop(
     bind_ip: Ipv4Addr,
     nat: Arc<NatManager>,
     config: Ed2kConfig,
     hello_identity: Ed2kHelloIdentity,
     state: Arc<RwLock<Ed2kServerState>>,
+    mut search_inbox: Ed2kServerSearchInbox,
     kad_firewall: Arc<Mutex<KadFirewallState>>,
     shutdown: Arc<AtomicBool>,
 ) {
@@ -565,7 +726,9 @@ pub async fn run_ed2k_server_loop(
             attempted_any = true;
             match resolve_server_entry(configured_server).await {
                 Ok(server) => {
-                    if let Err(error) = run_one_server_session(&server, &session_context).await {
+                    if let Err(error) =
+                        run_one_server_session(&server, &session_context, &mut search_inbox).await
+                    {
                         clear_server_connection_state(&state).await;
                         warn!(
                             "ED2K server session ended for {} name={}: {error}",
@@ -597,14 +760,18 @@ pub async fn run_ed2k_server_loop(
 async fn run_one_server_session(
     server: &ResolvedServerEntry,
     context: &ServerSessionContext,
+    search_inbox: &mut Ed2kServerSearchInbox,
 ) -> Result<()> {
     let use_server_obfuscation =
         should_use_server_obfuscation(context.hello_identity.connect_options, server);
+    let login_identity =
+        login_identity_for_server_transport(context.hello_identity, use_server_obfuscation);
     let transport_endpoint = server.transport_endpoint(use_server_obfuscation);
     let mut session = ServerSession::connect(
         context.bind_ip,
         transport_endpoint,
         Arc::clone(&context.state),
+        "background",
         context.connect_timeout,
     )
     .await?;
@@ -618,11 +785,12 @@ async fn run_one_server_session(
 
     let nat_status = context.nat.status().await;
     let observed_external_ip = nat_status.observed_external_addresses.first().cloned();
-    let login_payload = encode_login_request(context.hello_identity);
+    let login_payload = encode_login_request(login_identity);
     info!(
-        "connected to ED2K server {} name={} bind_ip={} observed_external_ip={} transport={} connect_options={} supports_obf_tcp={} obf_port={} udp_flags=0x{:08X} udp_key_present={} chosen_port={}",
+        "connected to ED2K server {} name={} trace_id={} role=background bind_ip={} observed_external_ip={} transport={} connect_options={} supports_obf_tcp={} obf_port={} udp_flags=0x{:08X} udp_key_present={} chosen_port={}",
         server.base_endpoint(),
         server.entry.display_name(),
+        session.trace_id,
         context.bind_ip,
         observed_external_ip.as_deref().unwrap_or("unknown"),
         if use_server_obfuscation {
@@ -630,7 +798,7 @@ async fn run_one_server_session(
         } else {
             "plaintext"
         },
-        format_connect_options(context.hello_identity.connect_options),
+        format_connect_options(login_identity.connect_options),
         server.entry.supports_obfuscation_tcp(),
         server.entry.obfuscation_port_tcp,
         server.entry.udp_flags,
@@ -648,9 +816,19 @@ async fn run_one_server_session(
     let rotation_deadline = context
         .rotation_interval
         .map(|interval| TokioInstant::now() + interval);
+    let mut queued_background_search = None;
+    let mut pending_background_search = None;
 
     loop {
         if context.shutdown.load(Ordering::Relaxed) {
+            fail_background_search_request(
+                &mut queued_background_search,
+                "ED2K background session is shutting down before search dispatch",
+            );
+            fail_pending_background_search(
+                &mut pending_background_search,
+                "ED2K background session is shutting down before search completion",
+            );
             clear_server_connection_state(&context.state).await;
             return Ok(());
         }
@@ -663,6 +841,14 @@ async fn run_one_server_session(
                     std::future::pending::<()>().await;
                 }
             } => {
+                fail_background_search_request(
+                    &mut queued_background_search,
+                    "ED2K background session rotated before search dispatch",
+                );
+                fail_pending_background_search(
+                    &mut pending_background_search,
+                    "ED2K background session rotated before search completion",
+                );
                 info!(
                     "rotating ED2K server session from {} after {:?}",
                     server.base_endpoint(),
@@ -671,14 +857,85 @@ async fn run_one_server_session(
                 clear_server_connection_state(&context.state).await;
                 return Ok(());
             }
+            request = search_inbox.receiver.recv(), if queued_background_search.is_none() && pending_background_search.is_none() => {
+                if let Some(request) = request {
+                    if session.login_accepted {
+                        match start_background_keyword_search(&mut session, request).await {
+                            Ok(pending) => pending_background_search = Some(pending),
+                            Err(error) => warn!("failed to start ED2K background keyword search on {}: {error}", server.base_endpoint()),
+                        }
+                    } else {
+                        info!(
+                            "queued ED2K background keyword search query={:?} endpoint={} trace_id={} awaiting login",
+                            request.query,
+                            session.endpoint,
+                            session.trace_id
+                        );
+                        queued_background_search = Some(request);
+                    }
+                }
+            }
+            _ = async {
+                if let Some(pending) = pending_background_search.as_ref() {
+                    tokio::time::sleep_until(pending.deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }, if pending_background_search.is_some() => {
+                fail_pending_background_search(
+                    &mut pending_background_search,
+                    "ED2K background session search timed out waiting for OP_SEARCHRESULT",
+                );
+            }
             packet = session.read_packet() => {
                 let Some(packet) = packet? else {
-                    anyhow::bail!(
+                    let closed_error = format!(
                         "ED2K server {} closed the connection",
                         server.base_endpoint()
                     );
+                    fail_background_search_request(
+                        &mut queued_background_search,
+                        &format!("{closed_error} before search dispatch"),
+                    );
+                    fail_pending_background_search(
+                        &mut pending_background_search,
+                        &format!("{closed_error} before search completion"),
+                    );
+                    anyhow::bail!(
+                        "{closed_error}"
+                    );
                 };
-                handle_server_packet(&mut session, packet, context).await?;
+                if packet.opcode == OP_SEARCHRESULT
+                    && let Some(pending) = pending_background_search.take()
+                {
+                    let results = decode_search_result_files(&packet.payload)?;
+                    log_search_result_page(session.endpoint, &results);
+                    info!(
+                        "completed ED2K background keyword search query={:?} endpoint={} trace_id={} result_count={}",
+                        pending.query,
+                        session.endpoint,
+                        session.trace_id,
+                        results.len()
+                    );
+                    let _ = pending.response.send(Ok(results));
+                    continue;
+                }
+                handle_server_packet(
+                    &mut session,
+                    packet,
+                    context,
+                    queued_background_search.is_none() && pending_background_search.is_none(),
+                )
+                .await?;
+                if session.login_accepted
+                    && pending_background_search.is_none()
+                    && let Some(request) = queued_background_search.take()
+                {
+                    match start_background_keyword_search(&mut session, request).await {
+                        Ok(pending) => pending_background_search = Some(pending),
+                        Err(error) => warn!("failed to start ED2K background keyword search on {}: {error}", server.base_endpoint()),
+                    }
+                }
             }
             _ = tokio::time::sleep(context.keepalive_interval) => {
                 if session.last_tx.elapsed() >= context.keepalive_interval {
@@ -690,17 +947,251 @@ async fn run_one_server_session(
     }
 }
 
+/// Executes a one-shot ED2K keyword search against the configured servers.
+///
+/// This is a staging path used by active `SearchJob`s before the fuller ED2K
+/// server connection pool exists. The function prefers the currently connected
+/// background server when one is available, caps how many configured servers it
+/// will probe, and returns the first non-empty result page it receives.
+pub async fn search_keyword_servers(
+    bind_ip: Ipv4Addr,
+    config: &Ed2kConfig,
+    hello_identity: Ed2kHelloIdentity,
+    preferred_endpoint: Option<SocketAddr>,
+    max_attempts: usize,
+    query: &str,
+    cancel: &CancellationToken,
+) -> Result<Vec<Ed2kSearchFile>> {
+    let mut configured_servers = configured_server_entries(config)?;
+    if configured_servers.is_empty() {
+        anyhow::bail!("ED2K keyword search requires at least one configured server");
+    }
+    if let Some(preferred_endpoint) = preferred_endpoint
+        && let Some(index) = configured_servers.iter().position(|entry| {
+            entry.host == preferred_endpoint.ip().to_string()
+                && entry.port == preferred_endpoint.port()
+        })
+    {
+        let preferred = configured_servers.remove(index);
+        configured_servers.insert(0, preferred);
+    }
+
+    let search_payload = encode_search_request(query)?;
+    if search_payload.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let idle_timeout = Duration::from_secs(config.connect_timeout_secs.max(5));
+    let mut last_error = None;
+
+    for (attempt_index, configured_server) in configured_servers
+        .into_iter()
+        .take(max_attempts.max(1))
+        .enumerate()
+    {
+        if cancel.is_cancelled() {
+            return Ok(Vec::new());
+        }
+
+        let resolved_server = match resolve_server_entry(&configured_server).await {
+            Ok(server) => server,
+            Err(error) => {
+                warn!(
+                    "failed to resolve ED2K search server {} name={}: {error}",
+                    configured_server.base_endpoint_text(),
+                    configured_server.display_name()
+                );
+                last_error = Some(error);
+                continue;
+            }
+        };
+        info!(
+            "ED2K keyword search attempt={}/{} endpoint={} name={}",
+            attempt_index + 1,
+            max_attempts.max(1),
+            resolved_server.base_endpoint(),
+            resolved_server.entry.display_name()
+        );
+
+        match search_keyword_on_server(
+            bind_ip,
+            &resolved_server,
+            hello_identity,
+            &search_payload,
+            idle_timeout,
+            cancel,
+        )
+        .await
+        {
+            Ok(results) if !results.is_empty() => return Ok(results),
+            Ok(_) => continue,
+            Err(error) => {
+                warn!(
+                    "ED2K keyword search failed for {} name={}: {error}",
+                    resolved_server.base_endpoint(),
+                    resolved_server.entry.display_name()
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+
+    if let Some(error) = last_error {
+        return Err(error);
+    }
+
+    Ok(Vec::new())
+}
+
+async fn search_keyword_on_server(
+    bind_ip: Ipv4Addr,
+    server: &ResolvedServerEntry,
+    hello_identity: Ed2kHelloIdentity,
+    search_payload: &[u8],
+    idle_timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<Vec<Ed2kSearchFile>> {
+    let use_server_obfuscation =
+        should_use_server_obfuscation(hello_identity.connect_options, server);
+    let login_identity =
+        login_identity_for_server_transport(hello_identity, use_server_obfuscation);
+    let transport_endpoint = server.transport_endpoint(use_server_obfuscation);
+    let mut session = ServerSession::connect(
+        bind_ip,
+        transport_endpoint,
+        Arc::new(RwLock::new(Ed2kServerState::default())),
+        "active_search",
+        idle_timeout,
+    )
+    .await?;
+    info!(
+        "ED2K active search session connected trace_id={} endpoint={} transport={} query_len={}",
+        session.trace_id,
+        transport_endpoint,
+        if use_server_obfuscation {
+            "obfuscated"
+        } else {
+            "plaintext"
+        },
+        search_payload.len()
+    );
+    let login_request = encode_packet(OP_LOGINREQUEST, &encode_login_request(login_identity));
+    if use_server_obfuscation {
+        session
+            .negotiate_obfuscation_and_send(&login_request)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to negotiate ED2K server obfuscation with {}",
+                    transport_endpoint
+                )
+            })?;
+    } else {
+        session
+            .stream
+            .write_all(&login_request)
+            .await
+            .with_context(|| {
+                format!("failed to send ED2K server login request to {transport_endpoint}")
+            })?;
+    }
+    session.last_tx = Instant::now();
+
+    let mut results = Vec::new();
+    let mut login_accepted = false;
+    let mut search_sent = false;
+
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(Vec::new());
+        }
+
+        let packet = tokio::time::timeout(idle_timeout, session.read_packet())
+            .await
+            .with_context(|| {
+                format!("timed out waiting for ED2K server search reply from {transport_endpoint}")
+            })??;
+        let Some(packet) = packet else {
+            break;
+        };
+
+        match packet.opcode {
+            OP_IDCHANGE => {
+                if packet.payload.len() < 4 {
+                    anyhow::bail!("short OP_IDCHANGE payload from {transport_endpoint}");
+                }
+                session.assigned_client_id =
+                    Some(u32::from_le_bytes(packet.payload[..4].try_into().unwrap()));
+                session.server_flags = (packet.payload.len() >= 8)
+                    .then(|| u32::from_le_bytes(packet.payload[4..8].try_into().unwrap()));
+                send_offer_files_advertisement(&mut session, hello_identity.tcp_port).await?;
+                login_accepted = true;
+            }
+            OP_SERVERMESSAGE | OP_SERVERIDENT | OP_SERVERLIST => {
+                if login_accepted && !search_sent {
+                    wait_for_offer_files_settle(&session).await;
+                    session
+                        .send_packet(OP_SEARCHREQUEST, search_payload)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to send ED2K keyword search request to {transport_endpoint}"
+                            )
+                        })?;
+                    search_sent = true;
+                }
+            }
+            OP_SEARCHRESULT => {
+                let mut page = decode_search_result_files(&packet.payload)?;
+                results.append(&mut page);
+            }
+            OP_REJECT => {
+                anyhow::bail!("ED2K server {transport_endpoint} rejected the search session");
+            }
+            _ => {}
+        }
+
+        if search_sent && !results.is_empty() {
+            break;
+        }
+    }
+
+    Ok(results)
+}
+
+async fn maybe_send_probe_search(
+    session: &mut ServerSession,
+    context: &ServerSessionContext,
+) -> Result<()> {
+    if !session.login_accepted || session.probe_search_sent {
+        return Ok(());
+    }
+    let Some(term) = context.probe_search_term.as_deref() else {
+        return Ok(());
+    };
+    let search_payload = encode_search_request(term)?;
+    if search_payload.is_empty() {
+        return Ok(());
+    }
+    wait_for_offer_files_settle(session).await;
+    session
+        .send_packet(OP_SEARCHREQUEST, &search_payload)
+        .await?;
+    session.probe_search_sent = true;
+    info!(
+        "sent ED2K server search probe term={term:?} endpoint={}",
+        session.endpoint
+    );
+    Ok(())
+}
+
 async fn handle_server_packet(
     session: &mut ServerSession,
     packet: Ed2kPacket,
     context: &ServerSessionContext,
+    allow_probe_search: bool,
 ) -> Result<()> {
     match packet.opcode {
-        OP_SERVERMESSAGE => {
-            if let Some(message) = decode_ed2k_string(&packet.payload)? {
-                info!("ED2K server message from {}: {}", session.endpoint, message);
-            }
-        }
         OP_IDCHANGE => {
             if packet.payload.len() < 4 {
                 anyhow::bail!("short OP_IDCHANGE payload from {}", session.endpoint);
@@ -728,35 +1219,14 @@ async fn handle_server_packet(
                     .map(|ip| ip.to_string())
                     .unwrap_or_else(|| "unknown".to_string())
             );
-            session.send_packet(OP_GETSERVERLIST, &[]).await?;
-            if !session.probe_search_sent
-                && let Some(term) = context.probe_search_term.as_deref()
-            {
-                let search_payload = encode_search_request(term)?;
-                if !search_payload.is_empty() {
-                    session
-                        .send_packet(OP_SEARCHREQUEST, &search_payload)
-                        .await?;
-                    session.probe_search_sent = true;
-                    info!(
-                        "sent ED2K server search probe term={term:?} endpoint={}",
-                        session.endpoint
-                    );
-                }
-            }
+            session.assigned_client_id = Some(client_id);
+            session.server_flags = server_flags;
+            session.login_accepted = true;
+            send_offer_files_advertisement(session, context.hello_identity.tcp_port).await?;
         }
         OP_SEARCHRESULT => {
-            let summary = decode_search_results(&packet.payload)?;
-            info!(
-                "ED2K search results from {}: count={} sample_names={}",
-                session.endpoint,
-                summary.count,
-                if summary.sample_names.is_empty() {
-                    "-".to_string()
-                } else {
-                    summary.sample_names.join(" | ")
-                }
-            );
+            let results = decode_search_result_files(&packet.payload)?;
+            log_search_result_page(session.endpoint, &results);
         }
         OP_SERVERSTATUS => {
             if packet.payload.len() >= 8 {
@@ -790,6 +1260,9 @@ async fn handle_server_packet(
                 name.as_deref().unwrap_or("-"),
                 description.as_deref().unwrap_or("-")
             );
+            if allow_probe_search {
+                maybe_send_probe_search(session, context).await?;
+            }
         }
         OP_SERVERLIST => {
             let count = packet.payload.first().copied().unwrap_or_default();
@@ -797,6 +1270,17 @@ async fn handle_server_packet(
                 "ED2K server {} returned {} server list entries",
                 session.endpoint, count
             );
+            if allow_probe_search {
+                maybe_send_probe_search(session, context).await?;
+            }
+        }
+        OP_SERVERMESSAGE => {
+            if let Some(message) = decode_ed2k_string(&packet.payload)? {
+                info!("ED2K server message from {}: {}", session.endpoint, message);
+            }
+            if allow_probe_search {
+                maybe_send_probe_search(session, context).await?;
+            }
         }
         OP_CALLBACKREQUESTED => {
             if let Some(callback) = decode_callback_request(&packet.payload)? {
@@ -864,6 +1348,66 @@ async fn handle_server_packet(
         }
     }
     Ok(())
+}
+
+fn fail_background_search_request(
+    request: &mut Option<BackgroundKeywordSearchRequest>,
+    error: &str,
+) {
+    if let Some(request) = request.take() {
+        let _ = request.response.send(Err(error.to_string()));
+    }
+}
+
+fn fail_pending_background_search(
+    request: &mut Option<PendingBackgroundKeywordSearch>,
+    error: &str,
+) {
+    if let Some(request) = request.take() {
+        let _ = request.response.send(Err(error.to_string()));
+    }
+}
+
+async fn start_background_keyword_search(
+    session: &mut ServerSession,
+    request: BackgroundKeywordSearchRequest,
+) -> Result<PendingBackgroundKeywordSearch> {
+    let search_payload = encode_search_request(&request.query)?;
+    if search_payload.is_empty() {
+        let _ = request.response.send(Ok(Vec::new()));
+        anyhow::bail!("ED2K background keyword search payload was unexpectedly empty");
+    }
+    wait_for_offer_files_settle(session).await;
+    session
+        .send_packet(OP_SEARCHREQUEST, &search_payload)
+        .await?;
+    info!(
+        "sent ED2K background keyword search query={:?} endpoint={} trace_id={} role={}",
+        request.query, session.endpoint, session.trace_id, session.trace_role
+    );
+    Ok(PendingBackgroundKeywordSearch {
+        query: request.query,
+        deadline: TokioInstant::now() + request.timeout,
+        response: request.response,
+    })
+}
+
+fn log_search_result_page(endpoint: SocketAddr, results: &[Ed2kSearchFile]) {
+    let sample_names = results
+        .iter()
+        .filter_map(|file| file.file_name.as_deref())
+        .take(3)
+        .collect::<Vec<_>>();
+    info!(
+        "ED2K search results from {}: count={} sample_names={}",
+        endpoint,
+        results.len(),
+        if sample_names.is_empty() {
+            "-".to_string()
+        } else {
+            sample_names.join(" | ")
+        }
+    );
 }
 
 fn decode_callback_request(payload: &[u8]) -> Result<Option<CallbackRequest>> {
@@ -947,33 +1491,64 @@ fn encode_login_request(identity: Ed2kHelloIdentity) -> Vec<u8> {
 }
 
 fn encode_search_request(term: &str) -> Result<Vec<u8>> {
-    let terms: Vec<&str> = term
+    let normalized = term
         .split_whitespace()
-        .filter(|term| !term.is_empty())
-        .collect();
-    if terms.is_empty() {
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.is_empty() {
         return Ok(Vec::new());
     }
 
     let mut payload = Vec::new();
-    encode_search_terms(&mut payload, &terms)?;
+    encode_search_string_param(&mut payload, &normalized)?;
     Ok(payload)
 }
 
-fn encode_search_terms(payload: &mut Vec<u8>, terms: &[&str]) -> Result<()> {
-    let Some((first, rest)) = terms.split_first() else {
-        return Ok(());
-    };
-    if rest.is_empty() {
-        encode_search_string_param(payload, first)?;
-        return Ok(());
+fn login_identity_for_server_transport(
+    mut identity: Ed2kHelloIdentity,
+    use_server_obfuscation: bool,
+) -> Ed2kHelloIdentity {
+    if !use_server_obfuscation {
+        identity.connect_options = 0;
     }
+    identity
+}
 
-    payload.push(0);
-    payload.push(0x00);
-    encode_search_string_param(payload, first)?;
-    encode_search_terms(payload, rest)?;
-    Ok(())
+fn encode_offer_files_payload(
+    client_id: Option<u32>,
+    tcp_port: u16,
+    server_flags: Option<u32>,
+) -> Vec<u8> {
+    let (advertised_client_id, advertised_client_port) =
+        advertised_client_endpoint_for_offer_file(client_id, tcp_port, server_flags);
+    let mut payload = Vec::with_capacity(80);
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&OFFER_FILE_SAMPLE_HASH);
+    payload.extend_from_slice(&advertised_client_id.to_le_bytes());
+    payload.extend_from_slice(&advertised_client_port.to_le_bytes());
+    payload.extend_from_slice(&3u32.to_le_bytes());
+    push_short_string_tag(&mut payload, FT_FILENAME, OFFER_FILE_SAMPLE_NAME);
+    push_short_u32_tag(&mut payload, FT_FILESIZE, OFFER_FILE_SAMPLE_SIZE);
+    push_short_u8_tag(&mut payload, FT_FILETYPE, ED2K_FILETYPE_PROGRAM);
+    payload
+}
+
+fn advertised_client_endpoint_for_offer_file(
+    client_id: Option<u32>,
+    tcp_port: u16,
+    server_flags: Option<u32>,
+) -> (u32, u16) {
+    if server_flags.unwrap_or_default() & SERVER_TCP_FLAG_COMPRESSION != 0 {
+        return (
+            OFFER_FILE_COMPLETE_SENTINEL_CLIENT_ID,
+            OFFER_FILE_COMPLETE_SENTINEL_CLIENT_PORT,
+        );
+    }
+    match client_id {
+        Some(client_id) if !is_low_id(client_id) => (client_id, tcp_port),
+        _ => (0, 0),
+    }
 }
 
 fn encode_search_string_param(payload: &mut Vec<u8>, value: &str) -> Result<()> {
@@ -1010,6 +1585,18 @@ fn push_u32_tag(payload: &mut Vec<u8>, name: u8, value: u32) {
     payload.extend_from_slice(&value.to_le_bytes());
 }
 
+fn push_short_u32_tag(payload: &mut Vec<u8>, name: u8, value: u32) {
+    payload.push(TAG_SHORT_NAME_MASK | TAGTYPE_UINT32);
+    payload.push(name);
+    payload.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_short_u8_tag(payload: &mut Vec<u8>, name: u8, value: u8) {
+    payload.push(TAG_SHORT_NAME_MASK | TAGTYPE_UINT8);
+    payload.push(name);
+    payload.push(value);
+}
+
 fn push_string_tag(payload: &mut Vec<u8>, name: u8, value: &str) {
     let value_bytes = value.as_bytes();
     let type_byte = if (1..=16).contains(&value_bytes.len()) {
@@ -1030,6 +1617,25 @@ fn push_string_tag(payload: &mut Vec<u8>, name: u8, value: &str) {
     payload.extend_from_slice(value_bytes);
 }
 
+fn push_short_string_tag(payload: &mut Vec<u8>, name: u8, value: &str) {
+    let value_bytes = value.as_bytes();
+    let type_byte = if (1..=16).contains(&value_bytes.len()) {
+        TAGTYPE_STR1 + u8::try_from(value_bytes.len() - 1).expect("string tag length fits in u8")
+    } else {
+        TAGTYPE_STRING
+    };
+    payload.push(TAG_SHORT_NAME_MASK | type_byte);
+    payload.push(name);
+    if type_byte == TAGTYPE_STRING {
+        payload.extend_from_slice(
+            &u16::try_from(value_bytes.len())
+                .expect("string tag length fits in u16")
+                .to_le_bytes(),
+        );
+    }
+    payload.extend_from_slice(value_bytes);
+}
+
 fn encode_packet(opcode: u8, payload: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(TCP_PACKET_HEADER_LEN + payload.len());
     bytes.push(OP_EDONKEYPROT);
@@ -1039,6 +1645,32 @@ fn encode_packet(opcode: u8, payload: &[u8]) -> Vec<u8> {
     bytes.push(opcode);
     bytes.extend_from_slice(payload);
     bytes
+}
+
+async fn send_offer_files_advertisement(session: &mut ServerSession, tcp_port: u16) -> Result<()> {
+    if session.offer_files_sent {
+        return Ok(());
+    }
+    let payload =
+        encode_offer_files_payload(session.assigned_client_id, tcp_port, session.server_flags);
+    session.send_packet(OP_OFFERFILES, &payload).await?;
+    session.offer_files_sent = true;
+    session.offer_files_sent_at = Some(Instant::now());
+    debug!(
+        "sent ED2K offer-files advertisement to {}",
+        session.endpoint
+    );
+    Ok(())
+}
+
+async fn wait_for_offer_files_settle(session: &ServerSession) {
+    let Some(sent_at) = session.offer_files_sent_at else {
+        return;
+    };
+    let elapsed = sent_at.elapsed();
+    if elapsed < OFFER_FILE_SEARCH_SETTLE_DELAY {
+        tokio::time::sleep(OFFER_FILE_SEARCH_SETTLE_DELAY - elapsed).await;
+    }
 }
 
 fn random_nonzero_biguint(byte_len: usize) -> BigUint {
@@ -1145,43 +1777,98 @@ fn decode_server_ident(payload: &[u8]) -> Result<(Option<String>, Option<String>
     Ok((name, description))
 }
 
+#[cfg(test)]
 fn decode_search_results(payload: &[u8]) -> Result<SearchResultSummary> {
+    let files = decode_search_result_files(payload)?;
+    let sample_names = files
+        .iter()
+        .filter_map(|file| file.file_name.clone())
+        .take(3)
+        .collect::<Vec<_>>();
+    Ok(SearchResultSummary {
+        count: u32::try_from(files.len()).expect("search result count fits in u32"),
+        sample_names,
+    })
+}
+
+fn decode_search_result_files(payload: &[u8]) -> Result<Vec<Ed2kSearchFile>> {
     if payload.len() < 4 {
         anyhow::bail!("short ED2K search results payload");
     }
     let count = u32::from_le_bytes(payload[..4].try_into().unwrap());
     let mut cursor = &payload[4..];
-    let mut sample_names = Vec::new();
+    let mut files = Vec::with_capacity(count as usize);
 
     for _ in 0..count {
         if cursor.len() < 26 {
             anyhow::bail!("short ED2K search result entry");
         }
-        cursor = &cursor[22..];
+        let file_hash = Ed2kHash(cursor[..16].try_into().unwrap());
+        cursor = &cursor[16..];
+        cursor = &cursor[4..];
+        cursor = &cursor[2..];
         let tag_count = u32::from_le_bytes(cursor[..4].try_into().unwrap());
         cursor = &cursor[4..];
         let mut name = None;
+        let mut size = None;
+        let mut size_hi = None;
+        let mut file_type = None;
+        let mut source_count = None;
         for _ in 0..tag_count {
-            let (tag_name, tag_value, rest) = decode_tag(cursor)?;
+            let (tag_name, tag_value, rest) = decode_tag_value(cursor)?;
             cursor = rest;
-            if tag_name == Some(FT_FILENAME) && name.is_none() {
-                name = tag_value;
+            match (tag_name, tag_value) {
+                (Some(FT_FILENAME), Some(DecodedTagValue::String(value))) if name.is_none() => {
+                    name = Some(value);
+                }
+                (Some(FT_FILESIZE), Some(DecodedTagValue::Unsigned(value))) => {
+                    size = Some(value);
+                }
+                (Some(FT_FILESIZE_HI), Some(DecodedTagValue::Unsigned(value))) => {
+                    size_hi = Some(value);
+                }
+                (Some(FT_FILETYPE), Some(DecodedTagValue::String(value)))
+                    if file_type.is_none() =>
+                {
+                    file_type = Some(value);
+                }
+                (Some(FT_SOURCES), Some(DecodedTagValue::Unsigned(value))) => {
+                    source_count =
+                        Some(u32::try_from(value).context("ED2K source count overflow")?);
+                }
+                _ => {}
             }
         }
-        if let Some(name) = name
-            && sample_names.len() < 3
-        {
-            sample_names.push(name);
-        }
+        let file_size = match (size, size_hi) {
+            (Some(value), Some(upper)) if value <= u32::MAX as u64 && upper != 0 => {
+                Some((upper << 32) | value)
+            }
+            (Some(value), _) => Some(value),
+            (None, Some(upper)) => Some(upper << 32),
+            (None, None) => None,
+        };
+        files.push(Ed2kSearchFile {
+            file_hash,
+            file_name: name,
+            file_size,
+            file_type,
+            source_count,
+        });
     }
 
-    Ok(SearchResultSummary {
-        count,
-        sample_names,
-    })
+    Ok(files)
 }
 
-fn decode_tag(mut bytes: &[u8]) -> Result<(Option<u8>, Option<String>, &[u8])> {
+fn decode_tag(bytes: &[u8]) -> Result<(Option<u8>, Option<String>, &[u8])> {
+    let (tag_name, tag_value, rest) = decode_tag_value(bytes)?;
+    let string_value = match tag_value {
+        Some(DecodedTagValue::String(value)) => Some(value),
+        _ => None,
+    };
+    Ok((tag_name, string_value, rest))
+}
+
+fn decode_tag_value(mut bytes: &[u8]) -> Result<(Option<u8>, Option<DecodedTagValue>, &[u8])> {
     if bytes.len() < 2 {
         anyhow::bail!("short ED2K tag header");
     }
@@ -1208,7 +1895,7 @@ fn decode_tag(mut bytes: &[u8]) -> Result<(Option<u8>, Option<String>, &[u8])> {
         name
     };
 
-    let string_value = match base_type {
+    let decoded_value = match base_type {
         TAGTYPE_STRING => {
             if bytes.len() < 2 {
                 anyhow::bail!("short ED2K string tag length");
@@ -1220,7 +1907,7 @@ fn decode_tag(mut bytes: &[u8]) -> Result<(Option<u8>, Option<String>, &[u8])> {
             }
             let value = String::from_utf8_lossy(&bytes[..len]).into_owned();
             bytes = &bytes[len..];
-            Some(value)
+            Some(DecodedTagValue::String(value))
         }
         TAGTYPE_STR1..=0x20 => {
             let len = usize::from(base_type - TAGTYPE_STR1 + 1);
@@ -1229,49 +1916,59 @@ fn decode_tag(mut bytes: &[u8]) -> Result<(Option<u8>, Option<String>, &[u8])> {
             }
             let value = String::from_utf8_lossy(&bytes[..len]).into_owned();
             bytes = &bytes[len..];
-            Some(value)
+            Some(DecodedTagValue::String(value))
         }
         TAGTYPE_UINT32 => {
             if bytes.len() < 4 {
                 anyhow::bail!("short ED2K uint32 tag value");
             }
+            let value = u32::from_le_bytes(bytes[..4].try_into().unwrap());
             bytes = &bytes[4..];
-            None
+            Some(DecodedTagValue::Unsigned(u64::from(value)))
         }
         TAGTYPE_UINT64 => {
             if bytes.len() < 8 {
                 anyhow::bail!("short ED2K uint64 tag value");
             }
+            let value = u64::from_le_bytes(bytes[..8].try_into().unwrap());
             bytes = &bytes[8..];
-            None
+            Some(DecodedTagValue::Unsigned(value))
         }
         TAGTYPE_UINT16 => {
             if bytes.len() < 2 {
                 anyhow::bail!("short ED2K uint16 tag value");
             }
+            let value = u16::from_le_bytes(bytes[..2].try_into().unwrap());
             bytes = &bytes[2..];
-            None
+            Some(DecodedTagValue::Unsigned(u64::from(value)))
         }
         TAGTYPE_UINT8 | TAGTYPE_BOOL => {
             if bytes.is_empty() {
                 anyhow::bail!("short ED2K uint8/bool tag value");
             }
+            let value = bytes[0];
             bytes = &bytes[1..];
-            None
+            if base_type == TAGTYPE_BOOL {
+                Some(DecodedTagValue::Bool(value != 0))
+            } else {
+                Some(DecodedTagValue::Unsigned(u64::from(value)))
+            }
         }
         TAGTYPE_FLOAT32 => {
             if bytes.len() < 4 {
                 anyhow::bail!("short ED2K float32 tag value");
             }
+            let value = f32::from_le_bytes(bytes[..4].try_into().unwrap());
             bytes = &bytes[4..];
-            None
+            Some(DecodedTagValue::Float32(value))
         }
         TAGTYPE_HASH => {
             if bytes.len() < 16 {
                 anyhow::bail!("short ED2K hash tag value");
             }
+            let value: [u8; 16] = bytes[..16].try_into().unwrap();
             bytes = &bytes[16..];
-            None
+            Some(DecodedTagValue::Hash(value))
         }
         TAGTYPE_BOOLARRAY => {
             if bytes.len() < 2 {
@@ -1283,8 +1980,9 @@ fn decode_tag(mut bytes: &[u8]) -> Result<(Option<u8>, Option<String>, &[u8])> {
             if bytes.len() < byte_len {
                 anyhow::bail!("short ED2K bool-array tag value");
             }
+            let value = bytes[..byte_len].to_vec();
             bytes = &bytes[byte_len..];
-            None
+            Some(DecodedTagValue::BoolArray(value))
         }
         TAGTYPE_BLOB => {
             if bytes.len() < 4 {
@@ -1296,13 +1994,14 @@ fn decode_tag(mut bytes: &[u8]) -> Result<(Option<u8>, Option<String>, &[u8])> {
             if bytes.len() < blob_len {
                 anyhow::bail!("short ED2K blob tag value");
             }
+            let value = bytes[..blob_len].to_vec();
             bytes = &bytes[blob_len..];
-            None
+            Some(DecodedTagValue::Blob(value))
         }
         _ => anyhow::bail!("unsupported ED2K tag type 0x{base_type:02X}"),
     };
 
-    Ok((tag_name, string_value, bytes))
+    Ok((tag_name, decoded_value, bytes))
 }
 
 fn format_server_flags(flags: u32) -> String {
@@ -1362,14 +2061,17 @@ mod tests {
         CT_EMULE_VERSION, CT_NAME, CT_SERVER_FLAGS, CT_VERSION, ConfiguredServerEntry,
         EDONKEY_VERSION, EMULE_ENCRYPTION_METHOD_OBFUSCATION, EMULE_TCP_CRYPT_MAGIC_REQUESTER,
         EMULE_TCP_CRYPT_MAGIC_SERVER, EMULE_TCP_CRYPT_MAGIC_SYNC, EMULE_VERSION_MAJOR,
-        EMULE_VERSION_MINOR, EMULE_VERSION_UPDATE, Ed2kServerState, FT_FILENAME, HELLO_NICKNAME,
-        OP_EDONKEYPROT, OP_GETSERVERLIST, OP_LOGINREQUEST, OP_PACKEDPROT, ResolvedServerEntry,
+        EMULE_VERSION_MINOR, EMULE_VERSION_UPDATE, Ed2kHash, Ed2kSearchFile, Ed2kServerState,
+        FT_FILENAME, FT_FILESIZE, FT_FILETYPE, FT_SOURCES, HELLO_NICKNAME, OP_EDONKEYPROT,
+        OP_GETSERVERLIST, OP_LOGINREQUEST, OP_OFFERFILES, OP_PACKEDPROT, ResolvedServerEntry,
         SERVER_OBFUSCATION_PRIME_BYTES, SERVER_OBFUSCATION_PUBLIC_KEY_LEN,
         SERVER_TCP_FLAG_COMPRESSION, SERVER_TCP_FLAG_LARGEFILES, SERVER_UDP_FLAG_UDPOBFUSCATION,
         ST_DESCRIPTION, ST_SERVERNAME, ServerSession, TAG_SHORT_NAME_MASK, TAGTYPE_UINT32,
-        biguint_to_fixed_be, decode_search_results, decode_server_ident, decode_server_payload,
-        derive_server_cipher, encode_login_request, encode_packet, encode_search_request,
-        format_server_flags, server_capabilities, should_use_server_obfuscation,
+        biguint_to_fixed_be, decode_search_result_files, decode_search_results,
+        decode_server_ident, decode_server_payload, derive_server_cipher, encode_login_request,
+        encode_offer_files_payload, encode_packet, encode_search_request, format_server_flags,
+        login_identity_for_server_transport, new_ed2k_server_search_channel,
+        search_keyword_via_background_session, server_capabilities, should_use_server_obfuscation,
     };
     use crate::ed2k_tcp::{Ed2kHelloIdentity, emule_connect_options};
     use flate2::{Compression, write::ZlibEncoder};
@@ -1381,6 +2083,7 @@ mod tests {
         net::TcpListener,
         sync::RwLock,
     };
+    use tokio_util::sync::CancellationToken;
 
     fn test_server(obfuscation_port_tcp: u16, udp_flags: u32) -> ResolvedServerEntry {
         ResolvedServerEntry {
@@ -1638,14 +2341,47 @@ mod tests {
     fn search_probe_encoding_matches_prefix_and_shape() {
         let payload = encode_search_request("ubuntu linux").unwrap();
 
-        assert_eq!(payload[0], 0);
-        assert_eq!(payload[1], 0);
-        assert_eq!(payload[2], 1);
-        assert_eq!(u16::from_le_bytes([payload[3], payload[4]]), 6);
-        assert_eq!(&payload[5..11], b"ubuntu");
-        assert_eq!(payload[11], 1);
-        assert_eq!(u16::from_le_bytes([payload[12], payload[13]]), 5);
-        assert_eq!(&payload[14..19], b"linux");
+        assert_eq!(payload[0], 1);
+        assert_eq!(u16::from_le_bytes([payload[1], payload[2]]), 12);
+        assert_eq!(&payload[3..15], b"ubuntu linux");
+    }
+
+    #[test]
+    fn plaintext_server_sessions_clear_crypt_capability_bits() {
+        let identity = login_identity_for_server_transport(
+            Ed2kHelloIdentity {
+                user_hash: [0x33; 16],
+                client_id: 0,
+                tcp_port: 41001,
+                udp_port: 41000,
+                server_ip: 0,
+                server_port: 0,
+                connect_options: emule_connect_options(true),
+                direct_udp_callback: false,
+            },
+            false,
+        );
+
+        assert_eq!(identity.connect_options, 0);
+    }
+
+    #[test]
+    fn offer_files_payload_matches_oracle_search_session_sample() {
+        let packet = encode_packet(
+            OP_OFFERFILES,
+            &encode_offer_files_payload(
+                Some(0x521B_5895),
+                46671,
+                Some(SERVER_TCP_FLAG_COMPRESSION),
+            ),
+        );
+
+        let expected = decode(
+            "e34a00000015010000009f3c23db7651efbac9a837a8a0ae3ed9fbfbfbfbfbfb0300000082011e007562756e74752d6c696e75782d6f7261636c652d73616d706c652e69736f830200002000890304",
+        )
+        .unwrap();
+
+        assert_eq!(packet, expected);
     }
 
     #[test]
@@ -1664,6 +2400,70 @@ mod tests {
 
         assert_eq!(summary.count, 1);
         assert_eq!(summary.sample_names, vec!["ubuntu.iso".to_string()]);
+    }
+
+    #[test]
+    fn search_results_decoder_extracts_size_type_and_sources() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&[0x22; 16]);
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&4662u16.to_le_bytes());
+        payload.extend_from_slice(&4u32.to_le_bytes());
+        payload.push(TAG_SHORT_NAME_MASK | (super::TAGTYPE_STR1 + 9));
+        payload.push(FT_FILENAME);
+        payload.extend_from_slice(b"ubuntu.iso");
+        payload.push(super::TAGTYPE_UINT64);
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.push(FT_FILESIZE);
+        payload.extend_from_slice(&4_294_967_300u64.to_le_bytes());
+        payload.push(TAG_SHORT_NAME_MASK | (super::TAGTYPE_STR1 + 4));
+        payload.push(FT_FILETYPE);
+        payload.extend_from_slice(b"Video");
+        payload.push(TAGTYPE_UINT32);
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.push(FT_SOURCES);
+        payload.extend_from_slice(&12u32.to_le_bytes());
+
+        let files = decode_search_result_files(&payload).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_name.as_deref(), Some("ubuntu.iso"));
+        assert_eq!(files[0].file_size, Some(4_294_967_300));
+        assert_eq!(files[0].file_type.as_deref(), Some("Video"));
+        assert_eq!(files[0].source_count, Some(12));
+    }
+
+    #[tokio::test]
+    async fn background_search_channel_round_trips_results() {
+        let (handle, mut inbox) = new_ed2k_server_search_channel(1);
+        let cancel = CancellationToken::new();
+        let expected = Ed2kSearchFile {
+            file_hash: Ed2kHash([0x44; 16]),
+            file_name: Some("ubuntu.iso".to_string()),
+            file_size: Some(123),
+            file_type: Some("Doc".to_string()),
+            source_count: Some(7),
+        };
+        let expected_for_task = expected.clone();
+
+        let responder = tokio::spawn(async move {
+            let request = inbox.receiver.recv().await.unwrap();
+            assert_eq!(request.query, "ubuntu linux");
+            let _ = request.response.send(Ok(vec![expected_for_task]));
+        });
+
+        let results = search_keyword_via_background_session(
+            &handle,
+            "ubuntu linux",
+            Duration::from_secs(1),
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results, vec![expected]);
+        responder.await.unwrap();
     }
 
     #[tokio::test]
@@ -1749,10 +2549,15 @@ mod tests {
         });
 
         let state = Arc::new(RwLock::new(Ed2kServerState::default()));
-        let mut session =
-            ServerSession::connect(Ipv4Addr::LOCALHOST, endpoint, state, Duration::from_secs(5))
-                .await
-                .unwrap();
+        let mut session = ServerSession::connect(
+            Ipv4Addr::LOCALHOST,
+            endpoint,
+            state,
+            "test",
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
         session
             .negotiate_obfuscation_and_send(&expected_login)
             .await
