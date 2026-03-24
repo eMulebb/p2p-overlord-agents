@@ -9,6 +9,7 @@ use uuid::Uuid;
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
     Kad2,
+    Ed2k,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +68,7 @@ pub enum SearchKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchJob {
     pub job_id: Uuid,
+    pub protocol: Protocol,
     pub kind: SearchKind,
     pub query: Option<String>,
     pub file_hash: Option<HashType>,
@@ -208,11 +210,21 @@ pub struct KadHarvestFamilyObservability {
 
 /// Passive replay telemetry for harvested keyword searches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct KadPassiveReplayTierSummary {
+    /// Phase-2 responder ceiling used for this tier.
+    pub responder_ceiling: u32,
+    /// Unique results added by this tier.
+    pub result_count: u32,
+}
+
+/// Passive replay telemetry for harvested Kad searches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct KadPassiveReplayObservability {
     pub started_cycles: u64,
     pub completed_cycles: u64,
     pub idle_cycles: u64,
     pub emitted_results: u64,
+    pub widened_cycles: u64,
     pub posted_batches: u64,
     pub post_failures: u64,
     pub last_started_at: Option<DateTime<Utc>>,
@@ -224,6 +236,11 @@ pub struct KadPassiveReplayObservability {
     pub last_restrictive_bytes: Option<u32>,
     pub last_result_count: u32,
     pub last_batches_posted: u32,
+    pub last_tiers_attempted: u32,
+    pub last_widest_responder_ceiling: Option<u32>,
+    pub last_widened: bool,
+    #[serde(default)]
+    pub last_tiers: Vec<KadPassiveReplayTierSummary>,
     pub last_error: Option<String>,
 }
 
@@ -234,6 +251,7 @@ pub struct KadHarvestObservability {
     pub source_requests: KadHarvestFamilyObservability,
     pub notes_requests: KadHarvestFamilyObservability,
     pub passive_keyword_replay: KadPassiveReplayObservability,
+    pub passive_source_replay: KadPassiveReplayObservability,
 }
 
 /// Kad search-request family observed on the wire.

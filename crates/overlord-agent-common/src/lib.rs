@@ -17,8 +17,8 @@ pub use types::{
     AgentInterfacesView, AgentLogFileStatus, ConfigUpdate, ContentType, FileRecord, HarvestFamily,
     HarvestReplayContext, HarvestReplayRecord, HashType, IndexerRegistration, IndexerStats,
     KadHarvestFamilyObservability, KadHarvestObservability, KadPassiveReplayObservability,
-    KadPublishObservability, PopularHash, Protocol, PublishBatchSummary, PublishCounters,
-    PublishSeedSource, RegisterRequest, RegistrationResponse, ResultBatch, SearchCancelRequest,
-    SearchEvent, SearchEventStatus, SearchJob, SearchKind, SnoopEntry, SnoopObservation, Source,
-    TagEntry,
+    KadPassiveReplayTierSummary, KadPublishObservability, PopularHash, Protocol,
+    PublishBatchSummary, PublishCounters, PublishSeedSource, RegisterRequest, RegistrationResponse,
+    ResultBatch, SearchCancelRequest, SearchEvent, SearchEventStatus, SearchJob, SearchKind,
+    SnoopEntry, SnoopObservation, Source, TagEntry,
 };

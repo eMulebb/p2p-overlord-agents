@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -37,7 +37,8 @@ use uuid::Uuid;
 use overlord_agent_common::{
     AgentInterfacesView, ConfigUpdate, ContentType, CoordinatorClient, FileRecord, HarvestFamily,
     HarvestReplayContext, HarvestReplayRecord, HashType, IndexerServer, IndexerService,
-    IndexerStats, KadHarvestFamilyObservability, KadHarvestObservability, KadPublishObservability,
+    IndexerStats, KadHarvestFamilyObservability, KadHarvestObservability,
+    KadPassiveReplayObservability, KadPassiveReplayTierSummary, KadPublishObservability,
     PopularHash, Protocol, PublishBatchSummary, PublishCounters, PublishSeedSource,
     RegisterRequest, ResultBatch, RunningIndexerServer, SearchEvent, SearchEventStatus, SearchJob,
     SearchKind, SnoopEntry, SnoopObservation, Source, TagEntry,
@@ -75,6 +76,8 @@ const COORDINATOR_RECONNECT_SECS: u64 = 30;
 const COORDINATOR_RECONNECT_SECS: u64 = 1;
 const SNOOP_FLUSH_SECS: u64 = 30;
 const PASSIVE_CRAWL_SECS: u64 = 45;
+const PASSIVE_KEYWORD_THIN_RESULT_THRESHOLD: usize = 10;
+const PASSIVE_SOURCE_THIN_RESULT_THRESHOLD: usize = 3;
 const KAD_HELLO_INTRO_SECS: u64 = 30;
 const KAD_HELLO_INTRO_FANOUT: usize = 24;
 const EMULE_LARGE_FILE_SIZE_THRESHOLD: u64 = u32::MAX as u64;
@@ -548,51 +551,96 @@ fn apply_queue_family_counts(
     observability.notes_requests.queued_entries = counts.notes as u32;
 }
 
-fn record_passive_keyword_replay_idle(
+fn passive_replay_observability_mut(
     observability: &mut KadHarvestObservability,
+    family: HarvestFamily,
+) -> &mut KadPassiveReplayObservability {
+    match family {
+        HarvestFamily::Keyword => &mut observability.passive_keyword_replay,
+        HarvestFamily::Source => &mut observability.passive_source_replay,
+        HarvestFamily::Notes => &mut observability.passive_keyword_replay,
+    }
+}
+
+fn passive_replay_tier_contact_limits(max_phase2_fanout: usize) -> Vec<usize> {
+    let mut tiers = vec![K, K.saturating_mul(2), max_phase2_fanout];
+    tiers.retain(|limit| *limit > 0);
+    tiers.sort_unstable();
+    tiers.dedup();
+    tiers
+}
+
+fn passive_replay_thin_result_threshold(family: HarvestFamily) -> usize {
+    match family {
+        HarvestFamily::Keyword => PASSIVE_KEYWORD_THIN_RESULT_THRESHOLD,
+        HarvestFamily::Source => PASSIVE_SOURCE_THIN_RESULT_THRESHOLD,
+        HarvestFamily::Notes => PASSIVE_SOURCE_THIN_RESULT_THRESHOLD,
+    }
+}
+
+fn record_passive_replay_idle(
+    observability: &mut KadHarvestObservability,
+    family: HarvestFamily,
     observed_at: DateTime<Utc>,
 ) {
-    let replay = &mut observability.passive_keyword_replay;
+    let replay = passive_replay_observability_mut(observability, family);
     replay.idle_cycles += 1;
     replay.last_idle_at = Some(observed_at);
 }
 
-fn record_passive_keyword_replay_start(
+fn record_passive_replay_start(
     observability: &mut KadHarvestObservability,
-    request: &SearchKeyReq,
+    family: HarvestFamily,
+    target: String,
+    start_position: Option<u16>,
+    restrictive_bytes: Option<u32>,
     started_at: DateTime<Utc>,
 ) {
-    let replay = &mut observability.passive_keyword_replay;
+    let replay = passive_replay_observability_mut(observability, family);
     replay.started_cycles += 1;
     replay.last_started_at = Some(started_at);
-    replay.last_target = Some(request.target.to_string());
-    replay.last_start_position = Some(request.start_position);
-    replay.last_restrictive_bytes = Some(request.restrictive_payload.len() as u32);
+    replay.last_target = Some(target);
+    replay.last_start_position = start_position;
+    replay.last_restrictive_bytes = restrictive_bytes;
+    replay.last_tiers.clear();
+    replay.last_tiers_attempted = 0;
+    replay.last_widest_responder_ceiling = None;
+    replay.last_widened = false;
     replay.last_error = None;
     replay.last_error_at = None;
 }
 
-fn record_passive_keyword_replay_complete(
+fn record_passive_replay_complete(
     observability: &mut KadHarvestObservability,
+    family: HarvestFamily,
     completed_at: DateTime<Utc>,
     replayed_results: usize,
     batches_posted: usize,
+    tier_summaries: Vec<KadPassiveReplayTierSummary>,
 ) {
-    let replay = &mut observability.passive_keyword_replay;
+    let replay = passive_replay_observability_mut(observability, family);
     replay.completed_cycles += 1;
     replay.emitted_results += replayed_results as u64;
     replay.posted_batches += batches_posted as u64;
     replay.last_completed_at = Some(completed_at);
     replay.last_result_count = replayed_results as u32;
     replay.last_batches_posted = batches_posted as u32;
+    replay.last_tiers_attempted = tier_summaries.len() as u32;
+    replay.last_widest_responder_ceiling = tier_summaries.last().map(|tier| tier.responder_ceiling);
+    replay.last_widened = tier_summaries.len() > 1;
+    if replay.last_widened {
+        replay.widened_cycles += 1;
+    }
+    replay.last_tiers = tier_summaries;
 }
 
-fn record_passive_keyword_post_failure(
+fn record_passive_replay_post_failure(
     observability: &mut KadHarvestObservability,
+    family: HarvestFamily,
     observed_at: DateTime<Utc>,
     error: &str,
 ) {
-    let replay = &mut observability.passive_keyword_replay;
+    let replay = passive_replay_observability_mut(observability, family);
     replay.post_failures += 1;
     replay.last_error_at = Some(observed_at);
     replay.last_error = Some(error.to_string());
@@ -1456,6 +1504,234 @@ fn map_source_result(result: &SourceResult, file_size: u64) -> FileRecord {
             }),
         }],
     }
+}
+
+#[derive(Debug, Default)]
+struct PassiveReplayRunOutcome {
+    result_count: usize,
+    batch_count: usize,
+    tier_summaries: Vec<KadPassiveReplayTierSummary>,
+    last_post_error: Option<String>,
+}
+
+struct PassiveReplayContext<'a> {
+    dht: &'a DhtNode,
+    coordinator: &'a CoordinatorClient,
+    indexer_id: Uuid,
+    replay_context: &'a HarvestReplayContext,
+    max_phase2_fanout: usize,
+    passive_result_count: &'a Arc<std::sync::atomic::AtomicU64>,
+    harvest_observability: &'a Arc<Mutex<KadHarvestObservability>>,
+}
+
+async fn post_passive_result_batch(
+    coordinator: &CoordinatorClient,
+    indexer_id: Uuid,
+    replay_context: &HarvestReplayContext,
+    files: Vec<FileRecord>,
+) -> Result<()> {
+    coordinator
+        .post_results(&ResultBatch {
+            job_id: None,
+            indexer_id,
+            protocol: Protocol::Kad2,
+            harvest_context: Some(replay_context.clone()),
+            files,
+        })
+        .await
+}
+
+async fn run_passive_keyword_replay(
+    context: PassiveReplayContext<'_>,
+    request: &SearchKeyReq,
+) -> PassiveReplayRunOutcome {
+    let mut outcome = PassiveReplayRunOutcome::default();
+    let mut seen_hashes = HashSet::new();
+    let mut files = Vec::new();
+
+    for responder_ceiling in passive_replay_tier_contact_limits(context.max_phase2_fanout) {
+        let tier_result_start = outcome.result_count;
+        info!(
+            "kad passive replay tier start family=keyword target={} responder_ceiling={} restrictive_bytes={}",
+            request.target,
+            responder_ceiling,
+            request.restrictive_payload.len()
+        );
+        let mut stream = context
+            .dht
+            .search_keyword_request_with_phase2_fanout_and_cancel(
+                request.clone(),
+                responder_ceiling,
+                CancellationToken::new(),
+            );
+        while let Some(result) = stream.next().await {
+            if !seen_hashes.insert(result.hash) {
+                continue;
+            }
+            if let Ok(file) = map_search_result_for(context.dht, &result) {
+                context.passive_result_count.fetch_add(1, Ordering::Relaxed);
+                outcome.result_count += 1;
+                files.push(file);
+                if files.len() >= PASSIVE_BATCH_SIZE {
+                    let batch = std::mem::take(&mut files);
+                    if let Err(error) = post_passive_result_batch(
+                        context.coordinator,
+                        context.indexer_id,
+                        context.replay_context,
+                        batch,
+                    )
+                    .await
+                    {
+                        warn!("failed to post passive result batch: {error}");
+                        outcome.last_post_error = Some(error.to_string());
+                        let mut observability = context.harvest_observability.lock().await;
+                        record_passive_replay_post_failure(
+                            &mut observability,
+                            HarvestFamily::Keyword,
+                            Utc::now(),
+                            outcome.last_post_error.as_deref().unwrap_or("post failed"),
+                        );
+                    } else {
+                        outcome.batch_count += 1;
+                    }
+                }
+            }
+        }
+
+        let tier_results = outcome.result_count - tier_result_start;
+        info!(
+            "kad passive replay tier done family=keyword target={} responder_ceiling={} tier_results={} cumulative_results={}",
+            request.target, responder_ceiling, tier_results, outcome.result_count
+        );
+        outcome.tier_summaries.push(KadPassiveReplayTierSummary {
+            responder_ceiling: responder_ceiling as u32,
+            result_count: tier_results as u32,
+        });
+
+        if outcome.result_count >= passive_replay_thin_result_threshold(HarvestFamily::Keyword) {
+            break;
+        }
+    }
+
+    if !files.is_empty() {
+        if let Err(error) = post_passive_result_batch(
+            context.coordinator,
+            context.indexer_id,
+            context.replay_context,
+            files,
+        )
+        .await
+        {
+            warn!("failed to post passive result batch: {error}");
+            outcome.last_post_error = Some(error.to_string());
+            let mut observability = context.harvest_observability.lock().await;
+            record_passive_replay_post_failure(
+                &mut observability,
+                HarvestFamily::Keyword,
+                Utc::now(),
+                outcome.last_post_error.as_deref().unwrap_or("post failed"),
+            );
+        } else {
+            outcome.batch_count += 1;
+        }
+    }
+
+    outcome
+}
+
+async fn run_passive_source_replay(
+    context: PassiveReplayContext<'_>,
+    request: &SearchSourceReq,
+) -> PassiveReplayRunOutcome {
+    let mut outcome = PassiveReplayRunOutcome::default();
+    let mut seen_sources = HashSet::<(std::net::Ipv4Addr, u16, u16)>::new();
+    let mut files = Vec::new();
+    let file_hash = Ed2kHash::from_bytes(request.target.0);
+
+    for responder_ceiling in passive_replay_tier_contact_limits(context.max_phase2_fanout) {
+        let tier_result_start = outcome.result_count;
+        info!(
+            "kad passive replay tier start family=source target={} responder_ceiling={} size={}",
+            request.target, responder_ceiling, request.size
+        );
+        let mut stream = context.dht.search_sources_with_phase2_fanout_and_cancel(
+            file_hash,
+            request.size,
+            responder_ceiling,
+            CancellationToken::new(),
+        );
+        while let Some(result) = stream.next().await {
+            let source_key = (result.ip, result.tcp_port, result.udp_port);
+            if !seen_sources.insert(source_key) {
+                continue;
+            }
+            context.passive_result_count.fetch_add(1, Ordering::Relaxed);
+            outcome.result_count += 1;
+            files.push(map_source_result(&result, request.size));
+            if files.len() >= PASSIVE_BATCH_SIZE {
+                let batch = std::mem::take(&mut files);
+                if let Err(error) = post_passive_result_batch(
+                    context.coordinator,
+                    context.indexer_id,
+                    context.replay_context,
+                    batch,
+                )
+                .await
+                {
+                    warn!("failed to post passive source result batch: {error}");
+                    outcome.last_post_error = Some(error.to_string());
+                    let mut observability = context.harvest_observability.lock().await;
+                    record_passive_replay_post_failure(
+                        &mut observability,
+                        HarvestFamily::Source,
+                        Utc::now(),
+                        outcome.last_post_error.as_deref().unwrap_or("post failed"),
+                    );
+                } else {
+                    outcome.batch_count += 1;
+                }
+            }
+        }
+
+        let tier_results = outcome.result_count - tier_result_start;
+        info!(
+            "kad passive replay tier done family=source target={} responder_ceiling={} tier_results={} cumulative_results={}",
+            request.target, responder_ceiling, tier_results, outcome.result_count
+        );
+        outcome.tier_summaries.push(KadPassiveReplayTierSummary {
+            responder_ceiling: responder_ceiling as u32,
+            result_count: tier_results as u32,
+        });
+
+        if outcome.result_count >= passive_replay_thin_result_threshold(HarvestFamily::Source) {
+            break;
+        }
+    }
+
+    if !files.is_empty() {
+        if let Err(error) = post_passive_result_batch(
+            context.coordinator,
+            context.indexer_id,
+            context.replay_context,
+            files,
+        )
+        .await
+        {
+            warn!("failed to post passive source result batch: {error}");
+            outcome.last_post_error = Some(error.to_string());
+            let mut observability = context.harvest_observability.lock().await;
+            record_passive_replay_post_failure(
+                &mut observability,
+                HarvestFamily::Source,
+                Utc::now(),
+                outcome.last_post_error.as_deref().unwrap_or("post failed"),
+            );
+        } else {
+            outcome.batch_count += 1;
+        }
+    }
+
+    outcome
 }
 
 async fn do_active_keyword_search(
@@ -3956,6 +4232,7 @@ impl OverlordAgentEmule {
         let passive_result_count = Arc::clone(&runtime.passive_result_count);
         let passive_replay_gate = Arc::clone(&runtime.passive_replay_gate);
         let harvest_observability = Arc::clone(&self.harvest_observability);
+        let passive_replay_phase2_fanout = config.p2p.kad.search_phase2_fanout;
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             while !shutdown.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_secs(PASSIVE_CRAWL_SECS)).await;
@@ -3969,7 +4246,11 @@ impl OverlordAgentEmule {
                 };
                 let Some(request) = next_passive_keyword_request(&snoop_queue).await else {
                     let mut observability = harvest_observability.lock().await;
-                    record_passive_keyword_replay_idle(&mut observability, Utc::now());
+                    record_passive_replay_idle(
+                        &mut observability,
+                        HarvestFamily::Keyword,
+                        Utc::now(),
+                    );
                     continue;
                 };
                 let replay_started_at = Utc::now();
@@ -3985,9 +4266,12 @@ impl OverlordAgentEmule {
                 };
                 {
                     let mut observability = harvest_observability.lock().await;
-                    record_passive_keyword_replay_start(
+                    record_passive_replay_start(
                         &mut observability,
-                        &request,
+                        HarvestFamily::Keyword,
+                        request.target.to_string(),
+                        Some(request.start_position),
+                        Some(request.restrictive_payload.len() as u32),
                         replay_started_at,
                     );
                 }
@@ -3997,68 +4281,29 @@ impl OverlordAgentEmule {
                     request.start_position,
                     request.restrictive_payload.len()
                 );
-                let mut stream = dht.search_keyword_request(request);
-                let mut files = Vec::new();
-                let mut replayed_results = 0usize;
-                let mut batches_posted = 0usize;
-                let mut last_post_error: Option<String> = None;
-                while let Some(result) = stream.next().await {
-                    if let Ok(file) = map_search_result_for(&dht, &result) {
-                        passive_result_count.fetch_add(1, Ordering::Relaxed);
-                        replayed_results += 1;
-                        files.push(file);
-                        if files.len() >= PASSIVE_BATCH_SIZE {
-                            let payload = ResultBatch {
-                                job_id: None,
-                                indexer_id,
-                                protocol: Protocol::Kad2,
-                                harvest_context: Some(replay_context.clone()),
-                                files: std::mem::take(&mut files),
-                            };
-                            if let Err(error) = coordinator.post_results(&payload).await {
-                                warn!("failed to post passive result batch: {error}");
-                                last_post_error = Some(error.to_string());
-                                let mut observability = harvest_observability.lock().await;
-                                record_passive_keyword_post_failure(
-                                    &mut observability,
-                                    Utc::now(),
-                                    last_post_error.as_deref().unwrap_or("post failed"),
-                                );
-                            } else {
-                                batches_posted += 1;
-                            }
-                        }
-                    }
-                }
-                if !files.is_empty() {
-                    let payload = ResultBatch {
-                        job_id: None,
+                let outcome = run_passive_keyword_replay(
+                    PassiveReplayContext {
+                        dht: &dht,
+                        coordinator: &coordinator,
                         indexer_id,
-                        protocol: Protocol::Kad2,
-                        harvest_context: Some(replay_context.clone()),
-                        files,
-                    };
-                    if let Err(error) = coordinator.post_results(&payload).await {
-                        warn!("failed to post passive result batch: {error}");
-                        last_post_error = Some(error.to_string());
-                        let mut observability = harvest_observability.lock().await;
-                        record_passive_keyword_post_failure(
-                            &mut observability,
-                            Utc::now(),
-                            last_post_error.as_deref().unwrap_or("post failed"),
-                        );
-                    } else {
-                        batches_posted += 1;
-                    }
-                }
+                        replay_context: &replay_context,
+                        max_phase2_fanout: passive_replay_phase2_fanout,
+                        passive_result_count: &passive_result_count,
+                        harvest_observability: &harvest_observability,
+                    },
+                    &request,
+                )
+                .await;
                 let replay_completed_at = Utc::now();
                 {
                     let mut observability = harvest_observability.lock().await;
-                    record_passive_keyword_replay_complete(
+                    record_passive_replay_complete(
                         &mut observability,
+                        HarvestFamily::Keyword,
                         replay_completed_at,
-                        replayed_results,
-                        batches_posted,
+                        outcome.result_count,
+                        outcome.batch_count,
+                        outcome.tier_summaries.clone(),
                     );
                 }
                 if let Err(error) = coordinator
@@ -4073,9 +4318,9 @@ impl OverlordAgentEmule {
                         restrictive_payload_hex: replay_context.restrictive_payload_hex.clone(),
                         started_at: replay_started_at,
                         completed_at: replay_completed_at,
-                        result_count: replayed_results as u32,
-                        batch_count: batches_posted as u32,
-                        error: last_post_error.clone(),
+                        result_count: outcome.result_count as u32,
+                        batch_count: outcome.batch_count as u32,
+                        error: outcome.last_post_error.clone(),
                     })
                     .await
                 {
@@ -4083,7 +4328,7 @@ impl OverlordAgentEmule {
                 }
                 info!(
                     "kad passive replay done results={} batches_posted={}",
-                    replayed_results, batches_posted
+                    outcome.result_count, outcome.batch_count
                 );
             }
         }));
@@ -4095,6 +4340,8 @@ impl OverlordAgentEmule {
         let indexer_id = self.indexer_id;
         let passive_result_count = Arc::clone(&runtime.passive_result_count);
         let passive_replay_gate = Arc::clone(&runtime.passive_replay_gate);
+        let harvest_observability = Arc::clone(&self.harvest_observability);
+        let passive_replay_phase2_fanout = config.p2p.kad.search_phase2_fanout;
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             while !shutdown.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_secs(PASSIVE_CRAWL_SECS)).await;
@@ -4107,6 +4354,12 @@ impl OverlordAgentEmule {
                     continue;
                 };
                 let Some(request) = next_passive_source_request(&snoop_queue).await else {
+                    let mut observability = harvest_observability.lock().await;
+                    record_passive_replay_idle(
+                        &mut observability,
+                        HarvestFamily::Source,
+                        Utc::now(),
+                    );
                     continue;
                 };
                 let replay_started_at = Utc::now();
@@ -4119,52 +4372,46 @@ impl OverlordAgentEmule {
                     size: Some(request.size),
                     restrictive_payload_hex: None,
                 };
+                {
+                    let mut observability = harvest_observability.lock().await;
+                    record_passive_replay_start(
+                        &mut observability,
+                        HarvestFamily::Source,
+                        request.target.to_string(),
+                        Some(request.start_position),
+                        None,
+                        replay_started_at,
+                    );
+                }
                 info!(
                     "kad passive source replay start target={} start_position={} size={}",
                     request.target, request.start_position, request.size
                 );
-                let file_hash = Ed2kHash::from_bytes(request.target.0);
-                let mut stream = dht.search_sources(file_hash, request.size);
-                let mut files = Vec::new();
-                let mut replayed_results = 0usize;
-                let mut batches_posted = 0usize;
-                let mut last_post_error: Option<String> = None;
-                while let Some(result) = stream.next().await {
-                    passive_result_count.fetch_add(1, Ordering::Relaxed);
-                    replayed_results += 1;
-                    files.push(map_source_result(&result, request.size));
-                    if files.len() >= PASSIVE_BATCH_SIZE {
-                        let payload = ResultBatch {
-                            job_id: None,
-                            indexer_id,
-                            protocol: Protocol::Kad2,
-                            harvest_context: Some(replay_context.clone()),
-                            files: std::mem::take(&mut files),
-                        };
-                        if let Err(error) = coordinator.post_results(&payload).await {
-                            warn!("failed to post passive source result batch: {error}");
-                            last_post_error = Some(error.to_string());
-                        } else {
-                            batches_posted += 1;
-                        }
-                    }
-                }
-                if !files.is_empty() {
-                    let payload = ResultBatch {
-                        job_id: None,
+                let outcome = run_passive_source_replay(
+                    PassiveReplayContext {
+                        dht: &dht,
+                        coordinator: &coordinator,
                         indexer_id,
-                        protocol: Protocol::Kad2,
-                        harvest_context: Some(replay_context.clone()),
-                        files,
-                    };
-                    if let Err(error) = coordinator.post_results(&payload).await {
-                        warn!("failed to post passive source result batch: {error}");
-                        last_post_error = Some(error.to_string());
-                    } else {
-                        batches_posted += 1;
-                    }
-                }
+                        replay_context: &replay_context,
+                        max_phase2_fanout: passive_replay_phase2_fanout,
+                        passive_result_count: &passive_result_count,
+                        harvest_observability: &harvest_observability,
+                    },
+                    &request,
+                )
+                .await;
                 let replay_completed_at = Utc::now();
+                {
+                    let mut observability = harvest_observability.lock().await;
+                    record_passive_replay_complete(
+                        &mut observability,
+                        HarvestFamily::Source,
+                        replay_completed_at,
+                        outcome.result_count,
+                        outcome.batch_count,
+                        outcome.tier_summaries.clone(),
+                    );
+                }
                 if let Err(error) = coordinator
                     .post_harvest_replay(&HarvestReplayRecord {
                         replay_id: replay_context.replay_id,
@@ -4177,9 +4424,9 @@ impl OverlordAgentEmule {
                         restrictive_payload_hex: replay_context.restrictive_payload_hex.clone(),
                         started_at: replay_started_at,
                         completed_at: replay_completed_at,
-                        result_count: replayed_results as u32,
-                        batch_count: batches_posted as u32,
-                        error: last_post_error.clone(),
+                        result_count: outcome.result_count as u32,
+                        batch_count: outcome.batch_count as u32,
+                        error: outcome.last_post_error.clone(),
                     })
                     .await
                 {
@@ -4187,7 +4434,7 @@ impl OverlordAgentEmule {
                 }
                 info!(
                     "kad passive source replay done results={} batches_posted={}",
-                    replayed_results, batches_posted
+                    outcome.result_count, outcome.batch_count
                 );
             }
         }));
@@ -4254,10 +4501,9 @@ mod tests {
         build_hello_response, build_kad_hello_tags, build_publish_batch_summary,
         current_tcp_firewalled, effective_publish_counters, empty_networking_config,
         emule_high_id_source_type, flush_snoop_queue, keyword_target,
-        normalize_ed2k_user_hash_markers, parse_kad_hello_metadata,
-        record_passive_keyword_post_failure, record_passive_keyword_replay_complete,
-        record_passive_keyword_replay_idle, record_passive_keyword_replay_start,
-        restore_snoop_queue, select_popular_hashes_for_seeding,
+        normalize_ed2k_user_hash_markers, parse_kad_hello_metadata, record_passive_replay_complete,
+        record_passive_replay_idle, record_passive_replay_post_failure,
+        record_passive_replay_start, restore_snoop_queue, select_popular_hashes_for_seeding,
         select_popular_hashes_from_fetch_result, significant_keyword_words, synthetic_file_hash,
         synthetic_popular_hashes, try_acquire_passive_replay_gate,
     };
@@ -4275,9 +4521,10 @@ mod tests {
     };
     use chrono::{TimeZone, Utc};
     use overlord_agent_common::{
-        AgentInterfacesView, ConfigUpdate, CoordinatorClient, HashType, IndexerRegistration,
-        IndexerService, KadHarvestObservability, PopularHash, Protocol, PublishCounters,
-        PublishSeedSource, RegisterRequest, RegistrationResponse, SnoopEntry,
+        AgentInterfacesView, ConfigUpdate, CoordinatorClient, HarvestFamily, HashType,
+        IndexerRegistration, IndexerService, KadHarvestObservability, KadPassiveReplayTierSummary,
+        PopularHash, Protocol, PublishCounters, PublishSeedSource, RegisterRequest,
+        RegistrationResponse, SnoopEntry,
     };
     use overlord_agent_nat::{UPNP_MINIUPNPC_BACKEND, UPNP_RUPNP_BACKEND};
     use overlord_kad_dht::{DhtConfig, DhtNode, PublishAttemptStats};
@@ -4786,16 +5033,46 @@ mod tests {
         let idle_at = Utc.with_ymd_and_hms(2026, 3, 22, 20, 1, 0).unwrap();
         let completed_at = Utc.with_ymd_and_hms(2026, 3, 22, 20, 2, 0).unwrap();
         let failed_at = Utc.with_ymd_and_hms(2026, 3, 22, 20, 3, 0).unwrap();
+        let tier_summaries = vec![
+            KadPassiveReplayTierSummary {
+                responder_ceiling: 10,
+                result_count: 2,
+            },
+            KadPassiveReplayTierSummary {
+                responder_ceiling: 20,
+                result_count: 5,
+            },
+        ];
 
-        record_passive_keyword_replay_idle(&mut observability, idle_at);
-        record_passive_keyword_replay_start(&mut observability, &request, started_at);
-        record_passive_keyword_replay_complete(&mut observability, completed_at, 7, 2);
-        record_passive_keyword_post_failure(&mut observability, failed_at, "post failed");
+        record_passive_replay_idle(&mut observability, HarvestFamily::Keyword, idle_at);
+        record_passive_replay_start(
+            &mut observability,
+            HarvestFamily::Keyword,
+            request.target.to_string(),
+            Some(request.start_position),
+            Some(request.restrictive_payload.len() as u32),
+            started_at,
+        );
+        record_passive_replay_complete(
+            &mut observability,
+            HarvestFamily::Keyword,
+            completed_at,
+            7,
+            2,
+            tier_summaries.clone(),
+        );
+        record_passive_replay_post_failure(
+            &mut observability,
+            HarvestFamily::Keyword,
+            failed_at,
+            "post failed",
+        );
 
         assert_eq!(observability.passive_keyword_replay.idle_cycles, 1);
         assert_eq!(observability.passive_keyword_replay.started_cycles, 1);
         assert_eq!(observability.passive_keyword_replay.completed_cycles, 1);
         assert_eq!(observability.passive_keyword_replay.emitted_results, 7);
+        assert_eq!(observability.passive_keyword_replay.widened_cycles, 1);
         assert_eq!(observability.passive_keyword_replay.posted_batches, 2);
         assert_eq!(observability.passive_keyword_replay.post_failures, 1);
         assert_eq!(
@@ -4812,6 +5089,18 @@ mod tests {
         );
         assert_eq!(observability.passive_keyword_replay.last_result_count, 7);
         assert_eq!(observability.passive_keyword_replay.last_batches_posted, 2);
+        assert_eq!(observability.passive_keyword_replay.last_tiers_attempted, 2);
+        assert_eq!(
+            observability
+                .passive_keyword_replay
+                .last_widest_responder_ceiling,
+            Some(20)
+        );
+        assert!(observability.passive_keyword_replay.last_widened);
+        assert_eq!(
+            observability.passive_keyword_replay.last_tiers,
+            tier_summaries
+        );
         assert_eq!(
             observability.passive_keyword_replay.last_error.as_deref(),
             Some("post failed")
@@ -4823,6 +5112,70 @@ mod tests {
         assert_eq!(
             observability.passive_keyword_replay.last_error_at,
             Some(failed_at)
+        );
+    }
+
+    #[test]
+    fn passive_source_replay_observability_tracks_tiered_cycle_lifecycle() {
+        let mut observability = KadHarvestObservability::default();
+        let started_at = Utc.with_ymd_and_hms(2026, 3, 22, 21, 0, 0).unwrap();
+        let idle_at = Utc.with_ymd_and_hms(2026, 3, 22, 21, 1, 0).unwrap();
+        let completed_at = Utc.with_ymd_and_hms(2026, 3, 22, 21, 2, 0).unwrap();
+        let tier_summaries = vec![KadPassiveReplayTierSummary {
+            responder_ceiling: 10,
+            result_count: 4,
+        }];
+
+        record_passive_replay_idle(&mut observability, HarvestFamily::Source, idle_at);
+        record_passive_replay_start(
+            &mut observability,
+            HarvestFamily::Source,
+            "ffeeddccbbaa99887766554433221100".to_string(),
+            Some(0),
+            None,
+            started_at,
+        );
+        record_passive_replay_complete(
+            &mut observability,
+            HarvestFamily::Source,
+            completed_at,
+            4,
+            1,
+            tier_summaries.clone(),
+        );
+
+        assert_eq!(observability.passive_source_replay.idle_cycles, 1);
+        assert_eq!(observability.passive_source_replay.started_cycles, 1);
+        assert_eq!(observability.passive_source_replay.completed_cycles, 1);
+        assert_eq!(observability.passive_source_replay.emitted_results, 4);
+        assert_eq!(observability.passive_source_replay.posted_batches, 1);
+        assert_eq!(
+            observability.passive_source_replay.last_target.as_deref(),
+            Some("ffeeddccbbaa99887766554433221100")
+        );
+        assert_eq!(
+            observability.passive_source_replay.last_start_position,
+            Some(0)
+        );
+        assert_eq!(
+            observability.passive_source_replay.last_restrictive_bytes,
+            None
+        );
+        assert_eq!(observability.passive_source_replay.last_tiers_attempted, 1);
+        assert_eq!(
+            observability
+                .passive_source_replay
+                .last_widest_responder_ceiling,
+            Some(10)
+        );
+        assert!(!observability.passive_source_replay.last_widened);
+        assert_eq!(
+            observability.passive_source_replay.last_tiers,
+            tier_summaries
+        );
+        assert_eq!(
+            observability.passive_source_replay.last_completed_at,
+            Some(completed_at)
         );
     }
 
