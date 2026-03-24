@@ -1,7 +1,7 @@
 use crate::error::NetError;
 use crate::obfuscation::{DecryptResult, ObfuscationLayer};
 use crate::rate_limit::RateLimiter;
-use crate::tracker::PacketTracker;
+use crate::tracker::{PacketTracker, PacketTrackerBucket, PacketTrackerKey};
 use crate::transport::Transport;
 use overlord_kad_proto::{KadPacket, constants::opcode};
 use std::collections::HashMap;
@@ -19,6 +19,8 @@ pub struct RpcConfig {
     pub max_outbound_pps: u32,
     /// Max inbound packets per IP per second before flood-blocking.
     pub max_inbound_per_ip: u32,
+    /// Max inbound SEARCH_RES packets per IP per second before flood-blocking.
+    pub max_inbound_search_res_per_ip: u32,
     /// Duration for flood-tracking window.
     pub flood_window: Duration,
     /// Capacity of the unsolicited broadcast channel.
@@ -30,6 +32,7 @@ impl Default for RpcConfig {
         Self {
             max_outbound_pps: 50,
             max_inbound_per_ip: 20,
+            max_inbound_search_res_per_ip: 256,
             flood_window: Duration::from_secs(1),
             broadcast_capacity: 256,
         }
@@ -97,6 +100,7 @@ impl RpcManager {
             rate_limiter: RateLimiter::new(config.max_outbound_pps),
             tracker: Mutex::new(PacketTracker::new(
                 config.max_inbound_per_ip,
+                config.max_inbound_search_res_per_ip,
                 config.flood_window,
             )),
             pending: Mutex::new(HashMap::new()),
@@ -114,14 +118,7 @@ impl RpcManager {
             loop {
                 match inner.transport.recv_raw().await {
                     Ok((data, from)) => {
-                        // 1. Flood check
-                        let allowed = inner.tracker.lock().unwrap().record_and_check(from.ip());
-                        if !allowed {
-                            warn!("flood-blocking {}", from.ip());
-                            continue;
-                        }
-
-                        // 2. Obfuscation decrypt
+                        // 1. Obfuscation decrypt
                         let DecryptResult {
                             data: plain,
                             was_obfuscated,
@@ -152,11 +149,31 @@ impl RpcManager {
                             }
                         };
 
+                        // 3. Flood check
+                        let response_opcode = packet.opcode();
+                        let flood_bucket = flood_bucket_for_opcode(response_opcode);
+                        let allowed =
+                            inner
+                                .tracker
+                                .lock()
+                                .unwrap()
+                                .record_and_check(PacketTrackerKey {
+                                    ip: from.ip(),
+                                    bucket: flood_bucket,
+                                });
+                        if !allowed {
+                            warn!(
+                                "flood-blocking {} opcode={} bucket={}",
+                                from.ip(),
+                                opcode_name(response_opcode),
+                                flood_bucket.label(),
+                            );
+                            continue;
+                        }
+
                         if let Some(peer_id) = peer_identity_from_packet(&packet) {
                             inner.obfuscation.register_peer_identity(from, peer_id);
                         }
-
-                        let response_opcode = packet.opcode();
 
                         // 4. Try to match a pending request
                         let matched = {
@@ -402,6 +419,14 @@ impl RpcManager {
         self.inner
             .obfuscation
             .register_peer_version(addr, kad_version);
+    }
+}
+
+fn flood_bucket_for_opcode(opcode: u8) -> PacketTrackerBucket {
+    if opcode == opcode::SEARCH_RES {
+        PacketTrackerBucket::SearchRes
+    } else {
+        PacketTrackerBucket::Default
     }
 }
 
@@ -670,6 +695,56 @@ mod tests {
         assert!(
             received_count <= 20,
             "received {} packets, expected at most 20",
+            received_count
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_res_uses_higher_flood_budget() {
+        let transport = MockTransport::new(make_local_addr());
+        let inject_tx = transport.injector();
+        let rpc = RpcManager::new(
+            transport,
+            ObfuscationLayer::new(overlord_kad_proto::NodeId::ZERO, 0, false),
+            RpcConfig {
+                max_inbound_per_ip: 20,
+                max_inbound_search_res_per_ip: 64,
+                flood_window: Duration::from_secs(1),
+                broadcast_capacity: 256,
+                ..Default::default()
+            },
+        );
+        let mut subscriber = rpc.subscribe();
+        let _handle = rpc.start();
+
+        let peer_addr: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        let packet = KadPacket::SearchRes(overlord_kad_proto::SearchRes {
+            sender_id: NodeId::from_bytes([0x44; 16]),
+            keyword_id: NodeId::from_bytes([0x55; 16]),
+            results: Vec::new(),
+        });
+        let encoded = packet.encode().unwrap();
+
+        for _ in 0..40usize {
+            let _ = inject_tx.send((encoded.clone(), peer_addr)).await;
+        }
+
+        let mut received_count = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, subscriber.recv()).await {
+                Ok(Ok(_)) => received_count += 1,
+                _ => break,
+            }
+        }
+
+        assert!(
+            received_count >= 40,
+            "received {} SEARCH_RES packets, expected all 40 to pass",
             received_count
         );
     }
