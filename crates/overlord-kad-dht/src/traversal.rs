@@ -362,15 +362,25 @@ async fn run_search_phase(
     let send_to = select_phase2_contacts(responded, target, phase2_fanout);
 
     info!(
-        "traversal phase2: sending search packets to {} nodes, qt={:.1}s",
+        "traversal phase2: walking search packets across {} nodes, qt={:.1}s",
         send_to.len(),
         qt.as_secs_f32()
     );
 
     let mut unsolicited = rpc.subscribe();
-    let queried_addrs: HashSet<SocketAddr> = send_to.iter().map(|contact| contact.addr).collect();
+    let mut queried_addrs = HashSet::new();
+    let total_contacts = send_to.len();
+    let mut search_entries = Vec::new();
+    let result_tx = result_tx;
 
-    for contact in send_to {
+    for (index, contact) in send_to.into_iter().enumerate() {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let now = Instant::now();
+        if now >= phase_deadline {
+            break;
+        }
         register_traversal_identity(rpc, contact);
         let packet = match kind {
             TraversalKind::Keyword { ref request } => KadPacket::SearchKeyReq(request.clone()),
@@ -389,74 +399,83 @@ async fn run_search_phase(
         if let Err(err) = rpc.send(contact.addr, &packet).await {
             trace!("search phase send failed for {}: {}", contact.id, err);
         }
-    }
+        queried_addrs.insert(contact.addr);
 
-    let mut search_entries = Vec::new();
-    let result_tx = result_tx;
-
-    loop {
-        if cancel.is_cancelled() {
-            break;
-        }
         let now = Instant::now();
         if now >= phase_deadline {
             break;
         }
-        let remaining = phase_deadline - now;
-        match tokio::select! {
-            _ = cancel.cancelled() => break,
-            result = tokio::time::timeout(remaining, unsolicited.recv()) => result,
-        } {
-            Ok(Ok(overlord_kad_net::ReceivedKadPacket {
-                packet: KadPacket::SearchRes(sr),
-                from,
-                ..
-            })) => {
-                if !queried_addrs.contains(&from) {
-                    trace!("ignoring SEARCH_RES from unqueried sender {}", from);
-                    continue;
-                }
-                if sr.keyword_id != target {
-                    trace!(
-                        "ignoring SEARCH_RES from {} for mismatched target {}",
-                        from, sr.keyword_id
-                    );
-                    continue;
-                }
+        let remaining_phase = phase_deadline - now;
+        let remaining_contacts = total_contacts.saturating_sub(index);
+        let step_budget = remaining_phase
+            .checked_div(u32::try_from(remaining_contacts).unwrap_or(u32::MAX))
+            .unwrap_or(remaining_phase);
+        let step_deadline = now + step_budget;
 
-                info!(
-                    "search phase got SearchRes: {} results from sender {}",
-                    sr.results.len(),
-                    sr.sender_id
-                );
-                for entry in sr.results {
-                    if let Some(tx) = result_tx.as_ref() {
-                        let _ = tx.send((entry.hash, entry.tags.clone())).await;
-                    }
-                    search_entries.push((entry.hash, entry.tags));
-                }
+        loop {
+            if cancel.is_cancelled() {
+                break;
             }
-            Ok(Ok(overlord_kad_net::ReceivedKadPacket {
-                packet: other,
-                from,
-                ..
-            })) => {
-                if queried_addrs.contains(&from) {
-                    trace!(
-                        "search phase unexpected packet opcode=0x{:02X} from {}",
-                        other.opcode(),
-                        from
+            let now = Instant::now();
+            if now >= step_deadline {
+                break;
+            }
+            let remaining = step_deadline - now;
+            match tokio::select! {
+                _ = cancel.cancelled() => break,
+                result = tokio::time::timeout(remaining, unsolicited.recv()) => result,
+            } {
+                Ok(Ok(overlord_kad_net::ReceivedKadPacket {
+                    packet: KadPacket::SearchRes(sr),
+                    from,
+                    ..
+                })) => {
+                    if !queried_addrs.contains(&from) {
+                        trace!("ignoring SEARCH_RES from unqueried sender {}", from);
+                        continue;
+                    }
+                    if sr.keyword_id != target {
+                        trace!(
+                            "ignoring SEARCH_RES from {} for mismatched target {}",
+                            from, sr.keyword_id
+                        );
+                        continue;
+                    }
+
+                    info!(
+                        "search phase got SearchRes: {} results from sender {}",
+                        sr.results.len(),
+                        sr.sender_id
+                    );
+                    for entry in sr.results {
+                        if let Some(tx) = result_tx.as_ref() {
+                            let _ = tx.send((entry.hash, entry.tags.clone())).await;
+                        }
+                        search_entries.push((entry.hash, entry.tags));
+                    }
+                }
+                Ok(Ok(overlord_kad_net::ReceivedKadPacket {
+                    packet: other,
+                    from,
+                    ..
+                })) => {
+                    if queried_addrs.contains(&from) {
+                        trace!(
+                            "search phase unexpected packet opcode=0x{:02X} from {}",
+                            other.opcode(),
+                            from
+                        );
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
+                    warn!(
+                        "search phase broadcast receiver lagged; skipped {} packets",
+                        skipped
                     );
                 }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_) => break,
             }
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
-                warn!(
-                    "search phase broadcast receiver lagged; skipped {} packets",
-                    skipped
-                );
-            }
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
-            Err(_) => break,
         }
     }
 

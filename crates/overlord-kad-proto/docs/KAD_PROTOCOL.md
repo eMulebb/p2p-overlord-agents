@@ -552,6 +552,10 @@ Repo policy:
 - after applying `SEARCHTOLERANCE`, it caps phase 2 at the oracle's closest `K` responders
 - `search_phase2_fanout` can still lower that ceiling for tests or stricter runs
 
+Scope note:
+
+- passive replay / harvest of unsolicited Kad demand is an Overlord indexer extension; eMule is only the oracle for the underlying source-search packet cadence, contact ordering, and `SEARCH_RES` handling once such a search is emitted
+
 ### Search Result Acceptance And Caps
 
 Repo policy:
