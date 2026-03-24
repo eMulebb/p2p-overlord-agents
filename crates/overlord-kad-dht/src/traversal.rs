@@ -45,8 +45,8 @@ pub enum TraversalKind {
     Store,
     /// Keyword search — after traversal, send SearchKeyReq to close nodes.
     Keyword { request: SearchKeyReq },
-    /// Source search — after traversal, send SearchSourceReq to close nodes.
-    Source { size: u64 },
+    /// Source search — after traversal, send the provided SearchSourceReq to close nodes.
+    Source { request: SearchSourceReq },
     /// Notes search — after traversal, send SearchNotesReq to close nodes.
     Notes { size: u64 },
 }
@@ -445,11 +445,7 @@ async fn run_search_phase(
         register_traversal_identity(rpc, contact);
         let packet = match kind {
             TraversalKind::Keyword { ref request } => KadPacket::SearchKeyReq(request.clone()),
-            TraversalKind::Source { size } => KadPacket::SearchSourceReq(SearchSourceReq {
-                target,
-                start_position: 0,
-                size,
-            }),
+            TraversalKind::Source { ref request } => KadPacket::SearchSourceReq(request.clone()),
             TraversalKind::Notes { size } => {
                 KadPacket::SearchNotesReq(SearchNotesReq { target, size })
             }
@@ -1090,6 +1086,58 @@ mod tests {
             panic!("expected SearchKeyReq");
         };
         assert_eq!(request, restrictive_request);
+    }
+
+    #[tokio::test]
+    async fn test_run_search_phase_replays_source_request_shape() {
+        let transport = Arc::new(MockTransport::new("127.0.0.1:0".parse().unwrap()));
+        let rpc = RpcManager::new(
+            Arc::clone(&transport),
+            ObfuscationLayer::new(NodeId::ZERO, 0, false),
+            RpcConfig::default(),
+        );
+        let _handle = rpc.start();
+
+        let target = NodeId::from_bytes([0x77; 16]);
+        let contact = TraversalContact {
+            id: NodeId::from_bytes([0x14; 16]),
+            addr: "192.168.1.22:4672".parse().unwrap(),
+            version: 9,
+        };
+        let source_request = SearchSourceReq {
+            target,
+            start_position: 0x1234,
+            size: 123_456,
+        };
+
+        let _ = run_search_phase(
+            &rpc,
+            SearchPhaseConfig {
+                responded: std::slice::from_ref(&contact),
+                kind: TraversalKind::Source {
+                    request: source_request.clone(),
+                },
+                target,
+                query_timeout: Duration::from_millis(20),
+                deadline: Instant::now() + Duration::from_millis(50),
+                phase2_fanout: 1,
+                last_lookup_response_at: None,
+                jumpstart_idle_grace: Duration::ZERO,
+                jumpstart_tick: Duration::from_millis(10),
+                cancel: &CancellationToken::new(),
+                result_tx: None,
+            },
+        )
+        .await;
+
+        let outgoing = transport.drain_outgoing();
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0].0, contact.addr);
+        let packet = KadPacket::decode(&outgoing[0].1).unwrap();
+        let KadPacket::SearchSourceReq(request) = packet else {
+            panic!("expected SearchSourceReq");
+        };
+        assert_eq!(request, source_request);
     }
 
     #[tokio::test]

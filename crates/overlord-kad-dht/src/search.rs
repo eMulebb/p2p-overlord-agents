@@ -2,7 +2,7 @@ use crate::traversal::{TraversalConfig, TraversalContact, TraversalKind, run_tra
 use crate::types::{NoteResult, SearchResult, SourceResult};
 use overlord_kad_net::RpcManager;
 use overlord_kad_proto::constants::SEARCH_TIMEOUT_SECS;
-use overlord_kad_proto::{Ed2kHash, NodeId, SearchKeyReq};
+use overlord_kad_proto::{Ed2kHash, NodeId, SearchKeyReq, SearchSourceReq};
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -110,15 +110,38 @@ pub fn search_sources(
     phase2_fanout: usize,
     cancel: CancellationToken,
 ) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
+    search_sources_by_request(
+        rpc,
+        initial,
+        SearchSourceReq {
+            target: NodeId::from_bytes(file_hash.0),
+            start_position: 0,
+            size: file_size,
+        },
+        result_cap,
+        phase2_fanout,
+        cancel,
+    )
+}
+
+/// Run a source search using a prebuilt Kad source request shape.
+pub fn search_sources_by_request(
+    rpc: RpcManager,
+    initial: Vec<TraversalContact>,
+    request: SearchSourceReq,
+    result_cap: usize,
+    phase2_fanout: usize,
+    cancel: CancellationToken,
+) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
     let (tx, rx) = mpsc::channel::<SourceResult>(SEARCH_RESULT_STREAM_BUFFER);
-    let target = NodeId::from_bytes(file_hash.0);
+    let target = request.target;
 
     tokio::spawn(async move {
         let (raw_tx, mut raw_rx) =
             mpsc::channel::<(Ed2kHash, Vec<overlord_kad_proto::Tag>)>(SEARCH_RESULT_STREAM_BUFFER);
         let config = TraversalConfig {
             target,
-            search_kind: TraversalKind::Source { size: file_size },
+            search_kind: TraversalKind::Source { request },
             timeout: SEARCH_TIMEOUT,
             query_timeout: QUERY_TIMEOUT,
             phase2_fanout,

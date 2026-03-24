@@ -1708,7 +1708,6 @@ async fn run_passive_source_replay(
     let mut outcome = PassiveReplayRunOutcome::default();
     let mut seen_sources = HashSet::<(std::net::Ipv4Addr, u16, u16)>::new();
     let mut files = Vec::new();
-    let file_hash = Ed2kHash::from_bytes(request.target.0);
     let (batch_tx, batch_task) = spawn_passive_batch_poster(
         context.coordinator.clone(),
         context.indexer_id,
@@ -1723,12 +1722,13 @@ async fn run_passive_source_replay(
             "kad passive replay tier start family=source target={} responder_ceiling={} size={}",
             request.target, responder_ceiling, request.size
         );
-        let mut stream = context.dht.search_sources_with_phase2_fanout_and_cancel(
-            file_hash,
-            request.size,
-            responder_ceiling,
-            CancellationToken::new(),
-        );
+        let mut stream = context
+            .dht
+            .search_source_request_with_phase2_fanout_and_cancel(
+                request.clone(),
+                responder_ceiling,
+                CancellationToken::new(),
+            );
         while let Some(result) = stream.next().await {
             let source_key = (result.ip, result.tcp_port, result.udp_port);
             if !seen_sources.insert(source_key) {

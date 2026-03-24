@@ -4,7 +4,8 @@ use crate::traversal::{TraversalConfig, TraversalContact, TraversalKind, run_tra
 use crate::types::{NoteResult, SearchResult, SourceResult};
 use overlord_kad_net::{ObfuscationLayer, ReceivedKadPacket, RpcConfig, RpcManager, UdpTransport};
 use overlord_kad_proto::{
-    Ed2kHash, KadPacket, KadUdpKey, NodeId, SearchKeyReq, Tag, constants::K, opcode,
+    Ed2kHash, KadPacket, KadUdpKey, NodeId, SearchKeyReq, SearchSourceReq, Tag, constants::K,
+    opcode,
 };
 use overlord_kad_routing::{Contact, RoutingTable};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -448,10 +449,53 @@ impl DhtNode {
         file_size: u64,
         cancel: CancellationToken,
     ) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
-        self.search_sources_with_phase2_fanout_and_cancel(
-            file_hash,
-            file_size,
+        self.search_source_request_with_phase2_fanout_and_cancel(
+            SearchSourceReq {
+                target: NodeId::from_bytes(file_hash.0),
+                start_position: 0,
+                size: file_size,
+            },
             self.inner.config.search_phase2_fanout,
+            cancel,
+        )
+    }
+
+    /// Replay a full Kad source request shape harvested from the network.
+    pub fn search_source_request(
+        &self,
+        request: SearchSourceReq,
+    ) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
+        self.search_source_request_with_cancel(request, CancellationToken::new())
+    }
+
+    pub fn search_source_request_with_cancel(
+        &self,
+        request: SearchSourceReq,
+        cancel: CancellationToken,
+    ) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
+        self.search_source_request_with_phase2_fanout_and_cancel(
+            request,
+            self.inner.config.search_phase2_fanout,
+            cancel,
+        )
+    }
+
+    /// Search for file sources with an explicit phase-2 responder ceiling while
+    /// preserving the full request shape.
+    pub fn search_source_request_with_phase2_fanout_and_cancel(
+        &self,
+        request: SearchSourceReq,
+        phase2_fanout: usize,
+        cancel: CancellationToken,
+    ) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
+        let target = request.target;
+        let initial = self.closest_search_contacts(target);
+        crate::search::search_sources_by_request(
+            self.inner.rpc.clone(),
+            initial,
+            request,
+            self.inner.config.source_result_cap,
+            phase2_fanout,
             cancel,
         )
     }
@@ -464,14 +508,12 @@ impl DhtNode {
         phase2_fanout: usize,
         cancel: CancellationToken,
     ) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
-        let target = NodeId::from_bytes(file_hash.0);
-        let initial = self.closest_search_contacts(target);
-        crate::search::search_sources(
-            self.inner.rpc.clone(),
-            initial,
-            file_hash,
-            file_size,
-            self.inner.config.source_result_cap,
+        self.search_source_request_with_phase2_fanout_and_cancel(
+            SearchSourceReq {
+                target: NodeId::from_bytes(file_hash.0),
+                start_position: 0,
+                size: file_size,
+            },
             phase2_fanout,
             cancel,
         )
