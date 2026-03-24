@@ -2164,6 +2164,12 @@ fn synthetic_popular_hash(index: usize, seed: &SyntheticPopularSeed) -> PopularH
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourcePublishSettings {
+    tcp_port: u16,
+    obfuscation_enabled: bool,
+}
+
 /// Chooses coordinator-provided hashes when available and otherwise falls back to the
 /// built-in synthetic seed set.
 fn select_popular_hashes_for_seeding(
@@ -2207,6 +2213,7 @@ async fn fetch_popular_hashes_for_seeding(
 async fn seed_popular_from_source(
     dht: &DhtNode,
     source_publish_identity: NodeId,
+    source_publish_settings: SourcePublishSettings,
     source: PublishSeedSource,
     hashes: Vec<PopularHash>,
     local_store: &Arc<Mutex<KadLocalStore>>,
@@ -2220,6 +2227,7 @@ async fn seed_popular_from_source(
     seed_popular_impl(
         dht,
         source_publish_identity,
+        source_publish_settings,
         source,
         hashes,
         local_store,
@@ -2231,6 +2239,7 @@ async fn seed_popular_from_source(
 async fn seed_popular_from_coordinator_or_fallback(
     dht: &DhtNode,
     source_publish_identity: NodeId,
+    source_publish_settings: SourcePublishSettings,
     coordinator: &CoordinatorClient,
     local_store: &Arc<Mutex<KadLocalStore>>,
     publish_observability: &Arc<Mutex<KadPublishObservability>>,
@@ -2239,6 +2248,7 @@ async fn seed_popular_from_coordinator_or_fallback(
     seed_popular_from_source(
         dht,
         source_publish_identity,
+        source_publish_settings,
         source,
         hashes,
         local_store,
@@ -2320,13 +2330,42 @@ fn load_or_create_ed2k_user_hash(path: &Path) -> Result<[u8; 16]> {
 /// Return the eMule-style `TAG_ENCRYPTION` bits for the current non-firewalled agent.
 ///
 /// This mirrors the oracle `GetMyConnectOptions(true, false)` shape we also expose over TCP hello.
-fn emule_source_encryption_options() -> u8 {
-    emule_connect_options(true)
+fn emule_source_encryption_options(obfuscation_enabled: bool) -> u8 {
+    emule_connect_options(obfuscation_enabled)
+}
+
+/// Builds the oracle-style source publish tag set for one file announcement.
+fn build_source_publish_tags(
+    bind_addr: SocketAddr,
+    source_publish_settings: SourcePublishSettings,
+    file_size: u64,
+) -> Vec<Tag> {
+    vec![
+        Tag::new_short(
+            tag_name::SOURCETYPE,
+            TagValue::UInt(u64::from(emule_high_id_source_type(file_size))),
+        ),
+        // Mirror the oracle: SOURCEPORT carries the ED2K TCP listener while
+        // SOURCEUPORT carries the Kad UDP listener.
+        Tag::new_short(
+            tag_name::SOURCEPORT,
+            TagValue::UInt(u64::from(source_publish_settings.tcp_port)),
+        ),
+        Tag::new_short(tag_name::SOURCEUPORT, TagValue::U16(bind_addr.port())),
+        Tag::filesize(file_size),
+        Tag::new_short(
+            tag_name::ENCRYPTION,
+            TagValue::U8(emule_source_encryption_options(
+                source_publish_settings.obfuscation_enabled,
+            )),
+        ),
+    ]
 }
 
 async fn seed_popular_impl(
     dht: &DhtNode,
     source_publish_identity: NodeId,
+    source_publish_settings: SourcePublishSettings,
     seed_source: PublishSeedSource,
     hashes: Vec<PopularHash>,
     local_store: &Arc<Mutex<KadLocalStore>>,
@@ -2400,22 +2439,7 @@ async fn seed_popular_impl(
                 );
             }
         }
-        let source_tags = vec![
-            Tag::new_short(
-                tag_name::SOURCETYPE,
-                TagValue::UInt(u64::from(emule_high_id_source_type(hash.size))),
-            ),
-            Tag::new_short(
-                tag_name::SOURCEPORT,
-                TagValue::UInt(u64::from(bind_addr.port())),
-            ),
-            Tag::new_short(tag_name::SOURCEUPORT, TagValue::U16(bind_addr.port())),
-            Tag::filesize(hash.size),
-            Tag::new_short(
-                tag_name::ENCRYPTION,
-                TagValue::U8(emule_source_encryption_options()),
-            ),
-        ];
+        let source_tags = build_source_publish_tags(bind_addr, source_publish_settings, hash.size);
         if let IpAddr::V4(source_ip) = bind_addr.ip() {
             let mut store = local_store.lock().await;
             store.record_source_publish(
@@ -3998,9 +4022,15 @@ impl IndexerService for OverlordAgentEmule {
             anyhow::bail!("agent networking is waiting for interface selection");
         };
         let source_publish_identity = source_publish_client_hash(self.indexer_id);
+        let config = self.config.read().await;
+        let source_publish_settings = SourcePublishSettings {
+            tcp_port: config.p2p.ed2k.listen_port,
+            obfuscation_enabled: config.p2p.ed2k.obfuscation_enabled,
+        };
         seed_popular_impl(
             &runtime.dht,
             source_publish_identity,
+            source_publish_settings,
             PublishSeedSource::ManualApi,
             hashes,
             &self.local_store,
@@ -4078,6 +4108,10 @@ impl OverlordAgentEmule {
         let local_store = Arc::clone(&self.local_store);
         let publish_observability = Arc::clone(&self.publish_observability);
         let source_publish_identity = source_publish_client_hash(self.indexer_id);
+        let source_publish_settings = SourcePublishSettings {
+            tcp_port: config.p2p.ed2k.listen_port,
+            obfuscation_enabled: config.p2p.ed2k.obfuscation_enabled,
+        };
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             while !shutdown.load(Ordering::Relaxed) && !dht.is_bootstrapped() {
                 match dht.bootstrap().await {
@@ -4088,6 +4122,7 @@ impl OverlordAgentEmule {
                         if let Err(error) = seed_popular_from_coordinator_or_fallback(
                             &dht,
                             source_publish_identity,
+                            source_publish_settings,
                             &coordinator,
                             &local_store,
                             &publish_observability,
@@ -5064,6 +5099,10 @@ impl OverlordAgentEmule {
         let local_store = Arc::clone(&self.local_store);
         let publish_observability = Arc::clone(&self.publish_observability);
         let source_publish_identity = source_publish_client_hash(self.indexer_id);
+        let source_publish_settings = SourcePublishSettings {
+            tcp_port: config.p2p.ed2k.listen_port,
+            obfuscation_enabled: config.p2p.ed2k.obfuscation_enabled,
+        };
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             while !shutdown.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_secs(republish_secs)).await;
@@ -5073,6 +5112,7 @@ impl OverlordAgentEmule {
                 if let Err(error) = seed_popular_from_coordinator_or_fallback(
                     &dht,
                     source_publish_identity,
+                    source_publish_settings,
                     &coordinator,
                     &local_store,
                     &publish_observability,
@@ -5090,12 +5130,13 @@ impl OverlordAgentEmule {
 mod tests {
     use super::{
         COORDINATOR_RECONNECT_SECS, EMULE_LARGE_FILE_SIZE_THRESHOLD, EmuleAgentConfig,
-        OverlordAgentEmule, PassiveReplaySelection, SYNTHETIC_POPULAR_SEEDS, apply_harvest_record,
-        apply_networking_config, apply_publish_summary, apply_queue_family_counts,
-        build_hello_request, build_hello_response, build_kad_hello_tags, build_keyword_snoop_entry,
-        build_notes_snoop_entry, build_publish_batch_summary, build_source_snoop_entry,
-        current_tcp_firewalled, effective_publish_counters, empty_networking_config,
-        emule_high_id_source_type, flush_snoop_queue, keyword_target, next_passive_replay_request,
+        OverlordAgentEmule, PassiveReplaySelection, SYNTHETIC_POPULAR_SEEDS, SourcePublishSettings,
+        apply_harvest_record, apply_networking_config, apply_publish_summary,
+        apply_queue_family_counts, build_hello_request, build_hello_response, build_kad_hello_tags,
+        build_keyword_snoop_entry, build_notes_snoop_entry, build_publish_batch_summary,
+        build_source_publish_tags, build_source_snoop_entry, current_tcp_firewalled,
+        effective_publish_counters, empty_networking_config, emule_high_id_source_type,
+        flush_snoop_queue, keyword_target, next_passive_replay_request,
         normalize_ed2k_user_hash_markers, parse_kad_hello_metadata, record_passive_replay_complete,
         record_passive_replay_idle, record_passive_replay_post_failure,
         record_passive_replay_start, restore_snoop_queue, select_popular_hashes_for_seeding,
@@ -6135,6 +6176,46 @@ mod tests {
                 Tag::new_short(tag_name::SOURCEUPORT, TagValue::U16(41000)),
                 Tag::new_short(tag_name::KADMISCOPTIONS, TagValue::U8(0x05)),
             ]
+        );
+    }
+
+    #[test]
+    fn source_publish_tags_match_oracle_plaintext_shape() {
+        let tags = build_source_publish_tags(
+            "10.54.206.206:41000".parse().unwrap(),
+            SourcePublishSettings {
+                tcp_port: 41001,
+                obfuscation_enabled: false,
+            },
+            2_097_152,
+        );
+
+        assert_eq!(
+            tags,
+            vec![
+                Tag::new_short(tag_name::SOURCETYPE, TagValue::UInt(1)),
+                Tag::new_short(tag_name::SOURCEPORT, TagValue::UInt(41001)),
+                Tag::new_short(tag_name::SOURCEUPORT, TagValue::U16(41000)),
+                Tag::filesize(2_097_152),
+                Tag::new_short(tag_name::ENCRYPTION, TagValue::U8(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn source_publish_tags_set_obfuscated_encryption_bits() {
+        let tags = build_source_publish_tags(
+            "10.54.206.206:41000".parse().unwrap(),
+            SourcePublishSettings {
+                tcp_port: 41001,
+                obfuscation_enabled: true,
+            },
+            2_097_152,
+        );
+
+        assert_eq!(
+            tags.last(),
+            Some(&Tag::new_short(tag_name::ENCRYPTION, TagValue::U8(3)))
         );
     }
 

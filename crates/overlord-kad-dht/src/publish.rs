@@ -10,6 +10,7 @@ use overlord_kad_proto::{
 };
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(STORE_TIMEOUT_SECS);
@@ -30,6 +31,63 @@ impl PublishAttemptStats {
     pub fn failed_contacts(self) -> u32 {
         self.attempted_contacts.saturating_sub(self.acked_contacts)
     }
+}
+
+/// Captures one in-flight publish RPC so the caller can log and aggregate the
+/// result after the concurrent fanout completes.
+#[derive(Debug, Clone)]
+struct PublishAttempt {
+    rank: u32,
+    total: u32,
+    contact: TraversalContact,
+}
+
+/// Send the publish RPC to all selected contacts concurrently so the live wire
+/// shape matches the oracle's bursty publish fanout instead of serial timeout
+/// chains.
+async fn execute_publish_fanout(
+    rpc: &RpcManager,
+    contacts: &[TraversalContact],
+    packet: &KadPacket,
+) -> Vec<(
+    PublishAttempt,
+    Result<KadPacket, overlord_kad_net::NetError>,
+)> {
+    let mut join_set = JoinSet::new();
+    let total = contacts.len() as u32;
+
+    for (index, contact) in contacts.iter().cloned().enumerate() {
+        let rpc = rpc.clone();
+        let packet = packet.clone();
+        let attempt = PublishAttempt {
+            rank: index as u32 + 1,
+            total,
+            contact,
+        };
+        join_set.spawn(async move {
+            let result = rpc
+                .request(
+                    attempt.contact.addr,
+                    &packet,
+                    opcode::PUBLISH_RES,
+                    PUBLISH_RESPONSE_TIMEOUT,
+                )
+                .await;
+            (attempt, result)
+        });
+    }
+
+    let mut results = Vec::with_capacity(contacts.len());
+    while let Some(joined) = join_set.join_next().await {
+        match joined {
+            Ok(result) => results.push(result),
+            Err(error) => {
+                tracing::warn!("publish request task failed to join: {error}");
+            }
+        }
+    }
+
+    results
 }
 
 /// Publish a keyword→file mapping.
@@ -72,13 +130,16 @@ pub async fn publish_keyword(
         entries: vec![entry],
     });
 
+    let publish_contacts: Vec<_> = traversal.closest.iter().take(K).cloned().collect();
     let mut stats = PublishAttemptStats {
         closest_contacts_considered: traversal.closest.len() as u32,
-        attempted_contacts: traversal.closest.iter().take(K).count() as u32,
+        attempted_contacts: publish_contacts.len() as u32,
         ..PublishAttemptStats::default()
     };
-    for (index, contact) in traversal.closest.iter().take(K).enumerate() {
+    for contact in &publish_contacts {
         register_publish_contact(rpc, contact);
+    }
+    for (index, contact) in publish_contacts.iter().enumerate() {
         tracing::info!(
             "kad publish contact family=keyword step=send rank={}/{} contact_addr={} contact_id={} contact_version={} target={} file_hash={}",
             index + 1,
@@ -89,23 +150,17 @@ pub async fn publish_keyword(
             target,
             file_hash,
         );
-        match rpc
-            .request(
-                contact.addr,
-                &packet,
-                opcode::PUBLISH_RES,
-                PUBLISH_RESPONSE_TIMEOUT,
-            )
-            .await
-        {
+    }
+    for (attempt, result) in execute_publish_fanout(rpc, &publish_contacts, &packet).await {
+        match result {
             Ok(KadPacket::PublishRes(response)) => {
                 stats.acked_contacts += 1;
                 tracing::info!(
                     "kad publish contact family=keyword step=ack rank={}/{} contact_addr={} contact_id={} response_target={} response_load={}",
-                    index + 1,
-                    stats.attempted_contacts,
-                    contact.addr,
-                    contact.id,
+                    attempt.rank,
+                    attempt.total,
+                    attempt.contact.addr,
+                    attempt.contact.id,
                     response.target,
                     response.load,
                 );
@@ -114,10 +169,10 @@ pub async fn publish_keyword(
                 stats.acked_contacts += 1;
                 tracing::info!(
                     "kad publish contact family=keyword step=ack rank={}/{} contact_addr={} contact_id={} response_opcode=0x{:02X}",
-                    index + 1,
-                    stats.attempted_contacts,
-                    contact.addr,
-                    contact.id,
+                    attempt.rank,
+                    attempt.total,
+                    attempt.contact.addr,
+                    attempt.contact.id,
                     other.opcode(),
                 );
             }
@@ -127,13 +182,17 @@ pub async fn publish_keyword(
                 }
                 tracing::info!(
                     "kad publish contact family=keyword step=fail rank={}/{} contact_addr={} contact_id={} error={}",
-                    index + 1,
-                    stats.attempted_contacts,
-                    contact.addr,
-                    contact.id,
+                    attempt.rank,
+                    attempt.total,
+                    attempt.contact.addr,
+                    attempt.contact.id,
                     e,
                 );
-                tracing::debug!("publish_keyword ack failed from {}: {}", contact.addr, e);
+                tracing::debug!(
+                    "publish_keyword ack failed from {}: {}",
+                    attempt.contact.addr,
+                    e
+                );
             }
         }
     }
@@ -177,13 +236,16 @@ pub async fn publish_source(
         tags,
     });
 
+    let publish_contacts: Vec<_> = traversal.closest.iter().take(K).cloned().collect();
     let mut stats = PublishAttemptStats {
         closest_contacts_considered: traversal.closest.len() as u32,
-        attempted_contacts: traversal.closest.iter().take(K).count() as u32,
+        attempted_contacts: publish_contacts.len() as u32,
         ..PublishAttemptStats::default()
     };
-    for (index, contact) in traversal.closest.iter().take(K).enumerate() {
+    for contact in &publish_contacts {
         register_publish_contact(rpc, contact);
+    }
+    for (index, contact) in publish_contacts.iter().enumerate() {
         tracing::info!(
             "kad publish contact family=source step=send rank={}/{} contact_addr={} contact_id={} contact_version={} target={} file_hash={} publisher_id={}",
             index + 1,
@@ -195,23 +257,17 @@ pub async fn publish_source(
             file_hash,
             publisher_id,
         );
-        match rpc
-            .request(
-                contact.addr,
-                &packet,
-                opcode::PUBLISH_RES,
-                PUBLISH_RESPONSE_TIMEOUT,
-            )
-            .await
-        {
+    }
+    for (attempt, result) in execute_publish_fanout(rpc, &publish_contacts, &packet).await {
+        match result {
             Ok(KadPacket::PublishRes(response)) => {
                 stats.acked_contacts += 1;
                 tracing::info!(
                     "kad publish contact family=source step=ack rank={}/{} contact_addr={} contact_id={} response_target={} response_load={}",
-                    index + 1,
-                    stats.attempted_contacts,
-                    contact.addr,
-                    contact.id,
+                    attempt.rank,
+                    attempt.total,
+                    attempt.contact.addr,
+                    attempt.contact.id,
                     response.target,
                     response.load,
                 );
@@ -220,10 +276,10 @@ pub async fn publish_source(
                 stats.acked_contacts += 1;
                 tracing::info!(
                     "kad publish contact family=source step=ack rank={}/{} contact_addr={} contact_id={} response_opcode=0x{:02X}",
-                    index + 1,
-                    stats.attempted_contacts,
-                    contact.addr,
-                    contact.id,
+                    attempt.rank,
+                    attempt.total,
+                    attempt.contact.addr,
+                    attempt.contact.id,
                     other.opcode(),
                 );
             }
@@ -233,13 +289,17 @@ pub async fn publish_source(
                 }
                 tracing::info!(
                     "kad publish contact family=source step=fail rank={}/{} contact_addr={} contact_id={} error={}",
-                    index + 1,
-                    stats.attempted_contacts,
-                    contact.addr,
-                    contact.id,
+                    attempt.rank,
+                    attempt.total,
+                    attempt.contact.addr,
+                    attempt.contact.id,
                     e,
                 );
-                tracing::debug!("publish_source ack failed from {}: {}", contact.addr, e);
+                tracing::debug!(
+                    "publish_source ack failed from {}: {}",
+                    attempt.contact.addr,
+                    e
+                );
             }
         }
     }
@@ -283,20 +343,20 @@ pub async fn publish_notes(
         tags,
     });
 
-    let mut acks = 0usize;
-    for contact in traversal.closest.iter().take(K) {
+    let publish_contacts: Vec<_> = traversal.closest.iter().take(K).cloned().collect();
+    for contact in &publish_contacts {
         register_publish_contact(rpc, contact);
-        match rpc
-            .request(
-                contact.addr,
-                &packet,
-                opcode::PUBLISH_RES,
-                PUBLISH_RESPONSE_TIMEOUT,
-            )
-            .await
-        {
+    }
+
+    let mut acks = 0usize;
+    for (attempt, result) in execute_publish_fanout(rpc, &publish_contacts, &packet).await {
+        match result {
             Ok(_) => acks += 1,
-            Err(e) => tracing::debug!("publish_notes ack failed from {}: {}", contact.addr, e),
+            Err(e) => tracing::debug!(
+                "publish_notes ack failed from {}: {}",
+                attempt.contact.addr,
+                e
+            ),
         }
     }
 
