@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use overlord_agent_common::SnoopEntry;
-use overlord_kad_proto::{NodeId, SearchKeyReq};
+use overlord_kad_proto::{NodeId, SearchKeyReq, SearchSourceReq};
 
 use crate::config::SnoopQueueConfig;
 
@@ -134,6 +134,54 @@ impl SnoopQueue {
         Some(selected.0)
     }
 
+    /// Selects the next source request eligible for passive drain and marks it as drained.
+    pub fn select_next_source_request(&mut self, now: DateTime<Utc>) -> Option<SearchSourceReq> {
+        self.prune_recent_drains(now);
+        if self.recent_drains.len() >= self.config.max_queries_per_600s as usize {
+            return None;
+        }
+
+        let dedup_cutoff = now - seconds(self.config.dedup_window_secs);
+        let cooldown_cutoff = now - seconds(self.config.drain_cooldown_secs);
+        let mut recent = Vec::new();
+        let mut stale = Vec::new();
+
+        for entry in self.entries.values() {
+            let Some(request) = source_request(entry) else {
+                continue;
+            };
+            if entry
+                .last_drained_at()
+                .is_some_and(|last_drained_at| last_drained_at > cooldown_cutoff)
+            {
+                continue;
+            }
+            let candidate = (
+                request,
+                entry.hit_count(),
+                entry.last_seen(),
+                entry.logical_key().to_string(),
+            );
+            if entry.last_seen() >= dedup_cutoff {
+                recent.push(candidate);
+            } else {
+                stale.push(candidate);
+            }
+        }
+
+        recent.sort_by(source_candidate_cmp);
+        stale.sort_by(source_candidate_cmp);
+        let selected = recent
+            .into_iter()
+            .next()
+            .or_else(|| stale.into_iter().next())?;
+        if let Some(entry) = self.entries.get_mut(&selected.3) {
+            entry.set_last_drained_at(Some(now));
+        }
+        self.recent_drains.push_back(now);
+        Some(selected.0)
+    }
+
     fn merge_entry(&mut self, entry: SnoopEntry) -> (bool, u32) {
         let logical_key = entry.logical_key().to_string();
         if let Some(existing) = self.entries.get_mut(&logical_key) {
@@ -212,6 +260,26 @@ fn keyword_request(entry: &SnoopEntry) -> Option<SearchKeyReq> {
     })
 }
 
+fn source_request(entry: &SnoopEntry) -> Option<SearchSourceReq> {
+    let SnoopEntry::Source {
+        target,
+        start_position,
+        size,
+        ..
+    } = entry
+    else {
+        return None;
+    };
+    if *size == 0 {
+        return None;
+    }
+    Some(SearchSourceReq {
+        target: NodeId::from_str(target).ok()?,
+        start_position: *start_position,
+        size: *size,
+    })
+}
+
 fn seconds(value: u64) -> TimeDelta {
     TimeDelta::seconds(i64::try_from(value).unwrap_or(i64::MAX))
 }
@@ -227,11 +295,22 @@ fn candidate_cmp(
         .then_with(|| left.3.cmp(&right.3))
 }
 
+fn source_candidate_cmp(
+    left: &(SearchSourceReq, u32, DateTime<Utc>, String),
+    right: &(SearchSourceReq, u32, DateTime<Utc>, String),
+) -> std::cmp::Ordering {
+    right
+        .1
+        .cmp(&left.1)
+        .then_with(|| right.2.cmp(&left.2))
+        .then_with(|| left.3.cmp(&right.3))
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
     use overlord_agent_common::SnoopEntry;
-    use overlord_kad_proto::SearchKeyReq;
+    use overlord_kad_proto::{SearchKeyReq, SearchSourceReq};
 
     use super::{SnoopQueue, SnoopQueueFamilyCounts};
     use crate::config::SnoopQueueConfig;
@@ -350,6 +429,63 @@ mod tests {
 
         let selected = queue.select_next_keyword_request(ts(130));
         assert!(selected.is_some());
+    }
+
+    #[test]
+    fn source_drain_selects_source_entries_without_keyword_shapes() {
+        let mut queue = queue();
+        queue.record(notes_entry(
+            "notes:00112233445566778899aabbccddeeff:4096",
+            "00112233445566778899aabbccddeeff",
+            4096,
+            100,
+        ));
+        queue.record(source_entry(
+            "source:00112233445566778899aabbccddeeff:8000:4096",
+            "00112233445566778899aabbccddeeff",
+            0x8000,
+            4096,
+            110,
+        ));
+
+        let selected = queue.select_next_source_request(ts(130));
+        assert_eq!(
+            selected,
+            Some(SearchSourceReq {
+                target: "00112233445566778899aabbccddeeff".parse().unwrap(),
+                start_position: 0x8000,
+                size: 4096,
+            })
+        );
+    }
+
+    #[test]
+    fn source_drain_skips_zero_sized_requests() {
+        let mut queue = queue();
+        queue.record(source_entry(
+            "source:00112233445566778899aabbccddeeff:0000:0",
+            "00112233445566778899aabbccddeeff",
+            0,
+            0,
+            100,
+        ));
+        queue.record(source_entry(
+            "source:11112222333344445555666677778888:0000:8192",
+            "11112222333344445555666677778888",
+            0,
+            8192,
+            110,
+        ));
+
+        let selected = queue.select_next_source_request(ts(130));
+        assert_eq!(
+            selected,
+            Some(SearchSourceReq {
+                target: "11112222333344445555666677778888".parse().unwrap(),
+                start_position: 0,
+                size: 8192,
+            })
+        );
     }
 
     #[test]

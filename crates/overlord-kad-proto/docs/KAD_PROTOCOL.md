@@ -549,8 +549,8 @@ Status:
 Repo policy:
 
 - unlike eMule's UI-oriented search manager, the Overlord Kad runtime does not stop phase 2 at the closest `K`
-- after applying `SEARCHTOLERANCE`, it fans out to a configurable broader responder set
-- default `search_phase2_fanout = 50`
+- after applying `SEARCHTOLERANCE`, it caps phase 2 at the oracle's closest `K` responders
+- `search_phase2_fanout` can still lower that ceiling for tests or stricter runs
 
 ### Search Result Acceptance And Caps
 

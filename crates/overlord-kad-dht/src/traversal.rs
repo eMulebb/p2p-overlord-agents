@@ -484,13 +484,14 @@ fn select_phase2_contacts(
     target: NodeId,
     phase2_fanout: usize,
 ) -> Vec<&TraversalContact> {
-    // Harvest-first repo policy: keep the eMule SEARCHTOLERANCE gate, but do
-    // not stop at the closest-K responders. This indexer asks a broader set of
-    // tolerated responders so it can collect more SEARCH_RES packets.
+    // eMule stops phase 2 at the closest tolerated responders. We keep the
+    // configurable ceiling for tests or explicit tightening, but never exceed
+    // the oracle's closest-K contact window.
+    let oracle_ceiling = phase2_fanout.min(K);
     responded
         .iter()
         .filter(|contact| passes_search_tolerance(target, contact))
-        .take(phase2_fanout)
+        .take(oracle_ceiling)
         .collect()
 }
 
@@ -771,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_phase2_contacts_can_exceed_k_with_fanout_limit() {
+    fn test_select_phase2_contacts_caps_fanout_at_oracle_k() {
         let target = NodeId::ZERO;
         let responded: Vec<TraversalContact> = (1u8..=20)
             .map(|n| TraversalContact {
@@ -782,8 +783,7 @@ mod tests {
             .collect();
 
         let selected = select_phase2_contacts(&responded, target, 15);
-        assert_eq!(selected.len(), 15);
-        assert!(selected.len() > K);
+        assert_eq!(selected.len(), K);
     }
 
     #[test]
