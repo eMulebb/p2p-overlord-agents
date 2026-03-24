@@ -406,27 +406,29 @@ impl DhtNode {
         request: SearchKeyReq,
         cancel: CancellationToken,
     ) -> impl tokio_stream::Stream<Item = SearchResult> + Send + 'static {
+        self.search_keyword_request_with_phase2_fanout_and_cancel(
+            request,
+            self.inner.config.search_phase2_fanout,
+            cancel,
+        )
+    }
+
+    /// Replay a harvested Kad keyword request shape with an explicit phase-2
+    /// responder ceiling.
+    pub fn search_keyword_request_with_phase2_fanout_and_cancel(
+        &self,
+        request: SearchKeyReq,
+        phase2_fanout: usize,
+        cancel: CancellationToken,
+    ) -> impl tokio_stream::Stream<Item = SearchResult> + Send + 'static {
         let target = request.target;
-        let initial = {
-            match self.inner.routing_table.try_lock() {
-                Ok(rt) => rt
-                    .get_closest(&target, K)
-                    .into_iter()
-                    .map(|c| TraversalContact {
-                        id: c.id,
-                        addr: SocketAddr::new(IpAddr::V4(c.ip), c.udp_port),
-                        version: c.kad_version,
-                    })
-                    .collect(),
-                Err(_) => vec![],
-            }
-        };
+        let initial = self.closest_search_contacts(target);
         crate::search::search_keywords_by_request(
             self.inner.rpc.clone(),
             initial,
             request,
             self.inner.config.keyword_result_cap,
-            self.inner.config.search_phase2_fanout,
+            phase2_fanout,
             cancel,
         )
     }
@@ -446,28 +448,31 @@ impl DhtNode {
         file_size: u64,
         cancel: CancellationToken,
     ) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
+        self.search_sources_with_phase2_fanout_and_cancel(
+            file_hash,
+            file_size,
+            self.inner.config.search_phase2_fanout,
+            cancel,
+        )
+    }
+
+    /// Search for file sources with an explicit phase-2 responder ceiling.
+    pub fn search_sources_with_phase2_fanout_and_cancel(
+        &self,
+        file_hash: Ed2kHash,
+        file_size: u64,
+        phase2_fanout: usize,
+        cancel: CancellationToken,
+    ) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
         let target = NodeId::from_bytes(file_hash.0);
-        let initial = {
-            match self.inner.routing_table.try_lock() {
-                Ok(rt) => rt
-                    .get_closest(&target, K)
-                    .into_iter()
-                    .map(|c| TraversalContact {
-                        id: c.id,
-                        addr: SocketAddr::new(IpAddr::V4(c.ip), c.udp_port),
-                        version: c.kad_version,
-                    })
-                    .collect(),
-                Err(_) => vec![],
-            }
-        };
+        let initial = self.closest_search_contacts(target);
         crate::search::search_sources(
             self.inner.rpc.clone(),
             initial,
             file_hash,
             file_size,
             self.inner.config.source_result_cap,
-            self.inner.config.search_phase2_fanout,
+            phase2_fanout,
             cancel,
         )
     }
@@ -562,6 +567,22 @@ impl DhtNode {
             tags,
         )
         .await
+    }
+
+    /// Returns the routing-table contacts used to seed one Kad search walk.
+    fn closest_search_contacts(&self, target: NodeId) -> Vec<TraversalContact> {
+        match self.inner.routing_table.try_lock() {
+            Ok(rt) => rt
+                .get_closest(&target, K)
+                .into_iter()
+                .map(|c| TraversalContact {
+                    id: c.id,
+                    addr: SocketAddr::new(IpAddr::V4(c.ip), c.udp_port),
+                    version: c.kad_version,
+                })
+                .collect(),
+            Err(_) => vec![],
+        }
     }
 
     fn load_bootstrap_contacts(&self) -> Vec<BootstrapContact> {
