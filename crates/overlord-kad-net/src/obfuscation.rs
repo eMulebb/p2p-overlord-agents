@@ -98,6 +98,8 @@ pub struct OutboundKadEncryptionInfo {
     pub mode: OutboundKadEncryptionMode,
     /// Known Kad node ID for the peer, when available.
     pub peer_node_id: Option<NodeId>,
+    /// Highest Kad version observed for the peer, when available.
+    pub peer_kad_version: Option<u8>,
     /// Latest receiver verify key learned from this peer, when available.
     pub receiver_verify_key: Option<u32>,
     /// Verify key this node would announce to the destination peer.
@@ -285,6 +287,7 @@ impl ObfuscationLayer {
         OutboundKadEncryptionInfo {
             mode,
             peer_node_id: peer.node_id,
+            peer_kad_version: peer.kad_version,
             receiver_verify_key: peer.receiver_verify_key,
             sender_verify_key,
         }

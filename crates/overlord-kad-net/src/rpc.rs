@@ -3,7 +3,7 @@ use crate::obfuscation::{DecryptResult, ObfuscationLayer};
 use crate::rate_limit::RateLimiter;
 use crate::tracker::{PacketTracker, PacketTrackerBucket, PacketTrackerKey};
 use crate::transport::Transport;
-use overlord_kad_proto::{KadPacket, constants::opcode};
+use overlord_kad_proto::{KadPacket, NodeId, constants::opcode};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,12 +17,14 @@ use tracing::{debug, error, info, warn};
 pub struct RpcConfig {
     /// Max outbound packets per second. 0 = unlimited.
     pub max_outbound_pps: u32,
-    /// Max inbound packets per IP per second before flood-blocking.
+    /// Max inbound control packets per IP per flood window before flood-blocking.
     pub max_inbound_per_ip: u32,
     /// Max inbound SEARCH_RES packets per IP per second before flood-blocking.
     pub max_inbound_search_res_per_ip: u32,
     /// Duration for flood-tracking window.
     pub flood_window: Duration,
+    /// Duration for oracle-shaped inbound search/publish request tracking.
+    pub request_tracking_window: Duration,
     /// Capacity of the unsolicited broadcast channel.
     pub broadcast_capacity: usize,
 }
@@ -34,6 +36,7 @@ impl Default for RpcConfig {
             max_inbound_per_ip: 20,
             max_inbound_search_res_per_ip: 256,
             flood_window: Duration::from_secs(1),
+            request_tracking_window: Duration::from_secs(60),
             broadcast_capacity: 256,
         }
     }
@@ -102,6 +105,7 @@ impl RpcManager {
                 config.max_inbound_per_ip,
                 config.max_inbound_search_res_per_ip,
                 config.flood_window,
+                config.request_tracking_window,
             )),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
@@ -149,30 +153,53 @@ impl RpcManager {
                             }
                         };
 
-                        // 3. Flood check
                         let response_opcode = packet.opcode();
-                        let flood_bucket = flood_bucket_for_opcode(response_opcode);
-                        let allowed =
+                        let inbound = inspect_inbound_packet(&packet);
+
+                        if let Some(peer_id) = inbound.peer_id {
+                            inner.obfuscation.register_peer_identity(from, peer_id);
+                        }
+                        if let Some(kad_version) = inbound.kad_version {
+                            inner.obfuscation.register_peer_version(from, kad_version);
+                        }
+
+                        debug!(
+                            "kad recv opcode={} from={} obfuscated={} receiver_key_valid={} sender_verify_key={} bucket={} peer_id={} peer_version={}",
+                            opcode_name(response_opcode),
+                            from,
+                            was_obfuscated,
+                            receiver_verify_key_valid,
+                            sender_verify_key.unwrap_or_default(),
+                            inbound.bucket.label(),
+                            inbound
+                                .peer_id
+                                .map(|peer_id| peer_id.to_string())
+                                .unwrap_or_else(|| "-".to_string()),
+                            inbound
+                                .kad_version
+                                .map_or_else(|| "-".to_string(), |version| version.to_string()),
+                        );
+
+                        let decision =
                             inner
                                 .tracker
                                 .lock()
                                 .unwrap()
                                 .record_and_check(PacketTrackerKey {
                                     ip: from.ip(),
-                                    bucket: flood_bucket,
+                                    bucket: inbound.bucket,
                                 });
-                        if !allowed {
+                        if !decision.allowed {
                             warn!(
-                                "flood-blocking {} opcode={} bucket={}",
+                                "flood-blocking {} opcode={} bucket={} observed_packets={} max_packets={} window_ms={}",
                                 from.ip(),
                                 opcode_name(response_opcode),
-                                flood_bucket.label(),
+                                inbound.bucket.label(),
+                                decision.observed_packets,
+                                decision.max_packets,
+                                decision.window.as_millis(),
                             );
                             continue;
-                        }
-
-                        if let Some(peer_id) = peer_identity_from_packet(&packet) {
-                            inner.obfuscation.register_peer_identity(from, peer_id);
                         }
 
                         // 4. Try to match a pending request
@@ -363,6 +390,22 @@ impl RpcManager {
             .inner
             .obfuscation
             .inspect_outbound(addr, packet.opcode());
+        debug!(
+            "kad send opcode={} to={} mode={} reason={} peer_version={} receiver_verify_key={} sender_verify_key={} peer_node_id={}",
+            opcode_name(packet.opcode()),
+            addr,
+            outbound.mode.as_str(),
+            outbound_transport_reason(packet.opcode(), outbound),
+            outbound
+                .peer_kad_version
+                .map_or_else(|| "-".to_string(), |version| version.to_string()),
+            outbound.receiver_verify_key.unwrap_or_default(),
+            outbound.sender_verify_key.unwrap_or_default(),
+            outbound
+                .peer_node_id
+                .map(|node_id| node_id.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        );
         let wire = self
             .inner
             .obfuscation
@@ -422,11 +465,74 @@ impl RpcManager {
     }
 }
 
-fn flood_bucket_for_opcode(opcode: u8) -> PacketTrackerBucket {
-    if opcode == opcode::SEARCH_RES {
-        PacketTrackerBucket::SearchRes
-    } else {
-        PacketTrackerBucket::Default
+#[derive(Debug, Clone, Copy)]
+struct InboundKadPacketInfo {
+    bucket: PacketTrackerBucket,
+    peer_id: Option<NodeId>,
+    kad_version: Option<u8>,
+}
+
+fn inspect_inbound_packet(packet: &KadPacket) -> InboundKadPacketInfo {
+    match packet {
+        KadPacket::BootstrapRes(res) => InboundKadPacketInfo {
+            bucket: PacketTrackerBucket::Bootstrap,
+            peer_id: Some(res.sender_id),
+            kad_version: Some(res.sender_version),
+        },
+        KadPacket::HelloReq(req) => InboundKadPacketInfo {
+            bucket: PacketTrackerBucket::Hello,
+            peer_id: Some(req.node_id),
+            kad_version: Some(req.version),
+        },
+        KadPacket::HelloRes(res) => InboundKadPacketInfo {
+            bucket: PacketTrackerBucket::Hello,
+            peer_id: Some(res.node_id),
+            kad_version: Some(res.version),
+        },
+        KadPacket::HelloResAck(ack) => InboundKadPacketInfo {
+            bucket: PacketTrackerBucket::Hello,
+            peer_id: Some(ack.node_id),
+            kad_version: None,
+        },
+        KadPacket::SearchRes(res) => InboundKadPacketInfo {
+            bucket: PacketTrackerBucket::SearchRes,
+            peer_id: Some(res.sender_id),
+            kad_version: None,
+        },
+        _ => InboundKadPacketInfo {
+            bucket: tracker_bucket_for_opcode(packet.opcode()),
+            peer_id: None,
+            kad_version: None,
+        },
+    }
+}
+
+fn tracker_bucket_for_opcode(opcode_value: u8) -> PacketTrackerBucket {
+    match opcode_value {
+        opcode::BOOTSTRAP_REQ | opcode::BOOTSTRAP_RES => PacketTrackerBucket::Bootstrap,
+        opcode::HELLO_REQ | opcode::HELLO_RES | opcode::HELLO_RES_ACK => PacketTrackerBucket::Hello,
+        opcode::SEARCH_KEY_REQ | opcode::SEARCH_SOURCE_REQ | opcode::SEARCH_NOTES_REQ => {
+            PacketTrackerBucket::SearchReq
+        }
+        opcode::PUBLISH_KEY_REQ => PacketTrackerBucket::PublishKeyReq,
+        opcode::PUBLISH_SOURCE_REQ => PacketTrackerBucket::PublishSourceReq,
+        opcode::PUBLISH_NOTES_REQ => PacketTrackerBucket::PublishNotesReq,
+        opcode::SEARCH_RES => PacketTrackerBucket::SearchRes,
+        opcode::REQ
+        | opcode::RES
+        | opcode::PUBLISH_RES
+        | opcode::PUBLISH_RES_ACK
+        | opcode::FIREWALLED_REQ
+        | opcode::FIREWALLED2_REQ
+        | opcode::FIREWALLED_RES
+        | opcode::FIREWALLED_ACK_RES
+        | opcode::FIREWALLUDP
+        | opcode::FINDBUDDY_REQ
+        | opcode::FINDBUDDY_RES
+        | opcode::CALLBACK_REQ
+        | opcode::PING
+        | opcode::PONG => PacketTrackerBucket::Control,
+        _ => PacketTrackerBucket::Default,
     }
 }
 
@@ -515,14 +621,51 @@ fn hex_prefix(bytes: &[u8], max_bytes: usize) -> String {
     out
 }
 
-fn peer_identity_from_packet(packet: &KadPacket) -> Option<overlord_kad_proto::NodeId> {
-    match packet {
-        KadPacket::BootstrapRes(res) => Some(res.sender_id),
-        KadPacket::HelloReq(req) => Some(req.node_id),
-        KadPacket::HelloRes(res) => Some(res.node_id),
-        KadPacket::SearchRes(res) => Some(res.sender_id),
-        _ => None,
+fn outbound_transport_reason(
+    opcode_value: u8,
+    outbound: crate::obfuscation::OutboundKadEncryptionInfo,
+) -> &'static str {
+    match outbound.mode {
+        crate::obfuscation::OutboundKadEncryptionMode::NodeId => "node_id_available",
+        crate::obfuscation::OutboundKadEncryptionMode::ReceiverVerifyKey => {
+            if is_response_opcode(opcode_value) {
+                "reply_uses_receiver_verify_key"
+            } else {
+                "receiver_verify_key_fallback"
+            }
+        }
+        crate::obfuscation::OutboundKadEncryptionMode::Plaintext => {
+            if outbound.peer_node_id.is_none() && outbound.receiver_verify_key.is_none() {
+                "missing_peer_identity_and_receiver_key"
+            } else if outbound.peer_node_id.is_none() {
+                "missing_peer_identity"
+            } else if outbound
+                .peer_kad_version
+                .is_some_and(|kad_version| kad_version < 6)
+            {
+                "peer_version_below_v6_without_receiver_key"
+            } else {
+                "missing_receiver_verify_key"
+            }
+        }
     }
+}
+
+fn is_response_opcode(opcode_value: u8) -> bool {
+    matches!(
+        opcode_value,
+        opcode::BOOTSTRAP_RES
+            | opcode::HELLO_RES
+            | opcode::HELLO_RES_ACK
+            | opcode::RES
+            | opcode::SEARCH_RES
+            | opcode::PUBLISH_RES
+            | opcode::PUBLISH_RES_ACK
+            | opcode::FIREWALLED_RES
+            | opcode::FIREWALLED_ACK_RES
+            | opcode::FINDBUDDY_RES
+            | opcode::PONG
+    )
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -534,6 +677,7 @@ mod tests {
     use crate::transport::MockTransport;
     use overlord_kad_proto::constants::opcode;
     use overlord_kad_proto::{KadPacket, NodeId};
+    use std::sync::Arc;
 
     fn make_local_addr() -> SocketAddr {
         "127.0.0.1:0".parse().unwrap()
@@ -551,6 +695,13 @@ mod tests {
 
     fn make_rpc_with_transport(transport: MockTransport) -> RpcManager {
         let obfuscation = ObfuscationLayer::new(overlord_kad_proto::NodeId::ZERO, 0, false);
+        RpcManager::new(transport, obfuscation, RpcConfig::default())
+    }
+
+    fn make_rpc_with_shared_transport(
+        transport: Arc<MockTransport>,
+        obfuscation: ObfuscationLayer,
+    ) -> RpcManager {
         RpcManager::new(transport, obfuscation, RpcConfig::default())
     }
 
@@ -747,5 +898,44 @@ mod tests {
             "received {} SEARCH_RES packets, expected all 40 to pass",
             received_count
         );
+    }
+
+    #[tokio::test]
+    async fn test_hello_request_registers_identity_and_version_for_obfuscated_reply() {
+        let transport = Arc::new(MockTransport::new(make_local_addr()));
+        let inject_tx = transport.injector();
+        let obfuscation = ObfuscationLayer::new(NodeId::from_bytes([0xAA; 16]), 0x1234_5678, true);
+        let rpc = make_rpc_with_shared_transport(Arc::clone(&transport), obfuscation);
+        let mut subscriber = rpc.subscribe();
+        let _handle = rpc.start();
+
+        let peer_addr = make_peer_addr();
+        let peer_id = NodeId::from_bytes([0x44; 16]);
+        let hello = KadPacket::HelloReq(overlord_kad_proto::HelloReq {
+            node_id: peer_id,
+            tcp_port: 4662,
+            version: 8,
+            tags: Vec::new(),
+        });
+        let encoded_hello = hello.encode().unwrap();
+        let _ = inject_tx.send((encoded_hello, peer_addr)).await;
+
+        let received = tokio::time::timeout(Duration::from_secs(1), subscriber.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(received.packet, KadPacket::HelloReq(_)));
+
+        let search = KadPacket::SearchKeyReq(overlord_kad_proto::SearchKeyReq {
+            target: NodeId::from_bytes([0x55; 16]),
+            start_position: 0,
+            restrictive_payload: Vec::new(),
+        });
+        rpc.send(peer_addr, &search).await.unwrap();
+
+        let outgoing = transport.drain_outgoing();
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0].0, peer_addr);
+        assert_ne!(outgoing[0].1[0], overlord_kad_proto::OP_KADEMLIAHEADER);
     }
 }
