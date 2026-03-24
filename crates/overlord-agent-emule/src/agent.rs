@@ -65,7 +65,7 @@ use crate::ed2k_tcp::{
 use crate::kad_firewall::{FirewallUdpPacketOutcome, KadFirewallState};
 use crate::kad_store::{KadLocalStore, KadLocalStoreConfig};
 use crate::logging::current_log_file_status;
-use crate::snoop_queue::{SnoopQueue, SnoopQueueFamilyCounts};
+use crate::snoop_queue::{ScheduledSnoopRequest, SnoopQueue, SnoopQueueFamilyCounts};
 
 const ACTIVE_BATCH_SIZE: usize = 25;
 const PASSIVE_BATCH_SIZE: usize = 50;
@@ -2778,7 +2778,7 @@ async fn record_snoop_entry(
 
 async fn next_passive_keyword_request(
     snoop_queue: &Arc<Mutex<SnoopQueue>>,
-) -> Option<SearchKeyReq> {
+) -> Option<ScheduledSnoopRequest<SearchKeyReq>> {
     snoop_queue
         .lock()
         .await
@@ -2787,11 +2787,23 @@ async fn next_passive_keyword_request(
 
 async fn next_passive_source_request(
     snoop_queue: &Arc<Mutex<SnoopQueue>>,
-) -> Option<SearchSourceReq> {
+) -> Option<ScheduledSnoopRequest<SearchSourceReq>> {
     snoop_queue
         .lock()
         .await
         .select_next_source_request(Utc::now())
+}
+
+async fn record_passive_replay_outcome(
+    snoop_queue: &Arc<Mutex<SnoopQueue>>,
+    logical_key: &str,
+    completed_at: DateTime<Utc>,
+    result_count: usize,
+) {
+    snoop_queue
+        .lock()
+        .await
+        .record_replay_outcome(logical_key, completed_at, result_count);
 }
 
 /// Acquire the single passive replay slot without blocking the background loop.
@@ -4244,7 +4256,8 @@ impl OverlordAgentEmule {
                 else {
                     continue;
                 };
-                let Some(request) = next_passive_keyword_request(&snoop_queue).await else {
+                let Some(selected_request) = next_passive_keyword_request(&snoop_queue).await
+                else {
                     let mut observability = harvest_observability.lock().await;
                     record_passive_replay_idle(
                         &mut observability,
@@ -4253,11 +4266,12 @@ impl OverlordAgentEmule {
                     );
                     continue;
                 };
+                let request = selected_request.request;
                 let replay_started_at = Utc::now();
                 let replay_context = HarvestReplayContext {
                     replay_id: Uuid::new_v4(),
                     family: HarvestFamily::Keyword,
-                    logical_key: keyword_logical_key(&request),
+                    logical_key: selected_request.logical_key,
                     target: request.target.to_string(),
                     start_position: Some(request.start_position),
                     size: None,
@@ -4295,6 +4309,13 @@ impl OverlordAgentEmule {
                 )
                 .await;
                 let replay_completed_at = Utc::now();
+                record_passive_replay_outcome(
+                    &snoop_queue,
+                    &replay_context.logical_key,
+                    replay_completed_at,
+                    outcome.result_count,
+                )
+                .await;
                 {
                     let mut observability = harvest_observability.lock().await;
                     record_passive_replay_complete(
@@ -4353,7 +4374,7 @@ impl OverlordAgentEmule {
                 else {
                     continue;
                 };
-                let Some(request) = next_passive_source_request(&snoop_queue).await else {
+                let Some(selected_request) = next_passive_source_request(&snoop_queue).await else {
                     let mut observability = harvest_observability.lock().await;
                     record_passive_replay_idle(
                         &mut observability,
@@ -4362,11 +4383,12 @@ impl OverlordAgentEmule {
                     );
                     continue;
                 };
+                let request = selected_request.request;
                 let replay_started_at = Utc::now();
                 let replay_context = HarvestReplayContext {
                     replay_id: Uuid::new_v4(),
                     family: HarvestFamily::Source,
-                    logical_key: source_logical_key(&request),
+                    logical_key: selected_request.logical_key,
                     target: request.target.to_string(),
                     start_position: Some(request.start_position),
                     size: Some(request.size),
@@ -4401,6 +4423,13 @@ impl OverlordAgentEmule {
                 )
                 .await;
                 let replay_completed_at = Utc::now();
+                record_passive_replay_outcome(
+                    &snoop_queue,
+                    &replay_context.logical_key,
+                    replay_completed_at,
+                    outcome.result_count,
+                )
+                .await;
                 {
                     let mut observability = harvest_observability.lock().await;
                     record_passive_replay_complete(

@@ -12,6 +12,7 @@ use crate::config::SnoopQueueConfig;
 pub struct SnoopQueue {
     config: SnoopQueueConfig,
     entries: HashMap<String, SnoopEntry>,
+    replay_feedback: HashMap<String, ReplayFeedback>,
     recent_drains: VecDeque<DateTime<Utc>>,
 }
 
@@ -32,12 +33,42 @@ pub struct SnoopQueueFamilyCounts {
     pub notes: usize,
 }
 
+/// One queued snoop entry selected for an active passive replay cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledSnoopRequest<Request> {
+    pub logical_key: String,
+    pub request: Request,
+}
+
+/// In-memory replay feedback used to bias the next passive replay choice.
+///
+/// This state is intentionally process-local: it helps the scheduler avoid
+/// spending every crawl cycle on the same zero-yield shape, but it should not
+/// become persisted queue metadata yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ReplayFeedback {
+    zero_result_streak: u32,
+    last_result_count: u32,
+    last_outcome_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplayCandidate<Request> {
+    scheduled: ScheduledSnoopRequest<Request>,
+    hit_count: u32,
+    last_seen: DateTime<Utc>,
+    zero_result_streak: u32,
+    last_result_count: u32,
+    observed_after_outcome: bool,
+}
+
 impl SnoopQueue {
     /// Creates an empty snoop queue with the provided scheduling settings.
     pub fn new(config: SnoopQueueConfig) -> Self {
         Self {
             config,
             entries: HashMap::new(),
+            replay_feedback: HashMap::new(),
             recent_drains: VecDeque::new(),
         }
     }
@@ -87,7 +118,10 @@ impl SnoopQueue {
     }
 
     /// Selects the next keyword request eligible for passive drain and marks it as drained.
-    pub fn select_next_keyword_request(&mut self, now: DateTime<Utc>) -> Option<SearchKeyReq> {
+    pub fn select_next_keyword_request(
+        &mut self,
+        now: DateTime<Utc>,
+    ) -> Option<ScheduledSnoopRequest<SearchKeyReq>> {
         self.prune_recent_drains(now);
         if self.recent_drains.len() >= self.config.max_queries_per_600s as usize {
             return None;
@@ -102,18 +136,37 @@ impl SnoopQueue {
             let Some(request) = keyword_request(entry) else {
                 continue;
             };
-            if entry
-                .last_drained_at()
-                .is_some_and(|last_drained_at| last_drained_at > cooldown_cutoff)
-            {
+            let logical_key = entry.logical_key().to_string();
+            let feedback = self
+                .replay_feedback
+                .get(&logical_key)
+                .copied()
+                .unwrap_or_default();
+            if entry.last_drained_at().is_some_and(|last_drained_at| {
+                last_drained_at
+                    > replay_cooldown_cutoff(
+                        cooldown_cutoff,
+                        now,
+                        self.config.drain_cooldown_secs,
+                        entry,
+                        feedback,
+                    )
+            }) {
                 continue;
             }
-            let candidate = (
-                request,
-                entry.hit_count(),
-                entry.last_seen(),
-                entry.logical_key().to_string(),
-            );
+            let candidate = ReplayCandidate {
+                scheduled: ScheduledSnoopRequest {
+                    logical_key,
+                    request,
+                },
+                hit_count: entry.hit_count(),
+                last_seen: entry.last_seen(),
+                zero_result_streak: feedback.zero_result_streak,
+                last_result_count: feedback.last_result_count,
+                observed_after_outcome: feedback
+                    .last_outcome_at
+                    .is_none_or(|last_outcome_at| entry.last_seen() > last_outcome_at),
+            };
             if entry.last_seen() >= dedup_cutoff {
                 recent.push(candidate);
             } else {
@@ -127,15 +180,18 @@ impl SnoopQueue {
             .into_iter()
             .next()
             .or_else(|| stale.into_iter().next())?;
-        if let Some(entry) = self.entries.get_mut(&selected.3) {
+        if let Some(entry) = self.entries.get_mut(&selected.scheduled.logical_key) {
             entry.set_last_drained_at(Some(now));
         }
         self.recent_drains.push_back(now);
-        Some(selected.0)
+        Some(selected.scheduled)
     }
 
     /// Selects the next source request eligible for passive drain and marks it as drained.
-    pub fn select_next_source_request(&mut self, now: DateTime<Utc>) -> Option<SearchSourceReq> {
+    pub fn select_next_source_request(
+        &mut self,
+        now: DateTime<Utc>,
+    ) -> Option<ScheduledSnoopRequest<SearchSourceReq>> {
         self.prune_recent_drains(now);
         if self.recent_drains.len() >= self.config.max_queries_per_600s as usize {
             return None;
@@ -150,18 +206,37 @@ impl SnoopQueue {
             let Some(request) = source_request(entry) else {
                 continue;
             };
-            if entry
-                .last_drained_at()
-                .is_some_and(|last_drained_at| last_drained_at > cooldown_cutoff)
-            {
+            let logical_key = entry.logical_key().to_string();
+            let feedback = self
+                .replay_feedback
+                .get(&logical_key)
+                .copied()
+                .unwrap_or_default();
+            if entry.last_drained_at().is_some_and(|last_drained_at| {
+                last_drained_at
+                    > replay_cooldown_cutoff(
+                        cooldown_cutoff,
+                        now,
+                        self.config.drain_cooldown_secs,
+                        entry,
+                        feedback,
+                    )
+            }) {
                 continue;
             }
-            let candidate = (
-                request,
-                entry.hit_count(),
-                entry.last_seen(),
-                entry.logical_key().to_string(),
-            );
+            let candidate = ReplayCandidate {
+                scheduled: ScheduledSnoopRequest {
+                    logical_key,
+                    request,
+                },
+                hit_count: entry.hit_count(),
+                last_seen: entry.last_seen(),
+                zero_result_streak: feedback.zero_result_streak,
+                last_result_count: feedback.last_result_count,
+                observed_after_outcome: feedback
+                    .last_outcome_at
+                    .is_none_or(|last_outcome_at| entry.last_seen() > last_outcome_at),
+            };
             if entry.last_seen() >= dedup_cutoff {
                 recent.push(candidate);
             } else {
@@ -175,11 +250,31 @@ impl SnoopQueue {
             .into_iter()
             .next()
             .or_else(|| stale.into_iter().next())?;
-        if let Some(entry) = self.entries.get_mut(&selected.3) {
+        if let Some(entry) = self.entries.get_mut(&selected.scheduled.logical_key) {
             entry.set_last_drained_at(Some(now));
         }
         self.recent_drains.push_back(now);
-        Some(selected.0)
+        Some(selected.scheduled)
+    }
+
+    /// Records the result density of one completed passive replay cycle.
+    pub fn record_replay_outcome(
+        &mut self,
+        logical_key: &str,
+        completed_at: DateTime<Utc>,
+        result_count: usize,
+    ) {
+        let feedback = self
+            .replay_feedback
+            .entry(logical_key.to_string())
+            .or_default();
+        feedback.last_result_count = result_count as u32;
+        feedback.last_outcome_at = Some(completed_at);
+        if result_count == 0 {
+            feedback.zero_result_streak = feedback.zero_result_streak.saturating_add(1);
+        } else {
+            feedback.zero_result_streak = 0;
+        }
     }
 
     fn merge_entry(&mut self, entry: SnoopEntry) -> (bool, u32) {
@@ -285,25 +380,49 @@ fn seconds(value: u64) -> TimeDelta {
 }
 
 fn candidate_cmp(
-    left: &(SearchKeyReq, u32, DateTime<Utc>, String),
-    right: &(SearchKeyReq, u32, DateTime<Utc>, String),
+    left: &ReplayCandidate<SearchKeyReq>,
+    right: &ReplayCandidate<SearchKeyReq>,
 ) -> std::cmp::Ordering {
     right
-        .1
-        .cmp(&left.1)
-        .then_with(|| right.2.cmp(&left.2))
-        .then_with(|| left.3.cmp(&right.3))
+        .observed_after_outcome
+        .cmp(&left.observed_after_outcome)
+        .then_with(|| left.zero_result_streak.cmp(&right.zero_result_streak))
+        .then_with(|| right.last_result_count.cmp(&left.last_result_count))
+        .then_with(|| right.hit_count.cmp(&left.hit_count))
+        .then_with(|| right.last_seen.cmp(&left.last_seen))
+        .then_with(|| left.scheduled.logical_key.cmp(&right.scheduled.logical_key))
 }
 
 fn source_candidate_cmp(
-    left: &(SearchSourceReq, u32, DateTime<Utc>, String),
-    right: &(SearchSourceReq, u32, DateTime<Utc>, String),
+    left: &ReplayCandidate<SearchSourceReq>,
+    right: &ReplayCandidate<SearchSourceReq>,
 ) -> std::cmp::Ordering {
     right
-        .1
-        .cmp(&left.1)
-        .then_with(|| right.2.cmp(&left.2))
-        .then_with(|| left.3.cmp(&right.3))
+        .observed_after_outcome
+        .cmp(&left.observed_after_outcome)
+        .then_with(|| left.zero_result_streak.cmp(&right.zero_result_streak))
+        .then_with(|| right.last_result_count.cmp(&left.last_result_count))
+        .then_with(|| right.hit_count.cmp(&left.hit_count))
+        .then_with(|| right.last_seen.cmp(&left.last_seen))
+        .then_with(|| left.scheduled.logical_key.cmp(&right.scheduled.logical_key))
+}
+
+fn replay_cooldown_cutoff(
+    default_cutoff: DateTime<Utc>,
+    now: DateTime<Utc>,
+    drain_cooldown_secs: u64,
+    entry: &SnoopEntry,
+    feedback: ReplayFeedback,
+) -> DateTime<Utc> {
+    let Some(last_outcome_at) = feedback.last_outcome_at else {
+        return default_cutoff;
+    };
+    if feedback.zero_result_streak == 0 || entry.last_seen() > last_outcome_at {
+        return default_cutoff;
+    }
+    let zero_backoff_multiplier = u64::from(feedback.zero_result_streak.saturating_add(1)).min(4);
+    let cooldown_secs = drain_cooldown_secs.saturating_mul(zero_backoff_multiplier);
+    now - seconds(cooldown_secs)
 }
 
 #[cfg(test)]
@@ -312,7 +431,7 @@ mod tests {
     use overlord_agent_common::SnoopEntry;
     use overlord_kad_proto::{SearchKeyReq, SearchSourceReq};
 
-    use super::{SnoopQueue, SnoopQueueFamilyCounts};
+    use super::{ScheduledSnoopRequest, SnoopQueue, SnoopQueueFamilyCounts};
     use crate::config::SnoopQueueConfig;
 
     fn queue() -> SnoopQueue {
@@ -451,10 +570,13 @@ mod tests {
         let selected = queue.select_next_source_request(ts(130));
         assert_eq!(
             selected,
-            Some(SearchSourceReq {
-                target: "00112233445566778899aabbccddeeff".parse().unwrap(),
-                start_position: 0x8000,
-                size: 4096,
+            Some(ScheduledSnoopRequest {
+                logical_key: "source:00112233445566778899aabbccddeeff:8000:4096".to_string(),
+                request: SearchSourceReq {
+                    target: "00112233445566778899aabbccddeeff".parse().unwrap(),
+                    start_position: 0x8000,
+                    size: 4096,
+                },
             })
         );
     }
@@ -480,10 +602,13 @@ mod tests {
         let selected = queue.select_next_source_request(ts(130));
         assert_eq!(
             selected,
-            Some(SearchSourceReq {
-                target: "11112222333344445555666677778888".parse().unwrap(),
-                start_position: 0,
-                size: 8192,
+            Some(ScheduledSnoopRequest {
+                logical_key: "source:11112222333344445555666677778888:0000:8192".to_string(),
+                request: SearchSourceReq {
+                    target: "11112222333344445555666677778888".parse().unwrap(),
+                    start_position: 0,
+                    size: 8192,
+                },
             })
         );
     }
@@ -578,11 +703,72 @@ mod tests {
         let selected = queue.select_next_keyword_request(ts(1000)).unwrap();
         assert_eq!(
             selected,
-            SearchKeyReq {
-                target: "00112233445566778899aabbccddeeff".parse().unwrap(),
-                start_position: 0x8000,
-                restrictive_payload: vec![0xAA, 0xBB],
+            ScheduledSnoopRequest {
+                logical_key: "keyword:00112233445566778899aabbccddeeff:8000:aabb".to_string(),
+                request: SearchKeyReq {
+                    target: "00112233445566778899aabbccddeeff".parse().unwrap(),
+                    start_position: 0x8000,
+                    restrictive_payload: vec![0xAA, 0xBB],
+                },
             }
+        );
+    }
+
+    #[test]
+    fn zero_result_replays_back_off_until_fresh_demand_reappears() {
+        let mut queue = queue();
+        queue.record(source_entry(
+            "source:00112233445566778899aabbccddeeff:0000:4096",
+            "00112233445566778899aabbccddeeff",
+            0,
+            4096,
+            100,
+        ));
+
+        let selected = queue.select_next_source_request(ts(110)).unwrap();
+        assert_eq!(
+            selected.logical_key,
+            "source:00112233445566778899aabbccddeeff:0000:4096"
+        );
+        queue.record_replay_outcome(&selected.logical_key, ts(120), 0);
+
+        assert!(queue.select_next_source_request(ts(151)).is_none());
+
+        queue.record(source_entry(
+            "source:00112233445566778899aabbccddeeff:0000:4096",
+            "00112233445566778899aabbccddeeff",
+            0,
+            4096,
+            170,
+        ));
+        assert!(queue.select_next_source_request(ts(171)).is_some());
+    }
+
+    #[test]
+    fn zero_result_history_is_deprioritized_behind_unseen_candidates() {
+        let mut queue = queue();
+        queue.record(source_entry(
+            "source:00112233445566778899aabbccddeeff:0000:4096",
+            "00112233445566778899aabbccddeeff",
+            0,
+            4096,
+            100,
+        ));
+        let selected = queue.select_next_source_request(ts(110)).unwrap();
+        queue.record_replay_outcome(&selected.logical_key, ts(120), 0);
+
+        queue.record(source_entry(
+            "source:11112222333344445555666677778888:0000:8192",
+            "11112222333344445555666677778888",
+            0,
+            8192,
+            121,
+        ));
+
+        let next_selected = queue.select_next_source_request(ts(160)).unwrap();
+        assert_eq!(
+            next_selected.logical_key,
+            "source:11112222333344445555666677778888:0000:8192"
         );
     }
 
