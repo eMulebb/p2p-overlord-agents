@@ -41,3 +41,12 @@ Running note for Kad oracle-parity findings that affect live behavior.
   - sampled passive replay windows no longer showed `flood-blocking` warnings while harvesting continued
   - the first post-change live pass completed with keyword harvest `result_count=202`, `batch_count=5`, and source harvest `result_count=9`
   - this makes high-volume inbound search-result bursts acceptable harvest traffic instead of being clipped by the generic `20/sec` IP budget
+- Live observation after passive harvest ingestion backpressure reduction landed:
+  - stream-based Kad searches no longer duplicate raw `SEARCH_RES` payloads into the final traversal result when the caller is already consuming the streamed channel
+  - passive replay coordinator callbacks now use larger local buffers and larger posted batches so harvest result floods spend less time blocked on callback overhead
+  - the first live pass after that change completed with keyword harvest `result_count=181`, `batch_count=1`, and source harvest `result_count=26`, `batch_count=1`
+  - this improved inbound harvest throughput without widening Kad search fanout or changing replay cadence
+- Live observation after passive batch posting was decoupled from replay ingestion:
+  - passive keyword and passive source replays now keep draining inbound Kad result streams while coordinator `/api/internal/results` callbacks are still in flight
+  - the posting queue is intentionally bounded so harvest stays memory-safe even during larger result floods
+  - this is an ingestion-only change; it does not widen replay radius, increase replay cadence, or otherwise make outbound Kad traffic less polite

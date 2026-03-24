@@ -26,7 +26,7 @@ use overlord_agent_nat::{
 use rand::{RngCore, seq::SliceRandom};
 use tokio::{
     net::TcpListener,
-    sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore},
+    sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore, mpsc},
     task::JoinHandle,
 };
 use tokio_stream::StreamExt;
@@ -72,6 +72,10 @@ const ACTIVE_BATCH_SIZE: usize = 25;
 /// than user-facing active searches. This reduces local callback overhead
 /// without changing any Kad outbound behavior.
 const PASSIVE_BATCH_SIZE: usize = 200;
+/// Passive harvest should keep ingesting inbound Kad results while coordinator
+/// callbacks are in flight, but the local queue must stay bounded so the agent
+/// remains polite on memory usage even during large floods.
+const PASSIVE_POST_QUEUE_DEPTH: usize = 8;
 const BOOTSTRAP_RETRY_SECS: u64 = 30;
 #[cfg(not(test))]
 const COORDINATOR_RECONNECT_SECS: u64 = 30;
@@ -1527,6 +1531,12 @@ struct PassiveReplayContext<'a> {
     harvest_observability: &'a Arc<Mutex<KadHarvestObservability>>,
 }
 
+#[derive(Debug, Default)]
+struct PassiveBatchPosterOutcome {
+    batch_count: usize,
+    last_post_error: Option<String>,
+}
+
 async fn post_passive_result_batch(
     coordinator: &CoordinatorClient,
     indexer_id: Uuid,
@@ -1544,6 +1554,57 @@ async fn post_passive_result_batch(
         .await
 }
 
+fn spawn_passive_batch_poster(
+    coordinator: CoordinatorClient,
+    indexer_id: Uuid,
+    replay_context: HarvestReplayContext,
+    family: HarvestFamily,
+    harvest_observability: Arc<Mutex<KadHarvestObservability>>,
+) -> (
+    mpsc::Sender<Vec<FileRecord>>,
+    JoinHandle<PassiveBatchPosterOutcome>,
+) {
+    let (tx, mut rx) = mpsc::channel::<Vec<FileRecord>>(PASSIVE_POST_QUEUE_DEPTH);
+    let task = tokio::spawn(async move {
+        let mut outcome = PassiveBatchPosterOutcome::default();
+        while let Some(batch) = rx.recv().await {
+            match post_passive_result_batch(&coordinator, indexer_id, &replay_context, batch).await
+            {
+                Ok(()) => {
+                    outcome.batch_count += 1;
+                }
+                Err(error) => {
+                    warn!("failed to post passive {:?} result batch: {error}", family);
+                    outcome.last_post_error = Some(error.to_string());
+                    let mut observability = harvest_observability.lock().await;
+                    record_passive_replay_post_failure(
+                        &mut observability,
+                        family,
+                        Utc::now(),
+                        outcome.last_post_error.as_deref().unwrap_or("post failed"),
+                    );
+                }
+            }
+        }
+        outcome
+    });
+    (tx, task)
+}
+
+async fn finish_passive_batch_poster(
+    sender: mpsc::Sender<Vec<FileRecord>>,
+    task: JoinHandle<PassiveBatchPosterOutcome>,
+) -> PassiveBatchPosterOutcome {
+    drop(sender);
+    match task.await {
+        Ok(outcome) => outcome,
+        Err(error) => PassiveBatchPosterOutcome {
+            batch_count: 0,
+            last_post_error: Some(format!("passive batch poster join failed: {error}")),
+        },
+    }
+}
+
 async fn run_passive_keyword_replay(
     context: PassiveReplayContext<'_>,
     request: &SearchKeyReq,
@@ -1551,6 +1612,13 @@ async fn run_passive_keyword_replay(
     let mut outcome = PassiveReplayRunOutcome::default();
     let mut seen_hashes = HashSet::new();
     let mut files = Vec::new();
+    let (batch_tx, batch_task) = spawn_passive_batch_poster(
+        context.coordinator.clone(),
+        context.indexer_id,
+        context.replay_context.clone(),
+        HarvestFamily::Keyword,
+        Arc::clone(context.harvest_observability),
+    );
 
     for responder_ceiling in passive_replay_tier_contact_limits(context.max_phase2_fanout) {
         let tier_result_start = outcome.result_count;
@@ -1575,28 +1643,12 @@ async fn run_passive_keyword_replay(
                 context.passive_result_count.fetch_add(1, Ordering::Relaxed);
                 outcome.result_count += 1;
                 files.push(file);
-                if files.len() >= PASSIVE_BATCH_SIZE {
-                    let batch = std::mem::take(&mut files);
-                    if let Err(error) = post_passive_result_batch(
-                        context.coordinator,
-                        context.indexer_id,
-                        context.replay_context,
-                        batch,
-                    )
-                    .await
-                    {
-                        warn!("failed to post passive result batch: {error}");
-                        outcome.last_post_error = Some(error.to_string());
-                        let mut observability = context.harvest_observability.lock().await;
-                        record_passive_replay_post_failure(
-                            &mut observability,
-                            HarvestFamily::Keyword,
-                            Utc::now(),
-                            outcome.last_post_error.as_deref().unwrap_or("post failed"),
-                        );
-                    } else {
-                        outcome.batch_count += 1;
-                    }
+                if files.len() >= PASSIVE_BATCH_SIZE
+                    && batch_tx.send(std::mem::take(&mut files)).await.is_err()
+                {
+                    outcome.last_post_error =
+                        Some("passive batch poster stopped accepting keyword batches".into());
+                    break;
                 }
             }
         }
@@ -1616,27 +1668,14 @@ async fn run_passive_keyword_replay(
         }
     }
 
-    if !files.is_empty() {
-        if let Err(error) = post_passive_result_batch(
-            context.coordinator,
-            context.indexer_id,
-            context.replay_context,
-            files,
-        )
-        .await
-        {
-            warn!("failed to post passive result batch: {error}");
-            outcome.last_post_error = Some(error.to_string());
-            let mut observability = context.harvest_observability.lock().await;
-            record_passive_replay_post_failure(
-                &mut observability,
-                HarvestFamily::Keyword,
-                Utc::now(),
-                outcome.last_post_error.as_deref().unwrap_or("post failed"),
-            );
-        } else {
-            outcome.batch_count += 1;
-        }
+    if !files.is_empty() && batch_tx.send(files).await.is_err() {
+        outcome.last_post_error =
+            Some("passive batch poster stopped accepting keyword batches".into());
+    }
+    let poster_outcome = finish_passive_batch_poster(batch_tx, batch_task).await;
+    outcome.batch_count = poster_outcome.batch_count;
+    if poster_outcome.last_post_error.is_some() {
+        outcome.last_post_error = poster_outcome.last_post_error;
     }
 
     outcome
@@ -1650,6 +1689,13 @@ async fn run_passive_source_replay(
     let mut seen_sources = HashSet::<(std::net::Ipv4Addr, u16, u16)>::new();
     let mut files = Vec::new();
     let file_hash = Ed2kHash::from_bytes(request.target.0);
+    let (batch_tx, batch_task) = spawn_passive_batch_poster(
+        context.coordinator.clone(),
+        context.indexer_id,
+        context.replay_context.clone(),
+        HarvestFamily::Source,
+        Arc::clone(context.harvest_observability),
+    );
 
     for responder_ceiling in passive_replay_tier_contact_limits(context.max_phase2_fanout) {
         let tier_result_start = outcome.result_count;
@@ -1671,28 +1717,12 @@ async fn run_passive_source_replay(
             context.passive_result_count.fetch_add(1, Ordering::Relaxed);
             outcome.result_count += 1;
             files.push(map_source_result(&result, request.size));
-            if files.len() >= PASSIVE_BATCH_SIZE {
-                let batch = std::mem::take(&mut files);
-                if let Err(error) = post_passive_result_batch(
-                    context.coordinator,
-                    context.indexer_id,
-                    context.replay_context,
-                    batch,
-                )
-                .await
-                {
-                    warn!("failed to post passive source result batch: {error}");
-                    outcome.last_post_error = Some(error.to_string());
-                    let mut observability = context.harvest_observability.lock().await;
-                    record_passive_replay_post_failure(
-                        &mut observability,
-                        HarvestFamily::Source,
-                        Utc::now(),
-                        outcome.last_post_error.as_deref().unwrap_or("post failed"),
-                    );
-                } else {
-                    outcome.batch_count += 1;
-                }
+            if files.len() >= PASSIVE_BATCH_SIZE
+                && batch_tx.send(std::mem::take(&mut files)).await.is_err()
+            {
+                outcome.last_post_error =
+                    Some("passive batch poster stopped accepting source batches".into());
+                break;
             }
         }
 
@@ -1711,27 +1741,14 @@ async fn run_passive_source_replay(
         }
     }
 
-    if !files.is_empty() {
-        if let Err(error) = post_passive_result_batch(
-            context.coordinator,
-            context.indexer_id,
-            context.replay_context,
-            files,
-        )
-        .await
-        {
-            warn!("failed to post passive source result batch: {error}");
-            outcome.last_post_error = Some(error.to_string());
-            let mut observability = context.harvest_observability.lock().await;
-            record_passive_replay_post_failure(
-                &mut observability,
-                HarvestFamily::Source,
-                Utc::now(),
-                outcome.last_post_error.as_deref().unwrap_or("post failed"),
-            );
-        } else {
-            outcome.batch_count += 1;
-        }
+    if !files.is_empty() && batch_tx.send(files).await.is_err() {
+        outcome.last_post_error =
+            Some("passive batch poster stopped accepting source batches".into());
+    }
+    let poster_outcome = finish_passive_batch_poster(batch_tx, batch_task).await;
+    outcome.batch_count = poster_outcome.batch_count;
+    if poster_outcome.last_post_error.is_some() {
+        outcome.last_post_error = poster_outcome.last_post_error;
     }
 
     outcome
