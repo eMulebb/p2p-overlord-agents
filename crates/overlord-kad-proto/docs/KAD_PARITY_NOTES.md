@@ -36,3 +36,8 @@ Running note for Kad oracle-parity findings that affect live behavior.
   - on the live network, source replay harvested `12` results on one target and `5` on the next target without needing widened tiers
   - keyword replay skipped an earlier zero-result shape and the next keyword target completed with `1364` harvested results over `28` posted batches at tier `K`
   - the next remaining harvest question is result shaping and batching under very large keyword result floods, not basic queue rotation anymore
+- Live observation after SEARCH_RES flood-budget relaxation landed:
+  - inbound flood tracking now keeps a separate, much larger per-IP budget for `SEARCH_RES` traffic while leaving the default packet budget intact
+  - sampled passive replay windows no longer showed `flood-blocking` warnings while harvesting continued
+  - the first post-change live pass completed with keyword harvest `result_count=202`, `batch_count=5`, and source harvest `result_count=9`
+  - this makes high-volume inbound search-result bursts acceptable harvest traffic instead of being clipped by the generic `20/sec` IP budget
