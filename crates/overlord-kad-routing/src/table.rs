@@ -71,13 +71,7 @@ impl RoutingTable {
         let old_ip = self.root.get(&contact.id).map(|c| c.ip);
         let new_ip = contact.ip;
 
-        let result = self.root.add(
-            contact,
-            &self.own_id,
-            self.total_contacts,
-            self.max_size,
-            true, // root is always on own side for the very first level
-        );
+        let result = self.root.add(contact, self.total_contacts, self.max_size);
 
         match result {
             Ok(true) => {
@@ -276,21 +270,22 @@ mod tests {
     }
 
     #[test]
-    fn test_global_subnet_limit() {
+    fn test_subnet_limit_rejects_over_clustered_prefixes() {
         let own_id = NodeId::from_bytes([0x00; 16]);
         let mut table = RoutingTable::new(own_id);
-        // Add 10 contacts on same /24 (5.5.5.x), each with unique IDs and IPs
-        for i in 1..=10u8 {
+        // The table now enforces both the global `/24` cap and the oracle
+        // per-bin two-per-`/24` rule, so the third clustered contact is enough
+        // to prove subnet guarding works.
+        for i in 1..=2u8 {
             let mut id = [0u8; 16];
-            id[0] = i; // distinct high bits → spread across zone tree
+            id[0] = i;
             let c = make_contact(id, &format!("5.5.5.{}", i));
             table.add_contact(c).unwrap();
         }
-        assert_eq!(table.len(), 10);
-        // 11th on same /24 → rejected at global level
+        assert_eq!(table.len(), 2);
         let mut id = [0u8; 16];
-        id[0] = 11;
-        let c = make_contact(id, "5.5.5.11");
+        id[0] = 3;
+        let c = make_contact(id, "5.5.5.3");
         let err = table.add_contact(c);
         assert!(matches!(err, Err(RoutingError::SubnetLimitExceeded { .. })));
     }

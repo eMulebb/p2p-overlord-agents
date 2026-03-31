@@ -1,4 +1,4 @@
-use overlord_kad_proto::{KBASE, NodeId};
+use overlord_kad_proto::{KBASE, KK, NodeId};
 
 use crate::bin::RoutingBin;
 use crate::contact::Contact;
@@ -20,6 +20,7 @@ enum ZoneContent {
 
 pub struct RoutingZone {
     depth: u32,
+    zone_index: usize,
     content: ZoneContent,
 }
 
@@ -28,32 +29,30 @@ impl RoutingZone {
     pub fn new_root() -> Self {
         RoutingZone {
             depth: 0,
+            zone_index: 0,
             content: ZoneContent::Leaf(RoutingBin::new()),
         }
     }
 
-    fn new_leaf(depth: u32) -> Self {
+    fn new_leaf(depth: u32, zone_index: usize) -> Self {
         RoutingZone {
             depth,
+            zone_index,
             content: ZoneContent::Leaf(RoutingBin::new()),
         }
     }
 
     /// Try to add a contact.
     ///
-    /// - `own_id`: our node ID (needed for split decision)
     /// - `total_contacts`: current total in the whole table
     /// - `max_table_size`: configured maximum
-    /// - `on_own_side`: whether own_id would be routed into this zone
     ///
     /// Returns `Ok(true)` = added new, `Ok(false)` = updated existing, `Err` = rejected.
     pub fn add(
         &mut self,
         contact: Contact,
-        own_id: &NodeId,
         total_contacts: usize,
         max_table_size: usize,
-        on_own_side: bool,
     ) -> Result<bool, RoutingError> {
         match &mut self.content {
             ZoneContent::Leaf(_) => {
@@ -69,10 +68,10 @@ impl RoutingZone {
                     Ok(added) => Ok(added),
                     Err(RoutingError::TableFull { .. }) => {
                         // Attempt to split.
-                        if self.can_split(on_own_side, total_contacts, max_table_size) {
-                            self.split(own_id);
+                        if self.can_split(total_contacts, max_table_size) {
+                            self.split();
                             // Retry after split.
-                            self.add(contact, own_id, total_contacts, max_table_size, on_own_side)
+                            self.add(contact, total_contacts, max_table_size)
                         } else {
                             Err(RoutingError::TableFull {
                                 max: max_table_size,
@@ -84,27 +83,12 @@ impl RoutingZone {
             }
             ZoneContent::Branch { left, right } => {
                 let bit = contact.id.bit(self.depth);
-                let own_bit = own_id.bit(self.depth);
                 if bit {
                     // contact goes right
-                    let child_on_own_side = on_own_side && own_bit;
-                    right.add(
-                        contact,
-                        own_id,
-                        total_contacts,
-                        max_table_size,
-                        child_on_own_side,
-                    )
+                    right.add(contact, total_contacts, max_table_size)
                 } else {
                     // contact goes left
-                    let child_on_own_side = on_own_side && !own_bit;
-                    left.add(
-                        contact,
-                        own_id,
-                        total_contacts,
-                        max_table_size,
-                        child_on_own_side,
-                    )
+                    left.add(contact, total_contacts, max_table_size)
                 }
             }
         }
@@ -175,7 +159,7 @@ impl RoutingZone {
     }
 
     /// Whether this zone may be split.
-    fn can_split(&self, on_own_side: bool, total_contacts: usize, max_table_size: usize) -> bool {
+    fn can_split(&self, total_contacts: usize, max_table_size: usize) -> bool {
         // Condition 1: depth < 127
         if self.depth >= 127 {
             return false;
@@ -184,15 +168,16 @@ impl RoutingZone {
         if total_contacts >= max_table_size {
             return false;
         }
-        // Condition 3: depth < KBASE OR on own side
-        if self.depth < KBASE as u32 || on_own_side {
+        // Condition 3: oracle `CanSplit` keeps splitting the low-index zones
+        // and the whole tree up to `KBASE`, regardless of our own node ID.
+        if self.depth < KBASE as u32 || self.zone_index < KK {
             return true;
         }
         false
     }
 
     /// Split a leaf into two child zones, redistributing contacts.
-    fn split(&mut self, own_id: &NodeId) {
+    fn split(&mut self) {
         let bin = match &mut self.content {
             ZoneContent::Leaf(b) => {
                 let mut drained = RoutingBin::new();
@@ -205,24 +190,34 @@ impl RoutingZone {
         };
 
         let depth = self.depth;
-        let mut left = Box::new(RoutingZone::new_leaf(depth + 1));
-        let mut right = Box::new(RoutingZone::new_leaf(depth + 1));
+        let mut left = Box::new(RoutingZone::new_leaf(
+            depth + 1,
+            child_zone_index(self.zone_index, false),
+        ));
+        let mut right = Box::new(RoutingZone::new_leaf(
+            depth + 1,
+            child_zone_index(self.zone_index, true),
+        ));
 
         for c in bin.iter() {
             let bit = c.id.bit(depth);
-            let own_bit = own_id.bit(depth);
             if bit {
-                let child_own_side = own_bit;
                 // We use a large max_table_size here since we're just redistributing
-                let _ = right.add(c.clone(), own_id, 0, usize::MAX, child_own_side);
+                let _ = right.add(c.clone(), 0, usize::MAX);
             } else {
-                let child_own_side = !own_bit;
-                let _ = left.add(c.clone(), own_id, 0, usize::MAX, child_own_side);
+                let _ = left.add(c.clone(), 0, usize::MAX);
             }
         }
 
         self.content = ZoneContent::Branch { left, right };
     }
+}
+
+fn child_zone_index(parent_zone_index: usize, right_child: bool) -> usize {
+    let child_zone_index = parent_zone_index
+        .saturating_mul(2)
+        .saturating_add(usize::from(right_child));
+    child_zone_index.min(KK)
 }
 
 #[cfg(test)]
@@ -245,13 +240,12 @@ mod tests {
     #[test]
     fn test_add_and_count() {
         let mut zone = RoutingZone::new_root();
-        let own_id = NodeId::from_bytes([0x00; 16]);
         for i in 0..5u8 {
             let mut id = [0u8; 16];
             id[0] = i + 1;
             // Use distinct /24 subnets to avoid per-bin subnet limit
             let c = make_contact(id, &format!("1.{}.0.1", i + 1));
-            zone.add(c, &own_id, i as usize, 1000, true).unwrap();
+            zone.add(c, i as usize, 1000).unwrap();
         }
         assert_eq!(zone.count(), 5);
     }
@@ -259,12 +253,11 @@ mod tests {
     #[test]
     fn test_get_closest_all_contacts() {
         let mut zone = RoutingZone::new_root();
-        let own_id = NodeId::from_bytes([0x00; 16]);
         for i in 1..=5u8 {
             let mut id = [0u8; 16];
             id[0] = i;
             let c = make_contact(id, &format!("10.0.0.{}", i));
-            zone.add(c, &own_id, i as usize, 1000, true).unwrap();
+            zone.add(c, i as usize, 1000).unwrap();
         }
         let mut result = Vec::new();
         let target = NodeId::from_bytes([0x00; 16]);
@@ -275,10 +268,9 @@ mod tests {
     #[test]
     fn test_remove() {
         let mut zone = RoutingZone::new_root();
-        let own_id = NodeId::from_bytes([0x00; 16]);
         let id = NodeId::from_bytes([0x01; 16]);
         let c = make_contact([0x01; 16], "1.1.1.1");
-        zone.add(c, &own_id, 0, 1000, true).unwrap();
+        zone.add(c, 0, 1000).unwrap();
         assert_eq!(zone.count(), 1);
         let removed = zone.remove(&id);
         assert!(removed.is_some());
@@ -288,7 +280,6 @@ mod tests {
     #[test]
     fn test_split_on_overflow() {
         // own_id starts with 0x00, so bit 0 = 0 → own side is left (bit=0)
-        let own_id = NodeId::from_bytes([0x00; 16]);
         let mut zone = RoutingZone::new_root();
 
         // Add K contacts with bit 0 = 0 (same side as own_id)
@@ -297,7 +288,7 @@ mod tests {
             let mut id = [0x00u8; 16];
             id[1] = i + 1; // all have bit 0 = 0
             let c = make_contact(id, &format!("1.{}.0.1", i + 1));
-            zone.add(c, &own_id, i as usize, 10000, true).unwrap();
+            zone.add(c, i as usize, 10000).unwrap();
         }
         assert_eq!(zone.count(), K);
 
@@ -305,7 +296,7 @@ mod tests {
         let mut extra_id = [0x00u8; 16];
         extra_id[2] = 1;
         let extra = make_contact(extra_id, "1.99.0.1");
-        let result = zone.add(extra, &own_id, K, 10000, true);
+        let result = zone.add(extra, K, 10000);
         // After split, it should succeed
         assert!(result.is_ok());
         assert_eq!(zone.count(), K + 1);
@@ -314,11 +305,59 @@ mod tests {
     #[test]
     fn test_get_by_id() {
         let mut zone = RoutingZone::new_root();
-        let own_id = NodeId::from_bytes([0x00; 16]);
         let id = NodeId::from_bytes([0xAB; 16]);
         let c = make_contact([0xAB; 16], "9.9.9.9");
-        zone.add(c, &own_id, 0, 1000, true).unwrap();
+        zone.add(c, 0, 1000).unwrap();
         assert!(zone.get(&id).is_some());
         assert!(zone.get(&NodeId::ZERO).is_none());
+    }
+
+    fn make_id_with_bit(depth: u32, wanted_bit: bool, discriminator: u8) -> [u8; 16] {
+        for candidate in 0u8..=u8::MAX {
+            let mut id = [0u8; 16];
+            id[0] = candidate;
+            id[15] = discriminator;
+            if NodeId::from_bytes(id).bit(depth) == wanted_bit {
+                return id;
+            }
+        }
+        panic!("failed to find id for depth={depth} wanted_bit={wanted_bit}");
+    }
+
+    fn make_full_leaf(depth: u32, zone_index: usize, right_contacts: usize) -> RoutingZone {
+        let mut zone = RoutingZone {
+            depth,
+            zone_index,
+            content: ZoneContent::Leaf(RoutingBin::new()),
+        };
+        for i in 0..K as u8 {
+            let wants_right_child = usize::from(i >= (K - right_contacts) as u8) != 0;
+            let id = make_id_with_bit(depth, wants_right_child, i + 1);
+            let contact = make_contact(id, &format!("20.{}.0.1", i + 1));
+            let _ = zone.add(contact, i as usize, usize::MAX);
+        }
+        zone
+    }
+
+    #[test]
+    fn test_zone_index_below_kk_still_splits_after_kbase() {
+        let mut zone = make_full_leaf(KBASE as u32, KK - 1, 1);
+        let extra = make_contact(make_id_with_bit(KBASE as u32, true, 200), "21.1.0.1");
+
+        let result = zone.add(extra, K, usize::MAX);
+
+        assert!(result.is_ok());
+        assert_eq!(zone.count(), K + 1);
+    }
+
+    #[test]
+    fn test_zone_index_at_kk_stops_splitting_after_kbase() {
+        let mut zone = make_full_leaf(KBASE as u32, KK, 0);
+        let extra = make_contact(make_id_with_bit(KBASE as u32, false, 201), "22.1.0.1");
+
+        let result = zone.add(extra, K, usize::MAX);
+
+        assert!(matches!(result, Err(RoutingError::TableFull { .. })));
+        assert_eq!(zone.count(), K);
     }
 }

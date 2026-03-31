@@ -3,8 +3,11 @@ use std::net::Ipv4Addr;
 
 use overlord_kad_proto::{K, NodeId};
 
-use crate::contact::{Contact, ContactType};
+use crate::contact::{Contact, ContactType, is_lan};
 use crate::error::RoutingError;
+
+/// Maximum contacts from one non-LAN `/24` inside a single bin.
+const MAX_PER_BIN_SUBNET24: usize = 2;
 
 /// A k-bucket holding up to K contacts.
 #[derive(Debug, Clone)]
@@ -47,8 +50,29 @@ impl RoutingBin {
     /// - `Ok(false)` — contact already existed and was refreshed/updated
     /// - `Err(TableFull)` — bin is full and cannot accept the new contact
     pub fn try_add(&mut self, contact: Contact) -> Result<bool, RoutingError> {
+        let existing_pos = self.contacts.iter().position(|c| c.id == contact.id);
+
+        // Mirror the oracle bucket-local anti-clustering rule: each non-LAN
+        // `/24` may occupy at most two slots inside one bin.
+        if !is_lan(contact.ip) {
+            let subnet = subnet24(contact.ip);
+            let same_subnet_contacts = self
+                .contacts
+                .iter()
+                .enumerate()
+                .filter(|(index, existing)| {
+                    Some(*index) != existing_pos
+                        && !is_lan(existing.ip)
+                        && subnet24(existing.ip) == subnet
+                })
+                .count();
+            if same_subnet_contacts >= MAX_PER_BIN_SUBNET24 {
+                return Err(RoutingError::SubnetLimitExceeded { prefix: 24 });
+            }
+        }
+
         // Check if contact already exists (update it).
-        if let Some(pos) = self.contacts.iter().position(|c| c.id == contact.id) {
+        if let Some(pos) = existing_pos {
             let existing = &mut self.contacts[pos];
             existing.ip = contact.ip;
             existing.udp_port = contact.udp_port;
@@ -116,6 +140,11 @@ impl RoutingBin {
     }
 }
 
+fn subnet24(ip: Ipv4Addr) -> [u8; 3] {
+    let octets = ip.octets();
+    [octets[0], octets[1], octets[2]]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,15 +194,19 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_same_subnet_ok_in_bin() {
-        // RoutingBin itself has no subnet limit; that is enforced globally by RoutingTable.
+    fn test_third_non_lan_contact_from_same_subnet_is_rejected() {
         let mut bin = RoutingBin::new();
-        for i in 1..=5u8 {
+        for i in 1..=2u8 {
             let ip: Ipv4Addr = format!("5.5.5.{}", i).parse().unwrap();
             let c = make_contact(i, ip);
             bin.try_add(c).unwrap();
         }
-        assert_eq!(bin.len(), 5);
+        let third = make_contact(3, "5.5.5.3".parse().unwrap());
+        assert!(matches!(
+            bin.try_add(third),
+            Err(RoutingError::SubnetLimitExceeded { prefix: 24 })
+        ));
+        assert_eq!(bin.len(), 2);
     }
 
     #[test]
