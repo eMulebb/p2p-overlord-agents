@@ -77,6 +77,13 @@ pub struct TraversalResult {
     pub search_entries: Vec<(Ed2kHash, Vec<overlord_kad_proto::Tag>)>,
 }
 
+fn traversal_closest_limit(search_kind: &TraversalKind, phase2_fanout: usize) -> usize {
+    match search_kind {
+        TraversalKind::Store => phase2_fanout.max(K),
+        _ => K,
+    }
+}
+
 /// Immutable inputs for the traversal phase-2 search pass.
 struct SearchPhaseConfig<'a> {
     responded: &'a [TraversalContact],
@@ -119,6 +126,7 @@ pub async fn run_traversal(
         result_tx,
     } = config;
     let deadline = Instant::now() + timeout;
+    let closest_limit = traversal_closest_limit(&search_kind, phase2_fanout);
 
     // Determine the count byte for Req based on search kind.
     let req_count = match search_kind {
@@ -280,22 +288,21 @@ pub async fn run_traversal(
             }
         }
 
-        if matches!(search_kind, TraversalKind::FindNode | TraversalKind::Store)
-            && find_node_lookup_converged(&candidates)
+        if matches!(search_kind, TraversalKind::FindNode) && find_node_lookup_converged(&candidates)
         {
             break;
         }
 
-        // Termination: K closest all done?
-        let k_closest_done = candidates
+        // Termination: the responder window this traversal cares about is done.
+        let closest_goal_done = candidates
             .iter()
-            .take(K)
+            .take(closest_limit)
             .all(|c| matches!(c.state, CandidateState::Responded | CandidateState::Failed));
         let any_inflight = candidates
             .iter()
             .any(|c| c.state == CandidateState::Inflight);
 
-        if k_closest_done && !any_inflight {
+        if closest_goal_done && !any_inflight {
             break;
         }
     }
@@ -307,7 +314,7 @@ pub async fn run_traversal(
         .filter(|c| c.state == CandidateState::Responded)
         .map(|c| c.contact.clone())
         .collect();
-    let closest: Vec<TraversalContact> = responded.iter().take(K).cloned().collect();
+    let closest: Vec<TraversalContact> = responded.iter().take(closest_limit).cloned().collect();
 
     let responded_count = candidates
         .iter()
@@ -595,10 +602,6 @@ fn select_phase2_contacts(
 }
 
 /// Returns true once a pure node lookup has already locked in its closest `K` responders.
-///
-/// `FindNode`-driven publish fanout only needs the nearest `K` contacts. After those
-/// positions are occupied by responders and every unfinished candidate is farther away
-/// than the current `K`th responder, the remaining walk cannot improve the publish set.
 fn find_node_lookup_converged(candidates: &[TraversalCandidate]) -> bool {
     let closest_responded = candidates
         .iter()
@@ -736,6 +739,30 @@ mod tests {
         candidates.sort_by(|a, b| a.distance.cmp(&b.distance));
         // 0x01... is closer to ZERO than 0xFF...
         assert_eq!(candidates[0].contact.id, NodeId::from_bytes([0x01; 16]));
+    }
+
+    #[test]
+    fn test_traversal_closest_limit_keeps_store_fanout_above_oracle_k() {
+        assert_eq!(traversal_closest_limit(&TraversalKind::Store, 20), 20);
+        assert_eq!(traversal_closest_limit(&TraversalKind::Store, 4), K);
+    }
+
+    #[test]
+    fn test_traversal_closest_limit_caps_non_store_walks_at_oracle_k() {
+        assert_eq!(traversal_closest_limit(&TraversalKind::FindNode, 20), K);
+        assert_eq!(
+            traversal_closest_limit(
+                &TraversalKind::Keyword {
+                    request: SearchKeyReq {
+                        target: NodeId::ZERO,
+                        start_position: 0,
+                        restrictive_payload: Vec::new(),
+                    },
+                },
+                20,
+            ),
+            K
+        );
     }
 
     #[test]
