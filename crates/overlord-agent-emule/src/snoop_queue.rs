@@ -334,6 +334,14 @@ impl SnoopQueue {
         completed_at: DateTime<Utc>,
         result_count: usize,
     ) {
+        if result_count > 0 {
+            // Successful passive replays are demand-driven one-shots. Remove the drained
+            // shape so fresh observations immediately reclaim scheduling priority instead of
+            // keeping a growing backlog of already-served requests across sessions.
+            self.entries.remove(logical_key);
+            self.replay_feedback.remove(logical_key);
+            return;
+        }
         let feedback = self
             .replay_feedback
             .entry(logical_key.to_string())
@@ -890,6 +898,24 @@ mod tests {
             next_selected.logical_key,
             "source:11112222333344445555666677778888:0000:8192"
         );
+    }
+
+    #[test]
+    fn successful_replay_evicts_drained_entry() {
+        let mut queue = queue();
+        let logical_key = "source:00112233445566778899aabbccddeeff:0000:4096";
+        queue.record(source_entry(
+            logical_key,
+            "00112233445566778899aabbccddeeff",
+            0,
+            4096,
+            100,
+        ));
+
+        queue.record_replay_outcome(logical_key, ts(120), 3);
+
+        assert!(queue.snapshot().is_empty());
+        assert_eq!(queue.family_counts(), SnoopQueueFamilyCounts::default());
     }
 
     #[test]
