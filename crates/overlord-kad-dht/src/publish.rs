@@ -43,8 +43,7 @@ struct PublishAttempt {
 }
 
 /// Send the publish RPC to all selected contacts concurrently so the live wire
-/// shape matches the oracle's bursty publish fanout instead of serial timeout
-/// chains.
+/// shape stays bursty while the caller can widen contact coverage for harvest.
 async fn execute_publish_fanout(
     rpc: &RpcManager,
     contacts: &[TraversalContact],
@@ -90,6 +89,21 @@ async fn execute_publish_fanout(
     results
 }
 
+/// Select the traversal contacts that should receive this publish round.
+///
+/// A zero configuration value falls back to one contact so a misconfigured
+/// runtime still emits publishes instead of silently disabling them.
+fn select_publish_contacts(
+    contacts: &[TraversalContact],
+    publish_contact_fanout: usize,
+) -> Vec<TraversalContact> {
+    contacts
+        .iter()
+        .take(publish_contact_fanout.max(1))
+        .cloned()
+        .collect()
+}
+
 /// Publish a keyword→file mapping.
 /// Returns the number of nodes that acknowledged.
 pub async fn publish_keyword(
@@ -98,6 +112,7 @@ pub async fn publish_keyword(
     keyword_hash: NodeId,
     file_hash: Ed2kHash,
     tags: Vec<Tag>,
+    publish_contact_fanout: usize,
 ) -> Result<PublishAttemptStats, DhtError> {
     let target = keyword_hash;
     let initial = get_initial(routing_table, &target).await;
@@ -130,7 +145,7 @@ pub async fn publish_keyword(
         entries: vec![entry],
     });
 
-    let publish_contacts: Vec<_> = traversal.closest.iter().take(K).cloned().collect();
+    let publish_contacts = select_publish_contacts(&traversal.closest, publish_contact_fanout);
     let mut stats = PublishAttemptStats {
         closest_contacts_considered: traversal.closest.len() as u32,
         attempted_contacts: publish_contacts.len() as u32,
@@ -207,6 +222,7 @@ pub async fn publish_source(
     publisher_id: NodeId,
     file_hash: Ed2kHash,
     tags: Vec<Tag>,
+    publish_contact_fanout: usize,
 ) -> Result<PublishAttemptStats, DhtError> {
     let target = NodeId::from_bytes(file_hash.0);
     let initial = get_initial(routing_table, &target).await;
@@ -236,7 +252,7 @@ pub async fn publish_source(
         tags,
     });
 
-    let publish_contacts: Vec<_> = traversal.closest.iter().take(K).cloned().collect();
+    let publish_contacts = select_publish_contacts(&traversal.closest, publish_contact_fanout);
     let mut stats = PublishAttemptStats {
         closest_contacts_considered: traversal.closest.len() as u32,
         attempted_contacts: publish_contacts.len() as u32,
@@ -314,6 +330,7 @@ pub async fn publish_notes(
     file_hash: Ed2kHash,
     note_hash: Ed2kHash,
     tags: Vec<Tag>,
+    publish_contact_fanout: usize,
 ) -> Result<usize, DhtError> {
     let target = NodeId::from_bytes(file_hash.0);
     let initial = get_initial(routing_table, &target).await;
@@ -343,7 +360,7 @@ pub async fn publish_notes(
         tags,
     });
 
-    let publish_contacts: Vec<_> = traversal.closest.iter().take(K).cloned().collect();
+    let publish_contacts = select_publish_contacts(&traversal.closest, publish_contact_fanout);
     for contact in &publish_contacts {
         register_publish_contact(rpc, contact);
     }
@@ -387,4 +404,44 @@ fn register_publish_contact(rpc: &RpcManager, contact: &TraversalContact) {
         rpc.register_peer_identity(contact.addr, contact.id);
     }
     rpc.register_peer_version(contact.addr, contact.version);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_publish_contacts;
+    use crate::traversal::TraversalContact;
+    use overlord_kad_proto::NodeId;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn traversal_contact(index: u8) -> TraversalContact {
+        TraversalContact {
+            id: NodeId::from_bytes([index; 16]),
+            addr: SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, index)),
+                4_000 + index as u16,
+            ),
+            version: index,
+        }
+    }
+
+    #[test]
+    fn select_publish_contacts_respects_requested_fanout() {
+        let contacts = (1..=5).map(traversal_contact).collect::<Vec<_>>();
+
+        let selected = select_publish_contacts(&contacts, 3);
+
+        assert_eq!(selected.len(), 3);
+        assert_eq!(selected[0].id, contacts[0].id);
+        assert_eq!(selected[2].id, contacts[2].id);
+    }
+
+    #[test]
+    fn select_publish_contacts_clamps_zero_to_one() {
+        let contacts = (1..=5).map(traversal_contact).collect::<Vec<_>>();
+
+        let selected = select_publish_contacts(&contacts, 0);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, contacts[0].id);
+    }
 }

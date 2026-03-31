@@ -25,6 +25,7 @@ bootstrap_nodes = []
 search_timeout_secs = 45
 store_timeout_secs = 140
 republish_interval_secs = 18000
+publish_contact_fanout = 20
 routing_refresh_interval_secs = 120
 nodes_dat_refresh_interval_secs = 300
 udp_firewall_check_enabled = true

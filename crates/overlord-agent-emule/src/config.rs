@@ -71,6 +71,8 @@ pub struct KadConfig {
     pub search_timeout_secs: u64,
     pub store_timeout_secs: u64,
     pub republish_interval_secs: u64,
+    /// Maximum number of closest contacts to publish to per Kad publish round.
+    pub publish_contact_fanout: usize,
     /// Interval between random-target Kad routing refresh walks.
     pub routing_refresh_interval_secs: u64,
     /// Maximum delay between `nodes.dat` snapshots while the routing table changes.
@@ -259,6 +261,7 @@ impl Default for KadConfig {
             search_timeout_secs: 45,
             store_timeout_secs: 140,
             republish_interval_secs: 18_000,
+            publish_contact_fanout: 20,
             routing_refresh_interval_secs: 120,
             nodes_dat_refresh_interval_secs: 300,
             udp_firewall_check_enabled: true,
@@ -766,6 +769,7 @@ state_dir = "{state_dir}"
 
         assert_eq!(config.p2p.kad.routing_refresh_interval_secs, 120);
         assert_eq!(config.p2p.kad.nodes_dat_refresh_interval_secs, 300);
+        assert_eq!(config.p2p.kad.publish_contact_fanout, 20);
         assert!(config.p2p.kad.udp_firewall_check_enabled);
         assert_eq!(config.p2p.kad.udp_firewall_recheck_interval_secs, 300);
         assert_eq!(config.p2p.kad.udp_firewall_check_timeout_secs, 20);

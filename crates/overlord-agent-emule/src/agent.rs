@@ -1358,6 +1358,7 @@ impl OverlordAgentEmule {
             search_timeout: Duration::from_secs(config.p2p.kad.search_timeout_secs),
             store_timeout: Duration::from_secs(config.p2p.kad.store_timeout_secs),
             republish_interval: Duration::from_secs(config.p2p.kad.republish_interval_secs),
+            publish_contact_fanout: config.p2p.kad.publish_contact_fanout,
             max_outbound_pps: config.p2p.kad.max_outbound_pps,
             search_phase2_fanout: config.p2p.kad.search_phase2_fanout,
             keyword_result_cap: config.p2p.kad.keyword_result_cap,

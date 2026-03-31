@@ -33,6 +33,8 @@ pub struct DhtConfig {
     pub store_timeout: Duration,
     /// Republish interval.
     pub republish_interval: Duration,
+    /// Maximum number of closest contacts to publish to per publish round.
+    pub publish_contact_fanout: usize,
     /// Max outbound packets per second. 0 = unlimited.
     pub max_outbound_pps: u32,
     /// Max number of phase-2 search packets to send after traversal.
@@ -63,6 +65,7 @@ impl Default for DhtConfig {
             search_timeout: Duration::from_secs(45),
             store_timeout: Duration::from_secs(140),
             republish_interval: Duration::from_secs(18000),
+            publish_contact_fanout: 20,
             max_outbound_pps: 50,
             search_phase2_fanout: 50,
             keyword_result_cap: 5000,
@@ -598,6 +601,7 @@ impl DhtNode {
             keyword_hash,
             file_hash,
             tags,
+            self.inner.config.publish_contact_fanout,
         )
         .await
     }
@@ -615,6 +619,7 @@ impl DhtNode {
             publisher_id,
             file_hash,
             tags,
+            self.inner.config.publish_contact_fanout,
         )
         .await
     }
@@ -632,6 +637,7 @@ impl DhtNode {
             file_hash,
             note_hash,
             tags,
+            self.inner.config.publish_contact_fanout,
         )
         .await
     }
