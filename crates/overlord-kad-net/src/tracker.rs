@@ -1,8 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-/// Tracks incoming packet counts per IP and Kad opcode family to detect flooding.
+/// Tracks incoming Kad request counts per IP and opcode family to detect flooding.
+///
+/// This mirrors the oracle `PacketTracking.cpp` intent more closely than a
+/// generic packet-per-IP limiter: only request families are throttled here,
+/// while reply validation is handled by [`OutboundRequestTracker`].
 pub struct PacketTracker {
     /// (packet_count, window_start)
     counts: HashMap<PacketTrackerKey, (u32, Instant)>,
@@ -19,13 +23,15 @@ pub struct PacketTrackerKey {
     pub bucket: PacketTrackerBucket,
 }
 
-/// Inbound Kad packet family with distinct rate limits.
+/// Inbound Kad request family with distinct oracle-shaped rate limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PacketTrackerBucket {
-    /// Bootstrap request/response traffic.
-    Bootstrap,
-    /// HELLO request/response/ack traffic.
-    Hello,
+    /// `KADEMLIA2_BOOTSTRAP_REQ`.
+    BootstrapReq,
+    /// `KADEMLIA2_HELLO_REQ`.
+    HelloReq,
+    /// `KADEMLIA2_REQ`.
+    FindNodeReq,
     /// Search request families share the oracle 3/min budget.
     SearchReq,
     /// Keyword publish requests use the eMule 4/min budget.
@@ -34,10 +40,16 @@ pub enum PacketTrackerBucket {
     PublishSourceReq,
     /// Notes publish requests use the eMule 2/min budget.
     PublishNotesReq,
-    /// Search responses keep the relaxed flood budget used by the current runtime.
+    /// Firewall-check requests share the oracle 2/min budget.
+    FirewalledReq,
+    /// Buddy lookup requests share the oracle 2/min budget.
+    FindBuddyReq,
+    /// Callback requests use the oracle 1/min budget.
+    CallbackReq,
+    /// Ping requests use the oracle 2/min budget.
+    PingReq,
+    /// Search responses keep the relaxed harvest budget used by the current runtime.
     SearchRes,
-    /// Control traffic such as ping/pong, lookup req/res, firewall checks and publish replies.
-    Control,
     /// Fallback bucket for any packet family not classified explicitly.
     Default,
 }
@@ -47,13 +59,17 @@ impl PacketTrackerBucket {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::Bootstrap => "bootstrap",
-            Self::Hello => "hello",
+            Self::BootstrapReq => "bootstrap_req",
+            Self::HelloReq => "hello_req",
+            Self::FindNodeReq => "find_node_req",
             Self::SearchReq => "search_req",
             Self::PublishKeyReq => "publish_key_req",
             Self::PublishSourceReq => "publish_source_req",
             Self::PublishNotesReq => "publish_notes_req",
-            Self::Control => "control",
+            Self::FirewalledReq => "firewalled_req",
+            Self::FindBuddyReq => "find_buddy_req",
+            Self::CallbackReq => "callback_req",
+            Self::PingReq => "ping_req",
             Self::Default => "default",
             Self::SearchRes => "search_res",
         }
@@ -99,8 +115,18 @@ impl PacketTracker {
     ) -> Self {
         let default_limit = PacketTrackerLimit::new(max_per_window, window);
         let limits = HashMap::from([
-            (PacketTrackerBucket::Bootstrap, default_limit),
-            (PacketTrackerBucket::Hello, default_limit),
+            (
+                PacketTrackerBucket::BootstrapReq,
+                PacketTrackerLimit::new(2, request_window),
+            ),
+            (
+                PacketTrackerBucket::HelloReq,
+                PacketTrackerLimit::new(3, request_window),
+            ),
+            (
+                PacketTrackerBucket::FindNodeReq,
+                PacketTrackerLimit::new(10, request_window),
+            ),
             (
                 PacketTrackerBucket::SearchReq,
                 PacketTrackerLimit::new(3, request_window),
@@ -118,10 +144,25 @@ impl PacketTracker {
                 PacketTrackerLimit::new(2, request_window),
             ),
             (
+                PacketTrackerBucket::FirewalledReq,
+                PacketTrackerLimit::new(2, request_window),
+            ),
+            (
+                PacketTrackerBucket::FindBuddyReq,
+                PacketTrackerLimit::new(2, request_window),
+            ),
+            (
+                PacketTrackerBucket::CallbackReq,
+                PacketTrackerLimit::new(1, request_window),
+            ),
+            (
+                PacketTrackerBucket::PingReq,
+                PacketTrackerLimit::new(2, request_window),
+            ),
+            (
                 PacketTrackerBucket::SearchRes,
                 PacketTrackerLimit::new(search_res_max_per_window, window),
             ),
-            (PacketTrackerBucket::Control, default_limit),
         ]);
         Self {
             counts: HashMap::new(),
@@ -170,6 +211,104 @@ impl PacketTracker {
     }
 }
 
+/// Tracks outbound Kad requests by IP and opcode for the oracle's "did we ask
+/// for this response?" validation.
+pub struct OutboundRequestTracker {
+    entries: VecDeque<OutboundRequestEntry>,
+    window: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutboundRequestEntry {
+    inserted_at: Instant,
+    ip: IpAddr,
+    opcode: u8,
+}
+
+impl OutboundRequestTracker {
+    /// Create a new outbound request tracker with the given retention window.
+    #[must_use]
+    pub fn new(window: Duration) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            window,
+        }
+    }
+
+    /// Record an outbound request if the oracle would track it.
+    pub fn record(&mut self, ip: IpAddr, opcode: u8) {
+        self.prune();
+        if !tracks_outbound_request_opcode(opcode) {
+            return;
+        }
+        self.entries.push_front(OutboundRequestEntry {
+            inserted_at: Instant::now(),
+            ip,
+            opcode,
+        });
+    }
+
+    /// Find a matching tracked request by IP and opcode.
+    ///
+    /// When `remove` is true the newest matching request is consumed, mirroring
+    /// the oracle's list walk.
+    #[must_use]
+    pub fn contains(&mut self, ip: IpAddr, opcode: u8, remove: bool) -> bool {
+        self.prune();
+        for index in 0..self.entries.len() {
+            let Some(entry) = self.entries.get(index).copied() else {
+                continue;
+            };
+            if entry.ip == ip && entry.opcode == opcode {
+                if remove {
+                    let _ = self.entries.remove(index);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Find the first matching opcode from the provided oracle-ordered set.
+    #[must_use]
+    pub fn find_any(&mut self, ip: IpAddr, opcodes: &[u8], remove: bool) -> Option<u8> {
+        for opcode in opcodes {
+            if self.contains(ip, *opcode, remove) {
+                return Some(*opcode);
+            }
+        }
+        None
+    }
+
+    fn prune(&mut self) {
+        let now = Instant::now();
+        while self
+            .entries
+            .back()
+            .is_some_and(|entry| now.duration_since(entry.inserted_at) >= self.window)
+        {
+            let _ = self.entries.pop_back();
+        }
+    }
+}
+
+fn tracks_outbound_request_opcode(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        overlord_kad_proto::constants::opcode::BOOTSTRAP_REQ
+            | overlord_kad_proto::constants::opcode::HELLO_REQ
+            | overlord_kad_proto::constants::opcode::HELLO_RES
+            | overlord_kad_proto::constants::opcode::REQ
+            | overlord_kad_proto::constants::opcode::SEARCH_NOTES_REQ
+            | overlord_kad_proto::constants::opcode::PUBLISH_KEY_REQ
+            | overlord_kad_proto::constants::opcode::PUBLISH_SOURCE_REQ
+            | overlord_kad_proto::constants::opcode::PUBLISH_NOTES_REQ
+            | overlord_kad_proto::constants::opcode::FINDBUDDY_REQ
+            | overlord_kad_proto::constants::opcode::CALLBACK_REQ
+            | overlord_kad_proto::constants::opcode::PING
+    )
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -201,7 +340,7 @@ mod tests {
     fn test_flood_over_limit_blocked() {
         let mut tracker =
             PacketTracker::new(5, 100, Duration::from_secs(1), Duration::from_secs(60));
-        let addr = key("1.2.3.4", PacketTrackerBucket::Control);
+        let addr = key("1.2.3.4", PacketTrackerBucket::Default);
         // First 5 pass
         for _ in 0..5 {
             assert!(tracker.record_and_check(addr).allowed);
@@ -216,7 +355,7 @@ mod tests {
         // Use a very short window to test expiry
         let mut tracker =
             PacketTracker::new(2, 100, Duration::from_millis(50), Duration::from_secs(60));
-        let addr = key("5.6.7.8", PacketTrackerBucket::Control);
+        let addr = key("5.6.7.8", PacketTrackerBucket::Default);
         assert!(tracker.record_and_check(addr).allowed);
         assert!(tracker.record_and_check(addr).allowed);
         assert!(!tracker.record_and_check(addr).allowed); // over limit
@@ -232,10 +371,10 @@ mod tests {
     fn test_search_res_uses_higher_limit_than_default_bucket() {
         let mut tracker =
             PacketTracker::new(5, 50, Duration::from_secs(1), Duration::from_secs(60));
-        let default_key = key("1.2.3.4", PacketTrackerBucket::Control);
+        let default_key = key("1.2.3.4", PacketTrackerBucket::FindNodeReq);
         let search_res_key = key("1.2.3.4", PacketTrackerBucket::SearchRes);
 
-        for _ in 0..5 {
+        for _ in 0..10 {
             assert!(tracker.record_and_check(default_key).allowed);
         }
         assert!(!tracker.record_and_check(default_key).allowed);
@@ -283,5 +422,87 @@ mod tests {
             assert!(tracker.record_and_check(publish_notes).allowed);
         }
         assert!(!tracker.record_and_check(publish_notes).allowed);
+    }
+
+    #[test]
+    fn test_request_buckets_follow_oracle_minute_limits() {
+        let mut tracker =
+            PacketTracker::new(20, 50, Duration::from_secs(1), Duration::from_secs(60));
+
+        for _ in 0..2 {
+            assert!(
+                tracker
+                    .record_and_check(key("1.2.3.4", PacketTrackerBucket::BootstrapReq))
+                    .allowed
+            );
+        }
+        assert!(
+            !tracker
+                .record_and_check(key("1.2.3.4", PacketTrackerBucket::BootstrapReq))
+                .allowed
+        );
+
+        for _ in 0..2 {
+            assert!(
+                tracker
+                    .record_and_check(key("1.2.3.5", PacketTrackerBucket::PingReq))
+                    .allowed
+            );
+        }
+        assert!(
+            !tracker
+                .record_and_check(key("1.2.3.5", PacketTrackerBucket::PingReq))
+                .allowed
+        );
+
+        assert!(
+            tracker
+                .record_and_check(key("1.2.3.6", PacketTrackerBucket::CallbackReq))
+                .allowed
+        );
+        assert!(
+            !tracker
+                .record_and_check(key("1.2.3.6", PacketTrackerBucket::CallbackReq))
+                .allowed
+        );
+    }
+
+    #[test]
+    fn outbound_request_tracker_matches_newest_request_by_ip_and_opcode() {
+        let mut tracker = OutboundRequestTracker::new(Duration::from_secs(180));
+        let ip = parse_ip("1.2.3.4");
+
+        tracker.record(ip, overlord_kad_proto::constants::opcode::PUBLISH_KEY_REQ);
+        tracker.record(ip, overlord_kad_proto::constants::opcode::PUBLISH_KEY_REQ);
+
+        assert!(tracker.contains(
+            ip,
+            overlord_kad_proto::constants::opcode::PUBLISH_KEY_REQ,
+            true
+        ));
+        assert!(tracker.contains(
+            ip,
+            overlord_kad_proto::constants::opcode::PUBLISH_KEY_REQ,
+            true
+        ));
+        assert!(!tracker.contains(
+            ip,
+            overlord_kad_proto::constants::opcode::PUBLISH_KEY_REQ,
+            true
+        ));
+    }
+
+    #[test]
+    fn outbound_request_tracker_ignores_untracked_opcodes() {
+        let mut tracker = OutboundRequestTracker::new(Duration::from_secs(180));
+        let ip = parse_ip("1.2.3.4");
+
+        tracker.record(ip, overlord_kad_proto::constants::opcode::PUBLISH_RES);
+
+        assert!(!tracker.contains(
+            ip,
+            overlord_kad_proto::constants::opcode::PUBLISH_RES,
+            false
+        ));
     }
 }

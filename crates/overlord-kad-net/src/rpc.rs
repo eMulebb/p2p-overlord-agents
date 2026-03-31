@@ -1,7 +1,9 @@
 use crate::error::NetError;
 use crate::obfuscation::{DecryptResult, ObfuscationLayer};
 use crate::rate_limit::RateLimiter;
-use crate::tracker::{PacketTracker, PacketTrackerBucket, PacketTrackerKey};
+use crate::tracker::{
+    OutboundRequestTracker, PacketTracker, PacketTrackerBucket, PacketTrackerKey,
+};
 use crate::transport::Transport;
 use overlord_kad_proto::{KadPacket, NodeId, constants::opcode};
 use std::collections::HashMap;
@@ -72,6 +74,7 @@ struct RpcInner {
     obfuscation: ObfuscationLayer,
     rate_limiter: RateLimiter,
     tracker: Mutex<PacketTracker>,
+    outbound_tracker: Mutex<OutboundRequestTracker>,
     pending: Mutex<HashMap<u64, PendingEntry>>,
     next_id: AtomicU64,
     unsolicited_tx: broadcast::Sender<ReceivedKadPacket>,
@@ -107,6 +110,7 @@ impl RpcManager {
                 config.flood_window,
                 config.request_tracking_window,
             )),
+            outbound_tracker: Mutex::new(OutboundRequestTracker::new(Duration::from_secs(180))),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
             unsolicited_tx,
@@ -170,7 +174,10 @@ impl RpcManager {
                             was_obfuscated,
                             receiver_verify_key_valid,
                             sender_verify_key.unwrap_or_default(),
-                            inbound.bucket.label(),
+                            inbound
+                                .tracker_bucket
+                                .map(PacketTrackerBucket::label)
+                                .unwrap_or("-"),
                             inbound
                                 .peer_id
                                 .map(|peer_id| peer_id.to_string())
@@ -180,33 +187,37 @@ impl RpcManager {
                                 .map_or_else(|| "-".to_string(), |version| version.to_string()),
                         );
 
-                        let decision =
-                            inner
-                                .tracker
-                                .lock()
-                                .unwrap()
-                                .record_and_check(PacketTrackerKey {
-                                    ip: from.ip(),
-                                    bucket: inbound.bucket,
-                                });
-                        if !decision.allowed {
-                            warn!(
-                                "flood-blocking {} opcode={} bucket={} observed_packets={} max_packets={} window_ms={}",
-                                from.ip(),
-                                opcode_name(response_opcode),
-                                inbound.bucket.label(),
-                                decision.observed_packets,
-                                decision.max_packets,
-                                decision.window.as_millis(),
-                            );
-                            continue;
+                        if let Some(bucket) = inbound.tracker_bucket {
+                            let decision =
+                                inner
+                                    .tracker
+                                    .lock()
+                                    .unwrap()
+                                    .record_and_check(PacketTrackerKey {
+                                        ip: from.ip(),
+                                        bucket,
+                                    });
+                            if !decision.allowed {
+                                warn!(
+                                    "flood-blocking {} opcode={} bucket={} observed_packets={} max_packets={} window_ms={}",
+                                    from.ip(),
+                                    opcode_name(response_opcode),
+                                    bucket.label(),
+                                    decision.observed_packets,
+                                    decision.max_packets,
+                                    decision.window.as_millis(),
+                                );
+                                continue;
+                            }
                         }
 
                         // 4. Try to match a pending request
                         let matched = {
                             let mut pending = inner.pending.lock().unwrap();
-                            // Find oldest matching entry
-                            let match_id = pending
+                            // Prefer the exact endpoint first, then fall back to
+                            // the oracle's IP-based response matching when the
+                            // source port changes underneath a still-valid reply.
+                            let exact_match_id = pending
                                 .iter()
                                 .filter(|(_, e)| {
                                     e.remote_addr == from && e.expected_opcode == response_opcode
@@ -214,9 +225,21 @@ impl RpcManager {
                                 .min_by_key(|(_, e)| e.created_at)
                                 .map(|(id, _)| *id);
 
-                            if let Some(id) = match_id {
+                            let ip_only_match_id = exact_match_id.or_else(|| {
+                                pending
+                                    .iter()
+                                    .filter(|(_, e)| {
+                                        e.remote_addr.ip() == from.ip()
+                                            && e.expected_opcode == response_opcode
+                                    })
+                                    .min_by_key(|(_, e)| e.created_at)
+                                    .map(|(id, _)| *id)
+                            });
+
+                            if let Some(id) = ip_only_match_id {
                                 let entry = pending.remove(&id).unwrap();
                                 let age_ms = entry.created_at.elapsed().as_millis();
+                                let matched_by_ip_only = entry.remote_addr != from;
                                 debug!(
                                     "matched pending response: opcode=0x{:02X} from={}",
                                     response_opcode, from
@@ -234,23 +257,34 @@ impl RpcManager {
                                     );
                                 }
                                 let _ = entry.tx.send(packet.clone());
-                                Some((id, age_ms, entry.request_opcode))
+                                Some((id, age_ms, entry.request_opcode, matched_by_ip_only))
                             } else {
                                 None
                             }
                         };
 
+                        let tracked_request_opcode = tracked_request_opcode_for_response(
+                            &inner.outbound_tracker,
+                            from.ip(),
+                            response_opcode,
+                        );
+
                         if is_publish_opcode(response_opcode) {
                             info!(
-                                "kad publish recv opcode={} from={} matched_pending={} matched_pending_id={} matched_age_ms={} matched_request_opcode={} obfuscated={} sender_verify_key={}",
+                                "kad publish recv opcode={} from={} matched_pending={} matched_pending_id={} matched_age_ms={} matched_request_opcode={} matched_by_ip_only={} tracked_by_ip={} tracked_request_opcode={} obfuscated={} sender_verify_key={}",
                                 opcode_name(response_opcode),
                                 from,
                                 matched.is_some(),
-                                matched.map(|(id, _, _)| id).unwrap_or_default(),
-                                matched.map(|(_, age_ms, _)| age_ms).unwrap_or_default(),
+                                matched.map(|(id, _, _, _)| id).unwrap_or_default(),
+                                matched.map(|(_, age_ms, _, _)| age_ms).unwrap_or_default(),
                                 matched
-                                    .map(|(_, _, request_opcode)| opcode_name(request_opcode))
+                                    .map(|(_, _, request_opcode, _)| opcode_name(request_opcode))
                                     .unwrap_or("-"),
+                                matched
+                                    .map(|(_, _, _, matched_by_ip_only)| matched_by_ip_only)
+                                    .unwrap_or(false),
+                                tracked_request_opcode.is_some(),
+                                tracked_request_opcode.map(opcode_name).unwrap_or("-"),
                                 was_obfuscated,
                                 sender_verify_key.unwrap_or_default(),
                             );
@@ -258,13 +292,26 @@ impl RpcManager {
 
                         // 5. If unmatched: broadcast
                         if matched.is_none() {
-                            if should_log_unsolicited_opcode(response_opcode) {
+                            if is_tracked_response_opcode(response_opcode)
+                                && tracked_request_opcode.is_none()
+                            {
                                 info!(
-                                    "kad recv unsolicited opcode={} from={} obfuscated={} sender_verify_key={}",
+                                    "kad recv dropping-unrequested-response opcode={} from={} obfuscated={} sender_verify_key={}",
                                     opcode_name(response_opcode),
                                     from,
                                     was_obfuscated,
                                     sender_verify_key.unwrap_or_default(),
+                                );
+                                continue;
+                            }
+                            if should_log_unsolicited_opcode(response_opcode) {
+                                info!(
+                                    "kad recv unsolicited opcode={} from={} obfuscated={} sender_verify_key={} tracked_request_opcode={}",
+                                    opcode_name(response_opcode),
+                                    from,
+                                    was_obfuscated,
+                                    sender_verify_key.unwrap_or_default(),
+                                    tracked_request_opcode.map(opcode_name).unwrap_or("-"),
                                 );
                             }
                             debug!(
@@ -410,6 +457,11 @@ impl RpcManager {
             .inner
             .obfuscation
             .encrypt(addr, packet.opcode(), &encoded);
+        self.inner
+            .outbound_tracker
+            .lock()
+            .unwrap()
+            .record(addr.ip(), packet.opcode());
         if is_publish_opcode(packet.opcode()) {
             let crypt_target = outbound
                 .peer_node_id
@@ -473,7 +525,7 @@ impl RpcManager {
 
 #[derive(Debug, Clone, Copy)]
 struct InboundKadPacketInfo {
-    bucket: PacketTrackerBucket,
+    tracker_bucket: Option<PacketTrackerBucket>,
     peer_id: Option<NodeId>,
     kad_version: Option<u8>,
 }
@@ -481,64 +533,57 @@ struct InboundKadPacketInfo {
 fn inspect_inbound_packet(packet: &KadPacket) -> InboundKadPacketInfo {
     match packet {
         KadPacket::BootstrapRes(res) => InboundKadPacketInfo {
-            bucket: PacketTrackerBucket::Bootstrap,
+            tracker_bucket: None,
             peer_id: Some(res.sender_id),
             kad_version: Some(res.sender_version),
         },
         KadPacket::HelloReq(req) => InboundKadPacketInfo {
-            bucket: PacketTrackerBucket::Hello,
+            tracker_bucket: Some(PacketTrackerBucket::HelloReq),
             peer_id: Some(req.node_id),
             kad_version: Some(req.version),
         },
         KadPacket::HelloRes(res) => InboundKadPacketInfo {
-            bucket: PacketTrackerBucket::Hello,
+            tracker_bucket: None,
             peer_id: Some(res.node_id),
             kad_version: Some(res.version),
         },
         KadPacket::HelloResAck(ack) => InboundKadPacketInfo {
-            bucket: PacketTrackerBucket::Hello,
+            tracker_bucket: None,
             peer_id: Some(ack.node_id),
             kad_version: None,
         },
         KadPacket::SearchRes(res) => InboundKadPacketInfo {
-            bucket: PacketTrackerBucket::SearchRes,
+            tracker_bucket: Some(PacketTrackerBucket::SearchRes),
             peer_id: Some(res.sender_id),
             kad_version: None,
         },
         _ => InboundKadPacketInfo {
-            bucket: tracker_bucket_for_opcode(packet.opcode()),
+            tracker_bucket: tracker_bucket_for_opcode(packet.opcode()),
             peer_id: None,
             kad_version: None,
         },
     }
 }
 
-fn tracker_bucket_for_opcode(opcode_value: u8) -> PacketTrackerBucket {
+fn tracker_bucket_for_opcode(opcode_value: u8) -> Option<PacketTrackerBucket> {
     match opcode_value {
-        opcode::BOOTSTRAP_REQ | opcode::BOOTSTRAP_RES => PacketTrackerBucket::Bootstrap,
-        opcode::HELLO_REQ | opcode::HELLO_RES | opcode::HELLO_RES_ACK => PacketTrackerBucket::Hello,
+        opcode::BOOTSTRAP_REQ => Some(PacketTrackerBucket::BootstrapReq),
+        opcode::HELLO_REQ => Some(PacketTrackerBucket::HelloReq),
+        opcode::REQ => Some(PacketTrackerBucket::FindNodeReq),
         opcode::SEARCH_KEY_REQ | opcode::SEARCH_SOURCE_REQ | opcode::SEARCH_NOTES_REQ => {
-            PacketTrackerBucket::SearchReq
+            Some(PacketTrackerBucket::SearchReq)
         }
-        opcode::PUBLISH_KEY_REQ => PacketTrackerBucket::PublishKeyReq,
-        opcode::PUBLISH_SOURCE_REQ => PacketTrackerBucket::PublishSourceReq,
-        opcode::PUBLISH_NOTES_REQ => PacketTrackerBucket::PublishNotesReq,
-        opcode::SEARCH_RES => PacketTrackerBucket::SearchRes,
-        opcode::REQ
-        | opcode::RES
-        | opcode::PUBLISH_RES
-        | opcode::PUBLISH_RES_ACK
-        | opcode::FIREWALLED_REQ
-        | opcode::FIREWALLED2_REQ
-        | opcode::FIREWALLED_RES
-        | opcode::FIREWALLED_ACK_RES
-        | opcode::FIREWALLUDP
-        | opcode::FINDBUDDY_REQ
-        | opcode::FINDBUDDY_RES
-        | opcode::CALLBACK_REQ
-        | opcode::PING
-        | opcode::PONG => PacketTrackerBucket::Control,
-        _ => PacketTrackerBucket::Default,
+        opcode::PUBLISH_KEY_REQ => Some(PacketTrackerBucket::PublishKeyReq),
+        opcode::PUBLISH_SOURCE_REQ => Some(PacketTrackerBucket::PublishSourceReq),
+        opcode::PUBLISH_NOTES_REQ => Some(PacketTrackerBucket::PublishNotesReq),
+        opcode::FIREWALLED_REQ | opcode::FIREWALLED2_REQ => {
+            Some(PacketTrackerBucket::FirewalledReq)
+        }
+        opcode::FINDBUDDY_REQ => Some(PacketTrackerBucket::FindBuddyReq),
+        opcode::CALLBACK_REQ => Some(PacketTrackerBucket::CallbackReq),
+        opcode::PING => Some(PacketTrackerBucket::PingReq),
+        opcode::SEARCH_RES => Some(PacketTrackerBucket::SearchRes),
+        _ => None,
     }
 }
 
@@ -581,6 +626,22 @@ fn should_log_unsolicited_opcode(opcode_value: u8) -> bool {
             | opcode::FINDBUDDY_RES
             | opcode::CALLBACK_REQ
             | opcode::PING
+            | opcode::PONG
+    )
+}
+
+fn is_tracked_response_opcode(opcode_value: u8) -> bool {
+    matches!(
+        opcode_value,
+        opcode::BOOTSTRAP_RES
+            | opcode::HELLO_RES
+            | opcode::HELLO_RES_ACK
+            | opcode::RES
+            | opcode::PUBLISH_RES
+            | opcode::PUBLISH_RES_ACK
+            | opcode::FIREWALLED_RES
+            | opcode::FIREWALLED_ACK_RES
+            | opcode::FINDBUDDY_RES
             | opcode::PONG
     )
 }
@@ -674,6 +735,39 @@ fn is_response_opcode(opcode_value: u8) -> bool {
     )
 }
 
+fn tracked_request_opcode_for_response(
+    outbound_tracker: &Mutex<OutboundRequestTracker>,
+    ip: std::net::IpAddr,
+    response_opcode: u8,
+) -> Option<u8> {
+    let mut tracker = outbound_tracker.lock().unwrap();
+    match response_opcode {
+        opcode::BOOTSTRAP_RES => tracker.find_any(ip, &[opcode::BOOTSTRAP_REQ], true),
+        opcode::HELLO_RES => tracker.find_any(ip, &[opcode::HELLO_REQ], true),
+        opcode::HELLO_RES_ACK => tracker.find_any(ip, &[opcode::HELLO_RES], true),
+        opcode::RES => tracker.find_any(ip, &[opcode::REQ], true),
+        opcode::PUBLISH_RES => {
+            let matched = tracker.find_any(
+                ip,
+                &[
+                    opcode::PUBLISH_KEY_REQ,
+                    opcode::PUBLISH_SOURCE_REQ,
+                    opcode::PUBLISH_NOTES_REQ,
+                ],
+                false,
+            )?;
+            let _ = tracker.contains(ip, matched, true);
+            Some(matched)
+        }
+        opcode::FIREWALLED_RES | opcode::FIREWALLED_ACK_RES => {
+            tracker.find_any(ip, &[opcode::FIREWALLED_REQ, opcode::FIREWALLED2_REQ], true)
+        }
+        opcode::FINDBUDDY_RES => tracker.find_any(ip, &[opcode::FINDBUDDY_REQ], true),
+        opcode::PONG => tracker.find_any(ip, &[opcode::PING], true),
+        _ => None,
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -757,7 +851,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unsolicited_broadcast() {
+    async fn test_unsolicited_request_broadcast() {
         let transport = MockTransport::new(make_local_addr());
         let inject_tx = transport.injector();
         let rpc = make_rpc_with_transport(transport);
@@ -766,11 +860,13 @@ mod tests {
 
         let peer_addr = make_peer_addr();
 
-        // Inject a HelloResAck (no pending request for it)
+        // Inject a HelloReq (requests are broadcast as unsolicited traffic).
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            let hello = KadPacket::HelloResAck(overlord_kad_proto::HelloResAck {
+            let hello = KadPacket::HelloReq(overlord_kad_proto::HelloReq {
                 node_id: NodeId::from_bytes([0x44; 16]),
+                tcp_port: 4662,
+                version: 8,
                 tags: Vec::new(),
             });
             let encoded = hello.encode().unwrap();
@@ -780,11 +876,82 @@ mod tests {
         let received = tokio::time::timeout(Duration::from_secs(2), subscriber.recv()).await;
         assert!(received.is_ok(), "timed out waiting for broadcast");
         let received = received.unwrap().unwrap();
-        assert!(matches!(received.packet, KadPacket::HelloResAck(_)));
+        assert!(matches!(received.packet, KadPacket::HelloReq(_)));
         assert_eq!(received.from, peer_addr);
         assert!(!received.was_obfuscated);
         assert_eq!(received.sender_verify_key, None);
         assert!(!received.receiver_verify_key_valid);
+    }
+
+    #[tokio::test]
+    async fn test_tracked_hello_response_is_broadcast_without_pending_request() {
+        let transport = Arc::new(MockTransport::new(make_local_addr()));
+        let inject_tx = transport.injector();
+        let obfuscation = ObfuscationLayer::new(NodeId::from_bytes([0xAA; 16]), 0x1234_5678, true);
+        let rpc = make_rpc_with_shared_transport(Arc::clone(&transport), obfuscation);
+        let mut subscriber = rpc.subscribe();
+        let _handle = rpc.start();
+
+        let peer_addr = make_peer_addr();
+        let peer_id = NodeId::from_bytes([0x44; 16]);
+        rpc.send(
+            peer_addr,
+            &KadPacket::HelloReq(overlord_kad_proto::HelloReq {
+                node_id: NodeId::from_bytes([0x55; 16]),
+                tcp_port: 4662,
+                version: 8,
+                tags: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let hello = KadPacket::HelloRes(overlord_kad_proto::HelloRes {
+                node_id: peer_id,
+                tcp_port: 4662,
+                version: 8,
+                tags: Vec::new(),
+            });
+            let encoded = hello.encode().unwrap();
+            let _ = inject_tx.send((encoded, peer_addr)).await;
+        });
+
+        let received = tokio::time::timeout(Duration::from_secs(2), subscriber.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(received.packet, KadPacket::HelloRes(_)));
+        assert_eq!(received.from, peer_addr);
+    }
+
+    #[tokio::test]
+    async fn test_untracked_response_is_dropped() {
+        let transport = MockTransport::new(make_local_addr());
+        let inject_tx = transport.injector();
+        let rpc = make_rpc_with_transport(transport);
+        let mut subscriber = rpc.subscribe();
+        let _handle = rpc.start();
+
+        let peer_addr = make_peer_addr();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let hello = KadPacket::HelloRes(overlord_kad_proto::HelloRes {
+                node_id: NodeId::from_bytes([0x44; 16]),
+                tcp_port: 4662,
+                version: 8,
+                tags: Vec::new(),
+            });
+            let encoded = hello.encode().unwrap();
+            let _ = inject_tx.send((encoded, peer_addr)).await;
+        });
+
+        let received = tokio::time::timeout(Duration::from_millis(200), subscriber.recv()).await;
+        assert!(
+            received.is_err(),
+            "unexpectedly received untracked response"
+        );
     }
 
     #[tokio::test]
@@ -826,7 +993,7 @@ mod tests {
         let pong = KadPacket::Pong;
         let encoded = pong.encode().unwrap();
 
-        // Inject 100 packets — only first 20 should be broadcast
+        // Inject 100 packets — untracked responses should be dropped.
         let total = 100usize;
         for _ in 0..total {
             let _ = inject_tx.send((encoded.clone(), peer_addr)).await;
@@ -848,10 +1015,9 @@ mod tests {
             }
         }
 
-        // Should receive at most max_inbound_per_ip (20) packets from that IP
         assert!(
-            received_count <= 20,
-            "received {} packets, expected at most 20",
+            received_count == 0,
+            "received {} packets, expected no unsolicited tracked responses",
             received_count
         );
     }
