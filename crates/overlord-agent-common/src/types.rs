@@ -57,7 +57,7 @@ pub struct FileRecord {
     pub sources: Vec<Source>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchKind {
     Keyword,
@@ -124,8 +124,39 @@ pub struct IndexerStats {
     pub uptime_secs: u64,
     pub nat: Option<NatStatusSnapshot>,
     pub interface_report: Option<AgentNetworkReport>,
+    pub agent_activity: Option<AgentActivitySnapshot>,
     pub publish_observability: Option<KadPublishObservability>,
     pub harvest_observability: Option<KadHarvestObservability>,
+}
+
+/// High-level current activity state for the running agent process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentActivityState {
+    Starting,
+    Bootstrapping,
+    Idle,
+    ActiveSearch,
+    PassiveHarvestReplay,
+    Publishing,
+    FlushingSnoops,
+    Reconfiguring,
+    Degraded,
+}
+
+/// Snapshot of the single operator-facing activity the agent is currently prioritizing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentActivitySnapshot {
+    pub state: AgentActivityState,
+    pub since: DateTime<Utc>,
+    pub job_id: Option<Uuid>,
+    pub protocol: Option<Protocol>,
+    pub kind: Option<SearchKind>,
+    pub query_or_target: Option<String>,
+    pub progress_current: Option<u32>,
+    pub progress_total: Option<u32>,
+    pub last_update_at: DateTime<Utc>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -496,6 +527,7 @@ pub struct AgentInterfacesView {
     pub report: Option<AgentNetworkReport>,
     pub config: AgentNetworkingConfig,
     pub nat: Option<NatStatusSnapshot>,
+    pub agent_activity: Option<AgentActivitySnapshot>,
     pub publish_observability: Option<KadPublishObservability>,
     pub harvest_observability: Option<KadHarvestObservability>,
     pub last_error: Option<String>,

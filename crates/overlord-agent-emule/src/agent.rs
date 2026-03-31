@@ -19,9 +19,10 @@ use overlord_agent_nat::{
     AgentControlConfig, AgentEd2kConfig, AgentInterface, AgentKadConfig, AgentNatConfig,
     AgentNatP2pConfig, AgentNetworkReport, AgentNetworkingConfig, AgentP2pConfig,
     InterfaceBindingSelection, InterfaceSelectionState, MappingExposure, MappingSpec,
-    NatCapableAgent, NatManager, NatManagerBuilder, ResolvedInterfaceBindingReport,
-    TransportProtocol, build_interface_binding_report, built_in_upnp_port_mapping_providers,
-    default_upnp_backend_order, detect_interfaces, recommend_interface, resolve_bind_ip,
+    NatCapableAgent, NatManager, NatManagerBuilder, NatStatusSnapshot,
+    ResolvedInterfaceBindingReport, TransportProtocol, build_interface_binding_report,
+    built_in_upnp_port_mapping_providers, default_upnp_backend_order, detect_interfaces,
+    recommend_interface, resolve_bind_ip,
 };
 use rand::{RngCore, seq::SliceRandom};
 use tokio::{
@@ -35,13 +36,13 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use overlord_agent_common::{
-    AgentInterfacesView, ConfigUpdate, ContentType, CoordinatorClient, FileRecord, HarvestFamily,
-    HarvestReplayContext, HarvestReplayRecord, HashType, IndexerServer, IndexerService,
-    IndexerStats, KadHarvestFamilyObservability, KadHarvestObservability,
-    KadPassiveReplayObservability, KadPassiveReplayTierSummary, KadPublishObservability,
-    PopularHash, Protocol, PublishBatchSummary, PublishCounters, PublishSeedSource,
-    RegisterRequest, ResultBatch, RunningIndexerServer, SearchEvent, SearchEventStatus, SearchJob,
-    SearchKind, SnoopEntry, SnoopObservation, Source, TagEntry,
+    AgentActivitySnapshot, AgentActivityState, AgentInterfacesView, ConfigUpdate, ContentType,
+    CoordinatorClient, FileRecord, HarvestFamily, HarvestReplayContext, HarvestReplayRecord,
+    HashType, IndexerServer, IndexerService, IndexerStats, KadHarvestFamilyObservability,
+    KadHarvestObservability, KadPassiveReplayObservability, KadPassiveReplayTierSummary,
+    KadPublishObservability, PopularHash, Protocol, PublishBatchSummary, PublishCounters,
+    PublishSeedSource, RegisterRequest, ResultBatch, RunningIndexerServer, SearchEvent,
+    SearchEventStatus, SearchJob, SearchKind, SnoopEntry, SnoopObservation, Source, TagEntry,
 };
 use overlord_kad_dht::{
     DhtConfig, DhtNode, NoteResult, PublishAttemptStats, ReceivedKadPacket, SearchResult,
@@ -96,6 +97,10 @@ const LOCAL_SEARCH_RESPONSE_LIMIT: usize = 64;
 const FIREWALLED_TCP_PROBE_TIMEOUT_SECS: u64 = 5;
 const ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS: usize = 3;
 const ED2K_BACKGROUND_SEARCH_QUEUE_CAPACITY: usize = 4;
+const ACTIVITY_KEY_STARTING: &str = "starting";
+const ACTIVITY_KEY_BOOTSTRAPPING: &str = "bootstrapping";
+const ACTIVITY_KEY_FLUSHING_SNOOPS: &str = "flushing_snoops";
+const ACTIVITY_KEY_RECONFIGURING: &str = "reconfiguring";
 
 async fn wait_for_shutdown_signal() -> Result<&'static str> {
     #[cfg(windows)]
@@ -706,6 +711,7 @@ pub struct OverlordAgentEmule {
     local_store: Arc<Mutex<KadLocalStore>>,
     publish_observability: Arc<Mutex<KadPublishObservability>>,
     harvest_observability: Arc<Mutex<KadHarvestObservability>>,
+    agent_activity: Arc<Mutex<AgentActivityTracker>>,
     runtime: Arc<Mutex<Option<AgentNetworkRuntime>>>,
     control_server: Arc<Mutex<Option<ControlServerRuntime>>>,
     control_selection_state: Arc<RwLock<ResolvedInterfaceBindingReport>>,
@@ -728,6 +734,223 @@ enum NetworkingConfigApplyOutcome {
     RestartRequired,
 }
 
+/// Small in-memory tracker that resolves overlapping runtime work into one operator-facing
+/// activity snapshot using a fixed precedence order.
+#[derive(Debug, Clone)]
+struct AgentActivityTracker {
+    active: HashMap<String, AgentActivitySnapshot>,
+    degraded: Option<AgentActivitySnapshot>,
+    idle_since: DateTime<Utc>,
+}
+
+impl AgentActivityTracker {
+    fn new(now: DateTime<Utc>) -> Self {
+        let mut active = HashMap::new();
+        active.insert(
+            ACTIVITY_KEY_STARTING.to_string(),
+            new_activity_snapshot(AgentActivityState::Starting, now),
+        );
+        Self {
+            active,
+            degraded: None,
+            idle_since: now,
+        }
+    }
+
+    fn enter(&mut self, key: String, snapshot: AgentActivitySnapshot) {
+        self.active.insert(key, snapshot);
+    }
+
+    fn leave(&mut self, key: &str, observed_at: DateTime<Utc>) {
+        if self.active.remove(key).is_some() && self.active.is_empty() {
+            self.idle_since = observed_at;
+        }
+    }
+
+    fn update_progress(
+        &mut self,
+        key: &str,
+        progress_current: Option<u32>,
+        progress_total: Option<u32>,
+        observed_at: DateTime<Utc>,
+    ) {
+        if let Some(snapshot) = self.active.get_mut(key) {
+            snapshot.progress_current = progress_current;
+            snapshot.progress_total = progress_total;
+            snapshot.last_update_at = observed_at;
+        }
+    }
+
+    fn update_error(&mut self, key: &str, error: String, observed_at: DateTime<Utc>) {
+        if let Some(snapshot) = self.active.get_mut(key) {
+            snapshot.last_error = Some(error);
+            snapshot.last_update_at = observed_at;
+        }
+    }
+
+    fn clear_degraded(&mut self) {
+        self.degraded = None;
+    }
+
+    fn record_degraded(&mut self, mut snapshot: AgentActivitySnapshot) {
+        snapshot.state = AgentActivityState::Degraded;
+        self.degraded = Some(snapshot);
+    }
+
+    fn current_snapshot(
+        &self,
+        external_error: Option<String>,
+        observed_at: DateTime<Utc>,
+    ) -> AgentActivitySnapshot {
+        if let Some(snapshot) = self
+            .active
+            .values()
+            .max_by_key(|snapshot| (activity_precedence(snapshot.state), snapshot.last_update_at))
+        {
+            return snapshot.clone();
+        }
+
+        if let Some(snapshot) = &self.degraded {
+            return snapshot.clone();
+        }
+
+        if let Some(error) = external_error {
+            let mut snapshot = new_activity_snapshot(AgentActivityState::Degraded, self.idle_since);
+            snapshot.last_update_at = observed_at;
+            snapshot.last_error = Some(error);
+            return snapshot;
+        }
+
+        let mut snapshot = new_activity_snapshot(AgentActivityState::Idle, self.idle_since);
+        snapshot.last_update_at = observed_at;
+        snapshot
+    }
+}
+
+fn activity_precedence(state: AgentActivityState) -> u8 {
+    match state {
+        AgentActivityState::Degraded => 8,
+        AgentActivityState::Reconfiguring => 7,
+        AgentActivityState::ActiveSearch => 6,
+        AgentActivityState::PassiveHarvestReplay => 5,
+        AgentActivityState::Publishing => 4,
+        AgentActivityState::FlushingSnoops => 3,
+        AgentActivityState::Bootstrapping => 2,
+        AgentActivityState::Starting => 1,
+        AgentActivityState::Idle => 0,
+    }
+}
+
+fn new_activity_snapshot(
+    state: AgentActivityState,
+    observed_at: DateTime<Utc>,
+) -> AgentActivitySnapshot {
+    AgentActivitySnapshot {
+        state,
+        since: observed_at,
+        job_id: None,
+        protocol: None,
+        kind: None,
+        query_or_target: None,
+        progress_current: None,
+        progress_total: None,
+        last_update_at: observed_at,
+        last_error: None,
+    }
+}
+
+fn active_search_key(job_id: Uuid) -> String {
+    format!("active_search:{job_id}")
+}
+
+fn passive_replay_key(replay_id: Uuid) -> String {
+    format!("passive_replay:{replay_id}")
+}
+
+fn publish_activity_key(seed_source: PublishSeedSource, observed_at: DateTime<Utc>) -> String {
+    format!(
+        "publishing:{}:{}",
+        seed_source.label(),
+        observed_at.timestamp_millis()
+    )
+}
+
+fn search_activity_context(job: &SearchJob) -> Option<String> {
+    match job.kind {
+        SearchKind::Keyword => job.query.clone(),
+        SearchKind::Source | SearchKind::Notes => job
+            .file_hash
+            .as_ref()
+            .map(|hash| format!("{:?}", hash))
+            .or_else(|| job.file_size.map(|size| format!("size={size}"))),
+    }
+}
+
+fn passive_replay_activity_context(family: HarvestFamily, target: &str) -> String {
+    format!("{family:?} {target}")
+}
+
+fn runtime_activity_error(
+    interface_report: &AgentNetworkReport,
+    nat_status: Option<&NatStatusSnapshot>,
+) -> Option<String> {
+    interface_report
+        .control
+        .last_error
+        .clone()
+        .or_else(|| interface_report.p2p.last_error.clone())
+        .or_else(|| nat_status.and_then(|status| status.last_error.clone()))
+}
+
+async fn begin_agent_activity(
+    tracker: &Arc<Mutex<AgentActivityTracker>>,
+    key: String,
+    snapshot: AgentActivitySnapshot,
+) {
+    tracker.lock().await.enter(key, snapshot);
+}
+
+async fn finish_agent_activity(
+    tracker: &Arc<Mutex<AgentActivityTracker>>,
+    key: &str,
+    observed_at: DateTime<Utc>,
+) {
+    tracker.lock().await.leave(key, observed_at);
+}
+
+async fn update_agent_activity_progress(
+    tracker: &Arc<Mutex<AgentActivityTracker>>,
+    key: &str,
+    progress_current: Option<u32>,
+    progress_total: Option<u32>,
+    observed_at: DateTime<Utc>,
+) {
+    tracker
+        .lock()
+        .await
+        .update_progress(key, progress_current, progress_total, observed_at);
+}
+
+async fn update_agent_activity_error(
+    tracker: &Arc<Mutex<AgentActivityTracker>>,
+    key: &str,
+    error: String,
+    observed_at: DateTime<Utc>,
+) {
+    tracker.lock().await.update_error(key, error, observed_at);
+}
+
+async fn record_agent_degraded_activity(
+    tracker: &Arc<Mutex<AgentActivityTracker>>,
+    snapshot: AgentActivitySnapshot,
+) {
+    tracker.lock().await.record_degraded(snapshot);
+}
+
+async fn clear_agent_degraded_activity(tracker: &Arc<Mutex<AgentActivityTracker>>) {
+    tracker.lock().await.clear_degraded();
+}
+
 impl OverlordAgentEmule {
     pub async fn new(config: EmuleAgentConfig) -> Result<Self> {
         let indexer_id = load_or_create_indexer_id(&config.agent.indexer_id_path)?;
@@ -747,6 +970,7 @@ impl OverlordAgentEmule {
             Self::resolve_p2p_selection_state(&config, &interfaces, None, false, false);
         let snoop_queue_config = config.p2p.snoop_queue.clone();
         let local_store = KadLocalStore::new(KadLocalStoreConfig::from_kad_config(&config.p2p.kad));
+        let activity_started_at = Utc::now();
 
         Ok(Self {
             config: Arc::new(RwLock::new(config)),
@@ -760,6 +984,7 @@ impl OverlordAgentEmule {
             local_store: Arc::new(Mutex::new(local_store)),
             publish_observability: Arc::new(Mutex::new(KadPublishObservability::default())),
             harvest_observability: Arc::new(Mutex::new(KadHarvestObservability::default())),
+            agent_activity: Arc::new(Mutex::new(AgentActivityTracker::new(activity_started_at))),
             runtime: Arc::new(Mutex::new(None)),
             control_server: Arc::new(Mutex::new(None)),
             control_selection_state: Arc::new(RwLock::new(control_selection_state)),
@@ -2173,6 +2398,14 @@ struct SourcePublishSettings {
     obfuscation_enabled: bool,
 }
 
+/// Shared publish-side dependencies that need to flow into both startup and manual seed runs.
+struct PublishExecutionContext<'a> {
+    local_store: &'a Arc<Mutex<KadLocalStore>>,
+    publish_observability: &'a Arc<Mutex<KadPublishObservability>>,
+    agent_activity: &'a Arc<Mutex<AgentActivityTracker>>,
+    activity_key: Option<&'a str>,
+}
+
 /// Chooses coordinator-provided hashes when available and otherwise falls back to the
 /// built-in synthetic seed set.
 fn select_popular_hashes_for_seeding(
@@ -2219,8 +2452,7 @@ async fn seed_popular_from_source(
     source_publish_settings: SourcePublishSettings,
     source: PublishSeedSource,
     hashes: Vec<PopularHash>,
-    local_store: &Arc<Mutex<KadLocalStore>>,
-    publish_observability: &Arc<Mutex<KadPublishObservability>>,
+    context: PublishExecutionContext<'_>,
 ) -> Result<()> {
     info!(
         "kad seeding source={} entries={}",
@@ -2233,8 +2465,7 @@ async fn seed_popular_from_source(
         source_publish_settings,
         source,
         hashes,
-        local_store,
-        publish_observability,
+        context,
     )
     .await
 }
@@ -2246,18 +2477,46 @@ async fn seed_popular_from_coordinator_or_fallback(
     coordinator: &CoordinatorClient,
     local_store: &Arc<Mutex<KadLocalStore>>,
     publish_observability: &Arc<Mutex<KadPublishObservability>>,
+    agent_activity: &Arc<Mutex<AgentActivityTracker>>,
 ) -> Result<()> {
     let (source, hashes) = fetch_popular_hashes_for_seeding(coordinator).await;
-    seed_popular_from_source(
+    let publish_started_at = Utc::now();
+    let activity_key = publish_activity_key(source, publish_started_at);
+    let mut activity_snapshot =
+        new_activity_snapshot(AgentActivityState::Publishing, publish_started_at);
+    activity_snapshot.query_or_target = Some(source.label().to_string());
+    activity_snapshot.progress_current = Some(0);
+    activity_snapshot.progress_total = Some(hashes.len() as u32);
+    begin_agent_activity(agent_activity, activity_key.clone(), activity_snapshot).await;
+    let result = seed_popular_from_source(
         dht,
         source_publish_identity,
         source_publish_settings,
         source,
         hashes,
-        local_store,
-        publish_observability,
+        PublishExecutionContext {
+            local_store,
+            publish_observability,
+            agent_activity,
+            activity_key: Some(activity_key.as_str()),
+        },
     )
-    .await
+    .await;
+    finish_agent_activity(agent_activity, &activity_key, Utc::now()).await;
+    match result {
+        Ok(()) => {
+            clear_agent_degraded_activity(agent_activity).await;
+            Ok(())
+        }
+        Err(error) => {
+            let mut degraded_snapshot =
+                new_activity_snapshot(AgentActivityState::Degraded, Utc::now());
+            degraded_snapshot.query_or_target = Some(source.label().to_string());
+            degraded_snapshot.last_error = Some(error.to_string());
+            record_agent_degraded_activity(agent_activity, degraded_snapshot).await;
+            Err(error)
+        }
+    }
 }
 
 /// Returns the eMule high-ID source type used for source publishes in the non-firewalled case.
@@ -2371,8 +2630,7 @@ async fn seed_popular_impl(
     source_publish_settings: SourcePublishSettings,
     seed_source: PublishSeedSource,
     hashes: Vec<PopularHash>,
-    local_store: &Arc<Mutex<KadLocalStore>>,
-    publish_observability: &Arc<Mutex<KadPublishObservability>>,
+    context: PublishExecutionContext<'_>,
 ) -> Result<()> {
     if !dht.is_bootstrapped() {
         anyhow::bail!("kad node is not bootstrapped yet");
@@ -2383,7 +2641,7 @@ async fn seed_popular_impl(
     let mut source_totals = PublishAttemptStats::default();
     let published_items = hashes.len();
     update_publish_progress(
-        publish_observability,
+        context.publish_observability,
         seed_source,
         0,
         keyword_totals,
@@ -2391,6 +2649,16 @@ async fn seed_popular_impl(
         Utc::now(),
     )
     .await;
+    if let Some(activity_key) = context.activity_key {
+        update_agent_activity_progress(
+            context.agent_activity,
+            activity_key,
+            Some(0),
+            Some(published_items as u32),
+            Utc::now(),
+        )
+        .await;
+    }
 
     for (index, hash) in hashes.into_iter().enumerate() {
         let HashType::Ed2k(raw_hash) = hash.hash;
@@ -2407,7 +2675,7 @@ async fn seed_popular_impl(
             Tag::sources(hash.source_count),
         ];
         {
-            let mut store = local_store.lock().await;
+            let mut store = context.local_store.lock().await;
             store.record_keyword_publish_batch(
                 keyword_hash,
                 &[overlord_kad_proto::PublishEntry {
@@ -2444,7 +2712,7 @@ async fn seed_popular_impl(
         }
         let source_tags = build_source_publish_tags(bind_addr, source_publish_settings, hash.size);
         if let IpAddr::V4(source_ip) = bind_addr.ip() {
-            let mut store = local_store.lock().await;
+            let mut store = context.local_store.lock().await;
             store.record_source_publish(
                 NodeId::from_bytes(file_hash.0),
                 source_publish_identity,
@@ -2477,7 +2745,7 @@ async fn seed_popular_impl(
         }
         let observed_at = Utc::now();
         update_publish_progress(
-            publish_observability,
+            context.publish_observability,
             seed_source,
             item_no,
             keyword_totals,
@@ -2485,6 +2753,16 @@ async fn seed_popular_impl(
             observed_at,
         )
         .await;
+        if let Some(activity_key) = context.activity_key {
+            update_agent_activity_progress(
+                context.agent_activity,
+                activity_key,
+                Some(item_no as u32),
+                Some(published_items as u32),
+                observed_at,
+            )
+            .await;
+        }
         info!(
             "kad publish progress seed_source={} items_done={}/{} keyword_attempted={} keyword_acked={} source_attempted={} source_acked={}",
             seed_source.label(),
@@ -2498,7 +2776,7 @@ async fn seed_popular_impl(
     }
 
     record_publish_summaries(
-        publish_observability,
+        context.publish_observability,
         seed_source,
         published_items,
         keyword_totals,
@@ -3839,6 +4117,7 @@ impl IndexerService for OverlordAgentEmule {
 
         restore_snoop_queue(&self.coordinator, self.indexer_id, &self.snoop_queue).await;
         self.reconcile_runtime().await?;
+        finish_agent_activity(&self.agent_activity, ACTIVITY_KEY_STARTING, Utc::now()).await;
         Ok(())
     }
 
@@ -3871,6 +4150,7 @@ impl IndexerService for OverlordAgentEmule {
         let config = self.config.clone();
         let callback_client = self.coordinator.clone();
         let active_searches = Arc::clone(&self.active_searches);
+        let agent_activity = Arc::clone(&self.agent_activity);
         let cancel = CancellationToken::new();
         {
             let mut active = active_searches.lock().await;
@@ -3885,6 +4165,20 @@ impl IndexerService for OverlordAgentEmule {
             );
         }
         tokio::spawn(async move {
+            let activity_key = active_search_key(job.job_id);
+            let activity_started_at = Utc::now();
+            let mut activity_snapshot =
+                new_activity_snapshot(AgentActivityState::ActiveSearch, activity_started_at);
+            activity_snapshot.job_id = Some(job.job_id);
+            activity_snapshot.protocol = Some(job.protocol);
+            activity_snapshot.kind = Some(job.kind.clone());
+            activity_snapshot.query_or_target = search_activity_context(&job);
+            begin_agent_activity(
+                &agent_activity,
+                activity_key.clone(),
+                activity_snapshot.clone(),
+            )
+            .await;
             let started_stats = SearchRunStats::default();
             if let Err(error) = emit_search_event(
                 &callback_client,
@@ -3967,13 +4261,21 @@ impl IndexerService for OverlordAgentEmule {
                 indexer_id,
                 final_event.0,
                 &final_event.1,
-                final_event.2,
+                final_event.2.clone(),
             )
             .await
             {
                 warn!("failed to report search completion: {error}");
             }
 
+            finish_agent_activity(&agent_activity, &activity_key, Utc::now()).await;
+            if let Some(error) = final_event.2 {
+                activity_snapshot.last_error = Some(error.to_string());
+                activity_snapshot.last_update_at = Utc::now();
+                record_agent_degraded_activity(&agent_activity, activity_snapshot).await;
+            } else {
+                clear_agent_degraded_activity(&agent_activity).await;
+            }
             active_searches.lock().await.remove(&job.job_id);
         });
         Ok(())
@@ -4005,6 +4307,14 @@ impl IndexerService for OverlordAgentEmule {
         };
         let config = self.config.read().await.clone();
         let interface_report = self.interface_report().await;
+        let nat_status = match runtime.clone() {
+            Some(runtime) => Some(runtime.nat.status().await.snapshot()),
+            None => None,
+        };
+        let agent_activity = self.agent_activity.lock().await.current_snapshot(
+            runtime_activity_error(&interface_report, nat_status.as_ref()),
+            Utc::now(),
+        );
         let mut publish_observability = self.publish_observability.lock().await.clone();
         publish_observability.keyword_counters = effective_publish_counters(
             &publish_observability.keyword_counters,
@@ -4031,28 +4341,68 @@ impl IndexerService for OverlordAgentEmule {
             snoop_queue_depth: queue_depth,
             staging_queue_depth: 0,
             uptime_secs,
-            nat: match runtime {
-                Some(runtime) => Some(runtime.nat.status().await.snapshot()),
-                None => None,
-            },
+            nat: nat_status,
             interface_report: Some(interface_report),
+            agent_activity: Some(agent_activity),
             publish_observability: Some(publish_observability),
             harvest_observability: Some(harvest_observability),
         })
     }
 
     async fn apply_config(&self, config: ConfigUpdate) -> Result<()> {
-        let next: AgentNetworkingConfig = serde_json::from_value(config.config)
-            .context("invalid config payload for overlord-agent-emule")?;
+        let reconfigure_started_at = Utc::now();
+        let mut reconfigure_snapshot =
+            new_activity_snapshot(AgentActivityState::Reconfiguring, reconfigure_started_at);
+        reconfigure_snapshot.protocol = Some(config.protocol);
+        begin_agent_activity(
+            &self.agent_activity,
+            ACTIVITY_KEY_RECONFIGURING.to_string(),
+            reconfigure_snapshot.clone(),
+        )
+        .await;
+        let next: AgentNetworkingConfig = match serde_json::from_value(config.config) {
+            Ok(next) => next,
+            Err(error) => {
+                let observed_at = Utc::now();
+                finish_agent_activity(
+                    &self.agent_activity,
+                    ACTIVITY_KEY_RECONFIGURING,
+                    observed_at,
+                )
+                .await;
+                let mut degraded_snapshot =
+                    new_activity_snapshot(AgentActivityState::Degraded, observed_at);
+                degraded_snapshot.query_or_target = Some("config update".to_string());
+                degraded_snapshot.last_error = Some(error.to_string());
+                record_agent_degraded_activity(&self.agent_activity, degraded_snapshot).await;
+                return Err(error).context("invalid config payload for overlord-agent-emule");
+            }
+        };
         // `/api/internal/config-update` requests restart only when the updated
         // networking shape changes the control endpoint; otherwise we reconcile
         // NAT/P2P runtime state in-process.
-        if let NetworkingConfigApplyOutcome::RestartRequired =
-            self.apply_networking_config_update(&next).await?
-        {
-            self.request_restart();
+        let apply_result = self.apply_networking_config_update(&next).await;
+        finish_agent_activity(&self.agent_activity, ACTIVITY_KEY_RECONFIGURING, Utc::now()).await;
+        match apply_result {
+            Ok(NetworkingConfigApplyOutcome::RestartRequired) => {
+                self.request_restart();
+                clear_agent_degraded_activity(&self.agent_activity).await;
+                Ok(())
+            }
+            Ok(NetworkingConfigApplyOutcome::Unchanged)
+            | Ok(NetworkingConfigApplyOutcome::ReconciledInPlace) => {
+                clear_agent_degraded_activity(&self.agent_activity).await;
+                Ok(())
+            }
+            Err(error) => {
+                let mut degraded_snapshot =
+                    new_activity_snapshot(AgentActivityState::Degraded, Utc::now());
+                degraded_snapshot.query_or_target = Some("config update".to_string());
+                degraded_snapshot.last_error = Some(error.to_string());
+                record_agent_degraded_activity(&self.agent_activity, degraded_snapshot).await;
+                Err(error)
+            }
         }
-        Ok(())
     }
 
     async fn seed_popular(&self, hashes: Vec<PopularHash>) -> Result<()> {
@@ -4066,16 +4416,49 @@ impl IndexerService for OverlordAgentEmule {
             tcp_port: config.p2p.ed2k.listen_port,
             obfuscation_enabled: config.p2p.ed2k.obfuscation_enabled,
         };
-        seed_popular_impl(
+        let publish_started_at = Utc::now();
+        let activity_key = publish_activity_key(PublishSeedSource::ManualApi, publish_started_at);
+        let mut activity_snapshot =
+            new_activity_snapshot(AgentActivityState::Publishing, publish_started_at);
+        activity_snapshot.query_or_target = Some(PublishSeedSource::ManualApi.label().to_string());
+        activity_snapshot.progress_current = Some(0);
+        activity_snapshot.progress_total = Some(hashes.len() as u32);
+        begin_agent_activity(
+            &self.agent_activity,
+            activity_key.clone(),
+            activity_snapshot,
+        )
+        .await;
+        let seed_result = seed_popular_impl(
             &runtime.dht,
             source_publish_identity,
             source_publish_settings,
             PublishSeedSource::ManualApi,
             hashes,
-            &self.local_store,
-            &self.publish_observability,
+            PublishExecutionContext {
+                local_store: &self.local_store,
+                publish_observability: &self.publish_observability,
+                agent_activity: &self.agent_activity,
+                activity_key: Some(activity_key.as_str()),
+            },
         )
-        .await
+        .await;
+        finish_agent_activity(&self.agent_activity, &activity_key, Utc::now()).await;
+        match seed_result {
+            Ok(()) => {
+                clear_agent_degraded_activity(&self.agent_activity).await;
+                Ok(())
+            }
+            Err(error) => {
+                let mut degraded_snapshot =
+                    new_activity_snapshot(AgentActivityState::Degraded, Utc::now());
+                degraded_snapshot.query_or_target =
+                    Some(PublishSeedSource::ManualApi.label().to_string());
+                degraded_snapshot.last_error = Some(error.to_string());
+                record_agent_degraded_activity(&self.agent_activity, degraded_snapshot).await;
+                Err(error)
+            }
+        }
     }
 
     async fn flush_snoop(&self) -> Result<Vec<SnoopEntry>> {
@@ -4146,12 +4529,23 @@ impl OverlordAgentEmule {
         let coordinator = self.coordinator.clone();
         let local_store = Arc::clone(&self.local_store);
         let publish_observability = Arc::clone(&self.publish_observability);
+        let agent_activity = Arc::clone(&self.agent_activity);
         let source_publish_identity = source_publish_client_hash(self.indexer_id);
         let source_publish_settings = SourcePublishSettings {
             tcp_port: config.p2p.ed2k.listen_port,
             obfuscation_enabled: config.p2p.ed2k.obfuscation_enabled,
         };
         runtime.tasks.lock().await.push(tokio::spawn(async move {
+            let bootstrap_started_at = Utc::now();
+            let mut bootstrap_snapshot =
+                new_activity_snapshot(AgentActivityState::Bootstrapping, bootstrap_started_at);
+            bootstrap_snapshot.query_or_target = Some("kad dht".to_string());
+            begin_agent_activity(
+                &agent_activity,
+                ACTIVITY_KEY_BOOTSTRAPPING.to_string(),
+                bootstrap_snapshot,
+            )
+            .await;
             while !shutdown.load(Ordering::Relaxed) && !dht.is_bootstrapped() {
                 match dht.bootstrap().await {
                     Ok(()) => {
@@ -4165,17 +4559,36 @@ impl OverlordAgentEmule {
                             &coordinator,
                             &local_store,
                             &publish_observability,
+                            &agent_activity,
                         )
                         .await
                         {
                             debug!("post-bootstrap seeding failed: {error}");
                         }
+                        finish_agent_activity(
+                            &agent_activity,
+                            ACTIVITY_KEY_BOOTSTRAPPING,
+                            Utc::now(),
+                        )
+                        .await;
+                        clear_agent_degraded_activity(&agent_activity).await;
                         break;
                     }
-                    Err(error) => debug!("bootstrap retry failed: {error}"),
+                    Err(error) => {
+                        let error_message = error.to_string();
+                        debug!("bootstrap retry failed: {error_message}");
+                        update_agent_activity_error(
+                            &agent_activity,
+                            ACTIVITY_KEY_BOOTSTRAPPING,
+                            error_message,
+                            Utc::now(),
+                        )
+                        .await;
+                    }
                 }
                 tokio::time::sleep(Duration::from_secs(BOOTSTRAP_RETRY_SECS)).await;
             }
+            finish_agent_activity(&agent_activity, ACTIVITY_KEY_BOOTSTRAPPING, Utc::now()).await;
         }));
 
         let dht = runtime.dht.clone();
@@ -4505,6 +4918,7 @@ impl OverlordAgentEmule {
         let passive_result_count = Arc::clone(&runtime.passive_result_count);
         let passive_replay_gate = Arc::clone(&runtime.passive_replay_gate);
         let harvest_observability = Arc::clone(&self.harvest_observability);
+        let agent_activity = Arc::clone(&self.agent_activity);
         let passive_replay_phase2_fanout = config.p2p.kad.search_phase2_fanout;
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             while !shutdown.load(Ordering::Relaxed) {
@@ -4545,6 +4959,23 @@ impl OverlordAgentEmule {
                             restrictive_payload_hex: (!request.restrictive_payload.is_empty())
                                 .then(|| hex::encode(&request.restrictive_payload)),
                         };
+                        let activity_key = passive_replay_key(replay_context.replay_id);
+                        let mut activity_snapshot = new_activity_snapshot(
+                            AgentActivityState::PassiveHarvestReplay,
+                            replay_started_at,
+                        );
+                        activity_snapshot.query_or_target = Some(
+                            passive_replay_activity_context(
+                                HarvestFamily::Keyword,
+                                replay_context.target.as_str(),
+                            ),
+                        );
+                        begin_agent_activity(
+                            &agent_activity,
+                            activity_key.clone(),
+                            activity_snapshot.clone(),
+                        )
+                        .await;
                         {
                             let mut observability = harvest_observability.lock().await;
                             record_passive_replay_start(
@@ -4620,6 +5051,14 @@ impl OverlordAgentEmule {
                             "kad passive replay done results={} batches_posted={}",
                             outcome.result_count, outcome.batch_count
                         );
+                        finish_agent_activity(&agent_activity, &activity_key, Utc::now()).await;
+                        if let Some(error) = outcome.last_post_error.clone() {
+                            activity_snapshot.last_error = Some(error);
+                            activity_snapshot.last_update_at = Utc::now();
+                            record_agent_degraded_activity(&agent_activity, activity_snapshot).await;
+                        } else {
+                            clear_agent_degraded_activity(&agent_activity).await;
+                        }
                     }
                     PassiveReplaySelection::Source(selected_request) => {
                         let request = selected_request.request;
@@ -4633,6 +5072,23 @@ impl OverlordAgentEmule {
                             size: Some(request.size),
                             restrictive_payload_hex: None,
                         };
+                        let activity_key = passive_replay_key(replay_context.replay_id);
+                        let mut activity_snapshot = new_activity_snapshot(
+                            AgentActivityState::PassiveHarvestReplay,
+                            replay_started_at,
+                        );
+                        activity_snapshot.query_or_target = Some(
+                            passive_replay_activity_context(
+                                HarvestFamily::Source,
+                                replay_context.target.as_str(),
+                            ),
+                        );
+                        begin_agent_activity(
+                            &agent_activity,
+                            activity_key.clone(),
+                            activity_snapshot.clone(),
+                        )
+                        .await;
                         {
                             let mut observability = harvest_observability.lock().await;
                             record_passive_replay_start(
@@ -4706,6 +5162,14 @@ impl OverlordAgentEmule {
                             "kad passive source replay done results={} batches_posted={}",
                             outcome.result_count, outcome.batch_count
                         );
+                        finish_agent_activity(&agent_activity, &activity_key, Utc::now()).await;
+                        if let Some(error) = outcome.last_post_error.clone() {
+                            activity_snapshot.last_error = Some(error);
+                            activity_snapshot.last_update_at = Utc::now();
+                            record_agent_degraded_activity(&agent_activity, activity_snapshot).await;
+                        } else {
+                            clear_agent_degraded_activity(&agent_activity).await;
+                        }
                     }
                     PassiveReplaySelection::Notes(selected_request) => {
                         let request = selected_request.request;
@@ -4719,6 +5183,23 @@ impl OverlordAgentEmule {
                             size: Some(request.size),
                             restrictive_payload_hex: None,
                         };
+                        let activity_key = passive_replay_key(replay_context.replay_id);
+                        let mut activity_snapshot = new_activity_snapshot(
+                            AgentActivityState::PassiveHarvestReplay,
+                            replay_started_at,
+                        );
+                        activity_snapshot.query_or_target = Some(
+                            passive_replay_activity_context(
+                                HarvestFamily::Notes,
+                                replay_context.target.as_str(),
+                            ),
+                        );
+                        begin_agent_activity(
+                            &agent_activity,
+                            activity_key.clone(),
+                            activity_snapshot.clone(),
+                        )
+                        .await;
                         {
                             let mut observability = harvest_observability.lock().await;
                             record_passive_replay_start(
@@ -4792,6 +5273,14 @@ impl OverlordAgentEmule {
                             "kad passive notes replay done results={} batches_posted={}",
                             outcome.result_count, outcome.batch_count
                         );
+                        finish_agent_activity(&agent_activity, &activity_key, Utc::now()).await;
+                        if let Some(error) = outcome.last_post_error.clone() {
+                            activity_snapshot.last_error = Some(error);
+                            activity_snapshot.last_update_at = Utc::now();
+                            record_agent_degraded_activity(&agent_activity, activity_snapshot).await;
+                        } else {
+                            clear_agent_degraded_activity(&agent_activity).await;
+                        }
                     }
                 }
             }
@@ -4805,6 +5294,7 @@ impl OverlordAgentEmule {
         let passive_result_count = Arc::clone(&runtime.passive_result_count);
         let passive_replay_gate = Arc::clone(&runtime.passive_replay_gate);
         let harvest_observability = Arc::clone(&self.harvest_observability);
+        let agent_activity = Arc::clone(&self.agent_activity);
         let passive_replay_phase2_fanout = config.p2p.kad.search_phase2_fanout;
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             while !shutdown.load(Ordering::Relaxed) {
@@ -4840,6 +5330,23 @@ impl OverlordAgentEmule {
                             restrictive_payload_hex: (!request.restrictive_payload.is_empty())
                                 .then(|| hex::encode(&request.restrictive_payload)),
                         };
+                        let activity_key = passive_replay_key(replay_context.replay_id);
+                        let mut activity_snapshot = new_activity_snapshot(
+                            AgentActivityState::PassiveHarvestReplay,
+                            replay_started_at,
+                        );
+                        activity_snapshot.query_or_target = Some(
+                            passive_replay_activity_context(
+                                HarvestFamily::Keyword,
+                                replay_context.target.as_str(),
+                            ),
+                        );
+                        begin_agent_activity(
+                            &agent_activity,
+                            activity_key.clone(),
+                            activity_snapshot.clone(),
+                        )
+                        .await;
                         {
                             let mut observability = harvest_observability.lock().await;
                             record_passive_replay_start(
@@ -4915,6 +5422,14 @@ impl OverlordAgentEmule {
                             "kad passive replay done results={} batches_posted={}",
                             outcome.result_count, outcome.batch_count
                         );
+                        finish_agent_activity(&agent_activity, &activity_key, Utc::now()).await;
+                        if let Some(error) = outcome.last_post_error.clone() {
+                            activity_snapshot.last_error = Some(error);
+                            activity_snapshot.last_update_at = Utc::now();
+                            record_agent_degraded_activity(&agent_activity, activity_snapshot).await;
+                        } else {
+                            clear_agent_degraded_activity(&agent_activity).await;
+                        }
                     }
                     PassiveReplaySelection::Source(selected_request) => {
                         let request = selected_request.request;
@@ -4928,6 +5443,23 @@ impl OverlordAgentEmule {
                             size: Some(request.size),
                             restrictive_payload_hex: None,
                         };
+                        let activity_key = passive_replay_key(replay_context.replay_id);
+                        let mut activity_snapshot = new_activity_snapshot(
+                            AgentActivityState::PassiveHarvestReplay,
+                            replay_started_at,
+                        );
+                        activity_snapshot.query_or_target = Some(
+                            passive_replay_activity_context(
+                                HarvestFamily::Source,
+                                replay_context.target.as_str(),
+                            ),
+                        );
+                        begin_agent_activity(
+                            &agent_activity,
+                            activity_key.clone(),
+                            activity_snapshot.clone(),
+                        )
+                        .await;
                         {
                             let mut observability = harvest_observability.lock().await;
                             record_passive_replay_start(
@@ -5001,6 +5533,14 @@ impl OverlordAgentEmule {
                             "kad passive source replay done results={} batches_posted={}",
                             outcome.result_count, outcome.batch_count
                         );
+                        finish_agent_activity(&agent_activity, &activity_key, Utc::now()).await;
+                        if let Some(error) = outcome.last_post_error.clone() {
+                            activity_snapshot.last_error = Some(error);
+                            activity_snapshot.last_update_at = Utc::now();
+                            record_agent_degraded_activity(&agent_activity, activity_snapshot).await;
+                        } else {
+                            clear_agent_degraded_activity(&agent_activity).await;
+                        }
                     }
                     PassiveReplaySelection::Notes(selected_request) => {
                         let request = selected_request.request;
@@ -5014,6 +5554,23 @@ impl OverlordAgentEmule {
                             size: Some(request.size),
                             restrictive_payload_hex: None,
                         };
+                        let activity_key = passive_replay_key(replay_context.replay_id);
+                        let mut activity_snapshot = new_activity_snapshot(
+                            AgentActivityState::PassiveHarvestReplay,
+                            replay_started_at,
+                        );
+                        activity_snapshot.query_or_target = Some(
+                            passive_replay_activity_context(
+                                HarvestFamily::Notes,
+                                replay_context.target.as_str(),
+                            ),
+                        );
+                        begin_agent_activity(
+                            &agent_activity,
+                            activity_key.clone(),
+                            activity_snapshot.clone(),
+                        )
+                        .await;
                         {
                             let mut observability = harvest_observability.lock().await;
                             record_passive_replay_start(
@@ -5087,6 +5644,14 @@ impl OverlordAgentEmule {
                             "kad passive notes replay done results={} batches_posted={}",
                             outcome.result_count, outcome.batch_count
                         );
+                        finish_agent_activity(&agent_activity, &activity_key, Utc::now()).await;
+                        if let Some(error) = outcome.last_post_error.clone() {
+                            activity_snapshot.last_error = Some(error);
+                            activity_snapshot.last_update_at = Utc::now();
+                            record_agent_degraded_activity(&agent_activity, activity_snapshot).await;
+                        } else {
+                            clear_agent_degraded_activity(&agent_activity).await;
+                        }
                     }
                 }
             }
@@ -5097,12 +5662,23 @@ impl OverlordAgentEmule {
         let snoop_queue = Arc::clone(&self.snoop_queue);
         let observed_snoop_events = Arc::clone(&self.observed_snoop_events);
         let indexer_id = self.indexer_id;
+        let agent_activity = Arc::clone(&self.agent_activity);
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             while !shutdown.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_secs(SNOOP_FLUSH_SECS)).await;
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
+                let flush_started_at = Utc::now();
+                let mut flush_snapshot =
+                    new_activity_snapshot(AgentActivityState::FlushingSnoops, flush_started_at);
+                flush_snapshot.query_or_target = Some(format!("indexer={indexer_id}"));
+                begin_agent_activity(
+                    &agent_activity,
+                    ACTIVITY_KEY_FLUSHING_SNOOPS.to_string(),
+                    flush_snapshot,
+                )
+                .await;
                 if let Err(error) = flush_snoop_queue(
                     &coordinator,
                     indexer_id,
@@ -5111,8 +5687,25 @@ impl OverlordAgentEmule {
                 )
                 .await
                 {
-                    debug!("snoop flush failed: {error}");
+                    let error_message = error.to_string();
+                    debug!("snoop flush failed: {error_message}");
+                    update_agent_activity_error(
+                        &agent_activity,
+                        ACTIVITY_KEY_FLUSHING_SNOOPS,
+                        error_message.clone(),
+                        Utc::now(),
+                    )
+                    .await;
+                    let mut degraded_snapshot =
+                        new_activity_snapshot(AgentActivityState::Degraded, Utc::now());
+                    degraded_snapshot.query_or_target = Some("snoop flush".to_string());
+                    degraded_snapshot.last_error = Some(error_message);
+                    record_agent_degraded_activity(&agent_activity, degraded_snapshot).await;
+                } else {
+                    clear_agent_degraded_activity(&agent_activity).await;
                 }
+                finish_agent_activity(&agent_activity, ACTIVITY_KEY_FLUSHING_SNOOPS, Utc::now())
+                    .await;
             }
         }));
 
@@ -5122,6 +5715,7 @@ impl OverlordAgentEmule {
         let republish_secs = config.p2p.kad.republish_interval_secs;
         let local_store = Arc::clone(&self.local_store);
         let publish_observability = Arc::clone(&self.publish_observability);
+        let agent_activity = Arc::clone(&self.agent_activity);
         let source_publish_identity = source_publish_client_hash(self.indexer_id);
         let source_publish_settings = SourcePublishSettings {
             tcp_port: config.p2p.ed2k.listen_port,
@@ -5140,6 +5734,7 @@ impl OverlordAgentEmule {
                     &coordinator,
                     &local_store,
                     &publish_observability,
+                    &agent_activity,
                 )
                 .await
                 {
@@ -6086,6 +6681,7 @@ mod tests {
             report: None,
             config: OverlordAgentEmule::networking_config(&config),
             nat: None,
+            agent_activity: None,
             publish_observability: None,
             harvest_observability: None,
             last_error: None,

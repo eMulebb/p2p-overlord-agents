@@ -308,6 +308,7 @@ mod tests {
                 uptime_secs: 0,
                 nat: None,
                 interface_report: None,
+                agent_activity: None,
                 publish_observability: None,
                 harvest_observability: None,
             })

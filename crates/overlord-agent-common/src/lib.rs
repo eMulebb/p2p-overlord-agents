@@ -14,8 +14,9 @@ pub use overlord_agent_nat::{
 pub use server::{IndexerServer, RunningIndexerServer};
 pub use service::IndexerService;
 pub use types::{
-    AgentInterfacesView, AgentLogFileStatus, ConfigUpdate, ContentType, FileRecord, HarvestFamily,
-    HarvestReplayContext, HarvestReplayRecord, HashType, IndexerRegistration, IndexerStats,
+    AgentActivitySnapshot, AgentActivityState, AgentInterfacesView, AgentLogFileStatus,
+    ConfigUpdate, ContentType, FileRecord, HarvestFamily, HarvestReplayContext,
+    HarvestReplayRecord, HashType, IndexerRegistration, IndexerStats,
     KadHarvestFamilyObservability, KadHarvestObservability, KadPassiveReplayObservability,
     KadPassiveReplayTierSummary, KadPublishObservability, PopularHash, Protocol,
     PublishBatchSummary, PublishCounters, PublishSeedSource, RegisterRequest, RegistrationResponse,
