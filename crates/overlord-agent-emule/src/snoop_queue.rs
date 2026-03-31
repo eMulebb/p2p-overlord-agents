@@ -247,11 +247,8 @@ impl SnoopQueue {
             }
         }
 
-        if recent.iter().any(source_candidate_is_high_quality) {
-            recent.retain(source_candidate_is_high_quality);
-        } else if stale.iter().any(source_candidate_is_high_quality) {
-            stale.retain(source_candidate_is_high_quality);
-        }
+        recent.retain(source_candidate_is_high_quality);
+        stale.retain(source_candidate_is_high_quality);
 
         recent.sort_by(source_candidate_cmp);
         stale.sort_by(source_candidate_cmp);
@@ -556,10 +553,15 @@ fn replay_cooldown_cutoff(
 }
 
 fn should_skip_restored_entry(entry: &SnoopEntry) -> bool {
-    matches!(entry, SnoopEntry::Source { .. })
-        && entry
-            .last_drained_at()
-            .is_some_and(|last_drained_at| entry.last_seen() <= last_drained_at)
+    match entry {
+        SnoopEntry::Source { .. } => {
+            entry
+                .last_drained_at()
+                .is_some_and(|last_drained_at| entry.last_seen() <= last_drained_at)
+                || entry.hit_count() <= 1
+        }
+        _ => false,
+    }
 }
 
 fn should_evict_zero_yield_source_entry(entry: &SnoopEntry) -> bool {
@@ -710,6 +712,13 @@ mod tests {
             4096,
             110,
         ));
+        queue.record(source_entry(
+            "source:00112233445566778899aabbccddeeff:8000:4096",
+            "00112233445566778899aabbccddeeff",
+            0x8000,
+            4096,
+            111,
+        ));
 
         let selected = queue.select_next_source_request(ts(130));
         assert_eq!(
@@ -764,6 +773,13 @@ mod tests {
             0,
             8192,
             110,
+        ));
+        queue.record(source_entry(
+            "source:11112222333344445555666677778888:0000:8192",
+            "11112222333344445555666677778888",
+            0,
+            8192,
+            111,
         ));
 
         let selected = queue.select_next_source_request(ts(130));
@@ -891,6 +907,13 @@ mod tests {
             4096,
             100,
         ));
+        queue.record(source_entry(
+            "source:00112233445566778899aabbccddeeff:0000:4096",
+            "00112233445566778899aabbccddeeff",
+            0,
+            4096,
+            101,
+        ));
 
         let selected = queue.select_next_source_request(ts(110)).unwrap();
         assert_eq!(
@@ -921,6 +944,13 @@ mod tests {
             4096,
             100,
         ));
+        queue.record(source_entry(
+            "source:00112233445566778899aabbccddeeff:0000:4096",
+            "00112233445566778899aabbccddeeff",
+            0,
+            4096,
+            101,
+        ));
         let selected = queue.select_next_source_request(ts(110)).unwrap();
         queue.record_replay_outcome(&selected.logical_key, ts(120), 0);
 
@@ -930,6 +960,13 @@ mod tests {
             0,
             8192,
             121,
+        ));
+        queue.record(source_entry(
+            "source:11112222333344445555666677778888:0000:8192",
+            "11112222333344445555666677778888",
+            0,
+            8192,
+            122,
         ));
 
         let next_selected = queue.select_next_source_request(ts(160)).unwrap();
@@ -967,6 +1004,13 @@ mod tests {
             0,
             4096,
             100,
+        ));
+        queue.record(source_entry(
+            logical_key,
+            "00112233445566778899aabbccddeeff",
+            0,
+            4096,
+            101,
         ));
 
         let selected = queue.select_next_source_request(ts(110)).unwrap();
@@ -1010,6 +1054,44 @@ mod tests {
     }
 
     #[test]
+    fn one_off_source_entries_stay_on_probation() {
+        let mut queue = queue();
+        queue.record(source_entry(
+            "source:00112233445566778899aabbccddeeff:0000:4096",
+            "00112233445566778899aabbccddeeff",
+            0,
+            4096,
+            100,
+        ));
+
+        assert!(queue.select_next_source_request(ts(130)).is_none());
+    }
+
+    #[test]
+    fn second_hit_promotes_probationary_source_entry() {
+        let mut queue = queue();
+        let logical_key = "source:00112233445566778899aabbccddeeff:0000:4096";
+        queue.record(source_entry(
+            logical_key,
+            "00112233445566778899aabbccddeeff",
+            0,
+            4096,
+            100,
+        ));
+        queue.record(source_entry(
+            logical_key,
+            "00112233445566778899aabbccddeeff",
+            0,
+            4096,
+            101,
+        ));
+
+        let selected = queue.select_next_source_request(ts(130)).unwrap();
+
+        assert_eq!(selected.logical_key, logical_key);
+    }
+
+    #[test]
     fn restore_skips_drained_source_entries_without_fresh_demand() {
         let mut queue = queue();
         queue.merge_snapshot(vec![
@@ -1032,6 +1114,41 @@ mod tests {
                 first_seen: ts(100),
                 last_seen: ts(140),
                 last_drained_at: Some(ts(130)),
+            },
+        ]);
+
+        let snapshot = queue.snapshot();
+
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(
+            snapshot[0].logical_key(),
+            "source:11112222333344445555666677778888:0000:8192"
+        );
+    }
+
+    #[test]
+    fn restore_skips_probationary_one_off_source_entries() {
+        let mut queue = queue();
+        queue.merge_snapshot(vec![
+            SnoopEntry::Source {
+                logical_key: "source:00112233445566778899aabbccddeeff:0000:4096".to_string(),
+                target: "00112233445566778899aabbccddeeff".to_string(),
+                start_position: 0,
+                size: 4096,
+                hit_count: 1,
+                first_seen: ts(100),
+                last_seen: ts(120),
+                last_drained_at: None,
+            },
+            SnoopEntry::Source {
+                logical_key: "source:11112222333344445555666677778888:0000:8192".to_string(),
+                target: "11112222333344445555666677778888".to_string(),
+                start_position: 0,
+                size: 8192,
+                hit_count: 2,
+                first_seen: ts(100),
+                last_seen: ts(121),
+                last_drained_at: None,
             },
         ]);
 
