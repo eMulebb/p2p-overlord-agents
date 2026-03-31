@@ -3035,13 +3035,17 @@ async fn persist_nodes_dat_for(dht: &DhtNode, state_paths: &AgentStatePaths) -> 
         .routing_contacts()
         .await
         .into_iter()
-        .map(|contact| BootstrapContact {
-            node_id: contact.id,
-            ip: contact.ip,
-            udp_port: contact.udp_port,
-            tcp_port: contact.tcp_port,
-            version: contact.kad_version,
-            udp_key: contact.udp_key,
+        .map(|contact| {
+            let addr = SocketAddr::new(IpAddr::V4(contact.ip), contact.udp_port);
+            let udp_key = dht.known_peer_key(addr).unwrap_or(contact.udp_key);
+            BootstrapContact {
+                node_id: contact.id,
+                ip: contact.ip,
+                udp_port: contact.udp_port,
+                tcp_port: contact.tcp_port,
+                version: contact.kad_version,
+                udp_key,
+            }
         })
         .collect::<Vec<_>>();
     let bytes = encode_nodes_dat(&contacts)?;

@@ -166,6 +166,11 @@ impl DhtNode {
         self.inner.rpc.verify_key_for_ip(ip)
     }
 
+    /// Return the latest peer UDP key learned for this endpoint's IP, when available.
+    pub fn known_peer_key(&self, addr: SocketAddr) -> Option<KadUdpKey> {
+        self.inner.rpc.known_peer_key(addr).map(KadUdpKey::new)
+    }
+
     /// Actual UDP bind address.
     pub fn bind_addr(&self) -> Result<SocketAddr, DhtError> {
         Ok(self.inner.rpc.local_addr()?)
@@ -198,7 +203,13 @@ impl DhtNode {
 
     /// Upsert a single contact into the routing table.
     pub async fn add_contact(&self, contact: Contact) -> Result<(), DhtError> {
+        let mut contact = contact;
         let addr = addr_from_contact(&contact);
+        if contact.udp_key == KadUdpKey::ZERO
+            && let Some(known_udp_key) = self.known_peer_key(addr)
+        {
+            contact.udp_key = known_udp_key;
+        }
         self.inner.rpc.register_peer_identity(addr, contact.id);
         self.inner
             .rpc
@@ -270,6 +281,17 @@ impl DhtNode {
                 Ok(KadPacket::BootstrapRes(res)) => {
                     responded += 1;
                     let mut rt = self.inner.routing_table.lock().await;
+                    let mut sender_contact = Contact::new(
+                        res.sender_id,
+                        bc.ip,
+                        bc.udp_port,
+                        res.sender_tcp_port,
+                        res.sender_version,
+                    );
+                    if let Some(known_udp_key) = self.known_peer_key(addr) {
+                        sender_contact.udp_key = known_udp_key;
+                    }
+                    let _ = rt.add_contact(sender_contact);
                     for entry in res.contacts {
                         if entry.ip == 0 || entry.udp_port == 0 {
                             continue;

@@ -452,6 +452,12 @@ impl RpcManager {
         self.inner.obfuscation.verify_key_for_ip(ip)
     }
 
+    /// Return the latest receiver verify key learned for the peer IP behind this endpoint.
+    #[must_use]
+    pub fn known_peer_key(&self, addr: SocketAddr) -> Option<u32> {
+        self.inner.obfuscation.receiver_verify_key_for_addr(addr)
+    }
+
     /// Register a peer's Kad node ID for NodeID-based request obfuscation.
     pub fn register_peer_identity(&self, addr: SocketAddr, node_id: overlord_kad_proto::NodeId) {
         self.inner.obfuscation.register_peer_identity(addr, node_id);

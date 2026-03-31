@@ -18,9 +18,6 @@ const UDP_PADDING_LEN: u8 = 0;
 
 #[derive(Debug, Clone, Default)]
 struct PeerCryptoState {
-    /// Latest sender verify key learned from an obfuscated packet sent by this
-    /// peer to us. This is the key the oracle reuses for reply packets.
-    receiver_verify_key: Option<u32>,
     /// Target node ID used for NodeID-based request obfuscation.
     node_id: Option<NodeId>,
     /// Highest Kad version we have seen this peer advertise.
@@ -58,7 +55,7 @@ fn is_response_opcode(opcode_value: u8) -> bool {
     )
 }
 
-fn can_use_node_id_mode(peer: &PeerCryptoState) -> bool {
+fn can_use_node_id_mode(peer: &ResolvedPeerCryptoState) -> bool {
     peer.node_id.is_some() && peer.kad_version.is_none_or(|version| version >= 6)
 }
 
@@ -201,6 +198,7 @@ pub struct ObfuscationLayer {
     our_udp_key: u32,
     enabled: bool,
     peers: Mutex<HashMap<SocketAddr, PeerCryptoState>>,
+    receiver_verify_keys: Mutex<HashMap<IpAddr, u32>>,
 }
 
 impl ObfuscationLayer {
@@ -210,6 +208,7 @@ impl ObfuscationLayer {
             our_udp_key,
             enabled,
             peers: Mutex::new(HashMap::new()),
+            receiver_verify_keys: Mutex::new(HashMap::new()),
         }
     }
 
@@ -231,8 +230,10 @@ impl ObfuscationLayer {
     /// The oracle stores this as the peer's `CKadUDPKey` value bound to our own
     /// public IP and reuses it for reply packets.
     pub fn register_peer_key(&self, addr: SocketAddr, key: u32) {
-        let mut guard = self.peers.lock().unwrap();
-        guard.entry(addr).or_default().receiver_verify_key = Some(key);
+        self.receiver_verify_keys
+            .lock()
+            .unwrap()
+            .insert(addr.ip(), key);
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -249,6 +250,16 @@ impl ObfuscationLayer {
         derive_udp_verify_key(self.our_udp_key, ip)
     }
 
+    /// Return the latest receiver verify key learned for the peer IP behind this endpoint.
+    #[must_use]
+    pub fn receiver_verify_key_for_addr(&self, addr: SocketAddr) -> Option<u32> {
+        self.receiver_verify_keys
+            .lock()
+            .unwrap()
+            .get(&addr.ip())
+            .copied()
+    }
+
     /// Describe the outbound Kad UDP transport shape currently selected for a peer.
     #[must_use]
     pub fn inspect_outbound(
@@ -256,13 +267,7 @@ impl ObfuscationLayer {
         addr: SocketAddr,
         opcode_value: u8,
     ) -> OutboundKadEncryptionInfo {
-        let peer = self
-            .peers
-            .lock()
-            .unwrap()
-            .get(&addr)
-            .cloned()
-            .unwrap_or_default();
+        let peer = self.peer_state_for_addr(addr);
         let mode = if !self.enabled {
             OutboundKadEncryptionMode::Plaintext
         } else if is_response_opcode(opcode_value) {
@@ -306,13 +311,7 @@ impl ObfuscationLayer {
             return plaintext.to_vec();
         }
 
-        let peer = self
-            .peers
-            .lock()
-            .unwrap()
-            .get(&addr)
-            .cloned()
-            .unwrap_or_default();
+        let peer = self.peer_state_for_addr(addr);
         let preferred_mode = match outbound.mode {
             OutboundKadEncryptionMode::Plaintext => None,
             OutboundKadEncryptionMode::NodeId => Some(KadKeyMode::NodeId),
@@ -437,6 +436,38 @@ impl ObfuscationLayer {
             receiver_verify_key_valid: false,
         }
     }
+
+    fn peer_state_for_addr(&self, addr: SocketAddr) -> ResolvedPeerCryptoState {
+        let peer = self
+            .peers
+            .lock()
+            .unwrap()
+            .get(&addr)
+            .cloned()
+            .unwrap_or_default();
+        let receiver_verify_key = self
+            .receiver_verify_keys
+            .lock()
+            .unwrap()
+            .get(&addr.ip())
+            .copied();
+        ResolvedPeerCryptoState {
+            receiver_verify_key,
+            node_id: peer.node_id,
+            kad_version: peer.kad_version,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ResolvedPeerCryptoState {
+    /// Latest sender verify key learned from any peer endpoint on this IP.
+    /// The oracle binds this key to the public IP, not the UDP port tuple.
+    receiver_verify_key: Option<u32>,
+    /// Target node ID used for NodeID-based request obfuscation.
+    node_id: Option<NodeId>,
+    /// Highest Kad version we have seen this peer advertise.
+    kad_version: Option<u8>,
 }
 
 #[cfg(test)]
@@ -579,6 +610,30 @@ mod tests {
 
         assert_ne!(encrypted, plaintext);
         assert_eq!(encrypted[0] & 0x03, KAD_MARKER_RECEIVER_KEY);
+    }
+
+    #[test]
+    fn test_receiver_verify_key_is_reused_across_ports_on_same_ip() {
+        let sender = ObfuscationLayer::new(NodeId::from_bytes([0xAB; 16]), 0xCAFE_BABE, true);
+        let receiver = ObfuscationLayer::new(NodeId::from_bytes([0xCD; 16]), 0xBEEF_CAFE, true);
+        let sender_ip = match sender_addr().ip() {
+            IpAddr::V4(ip) => ip,
+            IpAddr::V6(_) => unreachable!(),
+        };
+        let learned_addr: SocketAddr = "5.6.7.8:9999".parse().unwrap();
+        let reply_addr: SocketAddr = "5.6.7.8:4672".parse().unwrap();
+
+        sender.register_peer_key(learned_addr, receiver.verify_key_for_ip(sender_ip));
+
+        let plaintext = vec![OP_KADEMLIAHEADER, opcode::PONG, 0x44, 0x55];
+        let encrypted = sender.encrypt(reply_addr, opcode::PONG, &plaintext);
+
+        assert_ne!(encrypted, plaintext);
+        assert_eq!(encrypted[0] & 0x03, KAD_MARKER_RECEIVER_KEY);
+
+        let decrypted = receiver.decrypt(sender_addr(), &encrypted);
+        assert!(decrypted.was_obfuscated);
+        assert_eq!(decrypted.data, plaintext);
     }
 
     #[test]
