@@ -76,6 +76,9 @@ impl SnoopQueue {
     /// Restores persisted entries into the in-memory queue.
     pub fn merge_snapshot(&mut self, entries: Vec<SnoopEntry>) {
         for entry in entries {
+            if should_skip_restored_entry(&entry) {
+                continue;
+            }
             self.merge_entry(entry);
         }
     }
@@ -244,6 +247,12 @@ impl SnoopQueue {
             }
         }
 
+        if recent.iter().any(source_candidate_is_high_quality) {
+            recent.retain(source_candidate_is_high_quality);
+        } else if stale.iter().any(source_candidate_is_high_quality) {
+            stale.retain(source_candidate_is_high_quality);
+        }
+
         recent.sort_by(source_candidate_cmp);
         stale.sort_by(source_candidate_cmp);
         let selected = recent
@@ -350,6 +359,15 @@ impl SnoopQueue {
         feedback.last_outcome_at = Some(completed_at);
         if result_count == 0 {
             feedback.zero_result_streak = feedback.zero_result_streak.saturating_add(1);
+            if feedback.zero_result_streak >= 2
+                && self
+                    .entries
+                    .get(logical_key)
+                    .is_some_and(should_evict_zero_yield_source_entry)
+            {
+                self.entries.remove(logical_key);
+                self.replay_feedback.remove(logical_key);
+            }
         } else {
             feedback.zero_result_streak = 0;
         }
@@ -491,11 +509,18 @@ fn source_candidate_cmp(
     right
         .observed_after_outcome
         .cmp(&left.observed_after_outcome)
+        .then_with(|| {
+            source_candidate_is_high_quality(right).cmp(&source_candidate_is_high_quality(left))
+        })
         .then_with(|| left.zero_result_streak.cmp(&right.zero_result_streak))
         .then_with(|| right.last_result_count.cmp(&left.last_result_count))
         .then_with(|| right.hit_count.cmp(&left.hit_count))
         .then_with(|| right.last_seen.cmp(&left.last_seen))
         .then_with(|| left.scheduled.logical_key.cmp(&right.scheduled.logical_key))
+}
+
+fn source_candidate_is_high_quality(candidate: &ReplayCandidate<SearchSourceReq>) -> bool {
+    candidate.hit_count >= 2 || candidate.last_result_count > 0
 }
 
 fn notes_candidate_cmp(
@@ -528,6 +553,20 @@ fn replay_cooldown_cutoff(
     let zero_backoff_multiplier = u64::from(feedback.zero_result_streak.saturating_add(1)).min(4);
     let cooldown_secs = drain_cooldown_secs.saturating_mul(zero_backoff_multiplier);
     now - seconds(cooldown_secs)
+}
+
+fn should_skip_restored_entry(entry: &SnoopEntry) -> bool {
+    matches!(entry, SnoopEntry::Source { .. })
+        && entry
+            .last_drained_at()
+            .is_some_and(|last_drained_at| entry.last_seen() <= last_drained_at)
+}
+
+fn should_evict_zero_yield_source_entry(entry: &SnoopEntry) -> bool {
+    matches!(entry, SnoopEntry::Source { .. })
+        && entry
+            .last_drained_at()
+            .is_some_and(|last_drained_at| entry.last_seen() <= last_drained_at)
 }
 
 #[cfg(test)]
@@ -916,6 +955,93 @@ mod tests {
 
         assert!(queue.snapshot().is_empty());
         assert_eq!(queue.family_counts(), SnoopQueueFamilyCounts::default());
+    }
+
+    #[test]
+    fn repeated_zero_yield_source_entry_is_evicted() {
+        let mut queue = queue();
+        let logical_key = "source:00112233445566778899aabbccddeeff:0000:4096";
+        queue.record(source_entry(
+            logical_key,
+            "00112233445566778899aabbccddeeff",
+            0,
+            4096,
+            100,
+        ));
+
+        let selected = queue.select_next_source_request(ts(110)).unwrap();
+        queue.record_replay_outcome(&selected.logical_key, ts(120), 0);
+        let selected = queue.select_next_source_request(ts(200)).unwrap();
+        queue.record_replay_outcome(&selected.logical_key, ts(210), 0);
+
+        assert!(queue.snapshot().is_empty());
+    }
+
+    #[test]
+    fn source_drain_prefers_repeated_hot_entries() {
+        let mut queue = queue();
+        let repeated = "source:00112233445566778899aabbccddeeff:0000:4096";
+        let fresh = "source:11112222333344445555666677778888:0000:8192";
+        queue.record(source_entry(
+            repeated,
+            "00112233445566778899aabbccddeeff",
+            0,
+            4096,
+            100,
+        ));
+        queue.record(source_entry(
+            repeated,
+            "00112233445566778899aabbccddeeff",
+            0,
+            4096,
+            101,
+        ));
+        queue.record(source_entry(
+            fresh,
+            "11112222333344445555666677778888",
+            0,
+            8192,
+            110,
+        ));
+
+        let selected = queue.select_next_source_request(ts(130)).unwrap();
+
+        assert_eq!(selected.logical_key, repeated);
+    }
+
+    #[test]
+    fn restore_skips_drained_source_entries_without_fresh_demand() {
+        let mut queue = queue();
+        queue.merge_snapshot(vec![
+            SnoopEntry::Source {
+                logical_key: "source:00112233445566778899aabbccddeeff:0000:4096".to_string(),
+                target: "00112233445566778899aabbccddeeff".to_string(),
+                start_position: 0,
+                size: 4096,
+                hit_count: 3,
+                first_seen: ts(100),
+                last_seen: ts(120),
+                last_drained_at: Some(ts(130)),
+            },
+            SnoopEntry::Source {
+                logical_key: "source:11112222333344445555666677778888:0000:8192".to_string(),
+                target: "11112222333344445555666677778888".to_string(),
+                start_position: 0,
+                size: 8192,
+                hit_count: 2,
+                first_seen: ts(100),
+                last_seen: ts(140),
+                last_drained_at: Some(ts(130)),
+            },
+        ]);
+
+        let snapshot = queue.snapshot();
+
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(
+            snapshot[0].logical_key(),
+            "source:11112222333344445555666677778888:0000:8192"
+        );
     }
 
     #[test]
