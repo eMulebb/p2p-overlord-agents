@@ -306,8 +306,8 @@ impl Default for SnoopQueueConfig {
     fn default() -> Self {
         Self {
             dedup_window_secs: 28_800,
-            max_queries_per_600s: 8,
-            drain_cooldown_secs: 3_600,
+            max_queries_per_600s: 24,
+            drain_cooldown_secs: 900,
         }
     }
 }
@@ -781,5 +781,13 @@ state_dir = "{state_dir}"
         assert_eq!(config.p2p.kad.local_store_keyword_capacity, 20_000);
         assert_eq!(config.p2p.kad.local_store_source_capacity, 20_000);
         assert_eq!(config.p2p.kad.local_store_notes_capacity, 5_000);
+    }
+
+    #[test]
+    fn default_snoop_queue_config_is_harvest_oriented() {
+        let config = EmuleAgentConfig::default();
+
+        assert_eq!(config.p2p.snoop_queue.max_queries_per_600s, 24);
+        assert_eq!(config.p2p.snoop_queue.drain_cooldown_secs, 900);
     }
 }
