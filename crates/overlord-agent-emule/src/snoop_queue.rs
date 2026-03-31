@@ -13,7 +13,8 @@ pub struct SnoopQueue {
     config: SnoopQueueConfig,
     entries: HashMap<String, SnoopEntry>,
     replay_feedback: HashMap<String, ReplayFeedback>,
-    recent_drains: VecDeque<DateTime<Utc>>,
+    recent_general_drains: VecDeque<DateTime<Utc>>,
+    recent_source_drains: VecDeque<DateTime<Utc>>,
 }
 
 /// Outcome of recording one harvested search shape.
@@ -69,7 +70,8 @@ impl SnoopQueue {
             config,
             entries: HashMap::new(),
             replay_feedback: HashMap::new(),
-            recent_drains: VecDeque::new(),
+            recent_general_drains: VecDeque::new(),
+            recent_source_drains: VecDeque::new(),
         }
     }
 
@@ -125,13 +127,15 @@ impl SnoopQueue {
         &mut self,
         now: DateTime<Utc>,
     ) -> Option<ScheduledSnoopRequest<SearchKeyReq>> {
-        self.prune_recent_drains(now);
-        if self.recent_drains.len() >= self.config.max_queries_per_600s as usize {
+        let family = SnoopFamily::Keyword;
+        self.prune_recent_drains(now, family);
+        if self.recent_drain_len(family) >= self.family_max_queries_per_600s(family) as usize {
             return None;
         }
 
         let dedup_cutoff = now - seconds(self.config.dedup_window_secs);
-        let cooldown_cutoff = now - seconds(self.config.drain_cooldown_secs);
+        let cooldown_secs = self.family_drain_cooldown_secs(family);
+        let cooldown_cutoff = now - seconds(cooldown_secs);
         let mut recent = Vec::new();
         let mut stale = Vec::new();
 
@@ -147,13 +151,7 @@ impl SnoopQueue {
                 .unwrap_or_default();
             if entry.last_drained_at().is_some_and(|last_drained_at| {
                 last_drained_at
-                    > replay_cooldown_cutoff(
-                        cooldown_cutoff,
-                        now,
-                        self.config.drain_cooldown_secs,
-                        entry,
-                        feedback,
-                    )
+                    > replay_cooldown_cutoff(cooldown_cutoff, now, cooldown_secs, entry, feedback)
             }) {
                 continue;
             }
@@ -186,7 +184,7 @@ impl SnoopQueue {
         if let Some(entry) = self.entries.get_mut(&selected.scheduled.logical_key) {
             entry.set_last_drained_at(Some(now));
         }
-        self.recent_drains.push_back(now);
+        self.recent_drains_mut(family).push_back(now);
         Some(selected.scheduled)
     }
 
@@ -195,13 +193,15 @@ impl SnoopQueue {
         &mut self,
         now: DateTime<Utc>,
     ) -> Option<ScheduledSnoopRequest<SearchSourceReq>> {
-        self.prune_recent_drains(now);
-        if self.recent_drains.len() >= self.config.max_queries_per_600s as usize {
+        let family = SnoopFamily::Source;
+        self.prune_recent_drains(now, family);
+        if self.recent_drain_len(family) >= self.family_max_queries_per_600s(family) as usize {
             return None;
         }
 
         let dedup_cutoff = now - seconds(self.config.dedup_window_secs);
-        let cooldown_cutoff = now - seconds(self.config.drain_cooldown_secs);
+        let cooldown_secs = self.family_drain_cooldown_secs(family);
+        let cooldown_cutoff = now - seconds(cooldown_secs);
         let mut recent = Vec::new();
         let mut stale = Vec::new();
 
@@ -217,13 +217,7 @@ impl SnoopQueue {
                 .unwrap_or_default();
             if entry.last_drained_at().is_some_and(|last_drained_at| {
                 last_drained_at
-                    > replay_cooldown_cutoff(
-                        cooldown_cutoff,
-                        now,
-                        self.config.drain_cooldown_secs,
-                        entry,
-                        feedback,
-                    )
+                    > replay_cooldown_cutoff(cooldown_cutoff, now, cooldown_secs, entry, feedback)
             }) {
                 continue;
             }
@@ -259,7 +253,7 @@ impl SnoopQueue {
         if let Some(entry) = self.entries.get_mut(&selected.scheduled.logical_key) {
             entry.set_last_drained_at(Some(now));
         }
-        self.recent_drains.push_back(now);
+        self.recent_drains_mut(family).push_back(now);
         Some(selected.scheduled)
     }
 
@@ -268,13 +262,15 @@ impl SnoopQueue {
         &mut self,
         now: DateTime<Utc>,
     ) -> Option<ScheduledSnoopRequest<SearchNotesReq>> {
-        self.prune_recent_drains(now);
-        if self.recent_drains.len() >= self.config.max_queries_per_600s as usize {
+        let family = SnoopFamily::Notes;
+        self.prune_recent_drains(now, family);
+        if self.recent_drain_len(family) >= self.family_max_queries_per_600s(family) as usize {
             return None;
         }
 
         let dedup_cutoff = now - seconds(self.config.dedup_window_secs);
-        let cooldown_cutoff = now - seconds(self.config.drain_cooldown_secs);
+        let cooldown_secs = self.family_drain_cooldown_secs(family);
+        let cooldown_cutoff = now - seconds(cooldown_secs);
         let mut recent = Vec::new();
         let mut stale = Vec::new();
 
@@ -290,13 +286,7 @@ impl SnoopQueue {
                 .unwrap_or_default();
             if entry.last_drained_at().is_some_and(|last_drained_at| {
                 last_drained_at
-                    > replay_cooldown_cutoff(
-                        cooldown_cutoff,
-                        now,
-                        self.config.drain_cooldown_secs,
-                        entry,
-                        feedback,
-                    )
+                    > replay_cooldown_cutoff(cooldown_cutoff, now, cooldown_secs, entry, feedback)
             }) {
                 continue;
             }
@@ -329,7 +319,7 @@ impl SnoopQueue {
         if let Some(entry) = self.entries.get_mut(&selected.scheduled.logical_key) {
             entry.set_last_drained_at(Some(now));
         }
-        self.recent_drains.push_back(now);
+        self.recent_drains_mut(family).push_back(now);
         Some(selected.scheduled)
     }
 
@@ -390,14 +380,14 @@ impl SnoopQueue {
         (true, 1)
     }
 
-    fn prune_recent_drains(&mut self, now: DateTime<Utc>) {
+    fn prune_recent_drains(&mut self, now: DateTime<Utc>, family: SnoopFamily) {
         let cutoff = now - TimeDelta::minutes(10);
-        while self
-            .recent_drains
+        let recent_drains = self.recent_drains_mut(family);
+        while recent_drains
             .front()
             .is_some_and(|drained_at| drained_at < &cutoff)
         {
-            self.recent_drains.pop_front();
+            recent_drains.pop_front();
         }
     }
 
@@ -406,6 +396,34 @@ impl SnoopQueue {
             .values()
             .filter(|entry| entry_family(entry) == family)
             .count()
+    }
+
+    fn family_max_queries_per_600s(&self, family: SnoopFamily) -> u32 {
+        match family {
+            SnoopFamily::Keyword | SnoopFamily::Notes => self.config.general_max_queries_per_600s,
+            SnoopFamily::Source => self.config.source_max_queries_per_600s,
+        }
+    }
+
+    fn family_drain_cooldown_secs(&self, family: SnoopFamily) -> u64 {
+        match family {
+            SnoopFamily::Keyword | SnoopFamily::Notes => self.config.general_drain_cooldown_secs,
+            SnoopFamily::Source => self.config.source_drain_cooldown_secs,
+        }
+    }
+
+    fn recent_drain_len(&self, family: SnoopFamily) -> usize {
+        match family {
+            SnoopFamily::Keyword | SnoopFamily::Notes => self.recent_general_drains.len(),
+            SnoopFamily::Source => self.recent_source_drains.len(),
+        }
+    }
+
+    fn recent_drains_mut(&mut self, family: SnoopFamily) -> &mut VecDeque<DateTime<Utc>> {
+        match family {
+            SnoopFamily::Keyword | SnoopFamily::Notes => &mut self.recent_general_drains,
+            SnoopFamily::Source => &mut self.recent_source_drains,
+        }
     }
 }
 
@@ -583,8 +601,11 @@ mod tests {
     fn queue() -> SnoopQueue {
         SnoopQueue::new(SnoopQueueConfig {
             dedup_window_secs: 60,
-            max_queries_per_600s: 2,
-            drain_cooldown_secs: 30,
+            general_max_queries_per_600s: 2,
+            general_drain_cooldown_secs: 30,
+            source_max_queries_per_600s: 2,
+            source_drain_cooldown_secs: 30,
+            source_stop_after_results: 2,
         })
     }
 
@@ -1019,6 +1040,81 @@ mod tests {
         queue.record_replay_outcome(&selected.logical_key, ts(210), 0);
 
         assert!(queue.snapshot().is_empty());
+    }
+
+    #[test]
+    fn source_drain_uses_dedicated_rate_budget() {
+        let mut queue = SnoopQueue::new(SnoopQueueConfig {
+            dedup_window_secs: 60,
+            general_max_queries_per_600s: 1,
+            general_drain_cooldown_secs: 30,
+            source_max_queries_per_600s: 2,
+            source_drain_cooldown_secs: 30,
+            source_stop_after_results: 2,
+        });
+        queue.record(keyword_entry(
+            "keyword:00112233445566778899aabbccddeeff:0000",
+            "00112233445566778899aabbccddeeff",
+            0,
+            None,
+            100,
+        ));
+        queue.record(source_entry(
+            "source:11112222333344445555666677778888:0000:4096",
+            "11112222333344445555666677778888",
+            0,
+            4096,
+            101,
+        ));
+        queue.record(source_entry(
+            "source:11112222333344445555666677778888:0000:4096",
+            "11112222333344445555666677778888",
+            0,
+            4096,
+            102,
+        ));
+
+        assert!(queue.select_next_keyword_request(ts(110)).is_some());
+        assert!(queue.select_next_source_request(ts(111)).is_some());
+    }
+
+    #[test]
+    fn source_drain_uses_shorter_dedicated_cooldown() {
+        let mut queue = SnoopQueue::new(SnoopQueueConfig {
+            dedup_window_secs: 60,
+            general_max_queries_per_600s: 4,
+            general_drain_cooldown_secs: 90,
+            source_max_queries_per_600s: 4,
+            source_drain_cooldown_secs: 20,
+            source_stop_after_results: 2,
+        });
+        let logical_key = "source:00112233445566778899aabbccddeeff:0000:4096";
+        queue.record(source_entry(
+            logical_key,
+            "00112233445566778899aabbccddeeff",
+            0,
+            4096,
+            100,
+        ));
+        queue.record(source_entry(
+            logical_key,
+            "00112233445566778899aabbccddeeff",
+            0,
+            4096,
+            101,
+        ));
+
+        let selected = queue.select_next_source_request(ts(110)).unwrap();
+        queue.record_replay_outcome(&selected.logical_key, ts(111), 0);
+        queue.record(source_entry(
+            logical_key,
+            "00112233445566778899aabbccddeeff",
+            0,
+            4096,
+            131,
+        ));
+
+        assert!(queue.select_next_source_request(ts(132)).is_some());
     }
 
     #[test]

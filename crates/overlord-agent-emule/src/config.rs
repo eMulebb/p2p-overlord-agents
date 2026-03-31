@@ -166,9 +166,18 @@ pub struct Ed2kServerEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SnoopQueueConfig {
+    /// Window used to decide whether a harvested query is still fresh demand.
     pub dedup_window_secs: u64,
-    pub max_queries_per_600s: u32,
-    pub drain_cooldown_secs: u64,
+    /// Shared passive drain budget for keyword and notes requests over ten minutes.
+    pub general_max_queries_per_600s: u32,
+    /// Shared cooldown before keyword or notes requests may be replayed again.
+    pub general_drain_cooldown_secs: u64,
+    /// Dedicated passive drain budget for source requests over ten minutes.
+    pub source_max_queries_per_600s: u32,
+    /// Cooldown before one source request may be replayed again.
+    pub source_drain_cooldown_secs: u64,
+    /// Result count that is considered good enough for one passive source replay cycle.
+    pub source_stop_after_results: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -306,8 +315,11 @@ impl Default for SnoopQueueConfig {
     fn default() -> Self {
         Self {
             dedup_window_secs: 28_800,
-            max_queries_per_600s: 24,
-            drain_cooldown_secs: 900,
+            general_max_queries_per_600s: 24,
+            general_drain_cooldown_secs: 900,
+            source_max_queries_per_600s: 60,
+            source_drain_cooldown_secs: 300,
+            source_stop_after_results: 2,
         }
     }
 }
@@ -787,7 +799,10 @@ state_dir = "{state_dir}"
     fn default_snoop_queue_config_is_harvest_oriented() {
         let config = EmuleAgentConfig::default();
 
-        assert_eq!(config.p2p.snoop_queue.max_queries_per_600s, 24);
-        assert_eq!(config.p2p.snoop_queue.drain_cooldown_secs, 900);
+        assert_eq!(config.p2p.snoop_queue.general_max_queries_per_600s, 24);
+        assert_eq!(config.p2p.snoop_queue.general_drain_cooldown_secs, 900);
+        assert_eq!(config.p2p.snoop_queue.source_max_queries_per_600s, 60);
+        assert_eq!(config.p2p.snoop_queue.source_drain_cooldown_secs, 300);
+        assert_eq!(config.p2p.snoop_queue.source_stop_after_results, 2);
     }
 }

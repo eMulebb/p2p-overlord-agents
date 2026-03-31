@@ -1775,6 +1775,7 @@ struct PassiveReplayContext<'a> {
     indexer_id: Uuid,
     replay_context: &'a HarvestReplayContext,
     max_phase2_fanout: usize,
+    source_stop_after_results: usize,
     passive_result_count: &'a Arc<std::sync::atomic::AtomicU64>,
     harvest_observability: &'a Arc<Mutex<KadHarvestObservability>>,
 }
@@ -1936,6 +1937,7 @@ async fn run_passive_source_replay(
     let mut outcome = PassiveReplayRunOutcome::default();
     let mut seen_sources = HashSet::<(std::net::Ipv4Addr, u16, u16)>::new();
     let mut files = Vec::new();
+    let source_stop_after_results = context.source_stop_after_results.max(1);
     let (batch_tx, batch_task) = spawn_passive_batch_poster(
         context.coordinator.clone(),
         context.indexer_id,
@@ -1950,12 +1952,13 @@ async fn run_passive_source_replay(
             "kad passive replay tier start family=source target={} responder_ceiling={} size={}",
             request.target, responder_ceiling, request.size
         );
+        let cancel = CancellationToken::new();
         let mut stream = context
             .dht
             .search_source_request_with_phase2_fanout_and_cancel(
                 request.clone(),
                 responder_ceiling,
-                CancellationToken::new(),
+                cancel.clone(),
             );
         while let Some(result) = stream.next().await {
             let source_key = (result.ip, result.tcp_port, result.udp_port);
@@ -1972,6 +1975,10 @@ async fn run_passive_source_replay(
                     Some("passive batch poster stopped accepting source batches".into());
                 break;
             }
+            if outcome.result_count >= source_stop_after_results {
+                cancel.cancel();
+                break;
+            }
         }
 
         let tier_results = outcome.result_count - tier_result_start;
@@ -1984,7 +1991,7 @@ async fn run_passive_source_replay(
             result_count: tier_results as u32,
         });
 
-        if outcome.result_count >= passive_replay_thin_result_threshold(HarvestFamily::Source) {
+        if outcome.result_count >= source_stop_after_results {
             break;
         }
     }
@@ -3274,6 +3281,15 @@ async fn next_passive_replay_request(
     next_passive_replay_request_with_preference(snoop_queue, None).await
 }
 
+async fn next_passive_replay_request_for_family(
+    snoop_queue: &Arc<Mutex<SnoopQueue>>,
+    family: HarvestFamily,
+) -> Option<PassiveReplaySelection> {
+    let mut queue = snoop_queue.lock().await;
+    let now = Utc::now();
+    select_passive_replay_request(&mut queue, family, now)
+}
+
 async fn next_passive_replay_request_with_preference(
     snoop_queue: &Arc<Mutex<SnoopQueue>>,
     preferred_family: Option<HarvestFamily>,
@@ -3309,7 +3325,7 @@ async fn record_passive_replay_outcome(
         .record_replay_outcome(logical_key, completed_at, result_count);
 }
 
-/// Acquire the single passive replay slot without blocking the background loop.
+/// Acquire one passive replay slot without blocking the background loop.
 ///
 /// Passive keyword and passive source replays are an Overlord-only indexing
 /// extension, so we serialize them explicitly to avoid non-oracle overlap on
@@ -4920,6 +4936,7 @@ impl OverlordAgentEmule {
         let harvest_observability = Arc::clone(&self.harvest_observability);
         let agent_activity = Arc::clone(&self.agent_activity);
         let passive_replay_phase2_fanout = config.p2p.kad.search_phase2_fanout;
+        let passive_source_stop_after_results = config.p2p.snoop_queue.source_stop_after_results;
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             while !shutdown.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_secs(PASSIVE_SOURCE_CRAWL_SECS)).await;
@@ -4931,11 +4948,9 @@ impl OverlordAgentEmule {
                 else {
                     continue;
                 };
-                let Some(selected_request) = next_passive_replay_request_with_preference(
-                    &snoop_queue,
-                    Some(HarvestFamily::Source),
-                )
-                .await
+                let Some(selected_request) =
+                    next_passive_replay_request_for_family(&snoop_queue, HarvestFamily::Source)
+                        .await
                 else {
                     record_passive_replay_idle_for_worker(
                         &harvest_observability,
@@ -5000,6 +5015,7 @@ impl OverlordAgentEmule {
                                 indexer_id,
                                 replay_context: &replay_context,
                                 max_phase2_fanout: passive_replay_phase2_fanout,
+                                source_stop_after_results: passive_source_stop_after_results,
                                 passive_result_count: &passive_result_count,
                                 harvest_observability: &harvest_observability,
                             },
@@ -5111,6 +5127,7 @@ impl OverlordAgentEmule {
                                 indexer_id,
                                 replay_context: &replay_context,
                                 max_phase2_fanout: passive_replay_phase2_fanout,
+                                source_stop_after_results: passive_source_stop_after_results,
                                 passive_result_count: &passive_result_count,
                                 harvest_observability: &harvest_observability,
                             },
@@ -5222,6 +5239,7 @@ impl OverlordAgentEmule {
                                 indexer_id,
                                 replay_context: &replay_context,
                                 max_phase2_fanout: passive_replay_phase2_fanout,
+                                source_stop_after_results: passive_source_stop_after_results,
                                 passive_result_count: &passive_result_count,
                                 harvest_observability: &harvest_observability,
                             },
@@ -5296,6 +5314,7 @@ impl OverlordAgentEmule {
         let harvest_observability = Arc::clone(&self.harvest_observability);
         let agent_activity = Arc::clone(&self.agent_activity);
         let passive_replay_phase2_fanout = config.p2p.kad.search_phase2_fanout;
+        let passive_source_stop_after_results = config.p2p.snoop_queue.source_stop_after_results;
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             while !shutdown.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_secs(PASSIVE_GENERAL_CRAWL_SECS)).await;
@@ -5371,6 +5390,7 @@ impl OverlordAgentEmule {
                                 indexer_id,
                                 replay_context: &replay_context,
                                 max_phase2_fanout: passive_replay_phase2_fanout,
+                                source_stop_after_results: passive_source_stop_after_results,
                                 passive_result_count: &passive_result_count,
                                 harvest_observability: &harvest_observability,
                             },
@@ -5482,6 +5502,7 @@ impl OverlordAgentEmule {
                                 indexer_id,
                                 replay_context: &replay_context,
                                 max_phase2_fanout: passive_replay_phase2_fanout,
+                                source_stop_after_results: passive_source_stop_after_results,
                                 passive_result_count: &passive_result_count,
                                 harvest_observability: &harvest_observability,
                             },
@@ -5593,6 +5614,7 @@ impl OverlordAgentEmule {
                                 indexer_id,
                                 replay_context: &replay_context,
                                 max_phase2_fanout: passive_replay_phase2_fanout,
+                                source_stop_after_results: passive_source_stop_after_results,
                                 passive_result_count: &passive_result_count,
                                 harvest_observability: &harvest_observability,
                             },
@@ -5756,7 +5778,7 @@ mod tests {
         build_notes_snoop_entry, build_publish_batch_summary, build_source_publish_tags,
         build_source_snoop_entry, current_tcp_firewalled, effective_publish_counters,
         empty_networking_config, emule_high_id_source_type, flush_snoop_queue, keyword_target,
-        next_passive_replay_request, next_passive_replay_request_with_preference,
+        next_passive_replay_request, next_passive_replay_request_for_family,
         normalize_ed2k_user_hash_markers, parse_kad_hello_metadata, record_passive_replay_complete,
         record_passive_replay_idle, record_passive_replay_post_failure,
         record_passive_replay_start, restore_snoop_queue, select_popular_hashes_for_seeding,
@@ -6495,8 +6517,11 @@ mod tests {
     async fn next_passive_replay_request_prefers_source_when_backlog_is_heavier() {
         let queue = Arc::new(Mutex::new(SnoopQueue::new(SnoopQueueConfig {
             dedup_window_secs: 60,
-            max_queries_per_600s: 10,
-            drain_cooldown_secs: 30,
+            general_max_queries_per_600s: 10,
+            general_drain_cooldown_secs: 30,
+            source_max_queries_per_600s: 10,
+            source_drain_cooldown_secs: 30,
+            source_stop_after_results: 2,
         })));
         let now = Utc.with_ymd_and_hms(2026, 3, 24, 15, 12, 0).unwrap();
         {
@@ -6525,6 +6550,14 @@ mod tests {
                 },
                 now,
             ));
+            guard.record(build_source_snoop_entry(
+                &SearchSourceReq {
+                    target: NodeId::from_bytes([0x33; 16]),
+                    start_position: 0,
+                    size: 2_048,
+                },
+                now,
+            ));
         }
 
         let selected = next_passive_replay_request(&queue).await;
@@ -6535,8 +6568,11 @@ mod tests {
     async fn next_passive_replay_request_selects_notes_when_only_notes_are_queued() {
         let queue = Arc::new(Mutex::new(SnoopQueue::new(SnoopQueueConfig {
             dedup_window_secs: 60,
-            max_queries_per_600s: 10,
-            drain_cooldown_secs: 30,
+            general_max_queries_per_600s: 10,
+            general_drain_cooldown_secs: 30,
+            source_max_queries_per_600s: 10,
+            source_drain_cooldown_secs: 30,
+            source_stop_after_results: 2,
         })));
         let now = Utc.with_ymd_and_hms(2026, 3, 24, 15, 14, 0).unwrap();
         {
@@ -6597,8 +6633,11 @@ mod tests {
     async fn source_fast_path_prefers_source_replays() {
         let queue = Arc::new(Mutex::new(SnoopQueue::new(SnoopQueueConfig {
             dedup_window_secs: 600,
-            max_queries_per_600s: 10,
-            drain_cooldown_secs: 30,
+            general_max_queries_per_600s: 10,
+            general_drain_cooldown_secs: 30,
+            source_max_queries_per_600s: 10,
+            source_drain_cooldown_secs: 30,
+            source_stop_after_results: 2,
         })));
         let now = Utc::now();
         queue.lock().await.record(build_keyword_snoop_entry(
@@ -6617,11 +6656,42 @@ mod tests {
             },
             now,
         ));
+        queue.lock().await.record(build_source_snoop_entry(
+            &SearchSourceReq {
+                target: "11112222333344445555666677778888".parse().unwrap(),
+                start_position: 0,
+                size: 4096,
+            },
+            now,
+        ));
 
-        let selected =
-            next_passive_replay_request_with_preference(&queue, Some(HarvestFamily::Source)).await;
+        let selected = next_passive_replay_request_for_family(&queue, HarvestFamily::Source).await;
 
         assert!(matches!(selected, Some(PassiveReplaySelection::Source(_))));
+    }
+
+    #[tokio::test]
+    async fn source_fast_path_stays_idle_without_source_backlog() {
+        let queue = Arc::new(Mutex::new(SnoopQueue::new(SnoopQueueConfig {
+            dedup_window_secs: 600,
+            general_max_queries_per_600s: 10,
+            general_drain_cooldown_secs: 30,
+            source_max_queries_per_600s: 10,
+            source_drain_cooldown_secs: 30,
+            source_stop_after_results: 2,
+        })));
+        queue.lock().await.record(build_keyword_snoop_entry(
+            &SearchKeyReq {
+                target: "00112233445566778899aabbccddeeff".parse().unwrap(),
+                start_position: 0,
+                restrictive_payload: Vec::new(),
+            },
+            Utc::now(),
+        ));
+
+        let selected = next_passive_replay_request_for_family(&queue, HarvestFamily::Source).await;
+
+        assert!(selected.is_none());
     }
 
     #[tokio::test]

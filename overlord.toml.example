@@ -52,8 +52,11 @@ listen_port = 41001
 
 [p2p.snoop_queue]
 dedup_window_secs = 28800
-max_queries_per_600s = 24
-drain_cooldown_secs = 900
+general_max_queries_per_600s = 24
+general_drain_cooldown_secs = 900
+source_max_queries_per_600s = 60
+source_drain_cooldown_secs = 300
+source_stop_after_results = 2
 
 [nat.p2p]
 enabled = false
