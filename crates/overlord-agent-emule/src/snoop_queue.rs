@@ -241,15 +241,7 @@ impl SnoopQueue {
             }
         }
 
-        recent.retain(source_candidate_is_high_quality);
-        stale.retain(source_candidate_is_high_quality);
-
-        recent.sort_by(source_candidate_cmp);
-        stale.sort_by(source_candidate_cmp);
-        let selected = recent
-            .into_iter()
-            .next()
-            .or_else(|| stale.into_iter().next())?;
+        let selected = select_best_source_candidate(recent, stale)?;
         if let Some(entry) = self.entries.get_mut(&selected.scheduled.logical_key) {
             entry.set_last_drained_at(Some(now));
         }
@@ -536,6 +528,30 @@ fn source_candidate_cmp(
 
 fn source_candidate_is_high_quality(candidate: &ReplayCandidate<SearchSourceReq>) -> bool {
     candidate.hit_count >= 2 || candidate.last_result_count > 0
+}
+
+fn select_best_source_candidate(
+    recent: Vec<ReplayCandidate<SearchSourceReq>>,
+    stale: Vec<ReplayCandidate<SearchSourceReq>>,
+) -> Option<ReplayCandidate<SearchSourceReq>> {
+    // Prefer repeated or previously successful source demand, but do not let the
+    // source worker go idle while fresh one-off requests accumulate on the real network.
+    let promoted = recent
+        .iter()
+        .chain(stale.iter())
+        .any(source_candidate_is_high_quality);
+    let mut recent = recent;
+    let mut stale = stale;
+    if promoted {
+        recent.retain(source_candidate_is_high_quality);
+        stale.retain(source_candidate_is_high_quality);
+    }
+    recent.sort_by(source_candidate_cmp);
+    stale.sort_by(source_candidate_cmp);
+    recent
+        .into_iter()
+        .next()
+        .or_else(|| stale.into_iter().next())
 }
 
 fn notes_candidate_cmp(
@@ -1150,7 +1166,7 @@ mod tests {
     }
 
     #[test]
-    fn one_off_source_entries_stay_on_probation() {
+    fn one_off_source_entries_backfill_source_drain_when_queue_would_idle() {
         let mut queue = queue();
         queue.record(source_entry(
             "source:00112233445566778899aabbccddeeff:0000:4096",
@@ -1160,7 +1176,7 @@ mod tests {
             100,
         ));
 
-        assert!(queue.select_next_source_request(ts(130)).is_none());
+        assert!(queue.select_next_source_request(ts(130)).is_some());
     }
 
     #[test]
@@ -1185,6 +1201,38 @@ mod tests {
         let selected = queue.select_next_source_request(ts(130)).unwrap();
 
         assert_eq!(selected.logical_key, logical_key);
+    }
+
+    #[test]
+    fn repeated_source_entries_still_beat_one_off_backfill() {
+        let mut queue = queue();
+        let repeated = "source:00112233445566778899aabbccddeeff:0000:4096";
+        let one_off = "source:11112222333344445555666677778888:0000:8192";
+        queue.record(source_entry(
+            repeated,
+            "00112233445566778899aabbccddeeff",
+            0,
+            4096,
+            100,
+        ));
+        queue.record(source_entry(
+            repeated,
+            "00112233445566778899aabbccddeeff",
+            0,
+            4096,
+            101,
+        ));
+        queue.record(source_entry(
+            one_off,
+            "11112222333344445555666677778888",
+            0,
+            8192,
+            110,
+        ));
+
+        let selected = queue.select_next_source_request(ts(130)).unwrap();
+
+        assert_eq!(selected.logical_key, repeated);
     }
 
     #[test]
