@@ -598,7 +598,8 @@ async fn drive_firewall_helper_hello_exchange(
     context: FirewallHelperContext<'_>,
     peer_secure_ident: &mut Ed2kPeerSecureIdentState,
     timeout: Duration,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut hello_completed = false;
     let hello_packet = encode_hello_request(context.hello_identity);
     dump_ed2k_tcp_helper_send(
         context.helper_addr,
@@ -610,7 +611,10 @@ async fn drive_firewall_helper_hello_exchange(
         .await
         .with_context(|| format!("timed out sending OP_HELLO to {}", context.helper_addr))??;
 
-    let exchange_deadline = tokio::time::Instant::now() + timeout.min(Duration::from_millis(800));
+    // The oracle only advances the dedicated UDP firewall-check flow once the
+    // HELLO side channel actually answered. Keep this bounded, but do not fall
+    // through to OP_FWCHECKUDPREQ after a short silent timeout.
+    let exchange_deadline = tokio::time::Instant::now() + timeout.min(Duration::from_secs(3));
     while tokio::time::Instant::now() < exchange_deadline {
         let remaining = exchange_deadline.saturating_duration_since(tokio::time::Instant::now());
         let packet = match tokio::time::timeout(remaining, transport.read_packet()).await {
@@ -638,6 +642,7 @@ async fn drive_firewall_helper_hello_exchange(
             }
             Err(_) => break,
         };
+        let packet_completed_hello = helper_packet_completes_hello(&packet);
         if !handle_firewall_helper_packet(
             transport,
             context,
@@ -649,9 +654,17 @@ async fn drive_firewall_helper_hello_exchange(
         {
             break;
         }
+        hello_completed |= packet_completed_hello;
     }
 
-    Ok(())
+    Ok(hello_completed)
+}
+
+fn helper_packet_completes_hello(packet: &EmuleTcpPacket) -> bool {
+    matches!(
+        (packet.protocol, packet.opcode),
+        (OP_EDONKEYPROT, OP_HELLO) | (OP_EDONKEYPROT, OP_HELLOANSWER)
+    )
 }
 
 async fn handle_firewall_helper_packet(
@@ -857,13 +870,22 @@ pub async fn request_udp_firewall_check(
         dht: dht.as_ref(),
     };
     let mut peer_secure_ident = Ed2kPeerSecureIdentState::default();
-    drive_firewall_helper_hello_exchange(
+    let hello_completed = drive_firewall_helper_hello_exchange(
         &mut transport,
         helper_context,
         &mut peer_secure_ident,
         timeout,
     )
     .await?;
+    if !hello_completed {
+        dump_ed2k_tcp_helper_meta(
+            helper_addr,
+            Some(transport.mode),
+            "hello_exchange_incomplete",
+            "helper never completed HELLO before firewall request",
+        );
+        anyhow::bail!("helper {helper_addr} did not complete HELLO before OP_FWCHECKUDPREQ");
+    }
     let payload = request.encode();
     let packet = encode_packet(OP_EMULEPROT, OP_FWCHECKUDPREQ, &payload);
     dump_ed2k_tcp_helper_send(helper_addr, transport.mode, "fwcheck_request", &packet);
@@ -2878,5 +2900,77 @@ mod tests {
         assert_eq!(&fwcheck[6..8], &41000u16.to_le_bytes());
         assert_eq!(&fwcheck[8..10], &41000u16.to_le_bytes());
         assert_eq!(&fwcheck[10..14], &0xAABB_CCDDu32.to_le_bytes());
+    }
+
+    #[tokio::test]
+    async fn udp_firewall_check_request_skips_silent_helper_before_request() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let helper_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, peer_addr) = listener.accept().await.unwrap();
+            assert_eq!(peer_addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+            let mut header = [0u8; 6];
+            stream.read_exact(&mut header).await.unwrap();
+            let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+            let mut payload = vec![0u8; packet_len - 1];
+            stream.read_exact(&mut payload).await.unwrap();
+            assert_eq!(header[0], OP_EDONKEYPROT);
+            assert_eq!(header[5], OP_HELLO);
+
+            let mut extra_header = [0u8; 6];
+            let read_result = tokio::time::timeout(
+                Duration::from_millis(500),
+                stream.read_exact(&mut extra_header),
+            )
+            .await;
+            match read_result {
+                Err(_) => {}
+                Ok(Err(_)) => {}
+                Ok(Ok(_)) => {
+                    panic!(
+                        "silent helper unexpectedly received opcode 0x{:02X}",
+                        extra_header[5]
+                    );
+                }
+            }
+        });
+
+        let error = request_udp_firewall_check(
+            None,
+            Ipv4Addr::LOCALHOST,
+            helper_addr,
+            Ed2kHelloIdentity {
+                user_hash: [0x77; 16],
+                client_id: 0x1234_5678,
+                tcp_port: 41001,
+                udp_port: 41000,
+                server_ip: 0,
+                server_port: 0,
+                connect_options: emule_connect_options(false),
+                direct_udp_callback: false,
+            },
+            Arc::new(
+                Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+                    .unwrap(),
+            ),
+            FirewallCheckUdpRequest {
+                internal_udp_port: 41000,
+                external_udp_port: 41000,
+                sender_udp_key: 0xAABB_CCDD,
+            },
+            Duration::from_millis(300),
+        )
+        .await
+        .expect_err("silent helper must not receive firewall request");
+        assert!(
+            error
+                .to_string()
+                .contains("did not complete HELLO before OP_FWCHECKUDPREQ"),
+            "{error:#}"
+        );
+
+        server.await.unwrap();
     }
 }
