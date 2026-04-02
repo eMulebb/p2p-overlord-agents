@@ -335,7 +335,15 @@ Both are implemented with correct wire shapes. The current Rust runtime actively
 
 ### 3.7 Ping / Pong
 
-Both `KADEMLIA2_PING` (`0x60`) and `KADEMLIA2_PONG` (`0x61`) are empty payloads. Wire match: `Equivalent behavior`.
+`KADEMLIA2_PING` (`0x60`)` has an empty payload.
+
+`KADEMLIA2_PONG` (`0x61`) carries:
+
+| Field | Size | Meaning |
+|---|---:|---|
+| `udp_port` | 2 | sender-observed UDP port of the pinging peer |
+
+Status: `Equivalent behavior`. The Rust runtime now mirrors the oracle’s non-empty `PONG` body and echoes the source UDP port the responder observed.
 
 ---
 

@@ -405,9 +405,15 @@ pub struct CallbackReq {
 #[brw(little)]
 pub struct Ping;
 
+/// Kad liveness response carrying the UDP source port observed by the responder.
+///
+/// eMule uses this packet not only as a reply-to-ping marker, but also as an
+/// external-port hint for Kad firewall probing.
 #[derive(BinRead, BinWrite, Debug, Clone, PartialEq)]
 #[brw(little)]
-pub struct Pong;
+pub struct Pong {
+    pub udp_port: u16,
+}
 
 // ── KadPacket ────────────────────────────────────────────────────────────────
 
@@ -439,7 +445,7 @@ pub enum KadPacket {
     FindBuddyRes(FindBuddyRes),
     CallbackReq(CallbackReq),
     Ping,
-    Pong,
+    Pong(Pong),
     // KAD1_IGNORED: Kad1 packets dropped silently. See KADKAD.md §6 Kad1 Policy.
     Unknown { opcode: u8, payload: Vec<u8> },
 }
@@ -565,7 +571,10 @@ impl KadPacket {
                 KadPacket::CallbackReq(p)
             }
             opcode::PING => KadPacket::Ping,
-            opcode::PONG => KadPacket::Pong,
+            opcode::PONG => {
+                let p = cursor.read_le::<Pong>()?;
+                KadPacket::Pong(p)
+            }
             other => KadPacket::Unknown {
                 opcode: other,
                 payload: body.to_vec(),
@@ -608,11 +617,11 @@ impl KadPacket {
             KadPacket::FindBuddyReq(p) => buf.write_le(p)?,
             KadPacket::FindBuddyRes(p) => write_find_buddy_res(&mut buf, p)?,
             KadPacket::CallbackReq(p) => buf.write_le(p)?,
+            KadPacket::Pong(p) => buf.write_le(p)?,
             KadPacket::BootstrapReq
             | KadPacket::PublishResAck
             | KadPacket::FirewalledAckRes
-            | KadPacket::Ping
-            | KadPacket::Pong => {}
+            | KadPacket::Ping => {}
             KadPacket::Unknown { payload, .. } => {
                 buf.write_all(payload).map_err(ProtoError::Io)?;
             }
@@ -650,7 +659,7 @@ impl KadPacket {
             KadPacket::FindBuddyRes(_) => opcode::FINDBUDDY_RES,
             KadPacket::CallbackReq(_) => opcode::CALLBACK_REQ,
             KadPacket::Ping => opcode::PING,
-            KadPacket::Pong => opcode::PONG,
+            KadPacket::Pong(_) => opcode::PONG,
             KadPacket::Unknown { opcode, .. } => *opcode,
         }
     }
@@ -769,9 +778,11 @@ mod tests {
 
     #[test]
     fn test_pong_roundtrip() {
-        let pkt = KadPacket::Pong;
+        let pkt = KadPacket::Pong(Pong { udp_port: 4672 });
+        let bytes = pkt.encode().unwrap();
+        assert_eq!(bytes, vec![0xE4, 0x61, 0x40, 0x12]);
         let pkt2 = roundtrip(&pkt);
-        assert!(matches!(pkt2, KadPacket::Pong));
+        assert!(matches!(pkt2, KadPacket::Pong(Pong { udp_port: 4672 })));
     }
 
     #[test]

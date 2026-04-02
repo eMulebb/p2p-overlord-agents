@@ -705,11 +705,15 @@ US                                          PEER
 | -------------------------------------------> |
 |                                              |
 |  PONG  (0xE4 0x61)                          |
-|  payload: (empty)                            |
+|  udp_port: [2 bytes]                         |
+|    source UDP port observed by PEER          |
 | <------------------------------------------- |
 |                                              |
 | note: US marks PEER contact as Active and    |
 |       updates last_seen in the routing table.|
+|       Oracle also uses the reported UDP port |
+|       as a Kad external-port hint during     |
+|       firewall probing.                      |
 |       If no PONG arrives within timeout:     |
 |       PEER is marked Dead and becomes        |
 |       eligible for replacement by a fresher  |

@@ -1147,7 +1147,7 @@ mod tests {
         // In a background task: wait a bit, then inject a PONG from peer
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            let pong = KadPacket::Pong;
+            let pong = KadPacket::Pong(overlord_kad_proto::Pong { udp_port: 9999 });
             let encoded = pong.encode().unwrap();
             let _ = inject_tx.send((encoded, peer_addr)).await;
         });
@@ -1157,7 +1157,10 @@ mod tests {
             .await;
 
         assert!(result.is_ok(), "expected Ok, got {:?}", result);
-        assert!(matches!(result.unwrap(), KadPacket::Pong));
+        assert!(matches!(
+            result.unwrap(),
+            KadPacket::Pong(overlord_kad_proto::Pong { udp_port: 9999 })
+        ));
     }
 
     #[tokio::test]
@@ -1362,7 +1365,7 @@ mod tests {
         let _handle = rpc.start();
 
         let peer_addr: SocketAddr = "1.2.3.4:9999".parse().unwrap();
-        let pong = KadPacket::Pong;
+        let pong = KadPacket::Pong(overlord_kad_proto::Pong { udp_port: 9999 });
         let encoded = pong.encode().unwrap();
 
         // Inject 100 packets — untracked responses should be dropped.
@@ -1499,7 +1502,7 @@ mod tests {
         let _handle = rpc.start();
 
         let peer_addr = make_peer_addr();
-        let pong = KadPacket::Pong;
+        let pong = KadPacket::Pong(overlord_kad_proto::Pong { udp_port: 9999 });
         let encoded = pong.encode().unwrap();
         let _ = inject_tx.send((encoded, peer_addr)).await;
 

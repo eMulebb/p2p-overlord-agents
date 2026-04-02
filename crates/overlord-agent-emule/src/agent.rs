@@ -4023,7 +4023,15 @@ async fn handle_unsolicited_packet(
     } = received;
 
     match packet {
-        KadPacket::Ping => dht.send_packet(from, &KadPacket::Pong).await?,
+        KadPacket::Ping => {
+            dht.send_packet(
+                from,
+                &KadPacket::Pong(overlord_kad_proto::Pong {
+                    udp_port: from.port(),
+                }),
+            )
+            .await?
+        }
         KadPacket::FirewalledReq(req) => {
             spawn_firewalled_response(dht.clone(), from, req.tcp_port);
         }
