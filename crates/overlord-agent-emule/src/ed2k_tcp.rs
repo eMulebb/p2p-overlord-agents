@@ -17,16 +17,18 @@
 use std::{
     collections::VecDeque,
     fs, io,
+    io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
 use anyhow::{Context, Result};
+use chrono::SecondsFormat;
 use md5::compute as md5_compute;
 use rand::Rng;
 use rsa::{
@@ -36,6 +38,7 @@ use rsa::{
     rand_core::OsRng,
     signature::{RandomizedSigner, SignatureEncoding},
 };
+use serde::Serialize;
 use sha1::Sha1;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -259,6 +262,15 @@ struct Ed2kPeerSecureIdentState {
     requested_peer_key: bool,
 }
 
+/// Immutable session metadata shared by one outgoing TCP helper exchange.
+#[derive(Debug, Clone, Copy)]
+struct FirewallHelperContext<'a> {
+    helper_addr: SocketAddr,
+    hello_identity: Ed2kHelloIdentity,
+    kad_udp_port: u16,
+    secure_ident: &'a Ed2kSecureIdent,
+}
+
 #[derive(Debug)]
 struct Rc4KeyStream {
     s: [u8; 256],
@@ -317,6 +329,176 @@ impl Ed2kTransportMode {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct Ed2kTcpDumpRecord<'a> {
+    schema: &'static str,
+    ts_utc: String,
+    flow: &'static str,
+    phase: &'a str,
+    direction: &'a str,
+    remote_addr: String,
+    transport_mode: &'a str,
+    protocol: Option<&'static str>,
+    protocol_marker: Option<u8>,
+    opcode: Option<u8>,
+    opcode_name: Option<&'static str>,
+    raw_len: Option<usize>,
+    raw_hex: Option<String>,
+    payload_len: Option<usize>,
+    payload_hex: Option<String>,
+    note: Option<String>,
+}
+
+fn ed2k_tcp_dump_file() -> &'static StdMutex<Option<fs::File>> {
+    static DUMP_FILE: OnceLock<StdMutex<Option<fs::File>>> = OnceLock::new();
+    DUMP_FILE.get_or_init(|| {
+        let file = std::env::var("OVERLORD_LOG_DIR")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .and_then(|dir| {
+                fs::create_dir_all(&dir).ok()?;
+                let path = dir.join(format!(
+                    "agent-ed2k-tcp-dump-{}.jsonl",
+                    chrono::Utc::now().format("%Y.%m.%d-%H.%M.%S")
+                ));
+                fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .ok()
+            });
+        StdMutex::new(file)
+    })
+}
+
+fn ed2k_protocol_name(protocol: u8) -> &'static str {
+    match protocol {
+        OP_EDONKEYPROT => "ed2k",
+        OP_EMULEPROT => "emule",
+        OP_PACKEDPROT => "packed",
+        _ => "unknown",
+    }
+}
+
+fn ed2k_opcode_name(protocol: u8, opcode: u8) -> &'static str {
+    match (protocol, opcode) {
+        (OP_EDONKEYPROT, OP_HELLO) => "OP_HELLO",
+        (OP_EDONKEYPROT, OP_HELLOANSWER) => "OP_HELLOANSWER",
+        (OP_EMULEPROT, OP_EMULEINFO) => "OP_EMULEINFO",
+        (OP_EMULEPROT, OP_EMULEINFOANSWER) => "OP_EMULEINFOANSWER",
+        (OP_EMULEPROT, OP_PUBLICKEY) => "OP_PUBLICKEY",
+        (OP_EMULEPROT, OP_SIGNATURE) => "OP_SIGNATURE",
+        (OP_EMULEPROT, OP_SECIDENTSTATE) => "OP_SECIDENTSTATE",
+        (OP_EMULEPROT, OP_FWCHECKUDPREQ) => "OP_FWCHECKUDPREQ",
+        _ => "UNKNOWN",
+    }
+}
+
+fn dump_ed2k_tcp_record(record: &Ed2kTcpDumpRecord<'_>) {
+    let Ok(line) = serde_json::to_string(record) else {
+        return;
+    };
+    let Ok(mut guard) = ed2k_tcp_dump_file().lock() else {
+        return;
+    };
+    let Some(file) = guard.as_mut() else {
+        return;
+    };
+    let _ = writeln!(file, "{line}");
+}
+
+fn dump_ed2k_tcp_helper_meta(
+    remote_addr: SocketAddr,
+    transport_mode: Option<Ed2kTransportMode>,
+    phase: &str,
+    note: impl Into<String>,
+) {
+    let record = Ed2kTcpDumpRecord {
+        schema: "ed2k_tcp_helper_v1",
+        ts_utc: chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        flow: "udp_firewall_check",
+        phase,
+        direction: "meta",
+        remote_addr: remote_addr.to_string(),
+        transport_mode: transport_mode.map_or("unknown", Ed2kTransportMode::as_str),
+        protocol: None,
+        protocol_marker: None,
+        opcode: None,
+        opcode_name: None,
+        raw_len: None,
+        raw_hex: None,
+        payload_len: None,
+        payload_hex: None,
+        note: Some(note.into()),
+    };
+    dump_ed2k_tcp_record(&record);
+}
+
+fn dump_ed2k_tcp_helper_send(
+    remote_addr: SocketAddr,
+    transport_mode: Ed2kTransportMode,
+    phase: &str,
+    bytes: &[u8],
+) {
+    let protocol = bytes.first().copied();
+    let opcode = bytes.get(5).copied();
+    let payload = if bytes.len() > TCP_PACKET_HEADER_LEN {
+        Some(&bytes[TCP_PACKET_HEADER_LEN..])
+    } else {
+        None
+    };
+    let record = Ed2kTcpDumpRecord {
+        schema: "ed2k_tcp_helper_v1",
+        ts_utc: chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        flow: "udp_firewall_check",
+        phase,
+        direction: "send",
+        remote_addr: remote_addr.to_string(),
+        transport_mode: transport_mode.as_str(),
+        protocol: protocol.map(ed2k_protocol_name),
+        protocol_marker: protocol,
+        opcode,
+        opcode_name: protocol.zip(opcode).map(|(p, o)| ed2k_opcode_name(p, o)),
+        raw_len: Some(bytes.len()),
+        raw_hex: Some(hex::encode(bytes)),
+        payload_len: payload.map(<[u8]>::len),
+        payload_hex: payload.map(hex::encode),
+        note: None,
+    };
+    dump_ed2k_tcp_record(&record);
+}
+
+fn dump_ed2k_tcp_helper_recv(
+    remote_addr: SocketAddr,
+    transport_mode: Ed2kTransportMode,
+    phase: &str,
+    packet: &EmuleTcpPacket,
+) {
+    let record = Ed2kTcpDumpRecord {
+        schema: "ed2k_tcp_helper_v1",
+        ts_utc: chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        flow: "udp_firewall_check",
+        phase,
+        direction: "recv",
+        remote_addr: remote_addr.to_string(),
+        transport_mode: transport_mode.as_str(),
+        protocol: Some(ed2k_protocol_name(packet.protocol)),
+        protocol_marker: Some(packet.protocol),
+        opcode: Some(packet.opcode),
+        opcode_name: Some(ed2k_opcode_name(packet.protocol, packet.opcode)),
+        raw_len: Some(TCP_PACKET_HEADER_LEN + packet.payload.len()),
+        raw_hex: Some(hex::encode(encode_packet(
+            packet.protocol,
+            packet.opcode,
+            &packet.payload,
+        ))),
+        payload_len: Some(packet.payload.len()),
+        payload_hex: Some(hex::encode(&packet.payload)),
+        note: None,
+    };
+    dump_ed2k_tcp_record(&record);
+}
+
 /// Result of the agent's active eD2k peer connect path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Ed2kPeerConnectMode {
@@ -337,58 +519,198 @@ impl Ed2kPeerConnectMode {
 
 async fn drive_firewall_helper_hello_exchange(
     transport: &mut Ed2kTransport,
-    helper_addr: SocketAddr,
-    hello_identity: Ed2kHelloIdentity,
+    context: FirewallHelperContext<'_>,
+    peer_secure_ident: &mut Ed2kPeerSecureIdentState,
     timeout: Duration,
 ) -> Result<()> {
-    let hello_packet = encode_hello_request(hello_identity);
+    let hello_packet = encode_hello_request(context.hello_identity);
+    dump_ed2k_tcp_helper_send(
+        context.helper_addr,
+        transport.mode,
+        "hello_request",
+        &hello_packet,
+    );
     tokio::time::timeout(timeout, transport.write_all(&hello_packet))
         .await
-        .with_context(|| format!("timed out sending OP_HELLO to {helper_addr}"))??;
+        .with_context(|| format!("timed out sending OP_HELLO to {}", context.helper_addr))??;
 
-    let kad_udp_port = hello_identity.udp_port;
     let exchange_deadline = tokio::time::Instant::now() + timeout.min(Duration::from_millis(800));
     while tokio::time::Instant::now() < exchange_deadline {
         let remaining = exchange_deadline.saturating_duration_since(tokio::time::Instant::now());
         let packet = match tokio::time::timeout(remaining, transport.read_packet()).await {
             Ok(Ok(Some(packet))) => packet,
-            Ok(Ok(None)) => break,
+            Ok(Ok(None)) => {
+                dump_ed2k_tcp_helper_meta(
+                    context.helper_addr,
+                    Some(transport.mode),
+                    "hello_exchange_closed",
+                    "connection closed before helper hello exchange completed",
+                );
+                break;
+            }
             Ok(Err(error)) if is_connection_shutdown_error(&error) => break,
             Ok(Err(error)) => {
-                return Err(error)
-                    .with_context(|| format!("failed to read eD2k packet from {helper_addr}"));
+                dump_ed2k_tcp_helper_meta(
+                    context.helper_addr,
+                    Some(transport.mode),
+                    "hello_exchange_error",
+                    error.to_string(),
+                );
+                return Err(error).with_context(|| {
+                    format!("failed to read eD2k packet from {}", context.helper_addr)
+                });
             }
             Err(_) => break,
         };
-
-        match (packet.protocol, packet.opcode) {
-            // Helper peers often send OP_EMULEINFO after the hello answer. Reply
-            // here so the firewall-check request reuses a real-looking hello
-            // exchange instead of a single OP_HELLO write followed by an
-            // immediate Kad-specific control packet.
-            (OP_EMULEPROT, OP_EMULEINFO) => {
-                let reply = encode_emule_info_answer(kad_udp_port);
-                transport.write_all(&reply).await.with_context(|| {
-                    format!("failed to send OP_EMULEINFOANSWER to {helper_addr}")
-                })?;
-            }
-            (OP_EDONKEYPROT, OP_HELLO) => {
-                let reply = encode_hello_answer(hello_identity);
-                transport
-                    .write_all(&reply)
-                    .await
-                    .with_context(|| format!("failed to send OP_HELLOANSWER to {helper_addr}"))?;
-            }
-            (OP_EDONKEYPROT, OP_HELLOANSWER)
-            | (OP_EMULEPROT, OP_EMULEINFOANSWER)
-            | (OP_EMULEPROT, OP_SECIDENTSTATE)
-            | (OP_EMULEPROT, OP_PUBLICKEY)
-            | (OP_EMULEPROT, OP_SIGNATURE) => {}
-            _ => break,
+        if !handle_firewall_helper_packet(
+            transport,
+            context,
+            peer_secure_ident,
+            "hello_exchange",
+            packet,
+        )
+        .await?
+        {
+            break;
         }
     }
 
     Ok(())
+}
+
+async fn handle_firewall_helper_packet(
+    transport: &mut Ed2kTransport,
+    context: FirewallHelperContext<'_>,
+    peer_secure_ident: &mut Ed2kPeerSecureIdentState,
+    phase: &str,
+    packet: EmuleTcpPacket,
+) -> Result<bool> {
+    dump_ed2k_tcp_helper_recv(context.helper_addr, transport.mode, phase, &packet);
+
+    match (packet.protocol, packet.opcode) {
+        (OP_EDONKEYPROT, OP_HELLO) => {
+            let is_mule_hello = is_mule_hello(&packet.payload)?;
+            let reply = encode_hello_answer(context.hello_identity);
+            dump_ed2k_tcp_helper_send(context.helper_addr, transport.mode, "hello_answer", &reply);
+            transport.write_all(&reply).await.with_context(|| {
+                format!("failed to send OP_HELLOANSWER to {}", context.helper_addr)
+            })?;
+            if is_mule_hello && !peer_secure_ident.requested_peer_key {
+                let request = begin_secure_ident_probe(peer_secure_ident);
+                dump_ed2k_tcp_helper_send(
+                    context.helper_addr,
+                    transport.mode,
+                    "secure_ident_probe",
+                    &request,
+                );
+                transport.write_all(&request).await.with_context(|| {
+                    format!("failed to send OP_SECIDENTSTATE to {}", context.helper_addr)
+                })?;
+            }
+        }
+        (OP_EDONKEYPROT, OP_HELLOANSWER) => {
+            // Oracle behavior: a mule-style HELLOANSWER already satisfies the
+            // "both info packets received" gate, so the helper immediately
+            // starts secure-ident before it sends OP_FWCHECKUDPREQ.
+            let is_mule_hello = is_mule_hello_answer(&packet.payload)?;
+            if is_mule_hello && !peer_secure_ident.requested_peer_key {
+                let request = begin_secure_ident_probe(peer_secure_ident);
+                dump_ed2k_tcp_helper_send(
+                    context.helper_addr,
+                    transport.mode,
+                    "secure_ident_probe",
+                    &request,
+                );
+                transport.write_all(&request).await.with_context(|| {
+                    format!("failed to send OP_SECIDENTSTATE to {}", context.helper_addr)
+                })?;
+            }
+        }
+        (OP_EMULEPROT, OP_EMULEINFO) => {
+            let reply = encode_emule_info_answer(context.kad_udp_port);
+            dump_ed2k_tcp_helper_send(
+                context.helper_addr,
+                transport.mode,
+                "emule_info_answer",
+                &reply,
+            );
+            transport.write_all(&reply).await.with_context(|| {
+                format!(
+                    "failed to send OP_EMULEINFOANSWER to {}",
+                    context.helper_addr
+                )
+            })?;
+        }
+        (OP_EMULEPROT, OP_EMULEINFOANSWER) => {}
+        (OP_EMULEPROT, OP_SECIDENTSTATE) => {
+            let (state, challenge) = decode_secident_state(&packet.payload)?;
+            peer_secure_ident.peer_challenge_from = Some(challenge);
+            if state != 0 {
+                peer_secure_ident.pending_signature = true;
+            }
+            if state == ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED {
+                let public_key = encode_packet(
+                    OP_EMULEPROT,
+                    OP_PUBLICKEY,
+                    &context.secure_ident.public_key_payload()?,
+                );
+                dump_ed2k_tcp_helper_send(
+                    context.helper_addr,
+                    transport.mode,
+                    "public_key",
+                    &public_key,
+                );
+                transport.write_all(&public_key).await.with_context(|| {
+                    format!("failed to send OP_PUBLICKEY to {}", context.helper_addr)
+                })?;
+            }
+            if !try_send_secure_ident_signature(
+                transport,
+                context.helper_addr,
+                context.secure_ident,
+                peer_secure_ident,
+            )
+            .await?
+                && state == ED2K_SECURE_IDENT_SIGNATURE_NEEDED
+                && !peer_secure_ident.requested_peer_key
+            {
+                let challenge_for = random_nonzero_u32();
+                peer_secure_ident.challenge_for = Some(challenge_for);
+                peer_secure_ident.pending_signature = true;
+                peer_secure_ident.requested_peer_key = true;
+                let request = encode_secident_state(
+                    ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED,
+                    challenge_for,
+                );
+                dump_ed2k_tcp_helper_send(
+                    context.helper_addr,
+                    transport.mode,
+                    "secure_ident_probe",
+                    &request,
+                );
+                transport.write_all(&request).await.with_context(|| {
+                    format!(
+                        "failed to send fallback OP_SECIDENTSTATE to {}",
+                        context.helper_addr
+                    )
+                })?;
+            }
+        }
+        (OP_EMULEPROT, OP_PUBLICKEY) => {
+            peer_secure_ident.peer_public_key = Some(decode_public_key_payload(&packet.payload)?);
+            let _ = try_send_secure_ident_signature(
+                transport,
+                context.helper_addr,
+                context.secure_ident,
+                peer_secure_ident,
+            )
+            .await?;
+        }
+        (OP_EMULEPROT, OP_SIGNATURE) => {}
+        _ => return Ok(false),
+    }
+
+    Ok(true)
 }
 
 /// Send one `OP_FWCHECKUDPREQ` to a helper peer over eD2k TCP.
@@ -396,10 +718,11 @@ pub async fn request_udp_firewall_check(
     bind_ip: Ipv4Addr,
     helper_addr: SocketAddr,
     hello_identity: Ed2kHelloIdentity,
+    secure_ident: Arc<Ed2kSecureIdent>,
     request: FirewallCheckUdpRequest,
     timeout: Duration,
 ) -> Result<()> {
-    let mut transport = Ed2kTransport::connect_outgoing(
+    let mut transport = match Ed2kTransport::connect_outgoing(
         bind_ip,
         helper_addr,
         hello_identity.connect_options,
@@ -407,11 +730,43 @@ pub async fn request_udp_firewall_check(
         None,
         timeout,
     )
+    .await
+    {
+        Ok(transport) => transport,
+        Err(error) => {
+            dump_ed2k_tcp_helper_meta(helper_addr, None, "connect_error", error.to_string());
+            return Err(error);
+        }
+    };
+    dump_ed2k_tcp_helper_meta(
+        helper_addr,
+        Some(transport.mode),
+        "connect_ok",
+        format!(
+            "client_id={} server_ip={} server_port={} direct_udp_callback={}",
+            hello_identity.client_id,
+            Ipv4Addr::from(hello_identity.server_ip.to_le_bytes()),
+            hello_identity.server_port,
+            hello_identity.direct_udp_callback
+        ),
+    );
+    let helper_context = FirewallHelperContext {
+        helper_addr,
+        hello_identity,
+        kad_udp_port: hello_identity.udp_port,
+        secure_ident: &secure_ident,
+    };
+    let mut peer_secure_ident = Ed2kPeerSecureIdentState::default();
+    drive_firewall_helper_hello_exchange(
+        &mut transport,
+        helper_context,
+        &mut peer_secure_ident,
+        timeout,
+    )
     .await?;
-    drive_firewall_helper_hello_exchange(&mut transport, helper_addr, hello_identity, timeout)
-        .await?;
     let payload = request.encode();
     let packet = encode_packet(OP_EMULEPROT, OP_FWCHECKUDPREQ, &payload);
+    dump_ed2k_tcp_helper_send(helper_addr, transport.mode, "fwcheck_request", &packet);
     tokio::time::timeout(timeout, transport.write_all(&packet))
         .await
         .with_context(|| format!("timed out sending OP_FWCHECKUDPREQ to {helper_addr}"))??;
@@ -419,7 +774,45 @@ pub async fn request_udp_firewall_check(
     // Keep the helper TCP session around briefly so peers that finish their
     // hello side channel after receiving the request do not see an immediate
     // disconnect before scheduling the UDP callback.
-    let _ = tokio::time::timeout(Duration::from_millis(500), transport.read_packet()).await;
+    let post_fwcheck_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < post_fwcheck_deadline {
+        let remaining =
+            post_fwcheck_deadline.saturating_duration_since(tokio::time::Instant::now());
+        let packet = match tokio::time::timeout(remaining, transport.read_packet()).await {
+            Ok(Ok(Some(packet))) => packet,
+            Ok(Ok(None)) => {
+                dump_ed2k_tcp_helper_meta(
+                    helper_addr,
+                    Some(transport.mode),
+                    "post_fwcheck_closed",
+                    "connection closed after firewall request",
+                );
+                break;
+            }
+            Ok(Err(error)) if is_connection_shutdown_error(&error) => break,
+            Ok(Err(error)) => {
+                dump_ed2k_tcp_helper_meta(
+                    helper_addr,
+                    Some(transport.mode),
+                    "post_fwcheck_error",
+                    error.to_string(),
+                );
+                break;
+            }
+            Err(_) => break,
+        };
+        if !handle_firewall_helper_packet(
+            &mut transport,
+            helper_context,
+            &mut peer_secure_ident,
+            "post_fwcheck",
+            packet,
+        )
+        .await?
+        {
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -941,11 +1334,11 @@ fn decode_hello_tag(mut bytes: &[u8]) -> Result<(Option<u8>, &[u8])> {
     Ok((tag_name, remaining))
 }
 
-fn is_mule_hello(payload: &[u8]) -> Result<bool> {
-    if payload.len() < 1 + 16 + 4 + 2 + 4 {
-        anyhow::bail!("short eD2k OP_HELLO payload");
+fn is_mule_hello_type_payload(payload: &[u8]) -> Result<bool> {
+    if payload.len() < 16 + 4 + 2 + 4 {
+        anyhow::bail!("short eD2k hello-type payload");
     }
-    let mut cursor = &payload[1 + 16 + 4 + 2..];
+    let mut cursor = &payload[16 + 4 + 2..];
     let tag_count = usize::try_from(u32::from_le_bytes(cursor[..4].try_into().unwrap()))
         .context("eD2k hello tag count overflow")?;
     cursor = &cursor[4..];
@@ -959,6 +1352,17 @@ fn is_mule_hello(payload: &[u8]) -> Result<bool> {
     }
 
     Ok(false)
+}
+
+fn is_mule_hello(payload: &[u8]) -> Result<bool> {
+    if payload.len() < 1 + 16 + 4 + 2 + 4 {
+        anyhow::bail!("short eD2k OP_HELLO payload");
+    }
+    is_mule_hello_type_payload(&payload[1..])
+}
+
+fn is_mule_hello_answer(payload: &[u8]) -> Result<bool> {
+    is_mule_hello_type_payload(payload)
 }
 
 fn build_hello_responses(
@@ -2284,14 +2688,24 @@ mod tests {
             let emule_info = encode_emule_info_request(46673);
             stream.write_all(&emule_info).await.unwrap();
 
-            let emule_info_answer = read_packet(&mut stream).await;
-            assert_eq!(emule_info_answer[0], OP_EMULEPROT);
-            assert_eq!(emule_info_answer[5], OP_EMULEINFOANSWER);
-
-            let fwcheck = read_packet(&mut stream).await;
-            assert_eq!(fwcheck[0], OP_EMULEPROT);
-            assert_eq!(fwcheck[5], OP_FWCHECKUDPREQ);
-            fwcheck
+            let mut saw_emule_info_answer = false;
+            let mut fwcheck = None;
+            for _ in 0..3 {
+                let packet = read_packet(&mut stream).await;
+                match (packet[0], packet[5]) {
+                    (OP_EMULEPROT, OP_SECIDENTSTATE) => {}
+                    (OP_EMULEPROT, OP_EMULEINFOANSWER) => {
+                        saw_emule_info_answer = true;
+                    }
+                    (OP_EMULEPROT, OP_FWCHECKUDPREQ) => {
+                        fwcheck = Some(packet);
+                        break;
+                    }
+                    other => panic!("unexpected helper packet {:?}", other),
+                }
+            }
+            assert!(saw_emule_info_answer);
+            fwcheck.expect("expected OP_FWCHECKUDPREQ after hello exchange")
         });
 
         request_udp_firewall_check(
@@ -2307,6 +2721,10 @@ mod tests {
                 connect_options: emule_connect_options(false),
                 direct_udp_callback: false,
             },
+            Arc::new(
+                Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+                    .unwrap(),
+            ),
             FirewallCheckUdpRequest {
                 internal_udp_port: 41000,
                 external_udp_port: 41000,

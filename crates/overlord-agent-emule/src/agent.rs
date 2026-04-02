@@ -67,7 +67,7 @@ use crate::ed2k_server::{
 };
 use crate::ed2k_tcp::{
     Ed2kHelloIdentity, Ed2kSecureIdent, FirewallCheckUdpRequest, emule_connect_options,
-    request_udp_firewall_check, run_ed2k_listener,
+    enrich_hello_identity, request_udp_firewall_check, run_ed2k_listener,
 };
 use crate::kad_firewall::{FirewallUdpPacketOutcome, FirewalledResponseOutcome, KadFirewallState};
 use crate::kad_store::{KadLocalStore, KadLocalStoreConfig};
@@ -5250,6 +5250,8 @@ impl OverlordAgentEmule {
         let nat = Arc::clone(&runtime.nat);
         let shutdown = Arc::clone(&runtime.shutdown);
         let kad_firewall = Arc::clone(&runtime.kad_firewall);
+        let ed2k_server_state = Arc::clone(&runtime.ed2k_server_state);
+        let ed2k_secure_ident = Arc::clone(&runtime.ed2k_secure_ident);
         let udp_firewall_check_enabled = config.p2p.kad.udp_firewall_check_enabled;
         let udp_firewall_recheck_interval =
             Duration::from_secs(config.p2p.kad.udp_firewall_recheck_interval_secs.max(1));
@@ -5288,6 +5290,25 @@ impl OverlordAgentEmule {
                         continue;
                     }
                 };
+                let helper_hello_identity = enrich_hello_identity(
+                    ed2k_hello_identity,
+                    &ed2k_server_state,
+                    &kad_firewall,
+                )
+                .await;
+                if helper_hello_identity.client_id == 0
+                    || helper_hello_identity.server_ip == 0
+                    || helper_hello_identity.server_port == 0
+                {
+                    debug!(
+                        "kad firewall-check skipped: ED2K helper hello not ready client_id={} server_ip={} server_port={}",
+                        helper_hello_identity.client_id,
+                        Ipv4Addr::from(helper_hello_identity.server_ip.to_le_bytes()),
+                        helper_hello_identity.server_port
+                    );
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
                 let helper_contacts =
                     match select_udp_firewall_helpers(&dht, udp_firewall_check_contact_count).await
                     {
@@ -5330,6 +5351,13 @@ impl OverlordAgentEmule {
                     internal_udp_port,
                     external_udp_port
                 );
+                debug!(
+                    "kad udp firewall-check helper hello client_id={} server_ip={} server_port={} direct_udp_callback={}",
+                    helper_hello_identity.client_id,
+                    Ipv4Addr::from(helper_hello_identity.server_ip.to_le_bytes()),
+                    helper_hello_identity.server_port,
+                    helper_hello_identity.direct_udp_callback
+                );
 
                 let mut request_tasks = Vec::with_capacity(helper_contacts.len());
                 for contact in helper_contacts {
@@ -5340,11 +5368,13 @@ impl OverlordAgentEmule {
                         external_udp_port,
                         sender_udp_key: dht.verify_key_for_ip(contact.ip),
                     };
+                    let secure_ident = Arc::clone(&ed2k_secure_ident);
                     request_tasks.push(tokio::spawn(async move {
                         let result = request_udp_firewall_check(
                             bind_ip,
                             helper_addr,
-                            ed2k_hello_identity,
+                            helper_hello_identity,
+                            secure_ident,
                             request,
                             udp_firewall_check_timeout,
                         )
