@@ -448,9 +448,10 @@ Coordinator/Agent       US                          CLOSE_N
        | note: Result cap: 1000 notes results.           |
        |       Timeout: SEARCH_TIMEOUT_SECS = 45 s.      |
        |                                                 |
-       | CURRENT STATUS: notes search is wired at the   |
-       | DHT layer but agent.rs still rejects coordinator|
-       | -triggered notes searches ("not wired yet").    |
+       | CURRENT STATUS: active Kad notes search now     |
+       | runs end to end through the coordinator and     |
+       | agent runtime; the remaining gap is that note   |
+       | results still collapse into file-centric output.|
 ```
 
 ---

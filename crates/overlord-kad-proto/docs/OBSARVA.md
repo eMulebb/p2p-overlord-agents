@@ -535,11 +535,11 @@ Both may emit multiple `KADEMLIA2_SEARCH_RES` packets per request. Status: `Equi
 
 Rust status: The Rust runtime accepts configurable caps (keyword: 5000, source: 1000, notes: 1000) and does not enforce byte-budget fragmentation on the receive path. Status: `Repo policy`. The Overlord runtime is optimized for broad collection and later filtering rather than interactive client-style small result windows.
 
-### 7.8 Notes Search End-to-End Wiring
+### 7.8 Notes Search End-to-End Validation
 
-Status: **Pending parity gap**.
+Status: **Equivalent behavior, remaining modeling gap**.
 
-`overlord-kad-dht/src/traversal.rs` emits `SearchNotesReq { target, size }`, matching oracle wire shape. However, `overlord-agent-emule/src/agent.rs` currently rejects coordinator-triggered notes searches with `notes search is not wired yet`. The DHT path exists but is not reachable end-to-end from the agent runtime.
+`overlord-kad-dht/src/traversal.rs` emits `SearchNotesReq { target, size }`, matching oracle wire shape, and `overlord-agent-emule/src/agent.rs` now dispatches coordinator-triggered Kad notes searches through the live runtime. Real-network validation on April 2, 2026 confirmed the coordinator accepted a notes job, the agent emitted `KADEMLIA2_SEARCH_NOTES_REQ` on the wire, and the job completed cleanly. The remaining gap is on the coordinator side: notes are still projected into file-centric `SearchResult` / `FileRecord` views, so distinct note authors would collapse onto one file record for the same file hash.
 
 ---
 
@@ -707,7 +707,7 @@ Ranked by severity for live network interoperability.
 | 4 | **Packet-tracking live validation** | Oracle-shaped per-opcode packet tracking is now in place, but live acceptance still needs repeated validation against the oracle with the new tracker counters and drop reasons. | Medium |
 | 5 | **Zone split `can_split` condition** | Rust uses `on_own_side` which is not the same predicate as oracle `zone_index < KK`. Routing topology diverges under load. | Medium |
 | 6 | **Per-bin `/24` subnet cap** | `RoutingBin` missing oracle two-per-`/24` anti-clustering limit. Global limits are correct; per-bucket granularity is weaker. | Medium |
-| 7 | **Notes search end-to-end wiring** | DHT path (`traversal.rs`) exists and is wire-correct, but `agent.rs` rejects coordinator-triggered notes searches. | Medium |
+| 7 | **Kad notes result modeling** | Active Kad notes search is wired and live-validated, but coordinator result storage is still file-centric. Distinct note authors for the same file would collapse into one `FileRecord`. | Medium |
 | 8 | **`SearchRes.keyword_id` naming** | Misleading field name — the echoed target is not keyword-specific. Wire is correct; maintenance hazard. | Low (naming only) |
 | 9 | **Keyword expression serialization** | `start_position=0` only. Oracle expression-tree mode (`0x8000`) and numeric pagination not yet implemented. | Low |
 | 10 | **Source publish encryption and buddy tags** | Not audited against oracle send path for encryption capability tags and buddy/callback tag handling. | Low |
