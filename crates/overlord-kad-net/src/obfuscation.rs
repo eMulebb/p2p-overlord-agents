@@ -190,9 +190,9 @@ fn select_marker(mode: KadKeyMode) -> u8 {
 /// Oracle-shaped Kad UDP obfuscation layer.
 ///
 /// This mirrors the Kad branch of eMule/aMule `EncryptedDatagramSocket`:
-/// whenever we know the peer Kad ID we keep preferring NodeID-based
-/// obfuscation, and only fall back to the receiver verify key when the Kad ID
-/// is unavailable.
+/// once a peer verify key is known we prefer it for both requests and
+/// responses, and only fall back to NodeID-based request obfuscation when the
+/// peer has not completed the HELLO-driven key exchange yet.
 pub struct ObfuscationLayer {
     our_node_id: NodeId,
     our_udp_key: u32,
@@ -270,16 +270,12 @@ impl ObfuscationLayer {
         let peer = self.peer_state_for_addr(addr);
         let mode = if !self.enabled {
             OutboundKadEncryptionMode::Plaintext
-        } else if is_response_opcode(opcode_value) {
-            if peer.receiver_verify_key.is_some() {
-                OutboundKadEncryptionMode::ReceiverVerifyKey
-            } else {
-                OutboundKadEncryptionMode::Plaintext
-            }
-        } else if can_use_node_id_mode(&peer) {
-            OutboundKadEncryptionMode::NodeId
         } else if peer.receiver_verify_key.is_some() {
             OutboundKadEncryptionMode::ReceiverVerifyKey
+        } else if is_response_opcode(opcode_value) {
+            OutboundKadEncryptionMode::Plaintext
+        } else if can_use_node_id_mode(&peer) {
+            OutboundKadEncryptionMode::NodeId
         } else {
             OutboundKadEncryptionMode::Plaintext
         };
@@ -303,8 +299,9 @@ impl ObfuscationLayer {
     /// The caller still passes the opcode for tracing/call-site symmetry, but
     /// the oracle sender chooses transport shape from the packet direction and
     /// peer capability state:
-    /// request opcodes can use NodeID-based obfuscation for Kad `v6+` peers,
-    /// while response opcodes use the receiver verify key when available.
+    /// once a peer verify key is known it is preferred for both requests and
+    /// responses, while requests can fall back to NodeID-based obfuscation for
+    /// Kad `v6+` peers that have not completed the verify-key exchange yet.
     pub fn encrypt(&self, addr: SocketAddr, opcode_value: u8, plaintext: &[u8]) -> Vec<u8> {
         let outbound = self.inspect_outbound(addr, opcode_value);
         if matches!(outbound.mode, OutboundKadEncryptionMode::Plaintext) {
@@ -570,6 +567,29 @@ mod tests {
 
         let plaintext = vec![OP_KADEMLIAHEADER, opcode::PUBLISH_RES, 0xAA, 0x55];
         let encrypted = sender.encrypt(receiver_addr(), opcode::PUBLISH_RES, &plaintext);
+
+        assert_eq!(encrypted[0] & 0x03, KAD_MARKER_RECEIVER_KEY);
+
+        let decrypted = receiver.decrypt(sender_addr(), &encrypted);
+        assert!(decrypted.was_obfuscated);
+        assert_eq!(decrypted.data, plaintext);
+    }
+
+    #[test]
+    fn test_request_opcodes_prefer_receiver_key_once_known() {
+        let sender = ObfuscationLayer::new(NodeId::from_bytes([0x15; 16]), 0xAABB_CCDD, true);
+        let receiver = ObfuscationLayer::new(NodeId::from_bytes([0x26; 16]), 0x1122_3344, true);
+        let sender_ip = match sender_addr().ip() {
+            IpAddr::V4(ip) => ip,
+            IpAddr::V6(_) => unreachable!(),
+        };
+
+        sender.register_peer_identity(receiver_addr(), receiver.our_node_id);
+        sender.register_peer_version(receiver_addr(), 8);
+        sender.register_peer_key(receiver_addr(), receiver.verify_key_for_ip(sender_ip));
+
+        let plaintext = vec![OP_KADEMLIAHEADER, opcode::SEARCH_KEY_REQ, 0xAA, 0x55];
+        let encrypted = sender.encrypt(receiver_addr(), opcode::SEARCH_KEY_REQ, &plaintext);
 
         assert_eq!(encrypted[0] & 0x03, KAD_MARKER_RECEIVER_KEY);
 

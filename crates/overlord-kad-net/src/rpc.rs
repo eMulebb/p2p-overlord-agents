@@ -510,7 +510,8 @@ impl RpcManager {
         self.inner.obfuscation.receiver_verify_key_for_addr(addr)
     }
 
-    /// Register a peer's Kad node ID for NodeID-based request obfuscation.
+    /// Register a peer's Kad node ID for request-obfuscation fallback when no
+    /// receiver verify key is known yet.
     pub fn register_peer_identity(&self, addr: SocketAddr, node_id: overlord_kad_proto::NodeId) {
         self.inner.obfuscation.register_peer_identity(addr, node_id);
     }
@@ -693,12 +694,14 @@ fn outbound_transport_reason(
     outbound: crate::obfuscation::OutboundKadEncryptionInfo,
 ) -> &'static str {
     match outbound.mode {
-        crate::obfuscation::OutboundKadEncryptionMode::NodeId => "node_id_available",
+        crate::obfuscation::OutboundKadEncryptionMode::NodeId => {
+            "node_id_fallback_without_receiver_verify_key"
+        }
         crate::obfuscation::OutboundKadEncryptionMode::ReceiverVerifyKey => {
             if is_response_opcode(opcode_value) {
                 "reply_uses_receiver_verify_key"
             } else {
-                "receiver_verify_key_fallback"
+                "request_prefers_receiver_verify_key"
             }
         }
         crate::obfuscation::OutboundKadEncryptionMode::Plaintext => {
@@ -1108,6 +1111,85 @@ mod tests {
         let outgoing = transport.drain_outgoing();
         assert_eq!(outgoing.len(), 1);
         assert_eq!(outgoing[0].0, peer_addr);
+        assert_ne!(outgoing[0].1[0], overlord_kad_proto::OP_KADEMLIAHEADER);
+    }
+
+    #[tokio::test]
+    async fn test_obfuscated_hello_response_registers_receiver_key_for_future_requests() {
+        let transport = Arc::new(MockTransport::new(make_local_addr()));
+        let inject_tx = transport.injector();
+        let local_node_id = NodeId::from_bytes([0xAA; 16]);
+        let local_udp_key = 0x1234_5678;
+        let rpc = make_rpc_with_shared_transport(
+            Arc::clone(&transport),
+            ObfuscationLayer::new(local_node_id, local_udp_key, true),
+        );
+        let mut subscriber = rpc.subscribe();
+        let _handle = rpc.start();
+
+        let peer_addr = make_peer_addr();
+        let peer_node_id = NodeId::from_bytes([0x44; 16]);
+        let peer_udp_key = 0x5566_7788;
+        let peer_obfuscation = ObfuscationLayer::new(peer_node_id, peer_udp_key, true);
+        let local_addr = make_local_addr();
+        peer_obfuscation.register_peer_identity(local_addr, local_node_id);
+        peer_obfuscation.register_peer_version(local_addr, 8);
+        let local_ip = match local_addr.ip() {
+            std::net::IpAddr::V4(ip) => ip,
+            std::net::IpAddr::V6(_) => unreachable!(),
+        };
+        let peer_ip = match peer_addr.ip() {
+            std::net::IpAddr::V4(ip) => ip,
+            std::net::IpAddr::V6(_) => unreachable!(),
+        };
+        peer_obfuscation.register_peer_key(local_addr, rpc.verify_key_for_ip(peer_ip));
+
+        rpc.send(
+            peer_addr,
+            &KadPacket::HelloReq(overlord_kad_proto::HelloReq {
+                node_id: local_node_id,
+                tcp_port: 4662,
+                version: 8,
+                tags: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        transport.drain_outgoing();
+
+        let hello_res = KadPacket::HelloRes(overlord_kad_proto::HelloRes {
+            node_id: peer_node_id,
+            tcp_port: 4662,
+            version: 8,
+            tags: Vec::new(),
+        });
+        let encoded_hello_res = hello_res.encode().unwrap();
+        let encrypted_hello_res =
+            peer_obfuscation.encrypt(local_addr, opcode::HELLO_RES, &encoded_hello_res);
+        let _ = inject_tx.send((encrypted_hello_res, peer_addr)).await;
+
+        let received = tokio::time::timeout(Duration::from_secs(1), subscriber.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(received.packet, KadPacket::HelloRes(_)));
+        assert!(received.was_obfuscated);
+        assert_eq!(
+            received.sender_verify_key,
+            Some(peer_obfuscation.verify_key_for_ip(local_ip))
+        );
+
+        let search = KadPacket::SearchKeyReq(overlord_kad_proto::SearchKeyReq {
+            target: NodeId::from_bytes([0x55; 16]),
+            start_position: 0,
+            restrictive_payload: Vec::new(),
+        });
+        rpc.send(peer_addr, &search).await.unwrap();
+
+        let outgoing = transport.drain_outgoing();
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0].0, peer_addr);
+        assert_eq!(outgoing[0].1[0] & 0x03, 0x02);
         assert_ne!(outgoing[0].1[0], overlord_kad_proto::OP_KADEMLIAHEADER);
     }
 }

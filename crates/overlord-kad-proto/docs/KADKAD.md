@@ -413,7 +413,7 @@ Most modern nodes on the live network use obfuscation. Without it, many nodes wi
 
 - Default: **enabled**
 - Config: `[obfuscation] enabled = true`
-- When enabled: the current Rust runtime now follows the oracle Kad UDP key schedule more closely. Request packets prefer NodeID-based obfuscation, reply packets prefer the receiver verify key learned from prior obfuscated traffic, and inbound packets are tried as obfuscated first before falling back to plain decode.
+- When enabled: the current Rust runtime now follows the oracle Kad UDP key schedule more closely. Once a peer verify key is known, both request and reply packets prefer that receiver verify key; request packets only fall back to NodeID-based obfuscation while HELLO-driven key exchange is still incomplete, and inbound packets are tried as obfuscated first before falling back to plain decode.
 - When disabled: plain packets only (useful for debugging, Wireshark capture)
 
 ### Key Negotiation

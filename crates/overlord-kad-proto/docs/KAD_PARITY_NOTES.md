@@ -4,6 +4,9 @@ Running note for Kad oracle-parity findings that affect live behavior.
 
 ## 2026-03-24
 
+- Transport parity adjustment landed in `overlord-kad-net`:
+  - once a peer UDP verify key is known from HELLO or stored `nodes.dat` state, outbound Kad requests now prefer that receiver verify key instead of continuing to prefer NodeID-mode obfuscation
+  - NodeID-mode request obfuscation remains the fallback for peers that have identity context but have not completed verify-key exchange yet
 - Passive source replay is an Overlord-only indexing feature.
 - eMule remains the oracle for the underlying Kad source-search walk once a replayed query is emitted.
 - Verified from eMule `kademlia/kademlia/Search.cpp` and `SearchManager.cpp`:
