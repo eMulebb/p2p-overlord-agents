@@ -329,7 +329,7 @@ Status: `Equivalent behavior`.
 
 **`KADEMLIA_FIREWALLED_ACK_RES` (`0x59`)** and **`KADEMLIA2_FIREWALLUDP` (`0x62`)**
 
-Both are implemented with correct wire shapes. The current Rust runtime actively uses the firewall probe and `FIREWALLUDP` flows, but the larger firewall-plus-buddy state machine is still not at full oracle parity.
+Both are implemented with correct wire shapes. The current Rust runtime actively uses the firewalled probe flow, and it has a concrete `FIREWALLUDP` code path, but the April 2, 2026 firewalled parity JSONL runs still did not exercise `FIREWALLUDP` on the Rust side while the oracle did. The larger firewall-plus-buddy state machine is therefore still not at full oracle parity.
 
 ---
 

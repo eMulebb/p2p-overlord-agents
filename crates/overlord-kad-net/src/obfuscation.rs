@@ -7,7 +7,7 @@
 
 use md5::compute as md5_compute;
 use overlord_kad_proto::NodeId;
-use overlord_kad_proto::constants::{OP_KADEMLIAHEADER, OP_KADEMLIAPACKEDPROT};
+use overlord_kad_proto::constants::{OP_KADEMLIAHEADER, OP_KADEMLIAPACKEDPROT, opcode};
 use rand::Rng;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -47,6 +47,13 @@ pub struct DecryptResult {
 
 fn can_use_node_id_mode(peer: &ResolvedPeerCryptoState) -> bool {
     peer.node_id.is_some() && peer.kad_version.is_none_or(|version| version >= 6)
+}
+
+fn should_prefer_receiver_verify_key(opcode_value: u8) -> bool {
+    // Firewalled recheck requests are an oracle exception to the usual
+    // NodeID-first request rule: once we learned the peer's receiver verify
+    // key, eMule sends KADEMLIA2_FIREWALLED2_REQ in receiver-key mode.
+    opcode_value == opcode::FIREWALLED2_REQ
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,11 +262,15 @@ impl ObfuscationLayer {
     pub fn inspect_outbound(
         &self,
         addr: SocketAddr,
-        _opcode_value: u8,
+        opcode_value: u8,
     ) -> OutboundKadEncryptionInfo {
         let peer = self.peer_state_for_addr(addr);
         let mode = if !self.enabled {
             OutboundKadEncryptionMode::Plaintext
+        } else if should_prefer_receiver_verify_key(opcode_value)
+            && peer.receiver_verify_key.is_some()
+        {
+            OutboundKadEncryptionMode::ReceiverVerifyKey
         } else if can_use_node_id_mode(&peer) {
             OutboundKadEncryptionMode::NodeId
         } else if peer.receiver_verify_key.is_some() {
@@ -287,8 +298,10 @@ impl ObfuscationLayer {
     /// The caller still passes the opcode for tracing/call-site symmetry, but
     /// the oracle sender chooses transport shape from peer capability state:
     /// NodeID remains the primary Kad crypt target for peers that advertised a
-    /// usable Kad `v6+` identity, and the receiver verify key is only used when
-    /// that NodeID context is missing.
+    /// usable Kad `v6+` identity, except for the firewalled recheck request
+    /// family where live oracle traces prefer the learned receiver verify key.
+    /// Other request families still only use the receiver verify key when the
+    /// NodeID context is missing.
     pub fn encrypt(&self, addr: SocketAddr, opcode_value: u8, plaintext: &[u8]) -> Vec<u8> {
         let outbound = self.inspect_outbound(addr, opcode_value);
         if matches!(outbound.mode, OutboundKadEncryptionMode::Plaintext) {
@@ -579,6 +592,29 @@ mod tests {
         let encrypted = sender.encrypt(receiver_addr(), opcode::SEARCH_KEY_REQ, &plaintext);
 
         assert_ne!(encrypted[0] & 0x03, KAD_MARKER_RECEIVER_KEY);
+
+        let decrypted = receiver.decrypt(sender_addr(), &encrypted);
+        assert!(decrypted.was_obfuscated);
+        assert_eq!(decrypted.data, plaintext);
+    }
+
+    #[test]
+    fn test_firewalled2_req_prefers_receiver_key_when_available() {
+        let sender = ObfuscationLayer::new(NodeId::from_bytes([0x35; 16]), 0xAABB_CCDD, true);
+        let receiver = ObfuscationLayer::new(NodeId::from_bytes([0x46; 16]), 0x1122_3344, true);
+        let sender_ip = match sender_addr().ip() {
+            IpAddr::V4(ip) => ip,
+            IpAddr::V6(_) => unreachable!(),
+        };
+
+        sender.register_peer_identity(receiver_addr(), receiver.our_node_id);
+        sender.register_peer_version(receiver_addr(), 8);
+        sender.register_peer_key(receiver_addr(), receiver.verify_key_for_ip(sender_ip));
+
+        let plaintext = vec![OP_KADEMLIAHEADER, opcode::FIREWALLED2_REQ, 0xAA, 0x55];
+        let encrypted = sender.encrypt(receiver_addr(), opcode::FIREWALLED2_REQ, &plaintext);
+
+        assert_eq!(encrypted[0] & 0x03, KAD_MARKER_RECEIVER_KEY);
 
         let decrypted = receiver.decrypt(sender_addr(), &encrypted);
         assert!(decrypted.was_obfuscated);

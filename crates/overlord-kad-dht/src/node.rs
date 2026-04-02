@@ -324,6 +324,25 @@ impl DhtNode {
         Ok(())
     }
 
+    /// Send one Kad request and wait for the exact response opcode.
+    ///
+    /// This is the transport-level escape hatch for protocol families such as
+    /// HELLO-adjacent firewall checks where the caller needs the typed response
+    /// packet rather than the higher-level traversal/search abstractions.
+    pub async fn request_packet(
+        &self,
+        addr: SocketAddr,
+        packet: &KadPacket,
+        expected_opcode: u8,
+        timeout: Duration,
+    ) -> Result<KadPacket, DhtError> {
+        Ok(self
+            .inner
+            .rpc
+            .request(addr, packet, expected_opcode, timeout)
+            .await?)
+    }
+
     /// Register a peer's announced receiver verify key for obfuscated replies.
     pub fn register_peer_key(&self, addr: SocketAddr, udp_key: u32) {
         self.inner.rpc.register_peer_key(addr, udp_key);

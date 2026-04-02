@@ -53,7 +53,10 @@ use overlord_kad_dht::{
 };
 use overlord_kad_proto::{
     Ed2kHash, KadPacket, KadUdpKey, NodeId, SearchKeyReq, SearchNotesReq, SearchSourceReq, Tag,
-    TagName, TagValue, constants::K, packet::ContactEntry, tag_name,
+    TagName, TagValue,
+    constants::{K, opcode},
+    packet::ContactEntry,
+    tag_name,
 };
 use overlord_kad_routing::Contact;
 
@@ -66,7 +69,7 @@ use crate::ed2k_tcp::{
     Ed2kHelloIdentity, Ed2kSecureIdent, FirewallCheckUdpRequest, emule_connect_options,
     request_udp_firewall_check, run_ed2k_listener,
 };
-use crate::kad_firewall::{FirewallUdpPacketOutcome, KadFirewallState};
+use crate::kad_firewall::{FirewallUdpPacketOutcome, FirewalledResponseOutcome, KadFirewallState};
 use crate::kad_store::{KadLocalStore, KadLocalStoreConfig};
 use crate::logging::current_log_file_status;
 use crate::snoop_queue::{ScheduledSnoopRequest, SnoopQueue, SnoopQueueFamilyCounts};
@@ -100,6 +103,7 @@ const KAD_HELLO_INTRO_FANOUT: usize = 24;
 const EMULE_LARGE_FILE_SIZE_THRESHOLD: u64 = u32::MAX as u64;
 const LOCAL_SEARCH_RESPONSE_LIMIT: usize = 64;
 const FIREWALLED_TCP_PROBE_TIMEOUT_SECS: u64 = 5;
+const KAD_FIREWALLED_RESPONSE_TIMEOUT_SECS: u64 = 10;
 const ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS: usize = 3;
 const ED2K_BACKGROUND_SEARCH_QUEUE_CAPACITY: usize = 4;
 const ACTIVITY_KEY_STARTING: &str = "starting";
@@ -1416,12 +1420,13 @@ impl OverlordAgentEmule {
     ) -> Result<NetworkingConfigApplyOutcome> {
         let (old_networking, new_networking, restart_required) = {
             let mut guard = self.config.write().await;
+            let effective_desired = guard.effective_coordinator_networking(desired);
             let old_networking = Self::networking_config(&guard);
-            if old_networking == *desired {
+            if old_networking == effective_desired {
                 return Ok(NetworkingConfigApplyOutcome::Unchanged);
             }
 
-            apply_networking_config(&mut guard, desired);
+            apply_networking_config(&mut guard, &effective_desired);
             let new_networking = Self::networking_config(&guard);
             let restart_required =
                 Self::restart_required_for_networking_change(&old_networking, &new_networking);
@@ -3999,6 +4004,140 @@ fn spawn_firewalled_response(dht: DhtNode, from: SocketAddr, tcp_port: u16) {
     });
 }
 
+/// Mirror the oracle's HELLO-triggered Kad TCP firewall/IP recheck.
+///
+/// When the local runtime still looks TCP-firewalled, eMule emits up to four
+/// `KADEMLIA_FIREWALLED2_REQ` probes after successful HELLO exchanges. Each
+/// matching `KADEMLIA_FIREWALLED_RES` reports the externally observed IP and
+/// advances the bounded recheck loop.
+struct KadFirewalledCheckContext {
+    dht: DhtNode,
+    kad_firewall: Arc<Mutex<KadFirewallState>>,
+    ed2k_listener: Arc<TcpListener>,
+    ed2k_server_state: Arc<RwLock<Ed2kServerState>>,
+    ed2k_user_hash: Ed2kHash,
+    ed2k_obfuscation_enabled: bool,
+}
+
+fn spawn_kad_firewalled_check(
+    context: KadFirewalledCheckContext,
+    from: SocketAddr,
+    peer_version: u8,
+) {
+    tokio::spawn(async move {
+        let KadFirewalledCheckContext {
+            dht,
+            kad_firewall,
+            ed2k_listener,
+            ed2k_server_state,
+            ed2k_user_hash,
+            ed2k_obfuscation_enabled,
+        } = context;
+        let started_at = Utc::now();
+        let tcp_firewalled = current_tcp_firewalled(&ed2k_listener, &ed2k_server_state).await;
+        if !tcp_firewalled {
+            let mut firewall = kad_firewall.lock().await;
+            firewall.refresh_tcp_recheck(false, started_at);
+            return;
+        }
+
+        let IpAddr::V4(_) = from.ip() else {
+            return;
+        };
+
+        {
+            let mut firewall = kad_firewall.lock().await;
+            firewall.refresh_tcp_recheck(true, started_at);
+            if !firewall.try_begin_tcp_firewall_probe(from.ip(), started_at) {
+                return;
+            }
+        }
+
+        let tcp_port = match ed2k_listener.local_addr() {
+            Ok(addr) => addr.port(),
+            Err(error) => {
+                let mut firewall = kad_firewall.lock().await;
+                firewall.record_tcp_firewall_probe_failed(
+                    from.ip(),
+                    &format!("failed to read local eD2k TCP port: {error}"),
+                );
+                return;
+            }
+        };
+
+        let request = if peer_version > 6 {
+            KadPacket::Firewalled2Req(overlord_kad_proto::Firewalled2Req {
+                tcp_port,
+                user_hash: ed2k_user_hash,
+                connect_options: emule_connect_options(ed2k_obfuscation_enabled),
+            })
+        } else {
+            KadPacket::FirewalledReq(overlord_kad_proto::FirewalledReq { tcp_port })
+        };
+
+        debug!(
+            "sending Kad firewalled check to={} peer_version={} request_opcode={}",
+            from,
+            peer_version,
+            if peer_version > 6 {
+                "KADEMLIA_FIREWALLED2_REQ"
+            } else {
+                "KADEMLIA_FIREWALLED_REQ"
+            }
+        );
+
+        match dht
+            .request_packet(
+                from,
+                &request,
+                opcode::FIREWALLED_RES,
+                Duration::from_secs(KAD_FIREWALLED_RESPONSE_TIMEOUT_SECS),
+            )
+            .await
+        {
+            Ok(KadPacket::FirewalledRes(response)) => {
+                let reported_ip = IpAddr::V4(Ipv4Addr::from(response.ip));
+                let outcome = {
+                    let mut firewall = kad_firewall.lock().await;
+                    firewall.record_firewalled_response(from.ip(), reported_ip, Utc::now())
+                };
+                match outcome {
+                    FirewalledResponseOutcome::Recorded => {
+                        info!(
+                            "kad firewalled check recorded helper={} reported_ip={}",
+                            from, reported_ip
+                        );
+                    }
+                    FirewalledResponseOutcome::Completed => {
+                        info!(
+                            "kad firewalled check completed helper={} reported_ip={}",
+                            from, reported_ip
+                        );
+                    }
+                    FirewalledResponseOutcome::Ignored => {
+                        debug!(
+                            "ignored unmatched Kad firewalled response helper={} reported_ip={}",
+                            from, reported_ip
+                        );
+                    }
+                }
+            }
+            Ok(other) => {
+                let mut firewall = kad_firewall.lock().await;
+                firewall.record_tcp_firewall_probe_failed(
+                    from.ip(),
+                    &format!("unexpected Kad firewalled response {other:?}"),
+                );
+            }
+            Err(error) => {
+                let mut firewall = kad_firewall.lock().await;
+                firewall.record_tcp_firewall_probe_failed(from.ip(), &error.to_string());
+                debug!("Kad firewalled check failed for {}: {}", from, error);
+            }
+        }
+    });
+}
+
 struct UnsolicitedPacketContext<'a> {
     snoop_queue: &'a Arc<Mutex<SnoopQueue>>,
     observed_snoop_events: &'a Arc<Mutex<Vec<SnoopObservation>>>,
@@ -4007,6 +4146,8 @@ struct UnsolicitedPacketContext<'a> {
     kad_firewall: &'a Arc<Mutex<KadFirewallState>>,
     ed2k_listener: &'a Arc<TcpListener>,
     ed2k_server_state: &'a Arc<RwLock<Ed2kServerState>>,
+    ed2k_user_hash: Ed2kHash,
+    ed2k_obfuscation_enabled: bool,
 }
 
 async fn handle_unsolicited_packet(
@@ -4120,6 +4261,18 @@ async fn handle_unsolicited_packet(
                 peer_metadata.requests_hello_res_ack
             );
             let _ = dht.send_packet(from, &KadPacket::HelloRes(hello_res)).await;
+            spawn_kad_firewalled_check(
+                KadFirewalledCheckContext {
+                    dht: dht.clone(),
+                    kad_firewall: Arc::clone(context.kad_firewall),
+                    ed2k_listener: Arc::clone(context.ed2k_listener),
+                    ed2k_server_state: Arc::clone(context.ed2k_server_state),
+                    ed2k_user_hash: context.ed2k_user_hash,
+                    ed2k_obfuscation_enabled: context.ed2k_obfuscation_enabled,
+                },
+                from,
+                req.version,
+            );
         }
         KadPacket::HelloRes(res) => {
             if let Some(udp_key) = sender_verify_key {
@@ -4158,6 +4311,18 @@ async fn handle_unsolicited_packet(
                         .await;
                 }
             }
+            spawn_kad_firewalled_check(
+                KadFirewalledCheckContext {
+                    dht: dht.clone(),
+                    kad_firewall: Arc::clone(context.kad_firewall),
+                    ed2k_listener: Arc::clone(context.ed2k_listener),
+                    ed2k_server_state: Arc::clone(context.ed2k_server_state),
+                    ed2k_user_hash: context.ed2k_user_hash,
+                    ed2k_obfuscation_enabled: context.ed2k_obfuscation_enabled,
+                },
+                from,
+                res.version,
+            );
         }
         KadPacket::HelloResAck(_ack) => {}
         KadPacket::BootstrapReq => {
@@ -4980,6 +5145,8 @@ impl OverlordAgentEmule {
         let kad_firewall = Arc::clone(&runtime.kad_firewall);
         let ed2k_listener = Arc::clone(&runtime.ed2k_listener);
         let ed2k_server_state = Arc::clone(&runtime.ed2k_server_state);
+        let ed2k_user_hash = self.ed2k_user_hash;
+        let ed2k_obfuscation_enabled = config.p2p.ed2k.obfuscation_enabled;
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             let mut packets = dht.subscribe_packets();
             while !shutdown.load(Ordering::Relaxed) {
@@ -4995,6 +5162,8 @@ impl OverlordAgentEmule {
                                 kad_firewall: &kad_firewall,
                                 ed2k_listener: &ed2k_listener,
                                 ed2k_server_state: &ed2k_server_state,
+                                ed2k_user_hash: Ed2kHash::from_bytes(ed2k_user_hash),
+                                ed2k_obfuscation_enabled,
                             },
                             received,
                         )

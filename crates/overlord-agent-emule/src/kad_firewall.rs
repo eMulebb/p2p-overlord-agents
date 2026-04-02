@@ -4,6 +4,12 @@
 //! to send `KADEMLIA2_FIREWALLUDP` packets back to us. This module keeps just
 //! enough state to correlate those helper packets with an active verification
 //! round and derive an "open", "firewalled", or "unverified" result.
+//!
+//! The same state object also tracks the oracle's separate TCP-oriented Kad
+//! firewall recheck loop. That loop emits `KADEMLIA_FIREWALLED2_REQ` after
+//! HELLO exchanges while the local runtime still believes it is TCP
+//! firewalled, and it accepts up to four `KADEMLIA_FIREWALLED_RES` replies to
+//! converge on the externally observed IP address.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -40,11 +46,19 @@ enum HelperOutcome {
     Succeeded,
 }
 
+const TCP_FIREWALL_RECHECK_LIMIT: usize = 4;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UdpFirewallCheckRound {
     started_at: DateTime<Utc>,
     expected_ports: HashSet<u16>,
     helper_outcomes: HashMap<IpAddr, HelperOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TcpFirewallCheckRound {
+    active_helpers: HashSet<IpAddr>,
+    completed_checks: usize,
 }
 
 /// Process-local Kad firewall verification state.
@@ -66,7 +80,16 @@ pub struct KadFirewallState {
     pub last_reported_port: Option<u16>,
     /// Last firewall-check error captured by the runtime.
     pub last_error: Option<String>,
+    /// Whether the oracle-style TCP firewall/IP recheck loop is currently active.
+    pub tcp_recheck_active: bool,
+    /// Timestamp of the most recent TCP firewall/IP recheck start.
+    pub last_tcp_check_started_at: Option<DateTime<Utc>>,
+    /// Timestamp of the most recent completed TCP firewall/IP recheck response.
+    pub last_tcp_check_completed_at: Option<DateTime<Utc>>,
+    /// External IP most recently reported by a `KADEMLIA_FIREWALLED_RES` helper.
+    pub last_reported_external_ip: Option<String>,
     active_round: Option<UdpFirewallCheckRound>,
+    active_tcp_round: Option<TcpFirewallCheckRound>,
 }
 
 /// Result of processing a `KADEMLIA2_FIREWALLUDP` packet for the active round.
@@ -80,7 +103,98 @@ pub enum FirewallUdpPacketOutcome {
     Ignored,
 }
 
+/// Result of processing a `KADEMLIA_FIREWALLED_RES` packet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FirewalledResponseOutcome {
+    /// The reply was accepted and the TCP recheck loop is still active.
+    Recorded,
+    /// The reply completed the oracle's four-response recheck window.
+    Completed,
+    /// The reply did not match any active oracle-style TCP recheck.
+    Ignored,
+}
+
 impl KadFirewallState {
+    /// Ensure the oracle-style TCP firewall/IP recheck loop matches the current
+    /// local TCP-firewalled verdict.
+    pub fn refresh_tcp_recheck(&mut self, tcp_firewalled: bool, started_at: DateTime<Utc>) {
+        if tcp_firewalled {
+            if self.active_tcp_round.is_none() {
+                self.tcp_recheck_active = true;
+                self.last_tcp_check_started_at = Some(started_at);
+                self.active_tcp_round = Some(TcpFirewallCheckRound {
+                    active_helpers: HashSet::new(),
+                    completed_checks: 0,
+                });
+            }
+            return;
+        }
+
+        self.tcp_recheck_active = false;
+        self.active_tcp_round = None;
+    }
+
+    /// Reserve one helper IP for an outbound Kad TCP firewall recheck.
+    ///
+    /// Mirrors the oracle's `GetRecheckIP()` budget: at most four helpers may
+    /// contribute to one active TCP/IP recheck round.
+    pub fn try_begin_tcp_firewall_probe(
+        &mut self,
+        helper_ip: IpAddr,
+        started_at: DateTime<Utc>,
+    ) -> bool {
+        let Some(round) = &mut self.active_tcp_round else {
+            return false;
+        };
+        if round.completed_checks >= TCP_FIREWALL_RECHECK_LIMIT
+            || round.active_helpers.contains(&helper_ip)
+        {
+            return false;
+        }
+        self.tcp_recheck_active = true;
+        self.last_tcp_check_started_at = Some(started_at);
+        round.active_helpers.insert(helper_ip)
+    }
+
+    /// Release one helper slot after an outbound Kad TCP firewall probe fails.
+    pub fn record_tcp_firewall_probe_failed(&mut self, helper_ip: IpAddr, error: &str) {
+        if let Some(round) = &mut self.active_tcp_round {
+            round.active_helpers.remove(&helper_ip);
+        }
+        self.last_helper_ip = Some(helper_ip.to_string());
+        self.last_error = Some(error.to_string());
+    }
+
+    /// Record one inbound `KADEMLIA_FIREWALLED_RES` reply for the active
+    /// oracle-style TCP firewall/IP recheck round.
+    pub fn record_firewalled_response(
+        &mut self,
+        helper_ip: IpAddr,
+        reported_ip: IpAddr,
+        observed_at: DateTime<Utc>,
+    ) -> FirewalledResponseOutcome {
+        let Some(round) = &mut self.active_tcp_round else {
+            return FirewalledResponseOutcome::Ignored;
+        };
+        if !round.active_helpers.remove(&helper_ip) {
+            return FirewalledResponseOutcome::Ignored;
+        }
+
+        round.completed_checks += 1;
+        self.tcp_recheck_active = round.completed_checks < TCP_FIREWALL_RECHECK_LIMIT;
+        self.last_helper_ip = Some(helper_ip.to_string());
+        self.last_reported_external_ip = Some(reported_ip.to_string());
+        self.last_tcp_check_completed_at = Some(observed_at);
+        self.last_error = None;
+
+        if round.completed_checks >= TCP_FIREWALL_RECHECK_LIMIT {
+            self.active_tcp_round = None;
+            FirewalledResponseOutcome::Completed
+        } else {
+            FirewalledResponseOutcome::Recorded
+        }
+    }
+
     /// Start a new UDP firewall-check round.
     pub fn begin_udp_check(
         &mut self,
@@ -271,7 +385,7 @@ fn finalize_round(
 
 #[cfg(test)]
 mod tests {
-    use super::{FirewallUdpPacketOutcome, KadFirewallState};
+    use super::{FirewallUdpPacketOutcome, FirewalledResponseOutcome, KadFirewallState};
     use chrono::{TimeZone, Utc};
 
     #[test]
@@ -331,5 +445,63 @@ mod tests {
             state.last_error.as_deref(),
             Some("all UDP firewall-check TCP requests failed")
         );
+    }
+
+    #[test]
+    fn tcp_firewall_recheck_tracks_up_to_four_helper_responses() {
+        let mut state = KadFirewallState::default();
+        let started_at = Utc.with_ymd_and_hms(2026, 4, 2, 23, 0, 0).unwrap();
+
+        state.refresh_tcp_recheck(true, started_at);
+        assert!(state.tcp_recheck_active);
+
+        let helpers = [
+            "203.0.113.10".parse().unwrap(),
+            "203.0.113.11".parse().unwrap(),
+            "203.0.113.12".parse().unwrap(),
+            "203.0.113.13".parse().unwrap(),
+            "203.0.113.14".parse().unwrap(),
+        ];
+
+        for helper in helpers.iter().take(4) {
+            assert!(state.try_begin_tcp_firewall_probe(*helper, started_at));
+        }
+        assert!(!state.try_begin_tcp_firewall_probe(helpers[4], started_at));
+
+        for (index, helper) in helpers.iter().take(4).enumerate() {
+            let outcome = state.record_firewalled_response(
+                *helper,
+                "198.51.100.44".parse().unwrap(),
+                started_at + chrono::Duration::seconds(index as i64 + 1),
+            );
+            if index < 3 {
+                assert_eq!(outcome, FirewalledResponseOutcome::Recorded);
+                assert!(state.tcp_recheck_active);
+            } else {
+                assert_eq!(outcome, FirewalledResponseOutcome::Completed);
+                assert!(!state.tcp_recheck_active);
+            }
+        }
+
+        assert_eq!(
+            state.last_reported_external_ip.as_deref(),
+            Some("198.51.100.44")
+        );
+    }
+
+    #[test]
+    fn tcp_firewall_recheck_ignores_untracked_responses() {
+        let mut state = KadFirewallState::default();
+        let started_at = Utc.with_ymd_and_hms(2026, 4, 2, 23, 5, 0).unwrap();
+        state.refresh_tcp_recheck(true, started_at);
+
+        let outcome = state.record_firewalled_response(
+            "203.0.113.99".parse().unwrap(),
+            "198.51.100.99".parse().unwrap(),
+            started_at,
+        );
+
+        assert_eq!(outcome, FirewalledResponseOutcome::Ignored);
+        assert!(state.tcp_recheck_active);
     }
 }

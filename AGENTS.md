@@ -13,6 +13,10 @@
   - Every wire-facing or stateful module must carry `//!` docs that describe the protocol family or runtime state it owns.
   - State transitions, transport-mode choices, and identity semantics must be documented where they are implemented, not only in markdown design notes.
   - When a field name is semantically loaded by the oracle contract, document that meaning explicitly in code comments or doc comments.
+- Prefer JSONL dumps for packet-level runtime evidence.
+  - When Kad or eD2k parity work needs packet capture, prefer machine-readable JSONL dumps over ad-hoc text logs.
+  - Instrument both the Rust agent and the oracle as needed so the same scenario can be compared from structured dumps on both sides.
+  - Treat JSONL dump support as reusable observability infrastructure, not one-off debug code.
 - Treat `rustfmt` output as canonical.
 - Keep reusable operational tooling in `../overlord-helpers`, not inline in issue-specific commands.
 - Respect the workspace line-ending policy:

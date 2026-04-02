@@ -9,8 +9,8 @@ use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
 use overlord_agent_nat::{
-    AgentControlConfig, AgentNatConfig, AgentNetworkingConfig, AgentP2pConfig,
-    default_upnp_backend_order,
+    AgentControlConfig, AgentEd2kConfig, AgentKadConfig, AgentNatConfig, AgentNatP2pConfig,
+    AgentNetworkingConfig, AgentP2pConfig, default_upnp_backend_order,
 };
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +29,10 @@ pub struct EmuleAgentConfig {
     pub nat: NatConfig,
     /// Local logging settings.
     pub log: LogConfig,
+    /// Whether startup TOML sections should stay authoritative over later
+    /// coordinator-sourced networking snapshots.
+    #[serde(skip)]
+    networking_authority: NetworkingSectionAuthority,
 }
 
 const PERSISTED_NETWORKING_STATE_FILE: &str = "overlord-agent.networking.json";
@@ -407,6 +411,61 @@ impl Default for LogConfig {
 }
 
 impl EmuleAgentConfig {
+    /// Merge a coordinator networking snapshot with the locally authoritative
+    /// startup networking sections.
+    ///
+    /// This keeps explicit local test/runtime choices, such as firewalled
+    /// no-UPnP runs with fresh ports, from being overwritten by a stale
+    /// persisted snapshot pushed back through the coordinator.
+    #[must_use]
+    pub(crate) fn effective_coordinator_networking(
+        &self,
+        desired: &AgentNetworkingConfig,
+    ) -> AgentNetworkingConfig {
+        let mut effective = desired.clone();
+        if self.networking_authority.control {
+            effective.control = AgentControlConfig {
+                bind_iface: self.control.bind_iface.clone(),
+                bind_ip: self.control.bind_ip.clone(),
+                selection_confirmed: self.control.selection_confirmed,
+                listen_port: self.control.listen_port,
+            };
+        }
+        if self.networking_authority.p2p {
+            effective.p2p = AgentP2pConfig {
+                bind_iface: self.p2p.bind_iface.clone(),
+                bind_ip: self.p2p.bind_ip.clone(),
+                selection_confirmed: self.p2p.selection_confirmed,
+                kad: AgentKadConfig {
+                    listen_port: self.p2p.kad.listen_port,
+                },
+                ed2k: AgentEd2kConfig {
+                    listen_port: self.p2p.ed2k.listen_port,
+                },
+            };
+        }
+        if self.networking_authority.nat {
+            effective.nat = AgentNatConfig {
+                p2p: AgentNatP2pConfig {
+                    enabled: self.nat.p2p.enabled,
+                    backend_order: if self.nat.p2p.backend_order.is_empty() {
+                        default_upnp_backend_order()
+                    } else {
+                        self.nat.p2p.backend_order.clone()
+                    },
+                    igd_ip: self.nat.p2p.igd_ip.clone(),
+                    minissdpd_socket: self.nat.p2p.minissdpd_socket.clone(),
+                    ssdp_local_port: self.nat.p2p.ssdp_local_port,
+                    discovery_timeout_secs: self.nat.p2p.discovery_timeout_secs,
+                    lease_duration_secs: self.nat.p2p.lease_duration_secs,
+                    renew_margin_secs: self.nat.p2p.renew_margin_secs,
+                    external_ip_override: self.nat.p2p.external_ip_override.clone(),
+                },
+            };
+        }
+        effective
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             let mut config = Self::default();
@@ -420,16 +479,15 @@ impl EmuleAgentConfig {
             .with_context(|| format!("failed to read config from {}", path.display()))?;
         let raw_value: toml::Value = toml::from_str(&contents)
             .with_context(|| format!("failed to parse config from {}", path.display()))?;
+        let authority = detect_networking_section_authority(&raw_value);
         let mut config: Self = toml::from_str(&contents)
             .with_context(|| format!("failed to parse config from {}", path.display()))?;
+        config.networking_authority = authority;
         normalize_control_config(&mut config.control);
         normalize_p2p_config(&mut config.p2p);
         normalize_nat_config(&mut config.nat);
         normalize_log_config(&mut config.log);
-        merge_persisted_networking_fallback(
-            &mut config,
-            detect_networking_section_authority(&raw_value),
-        )?;
+        merge_persisted_networking_fallback(&mut config, authority)?;
         Ok(config)
     }
 }
@@ -577,6 +635,7 @@ mod tests {
     use overlord_agent_nat::{
         AgentControlConfig, AgentEd2kConfig, AgentKadConfig, AgentNatConfig, AgentNatP2pConfig,
         AgentNetworkingConfig, AgentP2pConfig, UPNP_MINIUPNPC_BACKEND, UPNP_RUPNP_BACKEND,
+        default_upnp_backend_order,
     };
     use std::fs;
 
@@ -825,6 +884,82 @@ state_dir = "{state_dir}"
         assert_eq!(
             config.nat.p2p.backend_order,
             vec![UPNP_RUPNP_BACKEND.to_string()]
+        );
+
+        fs::remove_dir_all(&temp_root).unwrap();
+    }
+
+    #[test]
+    fn coordinator_networking_keeps_locally_authoritative_sections() {
+        let temp_root = unique_test_dir("overlord-agent-emule-config-authority");
+        let config_path = temp_root.join("overlord.toml");
+        fs::write(
+            &config_path,
+            r#"
+[control]
+bind_ip = "127.0.0.10"
+listen_port = 13310
+
+[p2p]
+bind_ip = "10.0.0.10"
+selection_confirmed = true
+
+[p2p.kad]
+listen_port = 41120
+
+[p2p.ed2k]
+listen_port = 41121
+
+[nat.p2p]
+enabled = false
+backend_order = []
+discovery_timeout_secs = 5
+lease_duration_secs = 3600
+renew_margin_secs = 300
+"#,
+        )
+        .unwrap();
+
+        let config = EmuleAgentConfig::load(&config_path).unwrap();
+        let effective = config.effective_coordinator_networking(&AgentNetworkingConfig {
+            control: AgentControlConfig {
+                bind_iface: Some("coordinator-control".to_string()),
+                bind_ip: Some("127.0.0.20".to_string()),
+                selection_confirmed: false,
+                listen_port: 14000,
+            },
+            p2p: AgentP2pConfig {
+                bind_iface: Some("coordinator-p2p".to_string()),
+                bind_ip: Some("10.0.0.20".to_string()),
+                selection_confirmed: false,
+                kad: AgentKadConfig { listen_port: 42000 },
+                ed2k: AgentEd2kConfig { listen_port: 42001 },
+            },
+            nat: AgentNatConfig {
+                p2p: AgentNatP2pConfig {
+                    enabled: true,
+                    backend_order: vec![UPNP_RUPNP_BACKEND.to_string()],
+                    igd_ip: Some("10.0.0.1".to_string()),
+                    minissdpd_socket: Some("coordinator.sock".to_string()),
+                    ssdp_local_port: Some(1901),
+                    discovery_timeout_secs: 15,
+                    lease_duration_secs: 7200,
+                    renew_margin_secs: 600,
+                    external_ip_override: Some("203.0.113.10".to_string()),
+                },
+            },
+        });
+
+        assert_eq!(effective.control.bind_ip.as_deref(), Some("127.0.0.10"));
+        assert_eq!(effective.control.listen_port, 13310);
+        assert_eq!(effective.p2p.bind_ip.as_deref(), Some("10.0.0.10"));
+        assert!(effective.p2p.selection_confirmed);
+        assert_eq!(effective.p2p.kad.listen_port, 41120);
+        assert_eq!(effective.p2p.ed2k.listen_port, 41121);
+        assert!(!effective.nat.p2p.enabled);
+        assert_eq!(
+            effective.nat.p2p.backend_order,
+            default_upnp_backend_order()
         );
 
         fs::remove_dir_all(&temp_root).unwrap();
