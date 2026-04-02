@@ -1,3 +1,9 @@
+//! In-memory Kad publish cache used to answer inbound search traffic.
+//!
+//! The store mirrors the semantic meaning of the publish/search packet families:
+//! keyword publishes are indexed by file hash, source publishes by publisher
+//! identity and IP, and notes publishes by publisher identity plus note tags.
+
 use std::{net::Ipv4Addr, time::Duration};
 
 use chrono::{DateTime, Utc};
@@ -58,7 +64,7 @@ struct StoredSourcePublish {
 struct StoredNotesPublish {
     observed_at: DateTime<Utc>,
     target: NodeId,
-    note_hash: Ed2kHash,
+    publisher_id: NodeId,
     tags: Vec<Tag>,
     dedup_key: String,
 }
@@ -149,7 +155,7 @@ impl KadLocalStore {
     pub(crate) fn record_notes_publish(
         &mut self,
         target: NodeId,
-        note_hash: Ed2kHash,
+        publisher_id: NodeId,
         tags: &[Tag],
         observed_at: DateTime<Utc>,
     ) {
@@ -157,7 +163,7 @@ impl KadLocalStore {
             return;
         }
         purge_expired(&mut self.notes_entries, self.config.notes_ttl, observed_at);
-        let dedup_key = notes_dedup_key(target, note_hash, tags);
+        let dedup_key = notes_dedup_key(target, publisher_id, tags);
         upsert_entry(
             &mut self.notes_entries,
             self.config.notes_capacity,
@@ -165,7 +171,7 @@ impl KadLocalStore {
             StoredNotesPublish {
                 observed_at,
                 target,
-                note_hash,
+                publisher_id,
                 tags: tags.to_vec(),
                 dedup_key,
             },
@@ -255,7 +261,7 @@ impl KadLocalStore {
             })
             .take(limit)
             .map(|entry| SearchResultEntry {
-                hash: entry.note_hash,
+                hash: Ed2kHash::from_bytes(entry.publisher_id.0),
                 tags: entry.tags.clone(),
             })
             .collect::<Vec<_>>();
@@ -455,8 +461,8 @@ fn source_dedup_key(
     )
 }
 
-fn notes_dedup_key(target: NodeId, note_hash: Ed2kHash, tags: &[Tag]) -> String {
-    format!("notes:{target}:{note_hash}:{}", tag_fingerprint(tags))
+fn notes_dedup_key(target: NodeId, publisher_id: NodeId, tags: &[Tag]) -> String {
+    format!("notes:{target}:{publisher_id}:{}", tag_fingerprint(tags))
 }
 
 fn tag_fingerprint(tags: &[Tag]) -> String {
@@ -613,13 +619,13 @@ mod tests {
     fn notes_store_filters_by_size_when_available() {
         let mut store = KadLocalStore::new(config());
         let target = NodeId::from_bytes([7; 16]);
-        let note_hash = Ed2kHash::from_bytes([8; 16]);
+        let publisher_id = NodeId::from_bytes([8; 16]);
         let tags = vec![
             Tag::filesize(900),
             Tag::new_short(tag_name::DESCRIPTION, TagValue::String("good".into())),
         ];
 
-        store.record_notes_publish(target, note_hash, &tags, ts(1));
+        store.record_notes_publish(target, publisher_id, &tags, ts(1));
 
         let response = store
             .notes_search_response(
@@ -631,7 +637,10 @@ mod tests {
             .expect("notes response");
         assert_eq!(store.notes_entry_count(), 1);
         assert_eq!(response.results.len(), 1);
-        assert_eq!(response.results[0].hash, note_hash);
+        assert_eq!(
+            response.results[0].hash,
+            Ed2kHash::from_bytes(publisher_id.0)
+        );
 
         let missing = store.notes_search_response(
             NodeId::from_bytes([9; 16]),

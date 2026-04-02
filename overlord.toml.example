@@ -44,6 +44,7 @@ search_phase2_fanout = 50
 keyword_result_cap = 5000
 source_result_cap = 1000
 notes_result_cap = 1000
+seed_notes_publish_enabled = false
 obfuscation_enabled = true
 enable_mock_results = false
 

@@ -1,3 +1,10 @@
+//! Kad RPC manager and runtime observability surface.
+//!
+//! `RpcManager` is the stateful boundary where raw datagrams become typed Kad
+//! packets, obfuscation state is updated, pending requests are matched, and the
+//! oracle-shaped packet tracker decides whether unsolicited traffic should be
+//! accepted or dropped.
+
 use crate::error::NetError;
 use crate::obfuscation::{DecryptResult, ObfuscationLayer};
 use crate::rate_limit::RateLimiter;

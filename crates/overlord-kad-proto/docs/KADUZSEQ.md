@@ -587,11 +587,10 @@ US                                          CLOSE_N
 |    file hash (file being rated/commented)    |
 |  publisher_id: [16 bytes]                    |
 |    our Kad node ID (publisher identity)      |
-|    ORACLE: this is NodeId, not a file hash.  |
-|    CURRENT RUST: typed as Ed2kHash and named |
-|    note_hash — semantic+type bug, wire size  |
-|    is accidentally correct (both 16 bytes).  |
-|    Must be corrected to publisher_id: NodeId.|
+|    ORACLE + RUST: this is NodeId, not a file |
+|    hash. The wire stays 16 bytes wide, but   |
+|    the semantic meaning is publisher identity|
+|    throughout the runtime and local store.   |
 |  tag_count:    [1 byte]                      |
 |  tags[]:                                     |
 |    TAG_FILENAME    (0x01): file name          |
@@ -610,8 +609,9 @@ US                                          CLOSE_N
 |  load:   [1 byte]    CLOSE_N notes-index load|
 | <------------------------------------------- |
 |                                              |
-| note: End-to-end notes publish parity is     |
-|       Pending until note_hash field is fixed.|
+| note: Live validation uses the seed loop with|
+|       notes publish enabled explicitly. The  |
+|       default runtime keeps this path off.   |
 ```
 
 ---

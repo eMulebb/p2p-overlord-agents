@@ -104,6 +104,12 @@ pub struct KadConfig {
     pub keyword_result_cap: usize,
     pub source_result_cap: usize,
     pub notes_result_cap: usize,
+    /// Whether seed-popular runs should emit synthetic notes publishes in addition to
+    /// keyword and source publishes.
+    ///
+    /// This remains disabled by default so normal runtime behavior does not change.
+    /// Enable it only for controlled live validation of notes-publish parity.
+    pub seed_notes_publish_enabled: bool,
     pub obfuscation_enabled: bool,
     pub enable_mock_results: bool,
 }
@@ -289,6 +295,7 @@ impl Default for KadConfig {
             keyword_result_cap: 5_000,
             source_result_cap: 1_000,
             notes_result_cap: 1_000,
+            seed_notes_publish_enabled: false,
             obfuscation_enabled: true,
             enable_mock_results: false,
         }
@@ -793,6 +800,7 @@ state_dir = "{state_dir}"
         assert_eq!(config.p2p.kad.local_store_keyword_capacity, 20_000);
         assert_eq!(config.p2p.kad.local_store_source_capacity, 20_000);
         assert_eq!(config.p2p.kad.local_store_notes_capacity, 5_000);
+        assert!(!config.p2p.kad.seed_notes_publish_enabled);
     }
 
     #[test]

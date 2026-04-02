@@ -1,3 +1,10 @@
+//! Kad UDP transport, obfuscation, request tracking, and wire-dump support.
+//!
+//! This crate owns the state machines that sit between raw UDP datagrams and
+//! typed Kad packets. The exported API is intentionally small because the
+//! observable behavior is mostly in transport mode selection, pending-request
+//! tracking, and flood handling.
+
 pub mod error;
 pub mod obfuscation;
 pub mod rate_limit;

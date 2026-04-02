@@ -1,3 +1,9 @@
+//! Kad2 packet codecs and typed wire layouts.
+//!
+//! Several Kad packets reuse 16-byte fields for different logical identities.
+//! Field names in this module therefore document the oracle meaning of each
+//! slot, not just the raw byte width.
+
 use binrw::{BinRead, BinReaderExt, BinWrite, BinWriterExt, binrw};
 use std::io::{Cursor, Read, Write};
 
@@ -270,11 +276,17 @@ pub struct PublishSourceReq {
 #[brw(little)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublishNotesReq {
+    /// File hash target of the notes publish operation.
     pub target: NodeId,
-    pub note_hash: Ed2kHash,
+    /// Publisher Kad node identity written into the second 128-bit field.
+    ///
+    /// The wire width is still 16 bytes, but the semantic meaning is publisher
+    /// identity rather than a note-specific hash.
+    pub publisher_id: NodeId,
     #[br(temp)]
     #[bw(calc = u8::try_from(tags.len()).expect("tag count exceeds u8"))]
     tag_count: u8,
+    /// Note payload tags such as filename, filesize, rating, and description.
     #[br(count = tag_count)]
     pub tags: Vec<Tag>,
 }
@@ -962,6 +974,55 @@ mod tests {
         assert_eq!(encoded[0], OP_KADEMLIAHEADER);
         assert_eq!(encoded[1], opcode::PUBLISH_SOURCE_REQ);
         assert_eq!(encoded[34], 2, "source publish tag count must be u8");
+    }
+
+    #[test]
+    fn test_publish_notes_req_roundtrip() {
+        let pkt = KadPacket::PublishNotesReq(PublishNotesReq {
+            target: NodeId::from_bytes([0x44; 16]),
+            publisher_id: NodeId::from_bytes([0x55; 16]),
+            tags: vec![
+                Tag::new_short(
+                    crate::constants::tag_name::FILERATING,
+                    crate::tag::TagValue::U8(4),
+                ),
+                Tag::new_short(
+                    crate::constants::tag_name::DESCRIPTION,
+                    crate::tag::TagValue::String("oracle-style validation note".to_string()),
+                ),
+            ],
+        });
+        let pkt2 = roundtrip(&pkt);
+        if let KadPacket::PublishNotesReq(req) = pkt2 {
+            assert_eq!(req.target, NodeId::from_bytes([0x44; 16]));
+            assert_eq!(req.publisher_id, NodeId::from_bytes([0x55; 16]));
+            assert_eq!(req.tags.len(), 2);
+        } else {
+            panic!("wrong type");
+        }
+    }
+
+    #[test]
+    fn test_publish_notes_req_uses_u8_tag_count_on_wire() {
+        let pkt = KadPacket::PublishNotesReq(PublishNotesReq {
+            target: NodeId::from_bytes([0x44; 16]),
+            publisher_id: NodeId::from_bytes([0x55; 16]),
+            tags: vec![
+                Tag::new_short(
+                    crate::constants::tag_name::FILERATING,
+                    crate::tag::TagValue::U8(4),
+                ),
+                Tag::new_short(
+                    crate::constants::tag_name::DESCRIPTION,
+                    crate::tag::TagValue::String("validation".to_string()),
+                ),
+            ],
+        });
+
+        let encoded = pkt.encode().unwrap();
+        assert_eq!(encoded[0], OP_KADEMLIAHEADER);
+        assert_eq!(encoded[1], opcode::PUBLISH_NOTES_REQ);
+        assert_eq!(encoded[34], 2, "notes publish tag count must be u8");
     }
 
     #[test]

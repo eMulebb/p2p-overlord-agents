@@ -2609,18 +2609,26 @@ fn synthetic_popular_hash(index: usize, seed: &SyntheticPopularSeed) -> PopularH
     }
 }
 
+/// Static settings that make source publishes look like a stable eMule-style
+/// high-ID client on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SourcePublishSettings {
     tcp_port: u16,
     obfuscation_enabled: bool,
 }
 
-/// Shared publish-side dependencies that need to flow into both startup and manual seed runs.
+/// Shared publish-side dependencies that need to flow into both startup and
+/// manual seed runs.
+///
+/// The seed loop owns the operator-visible publishing state, so these handles
+/// are threaded through the helper instead of being reconstructed ad hoc.
+#[derive(Clone, Copy)]
 struct PublishExecutionContext<'a> {
     local_store: &'a Arc<Mutex<KadLocalStore>>,
     publish_observability: &'a Arc<Mutex<KadPublishObservability>>,
     agent_activity: &'a Arc<Mutex<AgentActivityTracker>>,
     activity_key: Option<&'a str>,
+    notes_publish_enabled: bool,
 }
 
 /// Chooses coordinator-provided hashes when available and otherwise falls back to the
@@ -2672,9 +2680,10 @@ async fn seed_popular_from_source(
     context: PublishExecutionContext<'_>,
 ) -> Result<()> {
     info!(
-        "kad seeding source={} entries={}",
+        "kad seeding source={} entries={} notes_publish_enabled={}",
         source.label(),
-        hashes.len()
+        hashes.len(),
+        context.notes_publish_enabled
     );
     seed_popular_impl(
         dht,
@@ -2687,14 +2696,16 @@ async fn seed_popular_from_source(
     .await
 }
 
+/// Fetches the current seed set and runs one publish batch against it.
+///
+/// This is the long-lived seeding state machine used after bootstrap and during
+/// periodic republish cycles.
 async fn seed_popular_from_coordinator_or_fallback(
     dht: &DhtNode,
     source_publish_identity: NodeId,
     source_publish_settings: SourcePublishSettings,
     coordinator: &CoordinatorClient,
-    local_store: &Arc<Mutex<KadLocalStore>>,
-    publish_observability: &Arc<Mutex<KadPublishObservability>>,
-    agent_activity: &Arc<Mutex<AgentActivityTracker>>,
+    context: PublishExecutionContext<'_>,
 ) -> Result<()> {
     let (source, hashes) = fetch_popular_hashes_for_seeding(coordinator).await;
     let publish_started_at = Utc::now();
@@ -2704,7 +2715,12 @@ async fn seed_popular_from_coordinator_or_fallback(
     activity_snapshot.query_or_target = Some(source.label().to_string());
     activity_snapshot.progress_current = Some(0);
     activity_snapshot.progress_total = Some(hashes.len() as u32);
-    begin_agent_activity(agent_activity, activity_key.clone(), activity_snapshot).await;
+    begin_agent_activity(
+        context.agent_activity,
+        activity_key.clone(),
+        activity_snapshot,
+    )
+    .await;
     let result = seed_popular_from_source(
         dht,
         source_publish_identity,
@@ -2712,17 +2728,15 @@ async fn seed_popular_from_coordinator_or_fallback(
         source,
         hashes,
         PublishExecutionContext {
-            local_store,
-            publish_observability,
-            agent_activity,
             activity_key: Some(activity_key.as_str()),
+            ..context
         },
     )
     .await;
-    finish_agent_activity(agent_activity, &activity_key, Utc::now()).await;
+    finish_agent_activity(context.agent_activity, &activity_key, Utc::now()).await;
     match result {
         Ok(()) => {
-            clear_agent_degraded_activity(agent_activity).await;
+            clear_agent_degraded_activity(context.agent_activity).await;
             Ok(())
         }
         Err(error) => {
@@ -2730,7 +2744,7 @@ async fn seed_popular_from_coordinator_or_fallback(
                 new_activity_snapshot(AgentActivityState::Degraded, Utc::now());
             degraded_snapshot.query_or_target = Some(source.label().to_string());
             degraded_snapshot.last_error = Some(error.to_string());
-            record_agent_degraded_activity(agent_activity, degraded_snapshot).await;
+            record_agent_degraded_activity(context.agent_activity, degraded_snapshot).await;
             Err(error)
         }
     }
@@ -2841,6 +2855,28 @@ fn build_source_publish_tags(
     ]
 }
 
+/// Builds a deterministic notes-publish payload for controlled live validation.
+///
+/// The notes-seeding path remains opt-in so the runtime can exercise notes
+/// publish parity without making synthetic notes part of the default behavior.
+fn build_notes_publish_tags(canonical_name: &str, file_size: u64) -> Vec<Tag> {
+    vec![
+        Tag::filename(canonical_name.to_string()),
+        Tag::filesize(file_size),
+        Tag::new_short(tag_name::FILERATING, TagValue::U8(4)),
+        Tag::new_short(
+            tag_name::DESCRIPTION,
+            TagValue::String(format!("overlord validation note for {canonical_name}")),
+        ),
+    ]
+}
+
+/// Executes one complete keyword/source/(optional) notes seeding pass.
+///
+/// Keyword and source publishes remain the default seeding behavior. Notes
+/// publishes are guarded by `PublishExecutionContext::notes_publish_enabled` so
+/// real-network validation can exercise the path without making synthetic notes
+/// part of the default runtime posture.
 async fn seed_popular_impl(
     dht: &DhtNode,
     source_publish_identity: NodeId,
@@ -2856,6 +2892,8 @@ async fn seed_popular_impl(
     let bind_addr = dht.bind_addr()?;
     let mut keyword_totals = PublishAttemptStats::default();
     let mut source_totals = PublishAttemptStats::default();
+    let mut notes_totals = PublishAttemptStats::default();
+    let notes_publish_identity = dht.own_id();
     let published_items = hashes.len();
     update_publish_progress(
         context.publish_observability,
@@ -2970,6 +3008,41 @@ async fn seed_popular_impl(
                 debug!("source publish failed for hash={}: {error}", raw_hash);
             }
         }
+        if context.notes_publish_enabled {
+            let notes_tags = build_notes_publish_tags(&hash.canonical_name, hash.size);
+            {
+                let mut store = context.local_store.lock().await;
+                store.record_notes_publish(
+                    NodeId::from_bytes(file_hash.0),
+                    notes_publish_identity,
+                    &notes_tags,
+                    Utc::now(),
+                );
+            }
+            info!(
+                "kad publish start family=notes seed_source={} item={}/{} target={} hash={} publisher_id={}",
+                seed_source.label(),
+                item_no,
+                published_items,
+                file_hash,
+                raw_hash,
+                notes_publish_identity
+            );
+            match dht
+                .publish_notes(file_hash, notes_publish_identity, notes_tags)
+                .await
+            {
+                Ok(stats) => {
+                    notes_totals.closest_contacts_considered += stats.closest_contacts_considered;
+                    notes_totals.attempted_contacts += stats.attempted_contacts;
+                    notes_totals.acked_contacts += stats.acked_contacts;
+                    notes_totals.timed_out_contacts += stats.timed_out_contacts;
+                }
+                Err(error) => {
+                    debug!("notes publish failed for hash={}: {error}", raw_hash);
+                }
+            }
+        }
         let observed_at = Utc::now();
         update_publish_progress(
             context.publish_observability,
@@ -2991,14 +3064,16 @@ async fn seed_popular_impl(
             .await;
         }
         info!(
-            "kad publish progress seed_source={} items_done={}/{} keyword_attempted={} keyword_acked={} source_attempted={} source_acked={}",
+            "kad publish progress seed_source={} items_done={}/{} keyword_attempted={} keyword_acked={} source_attempted={} source_acked={} notes_attempted={} notes_acked={}",
             seed_source.label(),
             item_no,
             published_items,
             keyword_totals.attempted_contacts,
             keyword_totals.acked_contacts,
             source_totals.attempted_contacts,
-            source_totals.acked_contacts
+            source_totals.acked_contacts,
+            notes_totals.attempted_contacts,
+            notes_totals.acked_contacts
         );
     }
 
@@ -4206,7 +4281,7 @@ async fn handle_unsolicited_packet(
         KadPacket::PublishNotesReq(req) => {
             {
                 let mut store = context.local_store.lock().await;
-                store.record_notes_publish(req.target, req.note_hash, &req.tags, Utc::now());
+                store.record_notes_publish(req.target, req.publisher_id, &req.tags, Utc::now());
             }
             let _ = dht
                 .send_packet(
@@ -4688,6 +4763,7 @@ impl IndexerService for OverlordAgentEmule {
             tcp_port: config.p2p.ed2k.listen_port,
             obfuscation_enabled: config.p2p.ed2k.obfuscation_enabled,
         };
+        let notes_publish_enabled = config.p2p.kad.seed_notes_publish_enabled;
         let publish_started_at = Utc::now();
         let activity_key = publish_activity_key(PublishSeedSource::ManualApi, publish_started_at);
         let mut activity_snapshot =
@@ -4712,6 +4788,7 @@ impl IndexerService for OverlordAgentEmule {
                 publish_observability: &self.publish_observability,
                 agent_activity: &self.agent_activity,
                 activity_key: Some(activity_key.as_str()),
+                notes_publish_enabled,
             },
         )
         .await;
@@ -4807,6 +4884,7 @@ impl OverlordAgentEmule {
             tcp_port: config.p2p.ed2k.listen_port,
             obfuscation_enabled: config.p2p.ed2k.obfuscation_enabled,
         };
+        let notes_publish_enabled = config.p2p.kad.seed_notes_publish_enabled;
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             let bootstrap_started_at = Utc::now();
             let mut bootstrap_snapshot =
@@ -4829,9 +4907,13 @@ impl OverlordAgentEmule {
                             source_publish_identity,
                             source_publish_settings,
                             &coordinator,
-                            &local_store,
-                            &publish_observability,
-                            &agent_activity,
+                            PublishExecutionContext {
+                                local_store: &local_store,
+                                publish_observability: &publish_observability,
+                                agent_activity: &agent_activity,
+                                activity_key: None,
+                                notes_publish_enabled,
+                            },
                         )
                         .await
                         {
@@ -5999,6 +6081,7 @@ impl OverlordAgentEmule {
             tcp_port: config.p2p.ed2k.listen_port,
             obfuscation_enabled: config.p2p.ed2k.obfuscation_enabled,
         };
+        let notes_publish_enabled = config.p2p.kad.seed_notes_publish_enabled;
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             while !shutdown.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_secs(republish_secs)).await;
@@ -6010,9 +6093,13 @@ impl OverlordAgentEmule {
                     source_publish_identity,
                     source_publish_settings,
                     &coordinator,
-                    &local_store,
-                    &publish_observability,
-                    &agent_activity,
+                    PublishExecutionContext {
+                        local_store: &local_store,
+                        publish_observability: &publish_observability,
+                        agent_activity: &agent_activity,
+                        activity_key: None,
+                        notes_publish_enabled,
+                    },
                 )
                 .await
                 {
@@ -6031,12 +6118,13 @@ mod tests {
         SYNTHETIC_POPULAR_SEEDS, SourcePublishSettings, apply_harvest_record,
         apply_networking_config, apply_publish_summary, apply_queue_family_counts,
         build_hello_request, build_hello_response, build_kad_hello_request_tags,
-        build_kad_hello_response_tags, build_keyword_snoop_entry, build_notes_snoop_entry,
-        build_publish_batch_summary, build_source_publish_tags, build_source_snoop_entry,
-        current_tcp_firewalled, ed2k_file_type_search_term, effective_publish_counters,
-        empty_networking_config, emule_high_id_source_type, flush_snoop_queue, keyword_target,
-        next_passive_replay_request, next_passive_replay_request_for_family,
-        normalize_ed2k_user_hash_markers, parse_kad_hello_metadata, record_passive_replay_complete,
+        build_kad_hello_response_tags, build_keyword_snoop_entry, build_notes_publish_tags,
+        build_notes_snoop_entry, build_publish_batch_summary, build_source_publish_tags,
+        build_source_snoop_entry, current_tcp_firewalled, ed2k_file_type_search_term,
+        effective_publish_counters, empty_networking_config, emule_high_id_source_type,
+        flush_snoop_queue, keyword_target, next_passive_replay_request,
+        next_passive_replay_request_for_family, normalize_ed2k_user_hash_markers,
+        parse_kad_hello_metadata, record_passive_replay_complete,
         record_passive_replay_enqueue_wait, record_passive_replay_idle,
         record_passive_replay_post_failure, record_passive_replay_post_latency,
         record_passive_replay_start, restore_snoop_queue, select_popular_hashes_for_seeding,
@@ -7258,6 +7346,24 @@ mod tests {
         assert_eq!(
             tags.last(),
             Some(&Tag::new_short(tag_name::ENCRYPTION, TagValue::U8(3)))
+        );
+    }
+
+    #[test]
+    fn notes_publish_tags_are_deterministic_and_note_shaped() {
+        let tags = build_notes_publish_tags("ubuntu linux.iso", 2_097_152);
+
+        assert_eq!(
+            tags,
+            vec![
+                Tag::filename("ubuntu linux.iso"),
+                Tag::filesize(2_097_152),
+                Tag::new_short(tag_name::FILERATING, TagValue::U8(4)),
+                Tag::new_short(
+                    tag_name::DESCRIPTION,
+                    TagValue::String("overlord validation note for ubuntu linux.iso".to_string()),
+                ),
+            ]
         );
     }
 

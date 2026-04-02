@@ -1,3 +1,10 @@
+//! Kad publish flows built on top of the generic lookup traversal.
+//!
+//! Each helper in this module first resolves the closest contacts to the target
+//! and then fans the publish packet out concurrently. The returned stats are
+//! intentionally contact-oriented because acceptance on the live Kad network is
+//! a per-contact outcome rather than a single transaction-wide success bit.
+
 use crate::error::DhtError;
 use crate::traversal::{TraversalConfig, TraversalContact, TraversalKind, run_traversal};
 use overlord_kad_net::RpcManager;
@@ -378,14 +385,19 @@ pub async fn publish_source(
 }
 
 /// Publish a note/rating for a file.
+///
+/// The oracle writes the publisher Kad node ID into the second 128-bit field of
+/// `KADEMLIA2_PUBLISH_NOTES_REQ`. The wire width matches a file hash, but the
+/// semantic meaning is publisher identity and must stay aligned across local
+/// store, notes search results, and wire dumps.
 pub async fn publish_notes(
     rpc: &RpcManager,
     routing_table: &tokio::sync::Mutex<overlord_kad_routing::RoutingTable>,
     file_hash: Ed2kHash,
-    note_hash: Ed2kHash,
+    publisher_id: NodeId,
     tags: Vec<Tag>,
     publish_contact_fanout: usize,
-) -> Result<usize, DhtError> {
+) -> Result<PublishAttemptStats, DhtError> {
     let target = NodeId::from_bytes(file_hash.0);
     let initial = get_initial(routing_table, &target).await;
 
@@ -410,7 +422,7 @@ pub async fn publish_notes(
 
     let packet = KadPacket::PublishNotesReq(PublishNotesReq {
         target,
-        note_hash,
+        publisher_id,
         tags,
     });
 
@@ -419,19 +431,65 @@ pub async fn publish_notes(
         register_publish_contact(rpc, contact);
     }
 
-    let mut acks = 0usize;
+    let mut stats = PublishAttemptStats {
+        closest_contacts_considered: traversal.closest.len() as u32,
+        attempted_contacts: publish_contacts.len() as u32,
+        ..PublishAttemptStats::default()
+    };
     for (attempt, result) in execute_publish_fanout(rpc, &publish_contacts, &packet).await {
         match result {
-            Ok(_) => acks += 1,
-            Err(e) => tracing::debug!(
-                "publish_notes ack failed from {}: {}",
-                attempt.contact.addr,
-                e
-            ),
+            Ok(KadPacket::PublishRes(response)) => {
+                stats.acked_contacts += 1;
+                tracing::info!(
+                    "kad publish contact family=notes step=ack rank={}/{} contact_addr={} contact_id={} response_target={} response_load={}",
+                    attempt.rank,
+                    attempt.total,
+                    attempt.contact.addr,
+                    attempt.contact.id,
+                    response.target,
+                    response.load
+                );
+            }
+            Ok(response) => {
+                tracing::debug!(
+                    "kad publish contact family=notes step=ack rank={}/{} contact_addr={} contact_id={} response_opcode=0x{:02X}",
+                    attempt.rank,
+                    attempt.total,
+                    attempt.contact.addr,
+                    attempt.contact.id,
+                    response.opcode()
+                );
+            }
+            Err(e) if matches!(e, overlord_kad_net::NetError::Timeout { .. }) => {
+                stats.timed_out_contacts += 1;
+                tracing::debug!(
+                    "kad publish contact family=notes step=timeout rank={}/{} contact_addr={} contact_id={} error={}",
+                    attempt.rank,
+                    attempt.total,
+                    attempt.contact.addr,
+                    attempt.contact.id,
+                    e
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "kad publish contact family=notes step=fail rank={}/{} contact_addr={} contact_id={} error={}",
+                    attempt.rank,
+                    attempt.total,
+                    attempt.contact.addr,
+                    attempt.contact.id,
+                    e
+                );
+                tracing::debug!(
+                    "publish_notes ack failed from {}: {}",
+                    attempt.contact.addr,
+                    e
+                );
+            }
         }
     }
 
-    Ok(acks)
+    Ok(stats)
 }
 
 async fn get_initial(

@@ -271,18 +271,16 @@ Pending parity gap: encryption capability tags and buddy/callback tag handling i
 | Field | Size | Meaning |
 |---|---:|---|
 | `target` | 16 | File hash target |
-| `author_id` (oracle) | 16 | Publisher Kad ID — the sender's `NodeId` |
+| `publisher_id` | 16 | Publisher Kad ID — the sender's `NodeId` |
 | `tag_count` | 1 | Number of tags |
 | `tags[tag_count]` | variable | Note tags |
 
-Status: **Verified difference — semantic and type bug**.
+Status: `Equivalent behavior`.
 
-The Rust struct defines the second field as `note_hash: Ed2kHash`. The oracle (eMule `kademlia/Search.cpp CSearch::StorePacket` and aMule equivalent) writes the **publisher's Kad node ID** — a `NodeId` — into this position. The `Ed2kHash` type is MD4-based and also 16 bytes, so the wire size is accidentally correct and no packet is malformed at the byte level. However:
-
-1. The type is semantically wrong: `Ed2kHash` implies a file hash. The oracle writes a node identity (`NodeId`).
-2. The name is wrong: `note_hash` implies a note-specific hash. The oracle uses this field for publisher identity in all publish flows.
-
-This must be corrected to `publisher_id: NodeId` to match the oracle contract before notes publish can be validated end-to-end. End-to-end notes publish interoperability is `Pending`.
+The Rust struct now models the second field as `publisher_id: NodeId`, matching
+the oracle contract directly instead of relying on the accidental 16-byte size
+match between `NodeId` and `Ed2kHash`. End-to-end notes publish validation is no
+longer blocked by a semantic field mismatch.
 
 Oracle typical tags in notes publish: `FILENAME`, `FILERATING`, `DESCRIPTION`, `FILESIZE` (for Kad2-capable peers).
 
@@ -561,12 +559,10 @@ Current Rust state: `publish_source` in `overlord-kad-dht/src/publish.rs` now fi
 
 Oracle: The second 128-bit field in `KADEMLIA2_PUBLISH_NOTES_REQ` is the publisher's Kad node ID — a `NodeId`, the sender's identity.
 
-Current Rust state: The field is `note_hash: Ed2kHash`. The wire size is accidentally correct (both `NodeId` and `Ed2kHash` are 16 bytes), but:
-
-- The type `Ed2kHash` encodes the wrong domain (file hash rather than node identity).
-- The name `note_hash` encodes the wrong concept (a note identifier rather than a publisher identity).
-
-This is a **verified semantic and naming bug**. It does not corrupt packets at the byte level but will cause confusion during maintenance and makes the struct's contract incorrect with respect to the oracle. The fix requires changing the field to `publisher_id: NodeId` and updating all call sites. Until this is done, end-to-end notes publish validation is blocked. Status: `Verified difference`.
+Current Rust state: `PublishNotesReq` now uses `publisher_id: NodeId`, and the
+agent-local notes store keys notes publishes by publisher identity rather than a
+fictitious note hash. The remaining work is live validation and broader
+coordinator-side notes-result modeling. Status: `Equivalent behavior`.
 
 ### 8.4 Publish Result Load Semantics
 
@@ -702,16 +698,15 @@ Ranked by severity for live network interoperability.
 | # | Area | Gap description | Severity |
 |---|---|---|---|
 | 1 | **Obfuscation transport dominance** | Live oracle is ~94% obfuscated; Rust runtime is still more plaintext than the oracle. Without matching obfuscation density, many live peers will ignore publish and search traffic. | Critical |
-| 2 | **`PublishNotesReq.note_hash`** | Wrong type (`Ed2kHash` vs `NodeId`) and wrong name. Wire size is accidentally correct. Notes publish cannot be validated end-to-end until this is corrected to `publisher_id: NodeId`. | High |
-| 3 | **HELLO / obfuscation key registration** | Full three-way HELLO parity around obfuscation key exchange not yet audited. Blocking full obfuscation context build-up with peers. | High |
-| 4 | **Packet-tracking live validation** | Oracle-shaped per-opcode packet tracking is now in place, but live acceptance still needs repeated validation against the oracle with the new tracker counters and drop reasons. | Medium |
-| 5 | **Kad notes result modeling** | Active Kad notes search is wired and live-validated, but coordinator result storage is still file-centric. Distinct note authors for the same file would collapse into one `FileRecord`. | Medium |
-| 6 | **`SearchRes.keyword_id` naming** | Misleading field name — the echoed target is not keyword-specific. Wire is correct; maintenance hazard. | Low (naming only) |
-| 7 | **Keyword expression serialization** | `start_position=0` only. Oracle expression-tree mode (`0x8000`) and numeric pagination not yet implemented. | Low |
-| 8 | **Source publish encryption and buddy tags** | Not audited against oracle send path for encryption capability tags and buddy/callback tag handling. | Low |
-| 9 | **Publish result load semantics** | `PUBLISH_RES.load` received but oracle load-tracking logic not modeled. | Low |
-| 10 | **`FIREWALLED2_REQ` in protocol docs** | Present in `constants.rs` and has a struct, but absent from `KAD_PROTOCOL.md` opcode table. Documentation gap. | Trivial |
-| 11 | **ED2K full server protocol** | `OP_OFFERFILES` body, server search, peer callback, file transfer. Intentionally deferred to Phase 2+. | Out of scope |
+| 2 | **HELLO / obfuscation key registration** | Full three-way HELLO parity around obfuscation key exchange not yet audited. Blocking full obfuscation context build-up with peers. | High |
+| 3 | **Packet-tracking live validation** | Oracle-shaped per-opcode packet tracking is now in place, but live acceptance still needs repeated validation against the oracle with the new tracker counters and drop reasons. | Medium |
+| 4 | **Kad notes result modeling** | Active Kad notes search is wired and live-validated, but coordinator result storage is still file-centric. Distinct note authors for the same file would collapse into one `FileRecord`. | Medium |
+| 5 | **`SearchRes.keyword_id` naming** | Misleading field name — the echoed target is not keyword-specific. Wire is correct; maintenance hazard. | Low (naming only) |
+| 6 | **Keyword expression serialization** | `start_position=0` only. Oracle expression-tree mode (`0x8000`) and numeric pagination not yet implemented. | Low |
+| 7 | **Source publish encryption and buddy tags** | Not audited against oracle send path for encryption capability tags and buddy/callback tag handling. | Low |
+| 8 | **Publish result load semantics** | `PUBLISH_RES.load` received but oracle load-tracking logic not modeled. | Low |
+| 9 | **`FIREWALLED2_REQ` in protocol docs** | Present in `constants.rs` and has a struct, but absent from `KAD_PROTOCOL.md` opcode table. Documentation gap. | Trivial |
+| 10 | **ED2K full server protocol** | `OP_OFFERFILES` body, server search, peer callback, file transfer. Intentionally deferred to Phase 2+. | Out of scope |
 
 ---
 

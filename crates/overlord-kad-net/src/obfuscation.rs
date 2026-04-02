@@ -1,3 +1,10 @@
+//! Kad UDP obfuscation state and encrypt/decrypt helpers.
+//!
+//! The oracle chooses between plaintext, NodeID-mode obfuscation, and
+//! receiver-verify-key obfuscation based on what it currently knows about a
+//! peer. This module keeps that per-peer state and exposes the exact transport
+//! mode decision used by the runtime.
+
 use md5::compute as md5_compute;
 use overlord_kad_proto::NodeId;
 use overlord_kad_proto::constants::{OP_KADEMLIAHEADER, OP_KADEMLIAPACKEDPROT};

@@ -1,3 +1,10 @@
+//! Kad2 wire primitives, packet codecs, and protocol constants shared by the
+//! Overlord agent runtime.
+//!
+//! This crate owns the byte-level contract with the Kad network. Types here
+//! should describe oracle semantics as well as field widths so higher layers do
+//! not need to reverse-engineer protocol intent from packet layouts alone.
+
 pub mod constants;
 pub mod error;
 pub mod hash;

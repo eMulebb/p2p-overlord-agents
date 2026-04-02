@@ -353,10 +353,10 @@ Verified wire shape in this repo and eMule send path:
 
 Important caution:
 
-- the current Rust field name is `note_hash`
+- the Rust field name is `publisher_id`
 - eMule writes the publisher Kad ID here
-- the current Rust public API still implies a note-hash style value even though the oracle semantics are publisher identity
-- end-to-end notes publish parity is still `Pending`
+- the Rust public API now matches the oracle publisher-identity semantics directly
+- the agent keeps notes publish disabled by default and enables it only for controlled validation runs
 
 ### `KADEMLIA2_PUBLISH_RES` (`0x4B`)
 
@@ -654,7 +654,7 @@ Verified from eMule send path:
 
 Pending:
 
-- the Rust field name `note_hash` is semantically misleading
+- the Rust field name `publisher_id` now matches the oracle publisher-identity semantics
 - end-to-end interoperability for notes publish remains to be verified against live peers
 
 ### Publish Result

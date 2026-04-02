@@ -1,3 +1,10 @@
+//! Stateful Kad node runtime built on top of routing, transport, and traversal.
+//!
+//! `DhtNode` owns the local node identity, the routing table, and the RPC
+//! manager. Public methods here represent observable protocol operations such as
+//! bootstrap, lookup, search, and publish, so their docs should explain the
+//! wire-facing role of each call rather than only the local implementation.
+
 use crate::bootstrap::{BootstrapContact, hardcoded_bootstrap, parse_nodes_dat, parse_nodes_text};
 use crate::error::DhtError;
 use crate::traversal::{TraversalConfig, TraversalContact, TraversalKind, run_traversal};
@@ -703,17 +710,20 @@ impl DhtNode {
     }
 
     /// Publish a note/rating for a file.
+    ///
+    /// The publisher identity is the Kad node ID written into the second
+    /// 128-bit field of `KADEMLIA2_PUBLISH_NOTES_REQ`.
     pub async fn publish_notes(
         &self,
         file_hash: Ed2kHash,
-        note_hash: Ed2kHash,
+        publisher_id: NodeId,
         tags: Vec<Tag>,
-    ) -> Result<usize, DhtError> {
+    ) -> Result<crate::publish::PublishAttemptStats, DhtError> {
         crate::publish::publish_notes(
             &self.inner.rpc,
             &self.inner.routing_table,
             file_hash,
-            note_hash,
+            publisher_id,
             tags,
             self.inner.config.publish_contact_fanout,
         )
