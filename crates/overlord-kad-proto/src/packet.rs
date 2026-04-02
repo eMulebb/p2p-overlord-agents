@@ -207,9 +207,9 @@ pub struct SearchResultEntry {
 // ── SearchRes ────────────────────────────────────────────────────────────────
 //
 // eMule Indexed.cpp SendValidKeywordResult wire format:
-//   sender_id:  NodeId (16 bytes) — the responder's Kad ID
-//   keyword_id: NodeId (16 bytes) — the keyword hash that was queried
-//   count:      u16              — number of results in this packet
+//   sender_id: NodeId (16 bytes) — the responder's Kad ID
+//   target:    NodeId (16 bytes) — echoed request target
+//   count:     u16               — number of results in this packet
 //   count × SearchResultEntry
 
 #[binrw]
@@ -220,10 +220,9 @@ pub struct SearchRes {
     pub sender_id: NodeId,
     /// Echoed search target from the request.
     ///
-    /// The field name is still narrower than the oracle wire meaning:
-    /// keyword searches echo the keyword hash here, while source and notes
+    /// Keyword searches echo the keyword hash here, while source and notes
     /// searches echo the searched file hash in the same 16-byte slot.
-    pub keyword_id: NodeId,
+    pub target: NodeId,
     #[br(temp)]
     #[bw(calc = u16::try_from(results.len()).expect("result count exceeds u16"))]
     count: u16,
@@ -603,7 +602,7 @@ fn read_search_res(cursor: &mut Cursor<&[u8]>) -> Result<SearchRes, ProtoError> 
     // - eMule srchybrid/kademlia/io/DataIO.cpp CDataIO::ReadStringUTF8(bool bOptACP)
     // - aMule src/kademlia/net/KademliaUDPListener.cpp ProcessSearchResponse
     let sender_id = cursor.read_le::<NodeId>()?;
-    let keyword_id = cursor.read_le::<NodeId>()?;
+    let target = cursor.read_le::<NodeId>()?;
     let count = cursor.read_le::<u16>()?;
     let mut results = Vec::with_capacity(count as usize);
 
@@ -623,7 +622,7 @@ fn read_search_res(cursor: &mut Cursor<&[u8]>) -> Result<SearchRes, ProtoError> 
 
     Ok(SearchRes {
         sender_id,
-        keyword_id,
+        target,
         results,
     })
 }
@@ -826,7 +825,7 @@ mod tests {
         };
         let pkt = KadPacket::SearchRes(SearchRes {
             sender_id: NodeId::from_bytes([0x11; 16]),
-            keyword_id: NodeId::from_bytes([0x22; 16]),
+            target: NodeId::from_bytes([0x22; 16]),
             results: vec![entry],
         });
         let bytes = pkt.encode().unwrap();
@@ -843,7 +842,7 @@ mod tests {
     fn test_search_res_decodes_legacy_cp1252_strings() {
         let mut bytes = vec![OP_KADEMLIAHEADER, opcode::SEARCH_RES];
         bytes.extend_from_slice(&[0x11; 16]); // sender_id
-        bytes.extend_from_slice(&[0x22; 16]); // keyword_id
+        bytes.extend_from_slice(&[0x22; 16]); // target
         bytes.extend_from_slice(&1u16.to_le_bytes()); // result count
         bytes.extend_from_slice(&[0x33; 16]); // file hash
         bytes.push(1); // tag count

@@ -1415,7 +1415,7 @@ mod tests {
         let peer_addr: SocketAddr = "1.2.3.4:9999".parse().unwrap();
         let packet = KadPacket::SearchRes(overlord_kad_proto::SearchRes {
             sender_id: NodeId::from_bytes([0x44; 16]),
-            keyword_id: NodeId::from_bytes([0x55; 16]),
+            target: NodeId::from_bytes([0x55; 16]),
             results: Vec::new(),
         });
         let encoded = packet.encode().unwrap();

@@ -200,7 +200,7 @@ Use the labels below when reading the current port status:
 
 | Crate | Status | Notes |
 |---|---|---|
-| `overlord-kad-proto` | `Equivalent behavior` + `Verified difference` | `src/packet.rs` matches the oracle Kad2 search-family wire shapes used by eMule `net/KademliaUDPListener.cpp Process_KADEMLIA2_SEARCH_*` and `kademlia/Search.cpp CSearch::StorePacket`, cross-checked against aMule `Process2Search*Request` and `CSearch::StorePacket`. The remaining semantic-name gap is `SearchRes.keyword_id`, which is still narrower than the echoed-target meaning used on the wire. |
+| `overlord-kad-proto` | `Equivalent behavior` | `src/packet.rs` matches the oracle Kad2 search-family wire shapes used by eMule `net/KademliaUDPListener.cpp Process_KADEMLIA2_SEARCH_*` and `kademlia/Search.cpp CSearch::StorePacket`, cross-checked against aMule `Process2Search*Request` and `CSearch::StorePacket`. `SearchRes.target` now uses the same generic echoed-target semantics as the wire across keyword, source, and notes responses. |
 | `overlord-kad-routing` | `Equivalent behavior` | `src/table.rs`, `src/zone.rs`, and `src/bin.rs` now match the oracle global duplicate limits, `RoutingZone.cpp CanSplit`, and the per-bin two-per-`/24` clustering cap enforced in `routing/RoutingBin.cpp AddContact`. |
 | `overlord-kad-net` | `Equivalent behavior` + `Pending parity gap` | `src/rpc.rs`, `src/tracker.rs`, and the transport flow now implement oracle-shaped per-IP, per-opcode request tracking and the current obfuscation-mode selection. The remaining gap is live-behavior density and HELLO-derived key registration, not generic tracker shape anymore. |
 | `overlord-kad-dht` | `Equivalent behavior` + `Repo policy` | `src/traversal.rs` emits the same Kad2 search request families as oracle `CSearch::StorePacket`, and the main search/source/notes traversal shape is recognizable. `src/search.rs is_acceptable_keyword_result` is currently repo policy rather than a direct oracle port, and source publish now fills the second `KADEMLIA2_PUBLISH_SOURCE_REQ` field with publisher identity like eMule/aMule. Bootstrap persistence now also preserves peer UDP keys from `nodes.dat` so restarts retain the same obfuscation context the oracle keeps. |
@@ -209,9 +209,8 @@ Use the labels below when reading the current port status:
 ### Current Oracle Findings Backlog
 
 1. `overlord-kad-net`: finish the oracle obfuscation port and verify it on the live network. The recent `a1`-`a7` eMule packet captures under `ext-deps/eMule_full_build_deps/eMule/srchybrid/x64/Debug/` show that modern oracle sessions are overwhelmingly obfuscated, while plaintext Kad appears only as a small bootstrap, hello, or fallback slice. An isolated oracle run from `ext-deps/eMule-build` on 2026-03-22 reinforced that result: a 5-minute capture on `46663/udp` produced `1009` packets, only `55` plaintext `0xE4...` packets, and `954` non-plaintext packets, while the oracle trace log still recorded successful publish sends and accepts.
-2. `overlord-kad-proto`: rename the remaining misleading echoed-target field `SearchRes.keyword_id` so the Rust API stops encoding the wrong mental model.
-3. `overlord-agent-emule`: preserve fuller snooped request shape so passive replay can match oracle keyword/source/notes request details more closely.
-4. `overlord-kad-net` and live runtime validation: keep re-running live-network acceptance to improve HELLO key registration completeness and obfuscation density against the oracle.
+2. `overlord-agent-emule`: preserve fuller snooped request shape so passive replay can match oracle keyword/source/notes request details more closely.
+3. `overlord-kad-net` and live runtime validation: keep re-running live-network acceptance to improve HELLO key registration completeness and obfuscation density against the oracle.
 
 ---
 

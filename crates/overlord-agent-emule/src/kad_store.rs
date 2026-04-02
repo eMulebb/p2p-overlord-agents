@@ -294,7 +294,7 @@ fn search_response(
     } else {
         Some(SearchRes {
             sender_id,
-            keyword_id: target,
+            target,
             results,
         })
     }

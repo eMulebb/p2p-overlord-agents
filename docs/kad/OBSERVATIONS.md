@@ -202,7 +202,7 @@ Oracle anchors:
 | Field | Size | Meaning |
 |---|---:|---|
 | `sender_id` | 16 | Kad ID of the responding node |
-| `keyword_id` | 16 | Echoed search target (see naming note below) |
+| `target` | 16 | Echoed search target |
 | `count` | 2 | Number of result entries in this packet |
 | `results[count]` | variable | `SearchResultEntry` records |
 
@@ -214,9 +214,7 @@ Oracle anchors:
 | `tag_count` | 1 | Number of tags |
 | `tags[tag_count]` | variable | Typed Kad tags describing the result |
 
-Status: `Equivalent behavior` for wire shape. The Rust codec correctly encodes and decodes this layout.
-
-Verified difference — naming: The Rust field `keyword_id` is named as if the response is keyword-only. In reality this field is the echoed search target for all three search families: it is the keyword hash for keyword searches, the file hash for source searches, and the file hash for notes searches. The name encodes the wrong mental model and should be renamed to a generic `target` or `search_target`. This is a naming bug only — it does not affect wire behavior.
+Status: `Equivalent behavior` for wire shape. The Rust codec correctly encodes and decodes this layout, and the Rust field is now named `target` to match the echoed-target wire meaning across keyword, source, and notes search responses.
 
 Oracle anchors:
 - eMule `srchybrid/kademlia/kademlia/Indexed.cpp SendValidKeywordResult`, `SendValidSourceResult`, `SendValidNoteResult`
@@ -701,7 +699,7 @@ Ranked by severity for live network interoperability.
 | 2 | **HELLO / obfuscation key registration** | Full three-way HELLO parity around obfuscation key exchange not yet audited. Blocking full obfuscation context build-up with peers. | High |
 | 3 | **Packet-tracking live validation** | Oracle-shaped per-opcode packet tracking is now in place, but live acceptance still needs repeated validation against the oracle with the new tracker counters and drop reasons. | Medium |
 | 4 | **Kad notes result modeling** | Active Kad notes search is wired and live-validated, but coordinator result storage is still file-centric. Distinct note authors for the same file would collapse into one `FileRecord`. | Medium |
-| 5 | **`SearchRes.keyword_id` naming** | Misleading field name — the echoed target is not keyword-specific. Wire is correct; maintenance hazard. | Low (naming only) |
+| 5 | **Search response target semantics** | `SEARCH_RES.target` is now documented and named for the generic echoed target semantics shared by keyword, source, and notes responses. | Closed |
 | 6 | **Keyword expression serialization** | `start_position=0` only. Oracle expression-tree mode (`0x8000`) and numeric pagination not yet implemented. | Low |
 | 7 | **Source publish encryption and buddy tags** | Not audited against oracle send path for encryption capability tags and buddy/callback tag handling. | Low |
 | 8 | **Publish result load semantics** | `PUBLISH_RES.load` received but oracle load-tracking logic not modeled. | Low |

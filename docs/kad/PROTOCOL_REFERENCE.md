@@ -279,11 +279,11 @@ Interpretation of `entry_id`:
 - source search: source/client-related 128-bit ID, not the searched file hash
 - notes search: note author/source ID
 
-Important repo note:
+Rust naming note:
 
-- the Rust struct currently names the echoed target field `keyword_id`
-- that name is narrower than the wire reality
-- for source and notes searches it is still the echoed file-hash target, not a keyword-only concept
+- the Rust struct names the echoed target field `target`
+- for keyword searches it carries the keyword hash
+- for source and notes searches it carries the echoed file-hash target
 
 Oracle anchors:
 

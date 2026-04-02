@@ -268,7 +268,7 @@ Coordinator/Agent       US                          CLOSE_N
        |                   |                              |
        |                   |  sender_id:  [16 bytes]      |
        |                   |    CLOSE_N Kad ID            |
-       |                   |  keyword_id: [16 bytes]      |
+       |                   |  target:     [16 bytes]      |
        |                   |    echoed target (keyword hash)
        |                   |  count:      [2 bytes]       |
        |                   |  results[0..count]:          |
@@ -349,7 +349,7 @@ Coordinator/Agent       US                          CLOSE_N
        |                   |                             |
        |                   |  sender_id:  [16 bytes]     |
        |                   |    CLOSE_N Kad ID           |
-       |                   |  keyword_id: [16 bytes]     |
+       |                   |  target:     [16 bytes]     |
        |                   |    echoed file hash (TARGET)|
        |                   |  count:      [2 bytes]      |
        |                   |  results[0..count]:         |
@@ -421,7 +421,7 @@ Coordinator/Agent       US                          CLOSE_N
        |                   |                             |
        |                   |  sender_id:  [16 bytes]     |
        |                   |    CLOSE_N Kad ID           |
-       |                   |  keyword_id: [16 bytes]     |
+       |                   |  target:     [16 bytes]     |
        |                   |    echoed file hash (TARGET)|
        |                   |  count:      [2 bytes]      |
        |                   |  results[0..count]:         |

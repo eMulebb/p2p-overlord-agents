@@ -555,10 +555,10 @@ async fn collect_search_results_until(
                     trace!("ignoring SEARCH_RES from unqueried sender {}", from);
                     continue;
                 }
-                if sr.keyword_id != target {
+                if sr.target != target {
                     trace!(
                         "ignoring SEARCH_RES from {} for mismatched target {}",
-                        from, sr.keyword_id
+                        from, sr.target
                     );
                     continue;
                 }
@@ -978,7 +978,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             let first = KadPacket::SearchRes(SearchRes {
                 sender_id: contact.id,
-                keyword_id: target,
+                target,
                 results: vec![overlord_kad_proto::packet::SearchResultEntry {
                     hash: Ed2kHash::from_bytes([1; 16]),
                     tags: vec![],
@@ -992,7 +992,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             let second = KadPacket::SearchRes(SearchRes {
                 sender_id: contact.id,
-                keyword_id: target,
+                target,
                 results: vec![overlord_kad_proto::packet::SearchResultEntry {
                     hash: Ed2kHash::from_bytes([2; 16]),
                     tags: vec![],
