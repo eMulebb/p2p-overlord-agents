@@ -3604,7 +3604,7 @@ async fn current_tcp_firewalled(
         .unwrap_or(true)
 }
 
-fn build_kad_hello_tags(
+fn build_kad_hello_response_tags(
     kad_udp_port: u16,
     udp_firewalled: bool,
     tcp_firewalled: bool,
@@ -3621,6 +3621,36 @@ fn build_kad_hello_tags(
         TagValue::U8(misc_options),
     ));
     tags
+}
+
+fn build_kad_hello_request_tags(
+    kad_udp_port: u16,
+    can_advertise_source_udp_port: bool,
+    udp_firewalled: bool,
+    tcp_firewalled: bool,
+    request_ack: bool,
+) -> Vec<Tag> {
+    // The matched oracle HELLO_REQ traffic in the live parity run emitted a
+    // narrower tag shape than HELLO_RES: it sent either SOURCEUPORT or
+    // KADMISCOPTIONS here, but not both in the same request.
+    if request_ack || udp_firewalled || tcp_firewalled {
+        let misc_options = u8::from(udp_firewalled)
+            | (u8::from(tcp_firewalled) << 1)
+            | (u8::from(request_ack) << 2);
+        return vec![Tag::new_short(
+            tag_name::KADMISCOPTIONS,
+            TagValue::U8(misc_options),
+        )];
+    }
+
+    if can_advertise_source_udp_port {
+        return vec![Tag::new_short(
+            tag_name::SOURCEUPORT,
+            TagValue::U16(kad_udp_port),
+        )];
+    }
+
+    Vec::new()
 }
 
 async fn build_hello_response(
@@ -3641,7 +3671,7 @@ async fn build_hello_response(
         node_id: dht.own_id(),
         tcp_port,
         version: overlord_kad_proto::KAD_VERSION,
-        tags: build_kad_hello_tags(
+        tags: build_kad_hello_response_tags(
             bind_addr.port(),
             firewall.udp_verified && !firewall.udp_open,
             current_tcp_firewalled(ed2k_listener, ed2k_server_state).await,
@@ -3668,8 +3698,9 @@ async fn build_hello_request(
         node_id: dht.own_id(),
         tcp_port,
         version: overlord_kad_proto::KAD_VERSION,
-        tags: build_kad_hello_tags(
+        tags: build_kad_hello_request_tags(
             bind_addr.port(),
+            firewall.udp_verified && firewall.udp_open,
             firewall.udp_verified && !firewall.udp_open,
             current_tcp_firewalled(ed2k_listener, ed2k_server_state).await,
             request_ack,
@@ -5911,12 +5942,13 @@ mod tests {
         OverlordAgentEmule, PASSIVE_REPLAY_CONCURRENCY, PassiveReplaySelection,
         SYNTHETIC_POPULAR_SEEDS, SourcePublishSettings, apply_harvest_record,
         apply_networking_config, apply_publish_summary, apply_queue_family_counts,
-        build_hello_request, build_hello_response, build_kad_hello_tags, build_keyword_snoop_entry,
-        build_notes_snoop_entry, build_publish_batch_summary, build_source_publish_tags,
-        build_source_snoop_entry, current_tcp_firewalled, effective_publish_counters,
-        empty_networking_config, emule_high_id_source_type, flush_snoop_queue, keyword_target,
-        next_passive_replay_request, next_passive_replay_request_for_family,
-        normalize_ed2k_user_hash_markers, parse_kad_hello_metadata, record_passive_replay_complete,
+        build_hello_request, build_hello_response, build_kad_hello_request_tags,
+        build_kad_hello_response_tags, build_keyword_snoop_entry, build_notes_snoop_entry,
+        build_publish_batch_summary, build_source_publish_tags, build_source_snoop_entry,
+        current_tcp_firewalled, effective_publish_counters, empty_networking_config,
+        emule_high_id_source_type, flush_snoop_queue, keyword_target, next_passive_replay_request,
+        next_passive_replay_request_for_family, normalize_ed2k_user_hash_markers,
+        parse_kad_hello_metadata, record_passive_replay_complete,
         record_passive_replay_enqueue_wait, record_passive_replay_idle,
         record_passive_replay_post_failure, record_passive_replay_post_latency,
         record_passive_replay_start, restore_snoop_queue, select_popular_hashes_for_seeding,
@@ -7061,8 +7093,8 @@ mod tests {
     }
 
     #[test]
-    fn kad_hello_tags_encode_expected_misc_bits() {
-        let tags = build_kad_hello_tags(41000, true, false, true);
+    fn kad_hello_response_tags_encode_expected_misc_bits() {
+        let tags = build_kad_hello_response_tags(41000, true, false, true);
 
         assert_eq!(
             tags,
@@ -7071,6 +7103,33 @@ mod tests {
                 Tag::new_short(tag_name::KADMISCOPTIONS, TagValue::U8(0x05)),
             ]
         );
+    }
+
+    #[test]
+    fn kad_hello_request_tags_prefer_misc_options_when_ack_is_requested() {
+        let tags = build_kad_hello_request_tags(41000, true, false, false, true);
+
+        assert_eq!(
+            tags,
+            vec![Tag::new_short(tag_name::KADMISCOPTIONS, TagValue::U8(0x04))]
+        );
+    }
+
+    #[test]
+    fn kad_hello_request_tags_advertise_source_uport_for_verified_open_udp() {
+        let tags = build_kad_hello_request_tags(41000, true, false, false, false);
+
+        assert_eq!(
+            tags,
+            vec![Tag::new_short(tag_name::SOURCEUPORT, TagValue::U16(41000))]
+        );
+    }
+
+    #[test]
+    fn kad_hello_request_tags_can_be_empty_before_udp_state_is_verified() {
+        let tags = build_kad_hello_request_tags(41000, false, false, false, false);
+
+        assert!(tags.is_empty());
     }
 
     #[test]
