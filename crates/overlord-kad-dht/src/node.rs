@@ -2,7 +2,10 @@ use crate::bootstrap::{BootstrapContact, hardcoded_bootstrap, parse_nodes_dat, p
 use crate::error::DhtError;
 use crate::traversal::{TraversalConfig, TraversalContact, TraversalKind, run_traversal};
 use crate::types::{NoteResult, SearchResult, SourceResult};
-use overlord_kad_net::{ObfuscationLayer, ReceivedKadPacket, RpcConfig, RpcManager, UdpTransport};
+use overlord_kad_net::{
+    ObfuscationLayer, ReceivedKadPacket, RpcConfig, RpcManager, RpcObservabilitySnapshot,
+    UdpTransport,
+};
 use overlord_kad_proto::{
     Ed2kHash, KadPacket, KadUdpKey, NodeId, SearchKeyReq, SearchSourceReq, Tag, constants::K,
     opcode,
@@ -81,7 +84,7 @@ impl Default for DhtConfig {
 
 struct DhtInner {
     own_id: NodeId,
-    routing_table: Mutex<RoutingTable>,
+    routing_table: Arc<Mutex<RoutingTable>>,
     rpc: RpcManager,
     config: DhtConfig,
     /// Semaphore for limiting concurrent searches. Reserved for future use.
@@ -123,23 +126,32 @@ impl DhtNode {
         let transport = UdpTransport::bind(config.bind_addr).await?;
         let obfuscation =
             ObfuscationLayer::new(config.node_id, config.udp_key, config.obfuscation_enabled);
+        let routing_table = Arc::new(Mutex::new(RoutingTable::with_max_size(
+            config.node_id,
+            config.max_routing_table_size,
+        )));
+        let flood_routing_table = Arc::clone(&routing_table);
         let rpc = RpcManager::new(
             transport,
             obfuscation,
             RpcConfig {
                 max_outbound_pps: config.max_outbound_pps,
+                massive_flood_handler: Some(Arc::new(move |addr| {
+                    let flood_routing_table = Arc::clone(&flood_routing_table);
+                    tokio::spawn(async move {
+                        expire_contact_for_massive_flood(&flood_routing_table, addr).await;
+                    });
+                })),
                 ..RpcConfig::default()
             },
         );
 
-        let routing_table =
-            RoutingTable::with_max_size(config.node_id, config.max_routing_table_size);
         let semaphore = Semaphore::new(config.max_concurrent_searches);
 
         Ok(Self {
             inner: Arc::new(DhtInner {
                 own_id: config.node_id,
-                routing_table: Mutex::new(routing_table),
+                routing_table,
                 rpc,
                 config,
                 semaphore,
@@ -197,6 +209,12 @@ impl DhtNode {
     /// Subscribe to unsolicited incoming Kad packets.
     pub fn subscribe_packets(&self) -> broadcast::Receiver<ReceivedKadPacket> {
         self.inner.rpc.subscribe()
+    }
+
+    /// Snapshot Kad RPC tracker behavior for operator-facing observability.
+    #[must_use]
+    pub fn rpc_observability(&self) -> RpcObservabilitySnapshot {
+        self.inner.rpc.observability()
     }
 
     /// Snapshot currently known contacts.
@@ -687,6 +705,30 @@ impl DhtNode {
 
 fn addr_from_contact(contact: &Contact) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(contact.ip), contact.udp_port)
+}
+
+/// Mirrors the oracle's higher punishment path for massive request floods by
+/// expiring the matching routing-table contact when we can identify one.
+async fn expire_contact_for_massive_flood(
+    routing_table: &Arc<Mutex<RoutingTable>>,
+    addr: SocketAddr,
+) {
+    let IpAddr::V4(ip) = addr.ip() else {
+        return;
+    };
+    let mut routing_table = routing_table.lock().await;
+    let contact_id = routing_table
+        .all_contacts()
+        .into_iter()
+        .find(|contact| contact.ip == ip && contact.udp_port == addr.port())
+        .map(|contact| contact.id);
+    if let Some(contact_id) = contact_id {
+        let _ = routing_table.remove(&contact_id);
+        warn!(
+            "expired routing contact after massive Kad request flood from {}",
+            addr
+        );
+    }
 }
 
 #[cfg(test)]

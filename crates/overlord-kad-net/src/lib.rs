@@ -9,6 +9,9 @@ mod wire_dump;
 pub use error::NetError;
 pub use obfuscation::ObfuscationLayer;
 pub use rate_limit::RateLimiter;
-pub use rpc::{ReceivedKadPacket, RpcConfig, RpcManager};
+pub use rpc::{
+    ReceivedKadPacket, RpcConfig, RpcManager, RpcObservabilitySnapshot, RpcResponseOpcodeSnapshot,
+    RpcTrackerBucketSnapshot,
+};
 pub use tracker::PacketTracker;
 pub use transport::{MockTransport, Transport, UdpTransport};

@@ -311,6 +311,7 @@ mod tests {
                 agent_activity: None,
                 publish_observability: None,
                 harvest_observability: None,
+                rpc_observability: None,
             })
         }
 

@@ -591,7 +591,13 @@ Both implement per-IP, per-opcode inbound request throttling. The two oracles di
 
 Overlord policy: eMule wins. The Rust implementation should use eMule's limits.
 
-Current Rust status: `overlord-kad-net/src/tracker.rs` applies a generic per-IP flood limit rather than per-IP, per-opcode logic. This means the Rust runtime's rate limiting does not faithfully reproduce oracle throttle behavior and may accept or reject inbound traffic at the wrong granularity. Status: **Pending parity gap**.
+Current Rust status: `overlord-kad-net/src/tracker.rs` now mirrors the oracle's per-IP, per-opcode buckets for bootstrap, HELLO, lookup, search, publish, firewall, buddy, callback, and ping traffic. The Rust runtime also now mirrors the oracle's three-state punishment model:
+
+- allow
+- ordinary flood drop
+- massive flood drop at `4x` the per-minute bucket, with a higher punishment path
+
+The response side is also tracked separately through `OutboundRequestTracker`, including the oracle's publish-response "peek then consume" behavior. The remaining gap is no longer bucket shape; it is broader live-behavior validation and acceptance tuning around the now-instrumented tracker decisions. Status: **Equivalent behavior (recently improved)**.
 
 ---
 
@@ -698,7 +704,7 @@ Ranked by severity for live network interoperability.
 | 1 | **Obfuscation transport dominance** | Live oracle is ~94% obfuscated; Rust runtime is still more plaintext than the oracle. Without matching obfuscation density, many live peers will ignore publish and search traffic. | Critical |
 | 2 | **`PublishNotesReq.note_hash`** | Wrong type (`Ed2kHash` vs `NodeId`) and wrong name. Wire size is accidentally correct. Notes publish cannot be validated end-to-end until this is corrected to `publisher_id: NodeId`. | High |
 | 3 | **HELLO / obfuscation key registration** | Full three-way HELLO parity around obfuscation key exchange not yet audited. Blocking full obfuscation context build-up with peers. | High |
-| 4 | **Per-opcode packet tracking** | `tracker.rs` uses generic per-IP flood limiting instead of oracle per-IP, per-opcode rates from `PacketTracking.cpp`. | Medium |
+| 4 | **Packet-tracking live validation** | Oracle-shaped per-opcode packet tracking is now in place, but live acceptance still needs repeated validation against the oracle with the new tracker counters and drop reasons. | Medium |
 | 5 | **Zone split `can_split` condition** | Rust uses `on_own_side` which is not the same predicate as oracle `zone_index < KK`. Routing topology diverges under load. | Medium |
 | 6 | **Per-bin `/24` subnet cap** | `RoutingBin` missing oracle two-per-`/24` anti-clustering limit. Global limits are correct; per-bucket granularity is weaker. | Medium |
 | 7 | **Notes search end-to-end wiring** | DHT path (`traversal.rs`) exists and is wire-correct, but `agent.rs` rejects coordinator-triggered notes searches. | Medium |

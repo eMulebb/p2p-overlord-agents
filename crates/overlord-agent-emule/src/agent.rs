@@ -41,13 +41,14 @@ use overlord_agent_common::{
     CoordinatorClient, FileRecord, HarvestFamily, HarvestReplayContext, HarvestReplayRecord,
     HashType, IndexerServer, IndexerService, IndexerStats, KadHarvestFamilyObservability,
     KadHarvestObservability, KadPassiveReplayObservability, KadPassiveReplayTierSummary,
-    KadPublishObservability, PopularHash, Protocol, PublishBatchSummary, PublishCounters,
+    KadPublishObservability, KadRpcObservability, KadRpcResponseOpcodeObservability,
+    KadRpcTrackerBucketObservability, PopularHash, Protocol, PublishBatchSummary, PublishCounters,
     PublishSeedSource, RegisterRequest, ResultBatch, RunningIndexerServer, SearchEvent,
     SearchEventStatus, SearchJob, SearchKind, SnoopEntry, SnoopObservation, Source, TagEntry,
 };
 use overlord_kad_dht::{
-    DhtConfig, DhtNode, NoteResult, PublishAttemptStats, ReceivedKadPacket, SearchResult,
-    SourceResult,
+    DhtConfig, DhtNode, NoteResult, PublishAttemptStats, ReceivedKadPacket,
+    RpcObservabilitySnapshot, SearchResult, SourceResult,
     bootstrap::{BootstrapContact, encode_nodes_dat},
 };
 use overlord_kad_proto::{
@@ -569,6 +570,33 @@ fn apply_queue_family_counts(
     observability.keyword_requests.queued_entries = counts.keyword as u32;
     observability.source_requests.queued_entries = counts.source as u32;
     observability.notes_requests.queued_entries = counts.notes as u32;
+}
+
+fn map_rpc_observability(snapshot: RpcObservabilitySnapshot) -> KadRpcObservability {
+    KadRpcObservability {
+        decode_failures: snapshot.decode_failures,
+        tracker_buckets: snapshot
+            .tracker_buckets
+            .into_iter()
+            .map(|bucket| KadRpcTrackerBucketObservability {
+                bucket: bucket.bucket.to_string(),
+                accepted_requests: bucket.accepted_requests,
+                tracker_drops: bucket.tracker_drops,
+                tracker_massive_drops: bucket.tracker_massive_drops,
+            })
+            .collect(),
+        response_opcodes: snapshot
+            .response_opcodes
+            .into_iter()
+            .map(|opcode| KadRpcResponseOpcodeObservability {
+                opcode: opcode.opcode.to_string(),
+                matched_pending: opcode.matched_pending,
+                matched_tracked: opcode.matched_tracked,
+                dropped_unrequested: opcode.dropped_unrequested,
+                accepted_unsolicited: opcode.accepted_unsolicited,
+            })
+            .collect(),
+    }
 }
 
 fn passive_replay_observability_mut(
@@ -4569,6 +4597,9 @@ impl IndexerService for OverlordAgentEmule {
         publish_observability.log_file = Some(current_log_file_status(&config));
         let mut harvest_observability = self.harvest_observability.lock().await.clone();
         apply_queue_family_counts(&mut harvest_observability, queue_family_counts);
+        let rpc_observability = runtime
+            .as_ref()
+            .map(|runtime| map_rpc_observability(runtime.dht.rpc_observability()));
 
         Ok(IndexerStats {
             indexer_id: self.indexer_id,
@@ -4586,6 +4617,7 @@ impl IndexerService for OverlordAgentEmule {
             agent_activity: Some(agent_activity),
             publish_observability: Some(publish_observability),
             harvest_observability: Some(harvest_observability),
+            rpc_observability,
         })
     }
 

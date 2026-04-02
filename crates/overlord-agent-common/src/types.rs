@@ -127,6 +127,7 @@ pub struct IndexerStats {
     pub agent_activity: Option<AgentActivitySnapshot>,
     pub publish_observability: Option<KadPublishObservability>,
     pub harvest_observability: Option<KadHarvestObservability>,
+    pub rpc_observability: Option<KadRpcObservability>,
 }
 
 /// High-level current activity state for the running agent process.
@@ -290,6 +291,35 @@ pub struct KadHarvestObservability {
     pub passive_keyword_replay: KadPassiveReplayObservability,
     pub passive_source_replay: KadPassiveReplayObservability,
     pub passive_notes_replay: KadPassiveReplayObservability,
+}
+
+/// Aggregate Kad RPC tracker counters for one oracle request bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KadRpcTrackerBucketObservability {
+    pub bucket: String,
+    pub accepted_requests: u64,
+    pub tracker_drops: u64,
+    pub tracker_massive_drops: u64,
+}
+
+/// Aggregate Kad RPC response counters for one opcode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KadRpcResponseOpcodeObservability {
+    pub opcode: String,
+    pub matched_pending: u64,
+    pub matched_tracked: u64,
+    pub dropped_unrequested: u64,
+    pub accepted_unsolicited: u64,
+}
+
+/// Machine-readable Kad RPC tracker and response-handling counters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct KadRpcObservability {
+    pub decode_failures: u64,
+    #[serde(default)]
+    pub tracker_buckets: Vec<KadRpcTrackerBucketObservability>,
+    #[serde(default)]
+    pub response_opcodes: Vec<KadRpcResponseOpcodeObservability>,
 }
 
 /// Kad search-request family observed on the wire.

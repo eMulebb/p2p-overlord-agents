@@ -94,6 +94,8 @@ impl PacketTrackerLimit {
 /// Result of recording one inbound Kad packet against a tracker bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PacketTrackerDecision {
+    /// Oracle-shaped action for this packet after applying the current bucket budget.
+    pub action: PacketTrackerAction,
     /// Whether the packet is still within the bucket's configured budget.
     pub allowed: bool,
     /// Number of packets observed for this bucket within the active window.
@@ -102,6 +104,33 @@ pub struct PacketTrackerDecision {
     pub max_packets: u32,
     /// Active rate-limit window used for the bucket.
     pub window: Duration,
+}
+
+/// Oracle-shaped disposition for one inbound tracked packet.
+///
+/// eMule uses a three-state return code in `PacketTracking.cpp`:
+/// allow, ordinary flood drop, and massive-flood drop with higher punishment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketTrackerAction {
+    /// The packet stays within the configured per-bucket budget.
+    Allow,
+    /// The packet exceeded the ordinary bucket budget and should be dropped.
+    Drop,
+    /// The packet exceeded the oracle's "massive flood" threshold and should
+    /// trigger the harsher contact-expiry path.
+    MassiveDrop,
+}
+
+impl PacketTrackerAction {
+    /// Stable machine-friendly label used in logs and JSONL dump output.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Drop => "drop",
+            Self::MassiveDrop => "massive_drop",
+        }
+    }
 }
 
 impl PacketTracker {
@@ -184,8 +213,16 @@ impl PacketTracker {
         }
 
         entry.0 += 1;
+        let action = if entry.0 > limit.max_packets.saturating_mul(4) {
+            PacketTrackerAction::MassiveDrop
+        } else if entry.0 > limit.max_packets {
+            PacketTrackerAction::Drop
+        } else {
+            PacketTrackerAction::Allow
+        };
         PacketTrackerDecision {
-            allowed: entry.0 <= limit.max_packets,
+            action,
+            allowed: matches!(action, PacketTrackerAction::Allow),
             observed_packets: entry.0,
             max_packets: limit.max_packets,
             window: limit.window,
@@ -422,6 +459,28 @@ mod tests {
             assert!(tracker.record_and_check(publish_notes).allowed);
         }
         assert!(!tracker.record_and_check(publish_notes).allowed);
+    }
+
+    #[test]
+    fn test_massive_flood_uses_oracle_four_x_threshold() {
+        let mut tracker =
+            PacketTracker::new(20, 50, Duration::from_secs(1), Duration::from_secs(60));
+        let publish_key = key("1.2.3.4", PacketTrackerBucket::PublishKeyReq);
+
+        for _ in 0..4 {
+            let decision = tracker.record_and_check(publish_key);
+            assert_eq!(decision.action, PacketTrackerAction::Allow);
+        }
+
+        let ordinary_drop = tracker.record_and_check(publish_key);
+        assert_eq!(ordinary_drop.action, PacketTrackerAction::Drop);
+
+        for _ in 0..11 {
+            let _ = tracker.record_and_check(publish_key);
+        }
+
+        let massive_drop = tracker.record_and_check(publish_key);
+        assert_eq!(massive_drop.action, PacketTrackerAction::MassiveDrop);
     }
 
     #[test]

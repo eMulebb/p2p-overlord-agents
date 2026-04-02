@@ -41,6 +41,16 @@ pub struct KadUdpDumpSummary {
     pub receiver_verify_key_valid: Option<bool>,
     /// Matched or inferred paired request opcode for a response, when known.
     pub tracked_request_opcode: Option<&'static str>,
+    /// Stable drop reason recorded at the receive boundary, when the packet was not accepted.
+    pub drop_reason: Option<&'static str>,
+    /// Oracle-shaped tracker bucket label, when one applied.
+    pub tracker_bucket: Option<&'static str>,
+    /// Oracle-shaped tracker action label, when a tracked inbound request was classified.
+    pub tracker_action: Option<&'static str>,
+    /// Number of packets observed in the current tracker window for this bucket.
+    pub tracker_observed_packets: Option<u32>,
+    /// Maximum packets allowed in the current tracker window for this bucket.
+    pub tracker_max_packets: Option<u32>,
 }
 
 impl KadUdpDumpSummary {
@@ -76,6 +86,23 @@ impl KadUdpDumpSummary {
         }
         if let Some(tracked_request_opcode) = self.tracked_request_opcode {
             parts.push(format!("tracked_request_opcode={tracked_request_opcode}"));
+        }
+        if let Some(drop_reason) = self.drop_reason {
+            parts.push(format!("drop_reason={drop_reason}"));
+        }
+        if let Some(tracker_bucket) = self.tracker_bucket {
+            parts.push(format!("tracker_bucket={tracker_bucket}"));
+        }
+        if let Some(tracker_action) = self.tracker_action {
+            parts.push(format!("tracker_action={tracker_action}"));
+        }
+        if let Some(tracker_observed_packets) = self.tracker_observed_packets {
+            parts.push(format!(
+                "tracker_observed_packets={tracker_observed_packets}"
+            ));
+        }
+        if let Some(tracker_max_packets) = self.tracker_max_packets {
+            parts.push(format!("tracker_max_packets={tracker_max_packets}"));
         }
         parts.join(" ")
     }
@@ -120,6 +147,16 @@ struct UdpDumpRecord {
     receiver_verify_key_valid: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tracked_request_opcode: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drop_reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tracker_bucket: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tracker_action: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tracker_observed_packets: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tracker_max_packets: Option<u32>,
 }
 
 /// Append one oracle-shaped Kad UDP packet record to the current agent dump file.
@@ -156,6 +193,11 @@ pub fn dump_kad_udp_packet(
         sender_verify_key: summary.sender_verify_key,
         receiver_verify_key_valid: summary.receiver_verify_key_valid,
         tracked_request_opcode: summary.tracked_request_opcode,
+        drop_reason: summary.drop_reason,
+        tracker_bucket: summary.tracker_bucket,
+        tracker_action: summary.tracker_action,
+        tracker_observed_packets: summary.tracker_observed_packets,
+        tracker_max_packets: summary.tracker_max_packets,
     };
 
     let Ok(mut guard) = writer.writer.lock() else {
@@ -273,11 +315,16 @@ mod tests {
             sender_verify_key: Some(456),
             receiver_verify_key_valid: Some(true),
             tracked_request_opcode: Some("KADEMLIA2_HELLO_REQ"),
+            drop_reason: Some("tracker_drop"),
+            tracker_bucket: Some("hello_req"),
+            tracker_action: Some("drop"),
+            tracker_observed_packets: Some(4),
+            tracker_max_packets: Some(3),
         };
 
         assert_eq!(
             summary.summary_string(),
-            "protocol=0xE4 opcode=0x21 opcode_name=KADEMLIA2_HELLO_REQ raw_obfuscated=yes transport_mode=receiver_verify_key requested_obfuscation=yes receiver_verify_key=123 sender_verify_key=456 receiver_verify_key_valid=yes tracked_request_opcode=KADEMLIA2_HELLO_REQ"
+            "protocol=0xE4 opcode=0x21 opcode_name=KADEMLIA2_HELLO_REQ raw_obfuscated=yes transport_mode=receiver_verify_key requested_obfuscation=yes receiver_verify_key=123 sender_verify_key=456 receiver_verify_key_valid=yes tracked_request_opcode=KADEMLIA2_HELLO_REQ drop_reason=tracker_drop tracker_bucket=hello_req tracker_action=drop tracker_observed_packets=4 tracker_max_packets=3"
         );
     }
 }

@@ -2,7 +2,8 @@ use crate::error::NetError;
 use crate::obfuscation::{DecryptResult, ObfuscationLayer};
 use crate::rate_limit::RateLimiter;
 use crate::tracker::{
-    OutboundRequestTracker, PacketTracker, PacketTrackerBucket, PacketTrackerKey,
+    OutboundRequestTracker, PacketTracker, PacketTrackerAction, PacketTrackerBucket,
+    PacketTrackerKey,
 };
 use crate::transport::Transport;
 use crate::wire_dump::{KadUdpDumpSummary, dump_kad_udp_packet};
@@ -15,6 +16,9 @@ use std::time::Duration;
 use tokio::sync::{broadcast, oneshot};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
+
+/// Callback invoked when the tracker hits the oracle's massive-flood tier.
+pub type MassiveFloodHandler = Arc<dyn Fn(SocketAddr) + Send + Sync>;
 
 /// Configuration for RpcManager.
 pub struct RpcConfig {
@@ -30,6 +34,9 @@ pub struct RpcConfig {
     pub request_tracking_window: Duration,
     /// Capacity of the unsolicited broadcast channel.
     pub broadcast_capacity: usize,
+    /// Optional callback fired when a tracked request crosses the oracle's
+    /// massive-flood threshold and should trigger contact expiry.
+    pub massive_flood_handler: Option<MassiveFloodHandler>,
 }
 
 impl Default for RpcConfig {
@@ -41,8 +48,48 @@ impl Default for RpcConfig {
             flood_window: Duration::from_secs(1),
             request_tracking_window: Duration::from_secs(60),
             broadcast_capacity: 256,
+            massive_flood_handler: None,
         }
     }
+}
+
+/// Aggregate tracker counters for one oracle request bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcTrackerBucketSnapshot {
+    /// Stable oracle-style bucket label.
+    pub bucket: &'static str,
+    /// Count of tracked inbound requests accepted for this bucket.
+    pub accepted_requests: u64,
+    /// Count of ordinary tracker drops for this bucket.
+    pub tracker_drops: u64,
+    /// Count of massive-flood drops for this bucket.
+    pub tracker_massive_drops: u64,
+}
+
+/// Aggregate response handling counters for one opcode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcResponseOpcodeSnapshot {
+    /// Stable Kad opcode label.
+    pub opcode: &'static str,
+    /// Responses that resolved an explicit pending request.
+    pub matched_pending: u64,
+    /// Responses accepted via the oracle's IP/opcode tracker path.
+    pub matched_tracked: u64,
+    /// Responses dropped because the oracle had no matching outbound request.
+    pub dropped_unrequested: u64,
+    /// Packets accepted as unsolicited inbound traffic.
+    pub accepted_unsolicited: u64,
+}
+
+/// Machine-readable snapshot of Kad RPC tracker behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcObservabilitySnapshot {
+    /// Count of inbound UDP payloads that failed Kad decode.
+    pub decode_failures: u64,
+    /// Per-bucket inbound request tracker counters.
+    pub tracker_buckets: Vec<RpcTrackerBucketSnapshot>,
+    /// Per-opcode response handling counters.
+    pub response_opcodes: Vec<RpcResponseOpcodeSnapshot>,
 }
 
 struct PendingEntry {
@@ -79,6 +126,8 @@ struct RpcInner {
     pending: Mutex<HashMap<u64, PendingEntry>>,
     next_id: AtomicU64,
     unsolicited_tx: broadcast::Sender<ReceivedKadPacket>,
+    observability: Mutex<RpcObservabilityState>,
+    massive_flood_handler: Option<MassiveFloodHandler>,
 }
 
 pub struct RpcManager {
@@ -89,6 +138,104 @@ impl Clone for RpcManager {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RpcTrackerBucketCounters {
+    accepted_requests: u64,
+    tracker_drops: u64,
+    tracker_massive_drops: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RpcResponseCounters {
+    matched_pending: u64,
+    matched_tracked: u64,
+    dropped_unrequested: u64,
+    accepted_unsolicited: u64,
+}
+
+#[derive(Debug, Default)]
+struct RpcObservabilityState {
+    decode_failures: u64,
+    tracker_buckets: HashMap<PacketTrackerBucket, RpcTrackerBucketCounters>,
+    response_opcodes: HashMap<u8, RpcResponseCounters>,
+}
+
+impl RpcObservabilityState {
+    fn record_decode_failure(&mut self) {
+        self.decode_failures += 1;
+    }
+
+    fn record_tracker_action(&mut self, bucket: PacketTrackerBucket, action: PacketTrackerAction) {
+        let counters = self.tracker_buckets.entry(bucket).or_default();
+        match action {
+            PacketTrackerAction::Allow => counters.accepted_requests += 1,
+            PacketTrackerAction::Drop => counters.tracker_drops += 1,
+            PacketTrackerAction::MassiveDrop => counters.tracker_massive_drops += 1,
+        }
+    }
+
+    fn record_response_matched_pending(&mut self, opcode_value: u8) {
+        self.response_opcodes
+            .entry(opcode_value)
+            .or_default()
+            .matched_pending += 1;
+    }
+
+    fn record_response_matched_tracked(&mut self, opcode_value: u8) {
+        self.response_opcodes
+            .entry(opcode_value)
+            .or_default()
+            .matched_tracked += 1;
+    }
+
+    fn record_response_dropped_unrequested(&mut self, opcode_value: u8) {
+        self.response_opcodes
+            .entry(opcode_value)
+            .or_default()
+            .dropped_unrequested += 1;
+    }
+
+    fn record_response_accepted_unsolicited(&mut self, opcode_value: u8) {
+        self.response_opcodes
+            .entry(opcode_value)
+            .or_default()
+            .accepted_unsolicited += 1;
+    }
+
+    fn snapshot(&self) -> RpcObservabilitySnapshot {
+        let mut tracker_buckets: Vec<_> = self
+            .tracker_buckets
+            .iter()
+            .map(|(bucket, counters)| RpcTrackerBucketSnapshot {
+                bucket: bucket.label(),
+                accepted_requests: counters.accepted_requests,
+                tracker_drops: counters.tracker_drops,
+                tracker_massive_drops: counters.tracker_massive_drops,
+            })
+            .collect();
+        tracker_buckets.sort_by_key(|bucket| bucket.bucket);
+
+        let mut response_opcodes: Vec<_> = self
+            .response_opcodes
+            .iter()
+            .map(|(opcode_value, counters)| RpcResponseOpcodeSnapshot {
+                opcode: opcode_name(*opcode_value),
+                matched_pending: counters.matched_pending,
+                matched_tracked: counters.matched_tracked,
+                dropped_unrequested: counters.dropped_unrequested,
+                accepted_unsolicited: counters.accepted_unsolicited,
+            })
+            .collect();
+        response_opcodes.sort_by_key(|opcode| opcode.opcode);
+
+        RpcObservabilitySnapshot {
+            decode_failures: self.decode_failures,
+            tracker_buckets,
+            response_opcodes,
         }
     }
 }
@@ -115,6 +262,8 @@ impl RpcManager {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
             unsolicited_tx,
+            observability: Mutex::new(RpcObservabilityState::default()),
+            massive_flood_handler: config.massive_flood_handler,
         });
         Self { inner }
     }
@@ -143,6 +292,7 @@ impl RpcManager {
                         let packet = match KadPacket::decode(&plain) {
                             Ok(p) => p,
                             Err(e) => {
+                                inner.observability.lock().unwrap().record_decode_failure();
                                 dump_kad_udp_packet(
                                     "recv",
                                     from,
@@ -162,6 +312,11 @@ impl RpcManager {
                                         sender_verify_key,
                                         receiver_verify_key_valid: Some(receiver_verify_key_valid),
                                         tracked_request_opcode: None,
+                                        drop_reason: Some("decode_failed"),
+                                        tracker_bucket: None,
+                                        tracker_action: None,
+                                        tracker_observed_packets: None,
+                                        tracker_max_packets: None,
                                     },
                                 );
                                 info!(
@@ -219,16 +374,60 @@ impl RpcManager {
                                         ip: from.ip(),
                                         bucket,
                                     });
+                            inner
+                                .observability
+                                .lock()
+                                .unwrap()
+                                .record_tracker_action(bucket, decision.action);
                             if !decision.allowed {
+                                let drop_reason = match decision.action {
+                                    PacketTrackerAction::Allow => None,
+                                    PacketTrackerAction::Drop => Some("tracker_drop"),
+                                    PacketTrackerAction::MassiveDrop => {
+                                        Some("tracker_massive_drop")
+                                    }
+                                };
+                                dump_kad_udp_packet(
+                                    "recv",
+                                    from,
+                                    &data,
+                                    &plain,
+                                    KadUdpDumpSummary {
+                                        protocol: plain.first().copied().unwrap_or_default(),
+                                        opcode: Some(response_opcode),
+                                        opcode_name: Some(opcode_name(response_opcode)),
+                                        raw_obfuscated: was_obfuscated,
+                                        transport_mode: Some(inbound_transport_mode(
+                                            was_obfuscated,
+                                            receiver_verify_key_valid,
+                                        )),
+                                        requested_obfuscation: None,
+                                        receiver_verify_key: None,
+                                        sender_verify_key,
+                                        receiver_verify_key_valid: Some(receiver_verify_key_valid),
+                                        tracked_request_opcode: None,
+                                        drop_reason,
+                                        tracker_bucket: Some(bucket.label()),
+                                        tracker_action: Some(decision.action.label()),
+                                        tracker_observed_packets: Some(decision.observed_packets),
+                                        tracker_max_packets: Some(decision.max_packets),
+                                    },
+                                );
                                 warn!(
-                                    "flood-blocking {} opcode={} bucket={} observed_packets={} max_packets={} window_ms={}",
+                                    "tracker-dropping {} opcode={} bucket={} action={} observed_packets={} max_packets={} window_ms={}",
                                     from.ip(),
                                     opcode_name(response_opcode),
                                     bucket.label(),
+                                    decision.action.label(),
                                     decision.observed_packets,
                                     decision.max_packets,
                                     decision.window.as_millis(),
                                 );
+                                if matches!(decision.action, PacketTrackerAction::MassiveDrop)
+                                    && let Some(handler) = &inner.massive_flood_handler
+                                {
+                                    handler(from);
+                                }
                                 continue;
                             }
                         }
@@ -294,27 +493,26 @@ impl RpcManager {
                             .map(|(_, _, request_opcode, _)| request_opcode)
                             .or(tracked_request_opcode);
 
-                        dump_kad_udp_packet(
-                            "recv",
-                            from,
-                            &data,
-                            &plain,
-                            KadUdpDumpSummary {
-                                protocol: plain.first().copied().unwrap_or_default(),
-                                opcode: Some(response_opcode),
-                                opcode_name: Some(opcode_name(response_opcode)),
-                                raw_obfuscated: was_obfuscated,
-                                transport_mode: Some(inbound_transport_mode(
-                                    was_obfuscated,
-                                    receiver_verify_key_valid,
-                                )),
-                                requested_obfuscation: None,
-                                receiver_verify_key: None,
-                                sender_verify_key,
-                                receiver_verify_key_valid: Some(receiver_verify_key_valid),
-                                tracked_request_opcode: dump_request_opcode.map(opcode_name),
-                            },
-                        );
+                        let mut dump_summary = KadUdpDumpSummary {
+                            protocol: plain.first().copied().unwrap_or_default(),
+                            opcode: Some(response_opcode),
+                            opcode_name: Some(opcode_name(response_opcode)),
+                            raw_obfuscated: was_obfuscated,
+                            transport_mode: Some(inbound_transport_mode(
+                                was_obfuscated,
+                                receiver_verify_key_valid,
+                            )),
+                            requested_obfuscation: None,
+                            receiver_verify_key: None,
+                            sender_verify_key,
+                            receiver_verify_key_valid: Some(receiver_verify_key_valid),
+                            tracked_request_opcode: dump_request_opcode.map(opcode_name),
+                            drop_reason: None,
+                            tracker_bucket: inbound.tracker_bucket.map(PacketTrackerBucket::label),
+                            tracker_action: inbound.tracker_bucket.map(|_| "allow"),
+                            tracker_observed_packets: None,
+                            tracker_max_packets: None,
+                        };
 
                         if is_publish_opcode(response_opcode) {
                             info!(
@@ -342,6 +540,13 @@ impl RpcManager {
                             if is_tracked_response_opcode(response_opcode)
                                 && tracked_request_opcode.is_none()
                             {
+                                inner
+                                    .observability
+                                    .lock()
+                                    .unwrap()
+                                    .record_response_dropped_unrequested(response_opcode);
+                                dump_summary.drop_reason = Some("unrequested_response");
+                                dump_kad_udp_packet("recv", from, &data, &plain, dump_summary);
                                 info!(
                                     "kad recv dropping-unrequested-response opcode={} from={} obfuscated={} sender_verify_key={}",
                                     opcode_name(response_opcode),
@@ -351,6 +556,20 @@ impl RpcManager {
                                 );
                                 continue;
                             }
+                            if is_tracked_response_opcode(response_opcode) {
+                                inner
+                                    .observability
+                                    .lock()
+                                    .unwrap()
+                                    .record_response_matched_tracked(response_opcode);
+                            } else {
+                                inner
+                                    .observability
+                                    .lock()
+                                    .unwrap()
+                                    .record_response_accepted_unsolicited(response_opcode);
+                            }
+                            dump_kad_udp_packet("recv", from, &data, &plain, dump_summary);
                             if should_log_unsolicited_opcode(response_opcode) {
                                 info!(
                                     "kad recv unsolicited opcode={} from={} obfuscated={} sender_verify_key={} tracked_request_opcode={}",
@@ -372,6 +591,13 @@ impl RpcManager {
                                 sender_verify_key,
                                 receiver_verify_key_valid,
                             });
+                        } else {
+                            inner
+                                .observability
+                                .lock()
+                                .unwrap()
+                                .record_response_matched_pending(response_opcode);
+                            dump_kad_udp_packet("recv", from, &data, &plain, dump_summary);
                         }
                     }
                     Err(e) => {
@@ -548,6 +774,11 @@ impl RpcManager {
                 sender_verify_key: outbound.sender_verify_key,
                 receiver_verify_key_valid: None,
                 tracked_request_opcode: None,
+                drop_reason: None,
+                tracker_bucket: None,
+                tracker_action: None,
+                tracker_observed_packets: None,
+                tracker_max_packets: None,
             },
         );
         self.inner.transport.send_raw(addr, &wire).await
@@ -562,6 +793,12 @@ impl RpcManager {
     /// Local UDP bind address.
     pub fn local_addr(&self) -> Result<SocketAddr, NetError> {
         self.inner.transport.local_addr().map_err(NetError::Io)
+    }
+
+    /// Snapshot the current tracker and response-handling counters.
+    #[must_use]
+    pub fn observability(&self) -> RpcObservabilitySnapshot {
+        self.inner.observability.lock().unwrap().snapshot()
     }
 
     /// Register a peer's announced receiver verify key for obfuscated replies.
@@ -862,6 +1099,7 @@ mod tests {
     use overlord_kad_proto::constants::opcode;
     use overlord_kad_proto::{KadPacket, NodeId};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     fn make_local_addr() -> SocketAddr {
         "127.0.0.1:0".parse().unwrap()
@@ -1197,6 +1435,125 @@ mod tests {
             "received {} SEARCH_RES packets, expected all 40 to pass",
             received_count
         );
+    }
+
+    #[tokio::test]
+    async fn test_massive_flood_invokes_handler_and_counts_tracker_actions() {
+        let transport = MockTransport::new(make_local_addr());
+        let inject_tx = transport.injector();
+        let massive_flood_hits = Arc::new(AtomicU64::new(0));
+        let massive_flood_hits_for_handler = Arc::clone(&massive_flood_hits);
+        let rpc = RpcManager::new(
+            transport,
+            ObfuscationLayer::new(overlord_kad_proto::NodeId::ZERO, 0, false),
+            RpcConfig {
+                request_tracking_window: Duration::from_secs(60),
+                massive_flood_handler: Some(Arc::new(move |_| {
+                    massive_flood_hits_for_handler.fetch_add(1, AtomicOrdering::Relaxed);
+                })),
+                ..Default::default()
+            },
+        );
+        let _handle = rpc.start();
+
+        let peer_addr: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        let hello = KadPacket::HelloReq(overlord_kad_proto::HelloReq {
+            node_id: NodeId::from_bytes([0x44; 16]),
+            tcp_port: 4662,
+            version: 8,
+            tags: Vec::new(),
+        });
+        let encoded = hello.encode().unwrap();
+
+        for _ in 0..13usize {
+            let _ = inject_tx.send((encoded.clone(), peer_addr)).await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let snapshot = rpc.observability();
+        let hello_bucket = snapshot
+            .tracker_buckets
+            .iter()
+            .find(|bucket| bucket.bucket == "hello_req")
+            .expect("hello bucket present");
+        assert_eq!(hello_bucket.accepted_requests, 3);
+        assert_eq!(hello_bucket.tracker_drops, 9);
+        assert_eq!(hello_bucket.tracker_massive_drops, 1);
+        assert_eq!(massive_flood_hits.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_unrequested_response_is_counted_and_dropped() {
+        let transport = MockTransport::new(make_local_addr());
+        let inject_tx = transport.injector();
+        let rpc = make_rpc_with_transport(transport);
+        let mut subscriber = rpc.subscribe();
+        let _handle = rpc.start();
+
+        let peer_addr = make_peer_addr();
+        let pong = KadPacket::Pong;
+        let encoded = pong.encode().unwrap();
+        let _ = inject_tx.send((encoded, peer_addr)).await;
+
+        let received = tokio::time::timeout(Duration::from_millis(100), subscriber.recv()).await;
+        assert!(received.is_err(), "unexpectedly accepted unrequested pong");
+
+        let snapshot = rpc.observability();
+        let pong_stats = snapshot
+            .response_opcodes
+            .iter()
+            .find(|opcode| opcode.opcode == "KADEMLIA2_PONG")
+            .expect("pong counters present");
+        assert_eq!(pong_stats.dropped_unrequested, 1);
+        assert_eq!(pong_stats.matched_pending, 0);
+        assert_eq!(pong_stats.matched_tracked, 0);
+    }
+
+    #[tokio::test]
+    async fn test_tracked_response_without_pending_request_is_broadcast_and_counted() {
+        let transport = MockTransport::new(make_local_addr());
+        let inject_tx = transport.injector();
+        let rpc = make_rpc_with_transport(transport);
+        let mut subscriber = rpc.subscribe();
+        let _handle = rpc.start();
+
+        let peer_addr = make_peer_addr();
+        rpc.send(
+            peer_addr,
+            &KadPacket::HelloReq(overlord_kad_proto::HelloReq {
+                node_id: NodeId::from_bytes([0x55; 16]),
+                tcp_port: 4662,
+                version: 8,
+                tags: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let hello_res = KadPacket::HelloRes(overlord_kad_proto::HelloRes {
+            node_id: NodeId::from_bytes([0x44; 16]),
+            tcp_port: 4662,
+            version: 8,
+            tags: Vec::new(),
+        });
+        let encoded = hello_res.encode().unwrap();
+        let _ = inject_tx.send((encoded, peer_addr)).await;
+
+        let received = tokio::time::timeout(Duration::from_secs(1), subscriber.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(received.packet, KadPacket::HelloRes(_)));
+
+        let snapshot = rpc.observability();
+        let hello_res_stats = snapshot
+            .response_opcodes
+            .iter()
+            .find(|opcode| opcode.opcode == "KADEMLIA2_HELLO_RES")
+            .expect("hello response counters present");
+        assert_eq!(hello_res_stats.matched_tracked, 1);
+        assert_eq!(hello_res_stats.dropped_unrequested, 0);
     }
 
     #[tokio::test]
