@@ -335,36 +335,91 @@ impl Ed2kPeerConnectMode {
     }
 }
 
+async fn drive_firewall_helper_hello_exchange(
+    transport: &mut Ed2kTransport,
+    helper_addr: SocketAddr,
+    hello_identity: Ed2kHelloIdentity,
+    timeout: Duration,
+) -> Result<()> {
+    let hello_packet = encode_hello_request(hello_identity);
+    tokio::time::timeout(timeout, transport.write_all(&hello_packet))
+        .await
+        .with_context(|| format!("timed out sending OP_HELLO to {helper_addr}"))??;
+
+    let kad_udp_port = hello_identity.udp_port;
+    let exchange_deadline = tokio::time::Instant::now() + timeout.min(Duration::from_millis(800));
+    while tokio::time::Instant::now() < exchange_deadline {
+        let remaining = exchange_deadline.saturating_duration_since(tokio::time::Instant::now());
+        let packet = match tokio::time::timeout(remaining, transport.read_packet()).await {
+            Ok(Ok(Some(packet))) => packet,
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) if is_connection_shutdown_error(&error) => break,
+            Ok(Err(error)) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read eD2k packet from {helper_addr}"));
+            }
+            Err(_) => break,
+        };
+
+        match (packet.protocol, packet.opcode) {
+            // Helper peers often send OP_EMULEINFO after the hello answer. Reply
+            // here so the firewall-check request reuses a real-looking hello
+            // exchange instead of a single OP_HELLO write followed by an
+            // immediate Kad-specific control packet.
+            (OP_EMULEPROT, OP_EMULEINFO) => {
+                let reply = encode_emule_info_answer(kad_udp_port);
+                transport.write_all(&reply).await.with_context(|| {
+                    format!("failed to send OP_EMULEINFOANSWER to {helper_addr}")
+                })?;
+            }
+            (OP_EDONKEYPROT, OP_HELLO) => {
+                let reply = encode_hello_answer(hello_identity);
+                transport
+                    .write_all(&reply)
+                    .await
+                    .with_context(|| format!("failed to send OP_HELLOANSWER to {helper_addr}"))?;
+            }
+            (OP_EDONKEYPROT, OP_HELLOANSWER)
+            | (OP_EMULEPROT, OP_EMULEINFOANSWER)
+            | (OP_EMULEPROT, OP_SECIDENTSTATE)
+            | (OP_EMULEPROT, OP_PUBLICKEY)
+            | (OP_EMULEPROT, OP_SIGNATURE) => {}
+            _ => break,
+        }
+    }
+
+    Ok(())
+}
+
 /// Send one `OP_FWCHECKUDPREQ` to a helper peer over eD2k TCP.
 pub async fn request_udp_firewall_check(
+    bind_ip: Ipv4Addr,
     helper_addr: SocketAddr,
     hello_identity: Ed2kHelloIdentity,
     request: FirewallCheckUdpRequest,
     timeout: Duration,
 ) -> Result<()> {
-    let stream = tokio::time::timeout(timeout, TcpStream::connect(helper_addr))
-        .await
-        .with_context(|| format!("timed out connecting to eD2k helper {helper_addr}"))??;
-    stream
-        .set_nodelay(true)
-        .with_context(|| format!("failed to enable TCP_NODELAY for helper {helper_addr}"))?;
-    let mut transport = Ed2kTransport {
-        stream,
-        prefetched: VecDeque::new(),
-        receive_cipher: None,
-        send_cipher: None,
-        mode: Ed2kTransportMode::Plaintext,
-    };
-    let hello_packet = encode_hello_request(hello_identity);
-    tokio::time::timeout(timeout, transport.write_all(&hello_packet))
-        .await
-        .with_context(|| format!("timed out sending OP_HELLO to {helper_addr}"))??;
-    let _ = tokio::time::timeout(Duration::from_millis(500), transport.read_packet()).await;
+    let mut transport = Ed2kTransport::connect_outgoing(
+        bind_ip,
+        helper_addr,
+        hello_identity.connect_options,
+        None,
+        None,
+        timeout,
+    )
+    .await?;
+    drive_firewall_helper_hello_exchange(&mut transport, helper_addr, hello_identity, timeout)
+        .await?;
     let payload = request.encode();
     let packet = encode_packet(OP_EMULEPROT, OP_FWCHECKUDPREQ, &payload);
     tokio::time::timeout(timeout, transport.write_all(&packet))
         .await
         .with_context(|| format!("timed out sending OP_FWCHECKUDPREQ to {helper_addr}"))??;
+
+    // Keep the helper TCP session around briefly so peers that finish their
+    // hello side channel after receiving the request do not see an immediate
+    // disconnect before scheduling the UDP callback.
+    let _ = tokio::time::timeout(Duration::from_millis(500), transport.read_packet()).await;
     Ok(())
 }
 
@@ -1523,7 +1578,7 @@ mod tests {
         emule_connect_options, emule_misc_options1, emule_misc_options2, emule_version_tag,
         encode_emule_info_answer, encode_emule_info_request, encode_hello_answer,
         encode_hello_request, encode_incoming_obfuscation_response, encode_packet,
-        encode_secident_state, enrich_hello_identity, is_mule_hello,
+        encode_secident_state, enrich_hello_identity, is_mule_hello, request_udp_firewall_check,
     };
     use crate::{ed2k_server::Ed2kServerState, kad_firewall::KadFirewallState};
     use hex::decode;
@@ -1536,13 +1591,13 @@ mod tests {
     };
     use sha1::Sha1;
     use std::{
-        net::{Ipv4Addr, SocketAddr},
+        net::{IpAddr, Ipv4Addr, SocketAddr},
         sync::Arc,
         time::Duration,
     };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
+        net::{TcpListener, TcpStream},
         sync::{Mutex, RwLock},
     };
 
@@ -2188,5 +2243,83 @@ mod tests {
         let packet = server.await.unwrap();
         assert_eq!(mode, Ed2kPeerConnectMode::Plaintext);
         assert_eq!(packet, expected_hello);
+    }
+
+    #[tokio::test]
+    async fn udp_firewall_check_request_completes_hello_exchange_before_request() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let helper_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
+                let mut header = [0u8; 6];
+                stream.read_exact(&mut header).await.unwrap();
+                let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+                let mut packet = header.to_vec();
+                let mut payload = vec![0u8; packet_len - 1];
+                stream.read_exact(&mut payload).await.unwrap();
+                packet.extend_from_slice(&payload);
+                packet
+            }
+
+            let (mut stream, peer_addr) = listener.accept().await.unwrap();
+            assert_eq!(peer_addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+            let hello = read_packet(&mut stream).await;
+            assert_eq!(hello[0], OP_EDONKEYPROT);
+            assert_eq!(hello[5], OP_HELLO);
+
+            let hello_answer = encode_hello_answer(Ed2kHelloIdentity {
+                user_hash: [0x10; 16],
+                client_id: 0x521B_5895,
+                tcp_port: 46671,
+                udp_port: 46673,
+                server_ip: u32::from_le_bytes([176, 123, 2, 239]),
+                server_port: 4232,
+                connect_options: emule_connect_options(false),
+                direct_udp_callback: false,
+            });
+            stream.write_all(&hello_answer).await.unwrap();
+
+            let emule_info = encode_emule_info_request(46673);
+            stream.write_all(&emule_info).await.unwrap();
+
+            let emule_info_answer = read_packet(&mut stream).await;
+            assert_eq!(emule_info_answer[0], OP_EMULEPROT);
+            assert_eq!(emule_info_answer[5], OP_EMULEINFOANSWER);
+
+            let fwcheck = read_packet(&mut stream).await;
+            assert_eq!(fwcheck[0], OP_EMULEPROT);
+            assert_eq!(fwcheck[5], OP_FWCHECKUDPREQ);
+            fwcheck
+        });
+
+        request_udp_firewall_check(
+            Ipv4Addr::LOCALHOST,
+            helper_addr,
+            Ed2kHelloIdentity {
+                user_hash: [0x77; 16],
+                client_id: 0x1234_5678,
+                tcp_port: 41001,
+                udp_port: 41000,
+                server_ip: 0,
+                server_port: 0,
+                connect_options: emule_connect_options(false),
+                direct_udp_callback: false,
+            },
+            FirewallCheckUdpRequest {
+                internal_udp_port: 41000,
+                external_udp_port: 41000,
+                sender_udp_key: 0xAABB_CCDD,
+            },
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+
+        let fwcheck = server.await.unwrap();
+        assert_eq!(&fwcheck[6..8], &41000u16.to_le_bytes());
+        assert_eq!(&fwcheck[8..10], &41000u16.to_le_bytes());
+        assert_eq!(&fwcheck[10..14], &0xAABB_CCDDu32.to_le_bytes());
     }
 }

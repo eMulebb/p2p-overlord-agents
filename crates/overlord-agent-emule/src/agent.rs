@@ -5302,6 +5302,13 @@ impl OverlordAgentEmule {
                     continue;
                 }
 
+                let bind_ip = match bind_addr.ip() {
+                    IpAddr::V4(ip) => ip,
+                    IpAddr::V6(_) => {
+                        debug!("kad firewall-check skipped: IPv6 bind addr is not supported");
+                        continue;
+                    }
+                };
                 let expected_ports = active_udp_firewall_ports(&nat, bind_addr.port()).await;
                 let started_at = Utc::now();
                 {
@@ -5335,6 +5342,7 @@ impl OverlordAgentEmule {
                     };
                     request_tasks.push(tokio::spawn(async move {
                         let result = request_udp_firewall_check(
+                            bind_ip,
                             helper_addr,
                             ed2k_hello_identity,
                             request,
