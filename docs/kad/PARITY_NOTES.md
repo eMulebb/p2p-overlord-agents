@@ -1,4 +1,4 @@
-# KAD_PARITY_NOTES
+# Kad Parity Notes
 
 Running note for Kad oracle-parity findings that affect live behavior.
 

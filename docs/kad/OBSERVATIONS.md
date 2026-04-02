@@ -1,14 +1,14 @@
-# OBSARVA — Protocol Parity Report
+# Kad Protocol Observations
 
 Comparative analysis of the Overlord Rust port against the eMule and aMule oracle implementations for Kad2 and ED2K protocols.
 
-This document was produced by cross-reading `KAD_PROTOCOL.md`, `KAD_DIFFS.md`, `KADKAD.md`, and the current Rust source tree (`constants.rs`, `packet.rs`, `zone.rs`, `ed2k_server.rs`, and related crates).
+This document was produced by cross-reading `PROTOCOL_REFERENCE.md`, `PROTOCOL_DIFFS.md`, `IMPLEMENTATION_REFERENCE.md`, and the current Rust source tree (`constants.rs`, `packet.rs`, `zone.rs`, `ed2k_server.rs`, and related crates).
 
 ---
 
 ## Methodology
 
-- **Oracle authority order**: eMule > aMule > libed2k (per project policy in `KAD_PROTOCOL.md §1`)
+- **Oracle authority order**: eMule > aMule > libed2k (per project policy in `PROTOCOL_REFERENCE.md §1`)
 - **Primary oracle anchors**: `KademliaUDPListener.cpp`, `Search.cpp`, `Indexed.cpp`, `PacketTracking.cpp`, `RoutingBin.cpp`, `RoutingZone.cpp`
 - **Status labels**
   - `Equivalent behavior` — Rust matches the oracle meaningfully enough for protocol work
@@ -33,7 +33,7 @@ This document was produced by cross-reading `KAD_PROTOCOL.md`, `KAD_DIFFS.md`, `
 
 ## 2. Opcode Registry
 
-The Rust `constants::opcode` module defines 22 opcodes. All hex values match eMule `srchybrid/Opcodes.h` and aMule `include/protocol/kad2/Client2Client/UDP.h`. The table also notes one opcode (`FIREWALLED2_REQ = 0x53`) that is present in code but absent from the `KAD_PROTOCOL.md` summary table; it corresponds to the Kad v7+ extended firewall-check path.
+The Rust `constants::opcode` module defines 22 opcodes. All hex values match eMule `srchybrid/Opcodes.h` and aMule `include/protocol/kad2/Client2Client/UDP.h`. The table also notes one opcode (`FIREWALLED2_REQ = 0x53`) that is present in code but absent from the `PROTOCOL_REFERENCE.md` summary table; it corresponds to the Kad v7+ extended firewall-check path.
 
 | Opcode | Hex | Rust Runtime Status | Protocol Role |
 |---|---|---|---|
@@ -54,7 +54,7 @@ The Rust `constants::opcode` module defines 22 opcodes. All hex values match eMu
 | `PUBLISH_RES` | `0x4B` | used | Publish acknowledgement with load byte |
 | `PUBLISH_RES_ACK` | `0x4C` | codec | Publish ack acknowledgement |
 | `FIREWALLED_REQ` | `0x50` | codec | Firewall check request carrying TCP port |
-| `FIREWALLED2_REQ` | `0x53` | codec | Extended firewall check for Kad v7+ (not in KAD_PROTOCOL.md table) |
+| `FIREWALLED2_REQ` | `0x53` | codec | Extended firewall check for Kad v7+ (not in PROTOCOL_REFERENCE.md table) |
 | `FIREWALLED_RES` | `0x58` | codec | Firewall response carrying external IP |
 | `FIREWALLED_ACK_RES` | `0x59` | codec | Empty firewall acknowledgement |
 | `FIREWALLUDP` | `0x62` | codec | UDP reachability test packet |
@@ -319,7 +319,7 @@ Status: `Equivalent behavior` for wire shape.
 | `user_hash` | 16 | Sender's eD2k user hash |
 | `connect_options` | 1 | Connection capability flags |
 
-Status: Wire shape implemented. This opcode is not listed in the `KAD_PROTOCOL.md` opcode table but is present in `constants.rs` and has a dedicated `Firewalled2Req` struct. Should be added to the protocol table for completeness.
+Status: Wire shape implemented. This opcode is not listed in the `PROTOCOL_REFERENCE.md` opcode table but is present in `constants.rs` and has a dedicated `Firewalled2Req` struct. Should be added to the protocol table for completeness.
 
 **`KADEMLIA2_FIREWALLED_RES` (`0x58`)**
 
@@ -605,7 +605,7 @@ This is the single most impactful remaining parity gap for live network interope
 
 Modern eMule nodes use RC4-based UDP obfuscation on all Kad2 traffic from version 6 onward. Key generation uses a per-peer session key negotiated through the `KADEMLIA2_HELLO_REQ/RES` exchange. Modern `nodes.dat` snapshots carry peer UDP keys enabling obfuscated communication on the first packet of a restart.
 
-A 5-minute isolated oracle run on `46663/udp` (2026-03-22, see `KADKAD.md §9`) produced:
+A 5-minute isolated oracle run on `46663/udp` (2026-03-22, see `IMPLEMENTATION_REFERENCE.md §9`) produced:
 
 - Total packets: 1009
 - Plaintext Kad packets (`0xE4`): 55 (5.5%)
@@ -631,7 +631,7 @@ The combined oracle conclusion (from pcap traces `a3` through `a7`) is that live
 
 ## 11. ED2K Server Protocol (TCP)
 
-The `ed2k_server.rs` and `ed2k_tcp.rs` modules in `overlord-agent-emule` implement a minimal eD2k server session. This scope is intentional — full server protocol is listed as Phase 2+ in `KADKAD.md §2`.
+The `ed2k_server.rs` and `ed2k_tcp.rs` modules in `overlord-agent-emule` implement a minimal eD2k server session. This scope is intentional — full server protocol is listed as Phase 2+ in `IMPLEMENTATION_REFERENCE.md §2`.
 
 ### 11.1 Protocol Headers
 
@@ -675,7 +675,7 @@ The `ed2k_server.rs` and `ed2k_tcp.rs` modules in `overlord-agent-emule` impleme
 
 ## 12. eMule vs aMule Oracle Differences Relevant to Porting
 
-These are the confirmed behavioral differences between the two oracle trees, as documented in `KAD_DIFFS.md`. They inform which oracle to follow for which decision.
+These are the confirmed behavioral differences between the two oracle trees, as documented in `PROTOCOL_DIFFS.md`. They inform which oracle to follow for which decision.
 
 | Area | eMule | aMule | Overlord follows |
 |---|---|---|---|
@@ -705,7 +705,7 @@ Ranked by severity for live network interoperability.
 | 6 | **Keyword expression serialization** | `start_position=0` only. Oracle expression-tree mode (`0x8000`) and numeric pagination not yet implemented. | Low |
 | 7 | **Source publish encryption and buddy tags** | Not audited against oracle send path for encryption capability tags and buddy/callback tag handling. | Low |
 | 8 | **Publish result load semantics** | `PUBLISH_RES.load` received but oracle load-tracking logic not modeled. | Low |
-| 9 | **`FIREWALLED2_REQ` in protocol docs** | Present in `constants.rs` and has a struct, but absent from `KAD_PROTOCOL.md` opcode table. Documentation gap. | Trivial |
+| 9 | **`FIREWALLED2_REQ` in protocol docs** | Present in `constants.rs` and has a struct, but absent from `PROTOCOL_REFERENCE.md` opcode table. Documentation gap. | Trivial |
 | 10 | **ED2K full server protocol** | `OP_OFFERFILES` body, server search, peer callback, file transfer. Intentionally deferred to Phase 2+. | Out of scope |
 
 ---

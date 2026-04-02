@@ -1,7 +1,7 @@
-# KAD_PROTOCOL
+# Kad Protocol Reference
 
 Kad2 wire-reference document for the Overlord Kad crates.
-This file is maintained in the current Overlord workspace under `overlord-agents/crates/overlord-kad-proto/docs/`.
+This file is maintained in the current Overlord workspace under `overlord-agents/docs/kad/`.
 
 Deep Kad2 wire-protocol reference for this repository.
 

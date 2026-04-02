@@ -1,4 +1,4 @@
-# KADUZSEQ — Kad2 and ED2K Protocol Sequence Diagrams
+# Kad and ED2K Wire Sequences
 
 Detailed sequence diagrams for every significant protocol exchange in the Overlord Kad2 and ED2K implementations.
 

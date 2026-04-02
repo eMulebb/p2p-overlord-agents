@@ -1,6 +1,7 @@
 # Agents Repo Rules
 
 - Follow the shared workspace guidance from `../AGENTS.md` in addition to this file.
+- Use `docs/README.md` as the canonical agents docs home.
 - Use `../overlord-be/BACKLOG.md` as the canonical active backlog.
 - Use `scripts/windows/rust_quality.ps1` as the canonical local quality gate for this repo.
 - Before finishing Rust changes, run:

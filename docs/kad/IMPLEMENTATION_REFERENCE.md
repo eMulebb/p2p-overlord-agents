@@ -1,7 +1,7 @@
-# Overlord Kad2 — Specification
+# Overlord Kad2 Implementation Reference
 
 Overlord Kad2 architecture and implementation reference.
-This file is maintained in the current Overlord workspace under `overlord-agents/crates/overlord-kad-proto/docs/`.
+This file is maintained in the current Overlord workspace under `overlord-agents/docs/kad/`.
 
 **Language**: Rust
 **Protocol**: eMule Kademlia v2 (Kad2), IPv4 only
@@ -221,7 +221,7 @@ Use the labels below when reading the current port status:
 ### Kad2 Packet Types
 
 All packets use the eMule `OP_KADEMLIAHEADER` (0xE4) or obfuscated header.
-For byte-level layouts, verified tag IDs, and packet-family notes, see `KAD_PROTOCOL.md`.
+For byte-level layouts, verified tag IDs, and packet-family notes, see `PROTOCOL_REFERENCE.md`.
 
 | Packet | Direction | Purpose |
 |---|---|---|
@@ -646,6 +646,24 @@ level = "info"
 - config updates for socket-shape/runtime-critical Kad settings currently require restart
 - Search defaults are intentionally indexer-oriented: fan out broadly in phase 2, collect a lot,
   and filter later in the coordinator/indexing plane rather than narrowing aggressively during network search
+
+### Multi-Agent Fleet Guidance
+
+For broad Kad search-serving coverage, prefer a fleet of long-lived agents over one oversized node.
+
+- Run multiple agents with separate `state_dir` roots so each agent keeps its own stable Kad node ID, UDP key, ports, and cached `nodes.dat`.
+- Register each agent as its own indexer instance under the coordinator.
+- Prefer distinct public IPv4 addresses per agent.
+- Prefer spreading those IPv4 addresses across different `/24` prefixes when possible.
+- Do not treat many random Kad IDs behind one public IPv4 as a substitute for real fleet coverage.
+- Do not churn Kad IDs unnecessarily; long-lived identities accumulate routing presence, peer UDP-key context, and more credible network behavior.
+
+Rationale:
+
+- Kad routing and publish/search ownership follow target proximity, not raw node capacity.
+- Kad v9+ node IDs are partially tied to the public IP, so keyspace placement is not freely controllable with arbitrary random IDs alone.
+- The routing layer also enforces duplicate-IP and subnet clustering constraints, so many agents behind one address or one tight subnet are a weaker network position than a fleet spread across real addresses.
+- From a wire-parity and acceptance perspective, stable always-on nodes are more useful than frequently rotated identities.
 
 ---
 

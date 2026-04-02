@@ -1,4 +1,4 @@
-# KAD_DIFFS
+# Kad Oracle Differences
 
 Comparative implementation report for the two oracle Kad trees used by this workspace.
 
