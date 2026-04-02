@@ -1,3 +1,5 @@
+# Runs the local Rust quality baseline for the agents repo.
+# This is the canonical repo-local validation entrypoint for Rust changes.
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
