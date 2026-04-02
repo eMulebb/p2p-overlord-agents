@@ -1,3 +1,9 @@
+//! Kad traversal state machine for lookup, search, and publish-preparation walks.
+//!
+//! The traversal owns the oracle-shaped `REQ` / `RES` phase, the jump-start
+//! timing for search phase 2, and the candidate-state bookkeeping that decides
+//! which contacts are still eligible to query.
+
 use overlord_kad_net::RpcManager;
 use overlord_kad_proto::{
     Ed2kHash, KadPacket, NodeId, Tag,
@@ -17,26 +23,39 @@ use tracing::{info, trace, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CandidateState {
+    /// Candidate discovered but not yet queried.
     Pending,
+    /// `REQ` sent and response still pending.
     Inflight,
+    /// Candidate answered with a `RES` and remains eligible for phase 2.
     Responded,
+    /// Candidate timed out or failed and should not be queried again in this traversal.
     Failed,
 }
 
+/// Minimal peer identity required to query one traversal candidate.
 #[derive(Debug, Clone)]
 pub struct TraversalContact {
+    /// Kad node ID of the candidate.
     pub id: NodeId,
+    /// UDP endpoint used for Kad traffic.
     pub addr: SocketAddr,
+    /// Highest Kad version known for this candidate.
     pub version: u8,
 }
 
+/// One traversal candidate plus its current state and XOR distance.
 #[derive(Debug, Clone)]
 pub struct TraversalCandidate {
+    /// Contact identity and endpoint.
     pub contact: TraversalContact,
+    /// Current traversal state for this candidate.
     pub state: CandidateState,
-    pub distance: NodeId, // XOR distance to target
+    /// XOR distance from the candidate ID to the traversal target.
+    pub distance: NodeId,
 }
 
+/// Phase-2 behavior that should follow once the closest contacts are known.
 #[derive(Debug, Clone)]
 pub enum TraversalKind {
     /// Pure node lookup — just find close nodes.
@@ -51,12 +70,19 @@ pub enum TraversalKind {
     Notes { size: u64 },
 }
 
+/// Inputs for one full traversal run.
 pub struct TraversalConfig {
+    /// Target ID being resolved or searched.
     pub target: NodeId,
+    /// Traversal flavor and phase-2 behavior.
     pub search_kind: TraversalKind,
+    /// Whole-traversal deadline.
     pub timeout: Duration,
-    pub query_timeout: Duration, // per-node query timeout
+    /// Per-node `REQ` timeout budget.
+    pub query_timeout: Duration,
+    /// Maximum number of close contacts to use in phase 2.
     pub phase2_fanout: usize,
+    /// External cancellation token for the whole run.
     pub cancel: CancellationToken,
     /// Optional streaming hook for phase-2 SEARCH_RES entries.
     ///
@@ -66,6 +92,7 @@ pub struct TraversalConfig {
     pub result_tx: Option<mpsc::Sender<(Ed2kHash, Vec<Tag>)>>,
 }
 
+/// Final traversal outcome returned to the caller.
 pub struct TraversalResult {
     /// K closest nodes that responded.
     pub closest: Vec<TraversalContact>,
@@ -111,6 +138,7 @@ const SEARCH_JUMPSTART_TICK: Duration = Duration::from_secs(1);
 /// eMule only jump-starts once the last lookup response is at least 3 seconds old.
 const SEARCH_JUMPSTART_IDLE_GRACE: Duration = Duration::from_secs(3);
 
+/// Run one oracle-shaped Kad traversal from `REQ` fanout through optional search phase 2.
 pub async fn run_traversal(
     rpc: &RpcManager,
     initial_candidates: Vec<TraversalContact>,

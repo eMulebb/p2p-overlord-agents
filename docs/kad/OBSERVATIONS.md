@@ -251,11 +251,11 @@ Typical oracle tags in keyword publish: `FILENAME`, `FILESIZE`, `FILETYPE`, `FIL
 | Field | Size | Meaning |
 |---|---:|---|
 | `target` | 16 | File hash target |
-| `publisher_id` | 16 | Publisher client hash / sender Kad identity |
+| `publisher_id` | 16 | Publisher client hash / source identifier |
 | `tag_count` | 1 | Number of tags |
 | `tags[tag_count]` | variable | Source metadata tags |
 
-Status: `Equivalent behavior`. The Rust field `publisher_id: NodeId` now carries the sender's Kad identity in this position, matching eMule `net/KademliaUDPListener.cpp SendPublishSourcePacket` and `kademlia/Search.cpp CSearch::StorePacket`. This was a previous semantic mismatch that was corrected.
+Status: `Equivalent behavior`. The Rust field `publisher_id: NodeId` now carries the sender's source-publish identity in this position, matching eMule `net/KademliaUDPListener.cpp SendPublishSourcePacket` and `kademlia/Search.cpp CSearch::StorePacket`. The Rust type stays `NodeId` only because the wire slot is still a raw 16-byte identity field.
 
 Oracle source type values carried in `TAG_SOURCETYPE`:
 - `1`: high-ID source
@@ -553,7 +553,7 @@ Oracle: The second 128-bit field in `KADEMLIA2_PUBLISH_SOURCE_REQ` is the publis
 
 Previous Rust state: this field was incorrectly described or populated.
 
-Current Rust state: `publish_source` in `overlord-kad-dht/src/publish.rs` now fills this field with publisher identity, and the struct field is correctly typed `publisher_id: NodeId`. Status: `Equivalent behavior`.
+Current Rust state: `publish_source` in `overlord-kad-dht/src/publish.rs` now fills this field with the stable source-publish identity, and the struct field is still typed `publisher_id: NodeId` only for 16-byte wire compatibility. Status: `Equivalent behavior`.
 
 ### 8.3 Notes Publish Identity Field
 

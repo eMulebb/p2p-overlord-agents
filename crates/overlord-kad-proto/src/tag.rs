@@ -7,12 +7,25 @@ use crate::constants::tag_name;
 use crate::error::ProtoError;
 use crate::hash::Ed2kHash;
 
+/// Kad tag-name representation.
+///
+/// eMule mostly uses one-byte FT_* tag identifiers, but some packet families
+/// also carry longer string names. The codec keeps both forms explicit so
+/// wire-level meaning is not lost during decode.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TagName {
+    /// One-byte FT_* tag identifier.
     Short(u8),
+    /// String tag name used by the long-name branch of the Kad tag codec.
     Long(String),
 }
 
+/// Typed Kad tag value.
+///
+/// The oracle reuses the same generic tag envelope across search results,
+/// publish packets, HELLO metadata, and ED2K-side metadata. This enum keeps the
+/// raw storage class visible so callers can preserve or reinterpret tags
+/// without reserializing from a lossy intermediate model.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TagValue {
     Hash(Ed2kHash),
@@ -28,9 +41,12 @@ pub enum TagValue {
     SmallBlob(Vec<u8>),
 }
 
+/// One decoded Kad tag.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tag {
+    /// Wire tag name, either a short FT_* code or a long string.
     pub name: TagName,
+    /// Typed wire value payload.
     pub value: TagValue,
 }
 
@@ -98,6 +114,7 @@ fn decode_legacy_search_result_string(bytes: &[u8]) -> String {
 }
 
 impl Tag {
+    /// Create a short-name Kad tag from a one-byte FT_* identifier.
     #[must_use]
     pub fn new_short(name_byte: u8, value: TagValue) -> Self {
         Tag {
@@ -106,6 +123,7 @@ impl Tag {
         }
     }
 
+    /// Create a long-name Kad tag from a string identifier.
     #[must_use]
     pub fn new_long(name: impl Into<String>, value: TagValue) -> Self {
         Tag {
@@ -114,26 +132,31 @@ impl Tag {
         }
     }
 
+    /// Create a `FILENAME` tag.
     #[must_use]
     pub fn filename(name: impl Into<String>) -> Self {
         Tag::new_short(tag_name::FILENAME, TagValue::String(name.into()))
     }
 
+    /// Create a `FILESIZE` tag using the compact numeric representation chosen by the codec.
     #[must_use]
     pub fn filesize(size: u64) -> Self {
         Tag::new_short(tag_name::FILESIZE, TagValue::UInt(size))
     }
 
+    /// Create a `FILETYPE` tag.
     #[must_use]
     pub fn filetype(t: impl Into<String>) -> Self {
         Tag::new_short(tag_name::FILETYPE, TagValue::String(t.into()))
     }
 
+    /// Create a `SOURCES` availability tag.
     #[must_use]
     pub fn sources(n: u32) -> Self {
         Tag::new_short(tag_name::SOURCES, TagValue::UInt(u64::from(n)))
     }
 
+    /// Create the Kad keyword-publish AICH tag used for Kad v9+ peers.
     #[must_use]
     pub fn kad_aich_hash_pub(hash: [u8; 20]) -> Self {
         Tag::new_short(tag_name::KADAICHHASHPUB, TagValue::SmallBlob(hash.to_vec()))

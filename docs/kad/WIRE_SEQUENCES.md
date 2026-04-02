@@ -796,9 +796,11 @@ US                                          PEER
 |       from the obfuscation trailer.          |
 |       Stores it in PEER's Contact.udp_key.   |
 |       All subsequent packets to PEER:        |
-|       - request packets: use PEER verify key |
-|         (receiver verify key preferred over  |
-|          NodeID-derived key)                 |
+|       - request packets: keep NodeID-mode as |
+|         the primary oracle path while usable |
+|         peer identity is known               |
+|       - fall back to receiver verify key     |
+|         when NodeID context is missing       |
 |       - response packets: use PEER verify key|
 |                                              |
 | note: US persists PEER's udp_key in          |

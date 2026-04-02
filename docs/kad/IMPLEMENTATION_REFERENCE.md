@@ -143,7 +143,7 @@ and transformations. This makes them trivially unit-testable.
 - `RoutingBin` — k-bucket, max K=10 contacts
 - `Contact` — node ID, IP, UDP port, TCP port, Kad version, UDP key, liveness type, last seen
 - Current split logic is close to the oracle but not identical; see §7 for the parity gap
-- Global IP/subnet duplicate enforcement (max 1 per IP, max 10 per /24 subnet); oracle per-bin /24 cap is still pending
+- Global IP/subnet duplicate enforcement (max 1 per IP, max 10 per /24 subnet) and the oracle per-bin two-per-`/24` cap
 - No `async`, no `tokio`, no networking
 
 ### `overlord-kad-net`
@@ -153,7 +153,7 @@ and transformations. This makes them trivially unit-testable.
 - `RpcManager` — pending request map keyed by transaction ID, timeout handling
 - Packet obfuscation layer (RC4, see §9)
 - Receives raw UDP datagrams, attempts decrypt, dispatches to `RpcManager`
-- `PacketTracker` — generic per-IP flood protection
+- `PacketTracker` — oracle-shaped per-IP, per-opcode flood protection with a separate search-result budget
 
 ### `overlord-kad-dht`
 
@@ -200,19 +200,18 @@ Use the labels below when reading the current port status:
 
 | Crate | Status | Notes |
 |---|---|---|
-| `overlord-kad-proto` | `Equivalent behavior` + `Verified difference` | `src/packet.rs` matches the oracle Kad2 search-family wire shapes used by eMule `net/KademliaUDPListener.cpp Process_KADEMLIA2_SEARCH_*` and `kademlia/Search.cpp CSearch::StorePacket`, cross-checked against aMule `Process2Search*Request` and `CSearch::StorePacket`. The remaining semantic-name gaps are `SearchRes.keyword_id` and `PublishNotesReq.note_hash`; source publish now uses a target-generic sender identity field. |
-| `overlord-kad-routing` | `Equivalent behavior` + `Verified difference` + `Pending parity gap` | `src/table.rs` already matches the oracle global duplicate limits from eMule/aMule `routing/RoutingBin.cpp CheckGlobalIPLimits`, but `src/zone.rs fn can_split` does not match `routing/RoutingZone.cpp CanSplit`, and `src/bin.rs` still lacks the oracle per-bin two-per-`/24` cap enforced in `routing/RoutingBin.cpp AddContact`. |
-| `overlord-kad-net` | `Equivalent behavior` + `Verified difference` + `Pending parity gap` | `src/rpc.rs` and the transport flow are close enough for Kad2 request/response exchange, but live-oracle traces show that eMule spends most of its Kad time on obfuscated UDP and only falls back to plaintext sparingly. `src/tracker.rs` also remains a generic per-IP limiter instead of the oracle per-IP, per-opcode logic in `net/PacketTracking.cpp`. Recent parity work also showed that startup NodeID and UDP-key context must be preserved from `nodes.dat` and HELLO traffic, or the runtime stays much more plaintext than the oracle. |
+| `overlord-kad-proto` | `Equivalent behavior` + `Verified difference` | `src/packet.rs` matches the oracle Kad2 search-family wire shapes used by eMule `net/KademliaUDPListener.cpp Process_KADEMLIA2_SEARCH_*` and `kademlia/Search.cpp CSearch::StorePacket`, cross-checked against aMule `Process2Search*Request` and `CSearch::StorePacket`. The remaining semantic-name gap is `SearchRes.keyword_id`, which is still narrower than the echoed-target meaning used on the wire. |
+| `overlord-kad-routing` | `Equivalent behavior` | `src/table.rs`, `src/zone.rs`, and `src/bin.rs` now match the oracle global duplicate limits, `RoutingZone.cpp CanSplit`, and the per-bin two-per-`/24` clustering cap enforced in `routing/RoutingBin.cpp AddContact`. |
+| `overlord-kad-net` | `Equivalent behavior` + `Pending parity gap` | `src/rpc.rs`, `src/tracker.rs`, and the transport flow now implement oracle-shaped per-IP, per-opcode request tracking and the current obfuscation-mode selection. The remaining gap is live-behavior density and HELLO-derived key registration, not generic tracker shape anymore. |
 | `overlord-kad-dht` | `Equivalent behavior` + `Repo policy` | `src/traversal.rs` emits the same Kad2 search request families as oracle `CSearch::StorePacket`, and the main search/source/notes traversal shape is recognizable. `src/search.rs is_acceptable_keyword_result` is currently repo policy rather than a direct oracle port, and source publish now fills the second `KADEMLIA2_PUBLISH_SOURCE_REQ` field with publisher identity like eMule/aMule. Bootstrap persistence now also preserves peer UDP keys from `nodes.dat` so restarts retain the same obfuscation context the oracle keeps. |
-| `overlord-agent-emule` | `Equivalent behavior` + `Verified difference` + `Pending parity gap` | `src/agent.rs` already observes unsolicited Kad `Search*Req` traffic and persists the snoop queue, but coordinator-triggered notes search still fails with `notes search is not wired yet`. `src/snoop_queue.rs` keeps only target-centric queue entries, so passive replay cannot yet preserve oracle request details such as restrictive keyword expressions, source pagination, or notes size-only semantics. |
+| `overlord-agent-emule` | `Equivalent behavior` + `Pending parity gap` | `src/agent.rs` already observes unsolicited Kad `Search*Req` traffic, persists the snoop queue, and now exposes active Kad notes search and validation-only notes publish. `src/snoop_queue.rs` still keeps only target-centric queue entries, so passive replay cannot yet preserve oracle request details such as restrictive keyword expressions, source pagination, or notes size-only semantics. |
 
 ### Current Oracle Findings Backlog
 
 1. `overlord-kad-net`: finish the oracle obfuscation port and verify it on the live network. The recent `a1`-`a7` eMule packet captures under `ext-deps/eMule_full_build_deps/eMule/srchybrid/x64/Debug/` show that modern oracle sessions are overwhelmingly obfuscated, while plaintext Kad appears only as a small bootstrap, hello, or fallback slice. An isolated oracle run from `ext-deps/eMule-build` on 2026-03-22 reinforced that result: a 5-minute capture on `46663/udp` produced `1009` packets, only `55` plaintext `0xE4...` packets, and `954` non-plaintext packets, while the oracle trace log still recorded successful publish sends and accepts.
-2. `overlord-kad-proto`: rename remaining misleading target/identity fields such as `SearchRes.keyword_id` and `PublishNotesReq.note_hash` so the Rust API stops encoding the wrong mental model.
-3. `overlord-kad-routing`: port the real `routing/RoutingZone.cpp CanSplit` rule and the per-bin `/24` clustering cap from `routing/RoutingBin.cpp AddContact` so routing behavior matches eMule/aMule under load.
-4. `overlord-agent-emule` and `overlord-kad-dht`: wire active notes search end to end and decide whether snoop replay must preserve oracle request-shape fields for keyword/source/notes traffic.
-5. `overlord-kad-net` and live runtime validation: move packet tracking closer to oracle `net/PacketTracking.cpp`, then keep re-running live-network acceptance to verify unsolicited search traffic, search replies, and publish flows under real conditions.
+2. `overlord-kad-proto`: rename the remaining misleading echoed-target field `SearchRes.keyword_id` so the Rust API stops encoding the wrong mental model.
+3. `overlord-agent-emule`: preserve fuller snooped request shape so passive replay can match oracle keyword/source/notes request details more closely.
+4. `overlord-kad-net` and live runtime validation: keep re-running live-network acceptance to improve HELLO key registration completeness and obfuscation density against the oracle.
 
 ---
 
@@ -262,7 +261,7 @@ pub const KK: usize = 5;               // peer selection parameter
 pub const SEARCH_TIMEOUT_SECS: u64 = 45;
 pub const STORE_TIMEOUT_SECS: u64 = 140;
 pub const REPUBLISH_INTERVAL_SECS: u64 = 18_000; // ~5 hours, configurable
-pub const KAD_VERSION: u8 = 9;         // our announced Kad version
+pub const KAD_VERSION: u8 = 10;        // our announced Kad version
 ```
 
 ---
@@ -286,8 +285,8 @@ Verified oracle rule:
 
 Current Rust status:
 
-- `crates/overlord-kad-routing/src/zone.rs fn can_split` gates on `depth < 127`, `total_contacts < max_table_size`, and `depth < KBASE || on_own_side`.
-- `Verified difference`: `on_own_side` is not the same rule as oracle `zone_index < KK`.
+- `crates/overlord-kad-routing/src/zone.rs fn can_split` gates on `depth < 127`, `total_contacts < max_table_size`, and the oracle `zone_index < KK || depth < KBASE` predicate.
+- `Equivalent behavior`: the Rust `can_split` path now uses the oracle `zone_index < KK || depth < KBASE` predicate instead of the old `on_own_side` heuristic.
 - `Repo policy`: the extra `max_table_size` guard is a local Overlord limit and should not be described as oracle routing behavior.
 
 ### Contact Liveness Types
@@ -312,8 +311,7 @@ Oracle rule from eMule/aMule `routing/RoutingBin.cpp AddContact`, `CheckGlobalIP
 Current Rust status:
 
 - `crates/overlord-kad-routing/src/table.rs` implements the global one-per-IP rule, the global ten-per-`/24` rule, and the LAN exemption.
-- `crates/overlord-kad-routing/src/bin.rs` does not implement the oracle per-bin two-per-`/24` cap; its tests explicitly document that subnet limits are treated as global only.
-- `Pending parity gap`: bucket-local anti-clustering is still weaker than in eMule/aMule.
+- `Equivalent behavior`: `crates/overlord-kad-routing/src/bin.rs` now enforces the oracle per-bin two-per-`/24` cap in addition to the global limits.
 
 ### Contact Fields
 
@@ -378,7 +376,7 @@ that size is unavailable. Notes results are stored in `notes`; the result entry 
 the note author's Kad/source ID and is persisted as `author_hash`.
 
 - `Equivalent behavior`: `crates/overlord-kad-dht/src/traversal.rs` emits `SearchNotesReq { target, size }`, matching eMule `kademlia/Search.cpp CSearch::StorePacket` and `net/KademliaUDPListener.cpp Process_KADEMLIA2_SEARCH_NOTES_REQ`, cross-checked against the aMule equivalents.
-- `Verified difference`: `crates/overlord-agent-emule/src/agent.rs` still rejects coordinator-triggered notes searches with `notes search is not wired yet`, so the runtime does not expose the existing DHT notes-search path end to end.
+- `Equivalent behavior`: `crates/overlord-agent-emule/src/agent.rs` now exposes coordinator-triggered Kad notes searches end to end; the remaining notes follow-up is richer result modeling for distinct note authors.
 
 ### Publish
 
@@ -390,7 +388,7 @@ On file add (automatic) and on schedule (configurable interval, default 18000s):
 
 - `Equivalent behavior`: the Kad2 publish packet families in `crates/overlord-kad-proto/src/packet.rs` follow the oracle send paths in eMule `kademlia/Search.cpp CSearch::StorePacket` and aMule `kademlia/Search.cpp CSearch::StorePacket`.
 - `Equivalent behavior`: `crates/overlord-kad-dht/src/publish.rs publish_source` now fills the second `KADEMLIA2_PUBLISH_SOURCE_REQ` field with publisher identity, matching eMule `net/KademliaUDPListener.cpp SendPublishSourcePacket` and `kademlia/Search.cpp CSearch::StorePacket`.
-- `Pending parity gap`: notes publish exists in `overlord-kad-dht`, but the full agent/runtime path and naming cleanup are still not audited to oracle parity end to end.
+- `Equivalent behavior`: notes publish now uses `publisher_id` semantics end to end and has been exercised through the validation-only seed path on the live network.
 
 ### Concurrent Search Limit
 
@@ -413,7 +411,7 @@ Most modern nodes on the live network use obfuscation. Without it, many nodes wi
 
 - Default: **enabled**
 - Config: `[obfuscation] enabled = true`
-- When enabled: the current Rust runtime now follows the oracle Kad UDP key schedule more closely. Once a peer verify key is known, both request and reply packets prefer that receiver verify key; request packets only fall back to NodeID-based obfuscation while HELLO-driven key exchange is still incomplete, and inbound packets are tried as obfuscated first before falling back to plain decode.
+- When enabled: the current Rust runtime now follows the oracle Kad UDP key schedule more closely. Requests keep NodeID-mode obfuscation as the primary path while usable peer identity is known, replies use the learned receiver verify key, and request fallback uses that verify key when NodeID context is missing. Inbound packets are still tried as obfuscated first before plain decode.
 - When disabled: plain packets only (useful for debugging, Wireshark capture)
 
 ### Key Negotiation

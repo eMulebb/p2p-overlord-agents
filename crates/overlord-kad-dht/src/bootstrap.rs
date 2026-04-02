@@ -1,3 +1,9 @@
+//! Bootstrap-node parsing and `nodes.dat` persistence helpers.
+//!
+//! This module is the boundary between the oracle's persisted contact formats
+//! and the in-memory DHT runtime. It intentionally preserves the peer UDP key
+//! field so restart-time obfuscation context stays aligned with eMule.
+
 use crate::error::DhtError;
 use binrw::{BinRead, BinWrite};
 use overlord_kad_proto::{KadUdpKey, NodeId};
@@ -30,10 +36,15 @@ struct NodesDatEntryExt {
 
 #[derive(Debug, Clone)]
 pub struct BootstrapContact {
+    /// Kad node ID loaded from `nodes.dat`, when known.
     pub node_id: NodeId,
+    /// IPv4 address of the bootstrap peer.
     pub ip: std::net::Ipv4Addr,
+    /// Kad UDP port.
     pub udp_port: u16,
+    /// ED2K TCP port advertised by the peer.
     pub tcp_port: u16,
+    /// Kad version announced by the peer.
     pub version: u8,
     /// Peer UDP anti-spoofing key persisted from `nodes.dat` or learned at runtime.
     pub udp_key: KadUdpKey,

@@ -334,8 +334,8 @@ Verified wire shape in this repo and eMule send path:
 Important caution:
 
 - the current Rust field name is `publisher_id`
-- eMule uses the sender's Kad identity in this position, not the file hash again
-- the current Rust send path now matches that oracle behavior
+- eMule uses the publisher/source client identity in this position, not the file hash again
+- the current Rust runtime models it as a 16-byte opaque publisher identity and fills it from the stable source-publish identity path
 
 ### `KADEMLIA2_PUBLISH_NOTES_REQ` (`0x45`)
 
@@ -375,7 +375,7 @@ Layout:
 - `Verified`: restrictive keyword mode is not just a flag bit. Oracle receive paths immediately parse a trailing search-expression tree via `CreateSearchExpressionTree` when `start_position & 0x8000 != 0`.
 - `Equivalent behavior, different implementation`: both eMule and aMule may emit multiple `KADEMLIA2_SEARCH_RES` packets for one request. eMule `kademlia/Indexed.cpp SendValid*Result` fragments on byte budget, while aMule `kademlia/Indexed.cpp SendValid*Result` sends fixed 50-result chunks.
 - `Verified difference (oracles)`: `net/PacketTracking.cpp` is not identical for publish opcodes. eMule allows 4/3/2 requests per minute for publish key/source/notes; aMule allows 3/2/2.
-- `Pending parity gap (Rust runtime)`: `crates/overlord-kad-net/src/rpc.rs` and `crates/overlord-kad-net/src/tracker.rs` currently apply generic per-IP flood blocking instead of oracle per-IP, per-opcode request tracking.
+- `Equivalent behavior (Rust runtime)`: `crates/overlord-kad-net/src/rpc.rs` and `crates/overlord-kad-net/src/tracker.rs` now apply oracle-shaped per-IP, per-opcode request tracking, while still keeping the Overlord-specific relaxed `SEARCH_RES` harvest budget.
 
 ## 5. Verified Tag Registry For Search And Publish
 
@@ -638,7 +638,7 @@ Verified source-type values used by eMule:
 Pending:
 
 - this repo has not yet done a full publish-source semantic audit for buddy, callback, or encryption tags
-- the Rust field name `publisher_id` now matches the sender-identity semantics used by eMule
+- the Rust field name `publisher_id` now matches the sender-identity semantics used by eMule, even though the stored Rust type remains `NodeId` for 16-byte wire compatibility
 
 ### Notes Publish
 
@@ -655,7 +655,7 @@ Verified from eMule send path:
 Pending:
 
 - the Rust field name `publisher_id` now matches the oracle publisher-identity semantics
-- end-to-end interoperability for notes publish remains to be verified against live peers
+- richer coordinator-side modeling for distinct note authors remains a separate follow-up; the Kad wire/runtime path itself has been validated live
 
 ### Publish Result
 
@@ -717,10 +717,9 @@ The following are still not safe to treat as fully settled:
 - full HELLO / HELLO_RES / HELLO_RES_ACK parity with eMule, especially around obfuscation registration
 - source publish and notes publish semantic naming cleanup in Rust structs
 - source-encryption and buddy/callback tag handling
-- strict `SEARCHTOLERANCE` gating before sending phase-2 search packets
 - keyword expression payloads and filename post-filtering parity
 - start-position pagination for keyword and source search
-- full live-network validation that remote eMule nodes accept all publish variants sent by this repo
+- broader live-network validation that remote eMule nodes accept all publish variants sent by this repo over longer windows
 - whether any additional version-gated tags should be filtered before exposing results
 
 ## 10. Reference Map

@@ -218,7 +218,11 @@ pub struct SearchResultEntry {
 pub struct SearchRes {
     /// The Kad ID of the node sending this response.
     pub sender_id: NodeId,
-    /// The keyword hash that was queried (echo of SearchKeyReq.target).
+    /// Echoed search target from the request.
+    ///
+    /// The field name is still narrower than the oracle wire meaning:
+    /// keyword searches echo the keyword hash here, while source and notes
+    /// searches echo the searched file hash in the same 16-byte slot.
     pub keyword_id: NodeId,
     #[br(temp)]
     #[bw(calc = u16::try_from(results.len()).expect("result count exceeds u16"))]
@@ -261,7 +265,13 @@ pub struct PublishKeyReq {
 #[brw(little)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublishSourceReq {
+    /// File-hash target being published.
     pub target: NodeId,
+    /// Publisher/source identity carried in the second 16-byte slot.
+    ///
+    /// eMule uses a source-publish client identity here rather than another
+    /// file hash. The Rust type stays `NodeId` because the wire slot is just 16
+    /// opaque bytes.
     pub publisher_id: NodeId,
     #[br(temp)]
     #[bw(calc = u8::try_from(tags.len()).expect("tag count exceeds u8"))]

@@ -18,17 +18,22 @@ pub enum RoutingSplitDeniedReason {
     ZoneIndexCap,
 }
 
+/// Routing-table insertion or split failures that matter for oracle parity.
 #[derive(Debug, thiserror::Error)]
 pub enum RoutingError {
+    /// The table-level hard cap blocked further growth.
     #[error("routing table is full (max {max} contacts)")]
     TableFull { max: usize },
+    /// The oracle one-per-IP rule rejected this contact.
     #[error("duplicate IP: {ip}")]
     IpLimitExceeded { ip: std::net::Ipv4Addr },
+    /// A `/24` clustering limit rejected this contact.
     #[error("subnet /{prefix} limit exceeded in {scope:?} scope")]
     SubnetLimitExceeded {
         prefix: u8,
         scope: RoutingSubnetLimitScope,
     },
+    /// A full leaf bin could not be split under the oracle `CanSplit` rules.
     #[error("routing leaf could not split because of {reason:?}")]
     SplitDenied { reason: RoutingSplitDeniedReason },
 }

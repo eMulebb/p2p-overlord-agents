@@ -1,3 +1,8 @@
+//! Routing-table contact model and LAN/subnet helpers.
+//!
+//! The routing crate keeps enough peer metadata to mirror the oracle's
+//! anti-clustering, HELLO-derived metadata, and UDP-key persistence rules.
+
 use std::net::Ipv4Addr;
 use std::time::SystemTime;
 
@@ -17,11 +22,17 @@ pub enum ContactType {
 /// A Kad2 routing table entry.
 #[derive(Debug, Clone)]
 pub struct Contact {
+    /// Peer Kad node ID.
     pub id: NodeId,
+    /// Peer IPv4 address.
     pub ip: Ipv4Addr,
+    /// Peer Kad UDP port.
     pub udp_port: u16,
+    /// Peer ED2K TCP port.
     pub tcp_port: u16,
+    /// Highest Kad version observed for the peer.
     pub kad_version: u8,
+    /// Latest persisted or learned UDP anti-spoofing key for this peer.
     pub udp_key: KadUdpKey,
     /// Peer-advertised Kad UDP port from `TAG_SOURCEUPORT`, if provided.
     pub hello_source_udp_port: Option<u16>,
@@ -31,9 +42,13 @@ pub struct Contact {
     pub tcp_firewalled: bool,
     /// Whether the peer requested a `HELLO_RES_ACK` packet.
     pub requests_hello_res_ack: bool,
+    /// Whether the contact has completed the stronger verified path in the routing table.
     pub verified: bool,
+    /// Current routing-table liveness state.
     pub contact_type: ContactType,
+    /// Most recent successful observation time.
     pub last_seen: SystemTime,
+    /// First insertion time for this contact.
     pub created_at: SystemTime,
 }
 

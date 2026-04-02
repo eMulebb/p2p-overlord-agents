@@ -1,3 +1,10 @@
+//! Agent configuration model for the eMule/Kad runtime.
+//!
+//! The config layer is the boundary between TOML/runtime state and the
+//! long-lived agent tasks. Public structs here should therefore document which
+//! fields affect oracle-facing wire behavior versus purely local control-plane
+//! behavior.
+
 use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
@@ -10,11 +17,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct EmuleAgentConfig {
+    /// Coordinator HTTP endpoint and registration settings.
     pub coordinator: CoordinatorConfig,
+    /// Agent identity and local state paths.
     pub agent: AgentConfig,
+    /// HTTP control-plane binding settings.
     pub control: ControlConfig,
+    /// P2P protocol listeners and Kad/eD2k runtime settings.
     pub p2p: P2pConfig,
+    /// NAT traversal and UPnP behavior.
     pub nat: NatConfig,
+    /// Local logging settings.
     pub log: LogConfig,
 }
 
@@ -30,43 +43,61 @@ struct NetworkingSectionAuthority {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CoordinatorConfig {
+    /// Base coordinator URL used for registration, search jobs, and result posting.
     pub url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentConfig {
+    /// Path of the persisted stable indexer UUID.
     pub indexer_id_path: String,
+    /// Directory that owns persisted runtime state such as `nodes.dat`.
     pub state_dir: String,
+    /// Hostname reported to the coordinator.
     pub hostname: String,
+    /// Agent version string reported to the coordinator.
     pub version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ControlConfig {
+    /// Optional interface name for the HTTP control surface.
     pub bind_iface: Option<String>,
+    /// Optional explicit IP for the HTTP control surface.
     pub bind_ip: Option<String>,
+    /// Whether the operator already confirmed this bind selection.
     pub selection_confirmed: bool,
+    /// Agent HTTP control port.
     pub listen_port: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct P2pConfig {
+    /// Optional interface name for P2P listeners.
     pub bind_iface: Option<String>,
+    /// Optional explicit P2P bind IP.
     pub bind_ip: Option<String>,
+    /// Whether the operator already confirmed this P2P bind selection.
     pub selection_confirmed: bool,
+    /// Kad runtime settings.
     pub kad: KadConfig,
+    /// ED2K runtime settings.
     pub ed2k: Ed2kConfig,
+    /// Passive snoop-queue scheduling and replay settings.
     pub snoop_queue: SnoopQueueConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KadConfig {
+    /// Local Kad UDP port.
     pub listen_port: u16,
+    /// Path of the persisted `nodes.dat`.
     pub nodes_dat_path: String,
+    /// Optional plaintext bootstrap contact list.
     pub bootstrap_nodes: Vec<String>,
     pub search_timeout_secs: u64,
     pub store_timeout_secs: u64,
@@ -186,35 +217,52 @@ pub struct SnoopQueueConfig {
     pub source_stop_after_results: usize,
 }
 
+/// NAT runtime configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct NatConfig {
+    /// P2P-facing NAT mapping settings.
     pub p2p: NatP2pConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NatP2pConfig {
+    /// Whether NAT mapping maintenance is enabled.
     pub enabled: bool,
+    /// Preferred NAT backends in priority order.
     pub backend_order: Vec<String>,
+    /// Optional fixed IGD address.
     pub igd_ip: Option<String>,
+    /// Optional minissdpd socket path.
     pub minissdpd_socket: Option<String>,
+    /// Optional local SSDP source port override.
     pub ssdp_local_port: Option<u16>,
+    /// Discovery timeout budget.
     pub discovery_timeout_secs: u64,
+    /// Requested mapping lease duration.
     pub lease_duration_secs: u32,
+    /// Renewal lead time before lease expiry.
     pub renew_margin_secs: u64,
+    /// Forced external IP override when discovery is unavailable.
     pub external_ip_override: Option<String>,
 }
 
+/// File-based logging configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LogConfig {
+    /// Default tracing level filter.
     pub level: String,
+    /// Optional log directory override.
     pub dir: Option<String>,
+    /// Rotation cadence for file sinks.
     pub rotation: LogRotation,
+    /// Maximum number of rotated files to retain.
     pub max_files: usize,
 }
 
+/// Supported file-rotation policies for agent logs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LogRotation {
