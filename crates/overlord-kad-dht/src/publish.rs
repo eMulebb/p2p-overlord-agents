@@ -1,7 +1,7 @@
 use crate::error::DhtError;
 use crate::traversal::{TraversalConfig, TraversalContact, TraversalKind, run_traversal};
 use overlord_kad_net::RpcManager;
-use overlord_kad_proto::constants::STORE_TIMEOUT_SECS;
+use overlord_kad_proto::constants::{KAD_VERSION_AICH_KEYWORD_PUBLISH, STORE_TIMEOUT_SECS};
 use overlord_kad_proto::{
     Ed2kHash, KadPacket, NodeId, Tag,
     constants::K,
@@ -112,6 +112,7 @@ pub async fn publish_keyword(
     keyword_hash: NodeId,
     file_hash: Ed2kHash,
     tags: Vec<Tag>,
+    aich_hash: Option<[u8; 20]>,
     publish_contact_fanout: usize,
 ) -> Result<PublishAttemptStats, DhtError> {
     let target = keyword_hash;
@@ -136,15 +137,6 @@ pub async fn publish_keyword(
         return Err(DhtError::PublishFailed);
     }
 
-    let entry = PublishEntry {
-        hash: file_hash,
-        tags,
-    };
-    let packet = KadPacket::PublishKeyReq(PublishKeyReq {
-        target,
-        entries: vec![entry],
-    });
-
     let publish_contacts = select_publish_contacts(&traversal.closest, publish_contact_fanout);
     let mut stats = PublishAttemptStats {
         closest_contacts_considered: traversal.closest.len() as u32,
@@ -166,7 +158,41 @@ pub async fn publish_keyword(
             file_hash,
         );
     }
-    for (attempt, result) in execute_publish_fanout(rpc, &publish_contacts, &packet).await {
+    let mut join_set = JoinSet::new();
+    let total = publish_contacts.len() as u32;
+    for (index, contact) in publish_contacts.iter().cloned().enumerate() {
+        let rpc = rpc.clone();
+        let packet =
+            build_keyword_publish_packet(target, file_hash, &tags, aich_hash, contact.version);
+        let attempt = PublishAttempt {
+            rank: index as u32 + 1,
+            total,
+            contact,
+        };
+        join_set.spawn(async move {
+            let result = rpc
+                .request(
+                    attempt.contact.addr,
+                    &packet,
+                    opcode::PUBLISH_RES,
+                    PUBLISH_RESPONSE_TIMEOUT,
+                )
+                .await;
+            (attempt, result)
+        });
+    }
+
+    let mut results = Vec::with_capacity(publish_contacts.len());
+    while let Some(joined) = join_set.join_next().await {
+        match joined {
+            Ok(result) => results.push(result),
+            Err(error) => {
+                tracing::warn!("publish request task failed to join: {error}");
+            }
+        }
+    }
+
+    for (attempt, result) in results {
         match result {
             Ok(KadPacket::PublishRes(response)) => {
                 stats.acked_contacts += 1;
@@ -213,6 +239,34 @@ pub async fn publish_keyword(
     }
 
     Ok(stats)
+}
+
+/// Build the oracle-style keyword publish body for a specific target contact.
+///
+/// eMule appends the keyword-publish AICH tag only for Kad v9+ peers, so the
+/// fanout cannot reuse a single keyword packet body across the whole contact set.
+fn build_keyword_publish_packet(
+    target: NodeId,
+    file_hash: Ed2kHash,
+    base_tags: &[Tag],
+    aich_hash: Option<[u8; 20]>,
+    contact_version: u8,
+) -> KadPacket {
+    let mut tags = base_tags.to_vec();
+    if contact_version >= KAD_VERSION_AICH_KEYWORD_PUBLISH
+        && let Some(aich_hash) = aich_hash
+    {
+        tags.push(Tag::kad_aich_hash_pub(aich_hash));
+    }
+
+    let entry = PublishEntry {
+        hash: file_hash,
+        tags,
+    };
+    KadPacket::PublishKeyReq(PublishKeyReq {
+        target,
+        entries: vec![entry],
+    })
 }
 
 /// Publish source availability for a file.
@@ -408,9 +462,9 @@ fn register_publish_contact(rpc: &RpcManager, contact: &TraversalContact) {
 
 #[cfg(test)]
 mod tests {
-    use super::select_publish_contacts;
+    use super::{build_keyword_publish_packet, select_publish_contacts};
     use crate::traversal::TraversalContact;
-    use overlord_kad_proto::NodeId;
+    use overlord_kad_proto::{Ed2kHash, KadPacket, NodeId, Tag, TagName, TagValue, tag_name};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn traversal_contact(index: u8) -> TraversalContact {
@@ -443,5 +497,42 @@ mod tests {
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, contacts[0].id);
+    }
+
+    #[test]
+    fn build_keyword_publish_packet_skips_aich_for_v8_contacts() {
+        let packet = build_keyword_publish_packet(
+            NodeId::from_bytes([1; 16]),
+            Ed2kHash::from_bytes([2; 16]),
+            &[Tag::filename("ubuntu.iso")],
+            Some([3; 20]),
+            8,
+        );
+
+        let KadPacket::PublishKeyReq(request) = packet else {
+            panic!("expected publish key packet");
+        };
+        assert_eq!(request.entries[0].tags.len(), 1);
+    }
+
+    #[test]
+    fn build_keyword_publish_packet_adds_aich_bsob_for_v9_contacts() {
+        let packet = build_keyword_publish_packet(
+            NodeId::from_bytes([1; 16]),
+            Ed2kHash::from_bytes([2; 16]),
+            &[Tag::filename("ubuntu.iso")],
+            Some([3; 20]),
+            9,
+        );
+
+        let KadPacket::PublishKeyReq(request) = packet else {
+            panic!("expected publish key packet");
+        };
+        let aich_tag = request.entries[0]
+            .tags
+            .iter()
+            .find(|tag| tag.name == TagName::Short(tag_name::KADAICHHASHPUB))
+            .expect("missing aich tag");
+        assert_eq!(aich_tag.value, TagValue::SmallBlob(vec![3; 20]));
     }
 }

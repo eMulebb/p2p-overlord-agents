@@ -477,6 +477,7 @@ fn tag_fingerprint(tags: &[Tag]) -> String {
                 TagValue::Float(value) => format!("float:{value:?}"),
                 TagValue::Bool(value) => format!("bool:{value}"),
                 TagValue::Blob(value) => format!("blob:{}", hex::encode(value)),
+                TagValue::SmallBlob(value) => format!("small_blob:{}", hex::encode(value)),
             };
             format!("{name}={value}")
         })

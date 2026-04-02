@@ -594,6 +594,7 @@ impl DhtNode {
         keyword_hash: NodeId,
         file_hash: Ed2kHash,
         tags: Vec<Tag>,
+        aich_hash: Option<[u8; 20]>,
     ) -> Result<crate::publish::PublishAttemptStats, DhtError> {
         crate::publish::publish_keyword(
             &self.inner.rpc,
@@ -601,6 +602,7 @@ impl DhtNode {
             keyword_hash,
             file_hash,
             tags,
+            aich_hash,
             self.inner.config.publish_contact_fanout,
         )
         .await

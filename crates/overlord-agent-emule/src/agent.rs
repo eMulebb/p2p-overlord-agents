@@ -25,6 +25,7 @@ use overlord_agent_nat::{
     recommend_interface, resolve_bind_ip,
 };
 use rand::{RngCore, seq::SliceRandom};
+use sha1::Sha1;
 use tokio::{
     net::TcpListener,
     sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore, mpsc},
@@ -2367,6 +2368,50 @@ fn ed2k_content_type(file_type: Option<&str>) -> Option<ContentType> {
     }
 }
 
+/// Infer the oracle-style eD2k search term for a filename's published file type.
+///
+/// eMule publishes keyword `FILETYPE` tags using a compact search vocabulary:
+/// `Audio`, `Video`, `Image`, `Doc`, `Pro`, or `EmuleCollection`.
+/// Archives, programs, and CD-image style extensions all collapse to `Pro`.
+#[must_use]
+fn ed2k_file_type_search_term(file_name: &str) -> Option<&'static str> {
+    let extension = file_name.rsplit('.').next()?;
+    if extension == file_name {
+        return None;
+    }
+
+    match extension.to_ascii_lowercase().as_str() {
+        "mp3" | "aac" | "ac3" | "flac" | "m4a" | "ogg" | "wav" | "wma" => Some("Audio"),
+        "avi" | "mkv" | "mov" | "mp4" | "mpeg" | "mpg" | "wmv" => Some("Video"),
+        "bmp" | "gif" | "jpeg" | "jpg" | "png" | "tif" | "tiff" | "webp" => Some("Image"),
+        "chm" | "csv" | "doc" | "docx" | "epub" | "htm" | "html" | "odt" | "pdf" | "pps"
+        | "ppt" | "pptx" | "rtf" | "txt" | "xls" | "xlsx" => Some("Doc"),
+        "7z" | "ace" | "apk" | "bat" | "bin" | "bz2" | "cab" | "cmd" | "com" | "dll" | "dmg"
+        | "exe" | "gz" | "img" | "iso" | "jar" | "msi" | "pkg" | "rar" | "sh" | "tar" | "tgz"
+        | "xz" | "zip" => Some("Pro"),
+        "emulecollection" => Some("EmuleCollection"),
+        _ => None,
+    }
+}
+
+/// Derive a stable synthetic AICH root for seeded publishes.
+///
+/// Seeded hashes do not have a real AICH tree behind them, but eMule adds an
+/// AICH root on keyword publishes to Kad v9+ peers. A deterministic SHA-1 over
+/// the advertised file identity keeps our wire shape stable across runs and
+/// lets the publish fanout mirror the oracle's version-gated tag branch.
+#[must_use]
+fn synthetic_publish_aich_hash(file_hash: &Ed2kHash, file_name: &str, file_size: u64) -> [u8; 20] {
+    let mut hasher = Sha1::new();
+    hasher.update(file_hash.0);
+    hasher.update(file_size.to_le_bytes());
+    hasher.update(file_name.as_bytes());
+    let digest = hasher.finalize();
+    let mut aich_hash = [0u8; 20];
+    aich_hash.copy_from_slice(&digest);
+    aich_hash
+}
+
 fn map_ed2k_keyword_result(result: &Ed2kSearchFile) -> FileRecord {
     let mut tags = Vec::new();
     if let Some(file_type) = result.file_type.as_deref() {
@@ -2809,15 +2854,20 @@ async fn seed_popular_impl(
         let file_hash = Ed2kHash::from_str(&raw_hash)
             .with_context(|| format!("invalid Ed2k hash {raw_hash}"))?;
         let keyword_hash = keyword_target(&hash.canonical_name);
+        let keyword_aich_hash =
+            synthetic_publish_aich_hash(&file_hash, &hash.canonical_name, hash.size);
         let item_no = index + 1;
         // Keep synthetic seed publishes indistinguishable from normal eMule-style content
         // publishes: filename/filesize/source count on the keyword publish and the normal
         // high-ID source port/type tags on the source publish.
-        let keyword_tags = vec![
+        let mut keyword_tags = vec![
             Tag::filename(hash.canonical_name.clone()),
             Tag::filesize(hash.size),
             Tag::sources(hash.source_count),
         ];
+        if let Some(file_type) = ed2k_file_type_search_term(&hash.canonical_name) {
+            keyword_tags.push(Tag::filetype(file_type));
+        }
         {
             let mut store = context.local_store.lock().await;
             store.record_keyword_publish_batch(
@@ -2838,7 +2888,12 @@ async fn seed_popular_impl(
             raw_hash
         );
         match dht
-            .publish_keyword(keyword_hash, file_hash, keyword_tags)
+            .publish_keyword(
+                keyword_hash,
+                file_hash,
+                keyword_tags,
+                Some(keyword_aich_hash),
+            )
             .await
         {
             Ok(stats) => {
@@ -3177,6 +3232,7 @@ fn tag_to_entry(tag: &Tag) -> TagEntry {
         TagValue::Float(value) => serde_json::json!(value),
         TagValue::Bool(value) => serde_json::json!(value),
         TagValue::Blob(value) => serde_json::json!(hex::encode(value)),
+        TagValue::SmallBlob(value) => serde_json::json!(hex::encode(value)),
     };
     TagEntry { key, value }
 }
@@ -5945,15 +6001,15 @@ mod tests {
         build_hello_request, build_hello_response, build_kad_hello_request_tags,
         build_kad_hello_response_tags, build_keyword_snoop_entry, build_notes_snoop_entry,
         build_publish_batch_summary, build_source_publish_tags, build_source_snoop_entry,
-        current_tcp_firewalled, effective_publish_counters, empty_networking_config,
-        emule_high_id_source_type, flush_snoop_queue, keyword_target, next_passive_replay_request,
-        next_passive_replay_request_for_family, normalize_ed2k_user_hash_markers,
-        parse_kad_hello_metadata, record_passive_replay_complete,
+        current_tcp_firewalled, ed2k_file_type_search_term, effective_publish_counters,
+        empty_networking_config, emule_high_id_source_type, flush_snoop_queue, keyword_target,
+        next_passive_replay_request, next_passive_replay_request_for_family,
+        normalize_ed2k_user_hash_markers, parse_kad_hello_metadata, record_passive_replay_complete,
         record_passive_replay_enqueue_wait, record_passive_replay_idle,
         record_passive_replay_post_failure, record_passive_replay_post_latency,
         record_passive_replay_start, restore_snoop_queue, select_popular_hashes_for_seeding,
         select_popular_hashes_from_fetch_result, significant_keyword_words, synthetic_file_hash,
-        synthetic_popular_hashes, try_acquire_passive_replay_gate,
+        synthetic_popular_hashes, synthetic_publish_aich_hash, try_acquire_passive_replay_gate,
     };
     use crate::{
         config::SnoopQueueConfig,
@@ -5977,7 +6033,8 @@ mod tests {
     use overlord_agent_nat::{UPNP_MINIUPNPC_BACKEND, UPNP_RUPNP_BACKEND};
     use overlord_kad_dht::{DhtConfig, DhtNode, PublishAttemptStats};
     use overlord_kad_proto::{
-        NodeId, SearchKeyReq, SearchNotesReq, SearchSourceReq, Tag, TagName, TagValue, tag_name,
+        Ed2kHash, NodeId, SearchKeyReq, SearchNotesReq, SearchSourceReq, Tag, TagName, TagValue,
+        tag_name,
     };
     use std::{
         collections::HashSet,
@@ -7170,6 +7227,45 @@ mod tests {
             tags.last(),
             Some(&Tag::new_short(tag_name::ENCRYPTION, TagValue::U8(3)))
         );
+    }
+
+    #[test]
+    fn ed2k_file_type_search_term_matches_oracle_program_family() {
+        assert_eq!(
+            ed2k_file_type_search_term("ubuntu-linux-oracle-sample.iso"),
+            Some("Pro")
+        );
+        assert_eq!(ed2k_file_type_search_term("archive.7z"), Some("Pro"));
+    }
+
+    #[test]
+    fn ed2k_file_type_search_term_matches_common_media_families() {
+        assert_eq!(ed2k_file_type_search_term("album.flac"), Some("Audio"));
+        assert_eq!(ed2k_file_type_search_term("movie.mkv"), Some("Video"));
+        assert_eq!(ed2k_file_type_search_term("scan.png"), Some("Image"));
+        assert_eq!(ed2k_file_type_search_term("manual.pdf"), Some("Doc"));
+        assert_eq!(
+            ed2k_file_type_search_term("bundle.emulecollection"),
+            Some("EmuleCollection")
+        );
+        assert_eq!(ed2k_file_type_search_term("README"), None);
+    }
+
+    #[test]
+    fn synthetic_publish_aich_hash_is_stable_for_same_file_identity() {
+        let file_hash = Ed2kHash::from_bytes([0xAB; 16]);
+        let first = synthetic_publish_aich_hash(&file_hash, "ubuntu.iso", 734_003_200);
+        let second = synthetic_publish_aich_hash(&file_hash, "ubuntu.iso", 734_003_200);
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 20);
+    }
+
+    #[test]
+    fn synthetic_publish_aich_hash_changes_when_file_identity_changes() {
+        let file_hash = Ed2kHash::from_bytes([0xAB; 16]);
+        let first = synthetic_publish_aich_hash(&file_hash, "ubuntu.iso", 734_003_200);
+        let second = synthetic_publish_aich_hash(&file_hash, "ubuntu.iso", 734_003_201);
+        assert_ne!(first, second);
     }
 
     #[tokio::test]

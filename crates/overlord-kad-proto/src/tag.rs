@@ -25,6 +25,7 @@ pub enum TagValue {
     Float(f32),
     Bool(bool),
     Blob(Vec<u8>),
+    SmallBlob(Vec<u8>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -132,6 +133,11 @@ impl Tag {
     pub fn sources(n: u32) -> Self {
         Tag::new_short(tag_name::SOURCES, TagValue::UInt(u64::from(n)))
     }
+
+    #[must_use]
+    pub fn kad_aich_hash_pub(hash: [u8; 20]) -> Self {
+        Tag::new_short(tag_name::KADAICHHASHPUB, TagValue::SmallBlob(hash.to_vec()))
+    }
 }
 
 /// Map `TagValue` to its raw type byte (without the `0x80` name flag).
@@ -154,6 +160,7 @@ fn value_type_byte(v: &TagValue) -> u8 {
         TagValue::Float(_) => 0x04,
         TagValue::Bool(_) => 0x05,
         TagValue::Blob(_) => 0x07,
+        TagValue::SmallBlob(_) => 0x0A,
         TagValue::U16(_) => 0x08,
         TagValue::U8(_) => 0x09,
         TagValue::U64(_) => 0x0B,
@@ -252,13 +259,13 @@ impl Tag {
                 TagValue::U8(v)
             }
             0x0A => {
-                // BSOB: u8 len + skip bytes => store as Blob
+                // BSOB: u8 len + bytes
                 let bsob_len: u8 = reader.read_type(endian)?;
                 let mut data = vec![0u8; bsob_len as usize];
                 reader
                     .read_exact(&mut data)
                     .map_err(|e| binrw::Error::Io(std::io::Error::new(e.kind(), e.to_string())))?;
-                TagValue::Blob(data)
+                TagValue::SmallBlob(data)
             }
             0x0B => {
                 let v: u64 = reader.read_type(endian)?;
@@ -339,6 +346,11 @@ impl BinWrite for Tag {
             }
             TagValue::Blob(data) => {
                 let len = u32::try_from(data.len()).expect("blob tag length exceeds u32");
+                writer.write_type(&len, endian)?;
+                writer.write_all(data).map_err(binrw::Error::Io)?;
+            }
+            TagValue::SmallBlob(data) => {
+                let len = u8::try_from(data.len()).expect("small blob tag length exceeds Kad BSOB");
                 writer.write_type(&len, endian)?;
                 writer.write_all(data).map_err(binrw::Error::Io)?;
             }
@@ -457,6 +469,24 @@ mod tests {
         let t = Tag::new_short(0x07, TagValue::Blob(vec![0xAA, 0xBB, 0xCC]));
         let t2 = roundtrip(&t);
         assert_eq!(t, t2);
+    }
+
+    #[test]
+    fn test_small_blob_value_uses_bsob_wire_type() {
+        let t = Tag::new_short(
+            tag_name::KADAICHHASHPUB,
+            TagValue::SmallBlob(vec![0x11; 20]),
+        );
+        let mut buf = Cursor::new(Vec::new());
+        t.write_le(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        assert_eq!(bytes[0], 0x0A);
+        assert_eq!(bytes[1..4], [0x01, 0x00, tag_name::KADAICHHASHPUB]);
+        assert_eq!(bytes[4], 20);
+
+        let mut cursor = Cursor::new(bytes);
+        let decoded = Tag::read_le(&mut cursor).unwrap();
+        assert_eq!(decoded, t);
     }
 
     #[test]

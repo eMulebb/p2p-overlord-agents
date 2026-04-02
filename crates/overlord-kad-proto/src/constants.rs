@@ -9,6 +9,8 @@ pub const OP_KADEMLIAPACKEDPROT: u8 = 0xE5;
 /// Live oracle captures from the local eMule debug build advertise `0x0A` in
 /// Kad HELLO packets, matching upstream `KADEMLIA_VERSION`.
 pub const KAD_VERSION: u8 = 10;
+/// Minimum Kad version that accepts the keyword-publish AICH tag.
+pub const KAD_VERSION_AICH_KEYWORD_PUBLISH: u8 = 9;
 
 /// K — k-bucket size.
 pub const K: usize = 10;
@@ -75,6 +77,7 @@ pub mod tag_name {
     pub const FILEFORMAT: u8 = 0x04;
     pub const DESCRIPTION: u8 = 0x0B;
     pub const SOURCES: u8 = 0x15;
+    pub const KADAICHHASHPUB: u8 = 0x36;
     pub const FILESIZE_HI: u8 = 0x3A;
     pub const MEDIA_ARTIST: u8 = 0xD0;
     pub const MEDIA_ALBUM: u8 = 0xD1;

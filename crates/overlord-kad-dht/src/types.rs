@@ -27,6 +27,7 @@ impl SearchResult {
                     }
                 }
                 TagName::Short(n) if *n == tag_name::FILESIZE => match &tag.value {
+                    TagValue::UInt(v) => size = Some(*v),
                     TagValue::U64(v) => size = Some(*v),
                     TagValue::U32(v) => size_low = Some(*v),
                     TagValue::U16(v) => size_low = Some((*v).into()),
@@ -34,12 +35,14 @@ impl SearchResult {
                     _ => {}
                 },
                 TagName::Short(n) if *n == tag_name::FILESIZE_HI => match &tag.value {
+                    TagValue::UInt(v) => size_high = Some(*v as u32),
                     TagValue::U32(v) => size_high = Some(*v),
                     TagValue::U16(v) => size_high = Some((*v).into()),
                     TagValue::U8(v) => size_high = Some((*v).into()),
                     _ => {}
                 },
                 TagName::Short(n) if *n == tag_name::SOURCES => match &tag.value {
+                    TagValue::UInt(v) => availability = Some(*v as u32),
                     TagValue::U32(v) => availability = Some(*v),
                     TagValue::U16(v) => availability = Some((*v).into()),
                     TagValue::U8(v) => availability = Some((*v).into()),
@@ -89,12 +92,14 @@ impl SourceResult {
                     }
                 }
                 TagName::Short(n) if *n == tag_name::SOURCEPORT => match &tag.value {
+                    TagValue::UInt(v) => tcp_port = *v as u16,
                     TagValue::U16(v) => tcp_port = *v,
                     TagValue::U32(v) => tcp_port = *v as u16,
                     TagValue::U8(v) => tcp_port = (*v).into(),
                     _ => {}
                 },
                 TagName::Short(n) if *n == tag_name::SOURCEUPORT => match &tag.value {
+                    TagValue::UInt(v) => udp_port = *v as u16,
                     TagValue::U16(v) => udp_port = *v,
                     TagValue::U32(v) => udp_port = *v as u16,
                     TagValue::U8(v) => udp_port = (*v).into(),
@@ -140,6 +145,7 @@ impl NoteResult {
         for tag in &tags {
             match &tag.name {
                 TagName::Short(n) if *n == tag_name::FILERATING => match &tag.value {
+                    TagValue::UInt(v) => rating = Some(*v as u8),
                     TagValue::U8(v) => rating = Some(*v),
                     TagValue::U32(v) => rating = Some(*v as u8),
                     TagValue::U16(v) => rating = Some(*v as u8),
