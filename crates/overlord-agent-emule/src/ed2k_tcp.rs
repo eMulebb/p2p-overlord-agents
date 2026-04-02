@@ -263,12 +263,13 @@ struct Ed2kPeerSecureIdentState {
 }
 
 /// Immutable session metadata shared by one outgoing TCP helper exchange.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct FirewallHelperContext<'a> {
     helper_addr: SocketAddr,
     hello_identity: Ed2kHelloIdentity,
     kad_udp_port: u16,
     secure_ident: &'a Ed2kSecureIdent,
+    dht: Option<&'a DhtNode>,
 }
 
 #[derive(Debug)]
@@ -407,7 +408,8 @@ fn dump_ed2k_tcp_record(record: &Ed2kTcpDumpRecord<'_>) {
     let _ = writeln!(file, "{line}");
 }
 
-fn dump_ed2k_tcp_helper_meta(
+fn dump_ed2k_tcp_meta(
+    flow: &'static str,
     remote_addr: SocketAddr,
     transport_mode: Option<Ed2kTransportMode>,
     phase: &str,
@@ -416,7 +418,7 @@ fn dump_ed2k_tcp_helper_meta(
     let record = Ed2kTcpDumpRecord {
         schema: "ed2k_tcp_helper_v1",
         ts_utc: chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-        flow: "udp_firewall_check",
+        flow,
         phase,
         direction: "meta",
         remote_addr: remote_addr.to_string(),
@@ -434,7 +436,8 @@ fn dump_ed2k_tcp_helper_meta(
     dump_ed2k_tcp_record(&record);
 }
 
-fn dump_ed2k_tcp_helper_send(
+fn dump_ed2k_tcp_send(
+    flow: &'static str,
     remote_addr: SocketAddr,
     transport_mode: Ed2kTransportMode,
     phase: &str,
@@ -450,7 +453,7 @@ fn dump_ed2k_tcp_helper_send(
     let record = Ed2kTcpDumpRecord {
         schema: "ed2k_tcp_helper_v1",
         ts_utc: chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-        flow: "udp_firewall_check",
+        flow,
         phase,
         direction: "send",
         remote_addr: remote_addr.to_string(),
@@ -468,7 +471,8 @@ fn dump_ed2k_tcp_helper_send(
     dump_ed2k_tcp_record(&record);
 }
 
-fn dump_ed2k_tcp_helper_recv(
+fn dump_ed2k_tcp_recv(
+    flow: &'static str,
     remote_addr: SocketAddr,
     transport_mode: Ed2kTransportMode,
     phase: &str,
@@ -477,7 +481,7 @@ fn dump_ed2k_tcp_helper_recv(
     let record = Ed2kTcpDumpRecord {
         schema: "ed2k_tcp_helper_v1",
         ts_utc: chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-        flow: "udp_firewall_check",
+        flow,
         phase,
         direction: "recv",
         remote_addr: remote_addr.to_string(),
@@ -497,6 +501,78 @@ fn dump_ed2k_tcp_helper_recv(
         note: None,
     };
     dump_ed2k_tcp_record(&record);
+}
+
+fn dump_ed2k_tcp_helper_meta(
+    remote_addr: SocketAddr,
+    transport_mode: Option<Ed2kTransportMode>,
+    phase: &str,
+    note: impl Into<String>,
+) {
+    dump_ed2k_tcp_meta(
+        "udp_firewall_check",
+        remote_addr,
+        transport_mode,
+        phase,
+        note,
+    );
+}
+
+fn dump_ed2k_tcp_helper_send(
+    remote_addr: SocketAddr,
+    transport_mode: Ed2kTransportMode,
+    phase: &str,
+    bytes: &[u8],
+) {
+    dump_ed2k_tcp_send(
+        "udp_firewall_check",
+        remote_addr,
+        transport_mode,
+        phase,
+        bytes,
+    );
+}
+
+fn dump_ed2k_tcp_helper_recv(
+    remote_addr: SocketAddr,
+    transport_mode: Ed2kTransportMode,
+    phase: &str,
+    packet: &EmuleTcpPacket,
+) {
+    dump_ed2k_tcp_recv(
+        "udp_firewall_check",
+        remote_addr,
+        transport_mode,
+        phase,
+        packet,
+    );
+}
+
+fn dump_ed2k_tcp_listener_meta(
+    remote_addr: SocketAddr,
+    transport_mode: Option<Ed2kTransportMode>,
+    phase: &str,
+    note: impl Into<String>,
+) {
+    dump_ed2k_tcp_meta("listener", remote_addr, transport_mode, phase, note);
+}
+
+fn dump_ed2k_tcp_listener_send(
+    remote_addr: SocketAddr,
+    transport_mode: Ed2kTransportMode,
+    phase: &str,
+    bytes: &[u8],
+) {
+    dump_ed2k_tcp_send("listener", remote_addr, transport_mode, phase, bytes);
+}
+
+fn dump_ed2k_tcp_listener_recv(
+    remote_addr: SocketAddr,
+    transport_mode: Ed2kTransportMode,
+    phase: &str,
+    packet: &EmuleTcpPacket,
+) {
+    dump_ed2k_tcp_recv("listener", remote_addr, transport_mode, phase, packet);
 }
 
 /// Result of the agent's active eD2k peer connect path.
@@ -707,6 +783,28 @@ async fn handle_firewall_helper_packet(
             .await?;
         }
         (OP_EMULEPROT, OP_SIGNATURE) => {}
+        (OP_EMULEPROT, OP_FWCHECKUDPREQ) => {
+            // Oracle peers can ask us for their UDP firewall check on any
+            // established client TCP session, including the same helper session
+            // we opened first. Mirror that bidirectional behavior here.
+            if let Some(dht) = context.dht {
+                let request = FirewallCheckUdpRequest::decode(&packet.payload)?;
+                dump_ed2k_tcp_helper_meta(
+                    context.helper_addr,
+                    Some(transport.mode),
+                    "peer_fwcheck_request",
+                    format!(
+                        "internal_udp_port={} external_udp_port={} sender_udp_key={}",
+                        request.internal_udp_port,
+                        request.external_udp_port,
+                        request.sender_udp_key
+                    ),
+                );
+                reply_with_firewall_udp(dht, context.helper_addr.ip(), request).await?;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
         _ => return Ok(false),
     }
 
@@ -715,6 +813,7 @@ async fn handle_firewall_helper_packet(
 
 /// Send one `OP_FWCHECKUDPREQ` to a helper peer over eD2k TCP.
 pub async fn request_udp_firewall_check(
+    dht: Option<DhtNode>,
     bind_ip: Ipv4Addr,
     helper_addr: SocketAddr,
     hello_identity: Ed2kHelloIdentity,
@@ -755,6 +854,7 @@ pub async fn request_udp_firewall_check(
         hello_identity,
         kad_udp_port: hello_identity.udp_port,
         secure_ident: &secure_ident,
+        dht: dht.as_ref(),
     };
     let mut peer_secure_ident = Ed2kPeerSecureIdentState::default();
     drive_firewall_helper_hello_exchange(
@@ -1513,6 +1613,12 @@ async fn handle_connection(
         "accepted eD2k TCP peer from {peer_addr} transport={}",
         transport.mode.as_str()
     );
+    dump_ed2k_tcp_listener_meta(
+        peer_addr,
+        Some(transport.mode),
+        "accept",
+        format!("udp_port={kad_udp_port}"),
+    );
     let mut peer_secure_ident = Ed2kPeerSecureIdentState::default();
 
     loop {
@@ -1526,6 +1632,7 @@ async fn handle_connection(
         let Some(packet) = packet else {
             return Ok(());
         };
+        dump_ed2k_tcp_listener_recv(peer_addr, transport.mode, "session", &packet);
 
         match (packet.protocol, packet.opcode) {
             (OP_EDONKEYPROT, OP_HELLO) => {
@@ -1535,6 +1642,7 @@ async fn handle_connection(
                     transport.mode.as_str(),
                 );
                 for reply in build_hello_responses(&packet.payload, response_identity)? {
+                    dump_ed2k_tcp_listener_send(peer_addr, transport.mode, "hello_reply", &reply);
                     transport
                         .write_all(&reply)
                         .await
@@ -1542,6 +1650,12 @@ async fn handle_connection(
                 }
                 if is_mule_hello && !peer_secure_ident.requested_peer_key {
                     let request = begin_secure_ident_probe(&mut peer_secure_ident);
+                    dump_ed2k_tcp_listener_send(
+                        peer_addr,
+                        transport.mode,
+                        "secure_ident_probe",
+                        &request,
+                    );
                     transport.write_all(&request).await.with_context(|| {
                         format!("failed to send OP_SECIDENTSTATE to {peer_addr}")
                     })?;
@@ -1559,6 +1673,7 @@ async fn handle_connection(
                     transport.mode.as_str()
                 );
                 let reply = encode_emule_info_answer(kad_udp_port);
+                dump_ed2k_tcp_listener_send(peer_addr, transport.mode, "emule_info_answer", &reply);
                 transport
                     .write_all(&reply)
                     .await
@@ -1587,6 +1702,12 @@ async fn handle_connection(
                         OP_PUBLICKEY,
                         &secure_ident.public_key_payload()?,
                     );
+                    dump_ed2k_tcp_listener_send(
+                        peer_addr,
+                        transport.mode,
+                        "public_key",
+                        &public_key,
+                    );
                     transport
                         .write_all(&public_key)
                         .await
@@ -1609,6 +1730,12 @@ async fn handle_connection(
                     let request = encode_secident_state(
                         ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED,
                         challenge_for,
+                    );
+                    dump_ed2k_tcp_listener_send(
+                        peer_addr,
+                        transport.mode,
+                        "secure_ident_probe",
+                        &request,
                     );
                     transport.write_all(&request).await.with_context(|| {
                         format!("failed to send fallback OP_SECIDENTSTATE to {peer_addr}")
@@ -1647,6 +1774,17 @@ async fn handle_connection(
                     transport.mode.as_str()
                 );
                 let request = FirewallCheckUdpRequest::decode(&packet.payload)?;
+                dump_ed2k_tcp_listener_meta(
+                    peer_addr,
+                    Some(transport.mode),
+                    "fwcheck_request",
+                    format!(
+                        "internal_udp_port={} external_udp_port={} sender_udp_key={}",
+                        request.internal_udp_port,
+                        request.external_udp_port,
+                        request.sender_udp_key
+                    ),
+                );
                 reply_with_firewall_udp(dht, peer_addr.ip(), request).await?;
             }
             _ => {
@@ -2709,6 +2847,7 @@ mod tests {
         });
 
         request_udp_firewall_check(
+            None,
             Ipv4Addr::LOCALHOST,
             helper_addr,
             Ed2kHelloIdentity {

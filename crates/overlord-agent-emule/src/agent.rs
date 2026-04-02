@@ -5369,8 +5369,10 @@ impl OverlordAgentEmule {
                         sender_udp_key: dht.verify_key_for_ip(contact.ip),
                     };
                     let secure_ident = Arc::clone(&ed2k_secure_ident);
+                    let helper_dht = dht.clone();
                     request_tasks.push(tokio::spawn(async move {
                         let result = request_udp_firewall_check(
+                            Some(helper_dht),
                             bind_ip,
                             helper_addr,
                             helper_hello_identity,
