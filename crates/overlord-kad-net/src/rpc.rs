@@ -770,16 +770,16 @@ fn outbound_transport_reason(
         }
         crate::obfuscation::OutboundKadEncryptionMode::ReceiverVerifyKey => {
             if is_response_opcode(opcode_value) {
-                "reply_uses_receiver_verify_key"
+                "reply_falls_back_to_receiver_verify_key_without_node_id"
             } else {
-                "request_prefers_receiver_verify_key"
+                "request_falls_back_to_receiver_verify_key_without_node_id"
             }
         }
         crate::obfuscation::OutboundKadEncryptionMode::Plaintext => {
             if outbound.peer_node_id.is_none() && outbound.receiver_verify_key.is_none() {
                 "missing_peer_identity_and_receiver_key"
             } else if outbound.peer_node_id.is_none() {
-                "missing_peer_identity"
+                "missing_peer_identity_for_node_id_mode"
             } else if outbound
                 .peer_kad_version
                 .is_some_and(|kad_version| kad_version < 6)
@@ -1011,6 +1011,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_plaintext_hello_response_stays_plaintext_without_obfuscation() {
+        let transport = Arc::new(MockTransport::new(make_local_addr()));
+        let inject_tx = transport.injector();
+        let rpc = make_rpc_with_shared_transport(
+            Arc::clone(&transport),
+            ObfuscationLayer::new(NodeId::from_bytes([0xAA; 16]), 0x1234_5678, false),
+        );
+        let mut subscriber = rpc.subscribe();
+        let _handle = rpc.start();
+
+        let peer_addr = make_peer_addr();
+        rpc.send(
+            peer_addr,
+            &KadPacket::HelloReq(overlord_kad_proto::HelloReq {
+                node_id: NodeId::from_bytes([0x55; 16]),
+                tcp_port: 4662,
+                version: overlord_kad_proto::KAD_VERSION,
+                tags: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let hello = KadPacket::HelloRes(overlord_kad_proto::HelloRes {
+            node_id: NodeId::from_bytes([0x44; 16]),
+            tcp_port: 4662,
+            version: overlord_kad_proto::KAD_VERSION,
+            tags: Vec::new(),
+        });
+        let encoded = hello.encode().unwrap();
+        let _ = inject_tx.send((encoded, peer_addr)).await;
+
+        let received = tokio::time::timeout(Duration::from_secs(1), subscriber.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(received.packet, KadPacket::HelloRes(_)));
+        assert!(!received.was_obfuscated);
+        assert_eq!(received.sender_verify_key, None);
+        assert!(!received.receiver_verify_key_valid);
+    }
+
+    #[tokio::test]
     async fn test_untracked_response_is_dropped() {
         let transport = MockTransport::new(make_local_addr());
         let inject_tx = transport.injector();
@@ -1196,7 +1239,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_obfuscated_hello_response_registers_receiver_key_for_future_requests() {
+    async fn test_obfuscated_hello_response_keeps_node_id_for_future_requests() {
         let transport = Arc::new(MockTransport::new(make_local_addr()));
         let inject_tx = transport.injector();
         let local_node_id = NodeId::from_bytes([0xAA; 16]);
@@ -1270,7 +1313,35 @@ mod tests {
         let outgoing = transport.drain_outgoing();
         assert_eq!(outgoing.len(), 1);
         assert_eq!(outgoing[0].0, peer_addr);
-        assert_eq!(outgoing[0].1[0] & 0x03, 0x02);
+        assert_ne!(outgoing[0].1[0] & 0x03, 0x02);
         assert_ne!(outgoing[0].1[0], overlord_kad_proto::OP_KADEMLIAHEADER);
+    }
+
+    #[tokio::test]
+    async fn test_plaintext_hello_request_send_keeps_raw_wire_shape() {
+        let transport = Arc::new(MockTransport::new(make_local_addr()));
+        let rpc = make_rpc_with_shared_transport(
+            Arc::clone(&transport),
+            ObfuscationLayer::new(NodeId::from_bytes([0xAA; 16]), 0x1234_5678, false),
+        );
+
+        let peer_addr = make_peer_addr();
+        rpc.send(
+            peer_addr,
+            &KadPacket::HelloReq(overlord_kad_proto::HelloReq {
+                node_id: NodeId::from_bytes([0x55; 16]),
+                tcp_port: 4662,
+                version: overlord_kad_proto::KAD_VERSION,
+                tags: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let outgoing = transport.drain_outgoing();
+        assert_eq!(outgoing.len(), 1);
+        let (_, wire) = &outgoing[0];
+        assert_eq!(wire[0], overlord_kad_proto::constants::OP_KADEMLIAHEADER);
+        assert_eq!(wire[1], opcode::HELLO_REQ);
     }
 }

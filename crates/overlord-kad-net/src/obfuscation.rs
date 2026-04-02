@@ -1,6 +1,6 @@
 use md5::compute as md5_compute;
 use overlord_kad_proto::NodeId;
-use overlord_kad_proto::constants::{OP_KADEMLIAHEADER, OP_KADEMLIAPACKEDPROT, opcode};
+use overlord_kad_proto::constants::{OP_KADEMLIAHEADER, OP_KADEMLIAPACKEDPROT};
 use rand::Rng;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -36,23 +36,6 @@ pub struct DecryptResult {
     /// Whether the packet proved our receiver verify key instead of using
     /// NodeID-mode request obfuscation.
     pub receiver_verify_key_valid: bool,
-}
-
-fn is_response_opcode(opcode_value: u8) -> bool {
-    matches!(
-        opcode_value,
-        opcode::BOOTSTRAP_RES
-            | opcode::HELLO_RES
-            | opcode::HELLO_RES_ACK
-            | opcode::RES
-            | opcode::SEARCH_RES
-            | opcode::PUBLISH_RES
-            | opcode::PUBLISH_RES_ACK
-            | opcode::FIREWALLED_RES
-            | opcode::FIREWALLED_ACK_RES
-            | opcode::FINDBUDDY_RES
-            | opcode::PONG
-    )
 }
 
 fn can_use_node_id_mode(peer: &ResolvedPeerCryptoState) -> bool {
@@ -190,9 +173,9 @@ fn select_marker(mode: KadKeyMode) -> u8 {
 /// Oracle-shaped Kad UDP obfuscation layer.
 ///
 /// This mirrors the Kad branch of eMule/aMule `EncryptedDatagramSocket`:
-/// once a peer verify key is known we prefer it for both requests and
-/// responses, and only fall back to NodeID-based request obfuscation when the
-/// peer has not completed the HELLO-driven key exchange yet.
+/// when a usable peer NodeID is available it stays the preferred Kad crypt
+/// target for outbound packets, and the learned receiver verify key only takes
+/// over when no usable NodeID context exists for that destination.
 pub struct ObfuscationLayer {
     our_node_id: NodeId,
     our_udp_key: u32,
@@ -265,17 +248,15 @@ impl ObfuscationLayer {
     pub fn inspect_outbound(
         &self,
         addr: SocketAddr,
-        opcode_value: u8,
+        _opcode_value: u8,
     ) -> OutboundKadEncryptionInfo {
         let peer = self.peer_state_for_addr(addr);
         let mode = if !self.enabled {
             OutboundKadEncryptionMode::Plaintext
-        } else if peer.receiver_verify_key.is_some() {
-            OutboundKadEncryptionMode::ReceiverVerifyKey
-        } else if is_response_opcode(opcode_value) {
-            OutboundKadEncryptionMode::Plaintext
         } else if can_use_node_id_mode(&peer) {
             OutboundKadEncryptionMode::NodeId
+        } else if peer.receiver_verify_key.is_some() {
+            OutboundKadEncryptionMode::ReceiverVerifyKey
         } else {
             OutboundKadEncryptionMode::Plaintext
         };
@@ -297,11 +278,10 @@ impl ObfuscationLayer {
     /// Encrypt a Kad packet for sending to `addr`.
     ///
     /// The caller still passes the opcode for tracing/call-site symmetry, but
-    /// the oracle sender chooses transport shape from the packet direction and
-    /// peer capability state:
-    /// once a peer verify key is known it is preferred for both requests and
-    /// responses, while requests can fall back to NodeID-based obfuscation for
-    /// Kad `v6+` peers that have not completed the verify-key exchange yet.
+    /// the oracle sender chooses transport shape from peer capability state:
+    /// NodeID remains the primary Kad crypt target for peers that advertised a
+    /// usable Kad `v6+` identity, and the receiver verify key is only used when
+    /// that NodeID context is missing.
     pub fn encrypt(&self, addr: SocketAddr, opcode_value: u8, plaintext: &[u8]) -> Vec<u8> {
         let outbound = self.inspect_outbound(addr, opcode_value);
         if matches!(outbound.mode, OutboundKadEncryptionMode::Plaintext) {
@@ -553,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn test_response_opcodes_prefer_receiver_key_when_available() {
+    fn test_response_opcodes_keep_node_id_when_identity_is_known() {
         let sender = ObfuscationLayer::new(NodeId::from_bytes([0x55; 16]), 0xAABB_CCDD, true);
         let receiver = ObfuscationLayer::new(NodeId::from_bytes([0x66; 16]), 0x1122_3344, true);
         let sender_ip = match sender_addr().ip() {
@@ -568,7 +548,7 @@ mod tests {
         let plaintext = vec![OP_KADEMLIAHEADER, opcode::PUBLISH_RES, 0xAA, 0x55];
         let encrypted = sender.encrypt(receiver_addr(), opcode::PUBLISH_RES, &plaintext);
 
-        assert_eq!(encrypted[0] & 0x03, KAD_MARKER_RECEIVER_KEY);
+        assert_ne!(encrypted[0] & 0x03, KAD_MARKER_RECEIVER_KEY);
 
         let decrypted = receiver.decrypt(sender_addr(), &encrypted);
         assert!(decrypted.was_obfuscated);
@@ -576,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn test_request_opcodes_prefer_receiver_key_once_known() {
+    fn test_request_opcodes_keep_node_id_when_identity_is_known() {
         let sender = ObfuscationLayer::new(NodeId::from_bytes([0x15; 16]), 0xAABB_CCDD, true);
         let receiver = ObfuscationLayer::new(NodeId::from_bytes([0x26; 16]), 0x1122_3344, true);
         let sender_ip = match sender_addr().ip() {
@@ -591,7 +571,7 @@ mod tests {
         let plaintext = vec![OP_KADEMLIAHEADER, opcode::SEARCH_KEY_REQ, 0xAA, 0x55];
         let encrypted = sender.encrypt(receiver_addr(), opcode::SEARCH_KEY_REQ, &plaintext);
 
-        assert_eq!(encrypted[0] & 0x03, KAD_MARKER_RECEIVER_KEY);
+        assert_ne!(encrypted[0] & 0x03, KAD_MARKER_RECEIVER_KEY);
 
         let decrypted = receiver.decrypt(sender_addr(), &encrypted);
         assert!(decrypted.was_obfuscated);
@@ -649,6 +629,27 @@ mod tests {
         let encrypted = sender.encrypt(reply_addr, opcode::PONG, &plaintext);
 
         assert_ne!(encrypted, plaintext);
+        assert_eq!(encrypted[0] & 0x03, KAD_MARKER_RECEIVER_KEY);
+
+        let decrypted = receiver.decrypt(sender_addr(), &encrypted);
+        assert!(decrypted.was_obfuscated);
+        assert_eq!(decrypted.data, plaintext);
+    }
+
+    #[test]
+    fn test_request_opcodes_use_receiver_key_when_node_id_is_missing() {
+        let sender = ObfuscationLayer::new(NodeId::from_bytes([0x15; 16]), 0xAABB_CCDD, true);
+        let receiver = ObfuscationLayer::new(NodeId::from_bytes([0x26; 16]), 0x1122_3344, true);
+        let sender_ip = match sender_addr().ip() {
+            IpAddr::V4(ip) => ip,
+            IpAddr::V6(_) => unreachable!(),
+        };
+
+        sender.register_peer_key(receiver_addr(), receiver.verify_key_for_ip(sender_ip));
+
+        let plaintext = vec![OP_KADEMLIAHEADER, opcode::SEARCH_KEY_REQ, 0xAA, 0x55];
+        let encrypted = sender.encrypt(receiver_addr(), opcode::SEARCH_KEY_REQ, &plaintext);
+
         assert_eq!(encrypted[0] & 0x03, KAD_MARKER_RECEIVER_KEY);
 
         let decrypted = receiver.decrypt(sender_addr(), &encrypted);

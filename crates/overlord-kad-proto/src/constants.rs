@@ -5,7 +5,10 @@ pub const OP_KADEMLIAHEADER: u8 = 0xE4;
 pub const OP_KADEMLIAPACKEDPROT: u8 = 0xE5;
 
 /// Our announced Kad version.
-pub const KAD_VERSION: u8 = 9;
+///
+/// Live oracle captures from the local eMule debug build advertise `0x0A` in
+/// Kad HELLO packets, matching upstream `KADEMLIA_VERSION`.
+pub const KAD_VERSION: u8 = 10;
 
 /// K — k-bucket size.
 pub const K: usize = 10;

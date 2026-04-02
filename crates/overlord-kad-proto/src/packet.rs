@@ -719,17 +719,17 @@ mod tests {
     }
 
     #[test]
-    fn test_hello_req_v9_with_tags_roundtrip() {
+    fn test_hello_req_v10_with_tags_roundtrip() {
         let pkt = KadPacket::HelloReq(HelloReq {
             node_id: NodeId::from_bytes([0xAA; 16]),
             tcp_port: 4662,
-            version: 9,
+            version: 10,
             tags: vec![Tag::filename("test.txt"), Tag::filesize(12345)],
         });
         let bytes = pkt.encode().unwrap();
         let pkt2 = KadPacket::decode(&bytes).unwrap();
         if let KadPacket::HelloReq(req) = pkt2 {
-            assert_eq!(req.version, 9);
+            assert_eq!(req.version, 10);
             assert_eq!(req.tags.len(), 2);
         } else {
             panic!("wrong packet type");
@@ -760,7 +760,7 @@ mod tests {
         let pkt = KadPacket::HelloReq(HelloReq {
             node_id,
             tcp_port: 4662,
-            version: 9,
+            version: crate::constants::KAD_VERSION,
             tags: vec![Tag::new_short(
                 crate::constants::tag_name::SOURCEUPORT,
                 TagValue::U16(41000),
@@ -773,7 +773,7 @@ mod tests {
         assert_eq!(bytes[1], crate::constants::opcode::HELLO_REQ);
         assert_eq!(&bytes[2..18], &node_id.0);
         assert_eq!(u16::from_le_bytes([bytes[18], bytes[19]]), 4662);
-        assert_eq!(bytes[20], 9);
+        assert_eq!(bytes[20], crate::constants::KAD_VERSION);
         assert_eq!(bytes[21], 1);
     }
 
