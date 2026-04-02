@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - ".github/workflows/rust-quality.yml"
+      - "AGENTS.md"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rustfmt.toml"
@@ -12,6 +13,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/rust-quality.yml"
+      - "AGENTS.md"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rustfmt.toml"
