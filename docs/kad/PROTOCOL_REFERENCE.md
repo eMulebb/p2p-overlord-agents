@@ -83,10 +83,10 @@ Status legend:
 |---|---|---|---|---|---|
 | `0x01` | `KADEMLIA2_BOOTSTRAP_REQ` | out | `BOOTSTRAP_RES` | ask a node for bootstrap contacts | used |
 | `0x09` | `KADEMLIA2_BOOTSTRAP_RES` | in | `BOOTSTRAP_REQ` | bootstrap response with sender info and contacts | used |
-| `0x11` | `KADEMLIA2_HELLO_REQ` | both | `HELLO_RES` | hello handshake and UDP-key exchange setup | codec |
-| `0x19` | `KADEMLIA2_HELLO_RES` | both | `HELLO_REQ` | hello response | codec |
+| `0x11` | `KADEMLIA2_HELLO_REQ` | both | `HELLO_RES` | hello handshake and UDP-key exchange setup | used |
+| `0x19` | `KADEMLIA2_HELLO_RES` | both | `HELLO_REQ` | hello response | used |
 | `0x21` | `KADEMLIA2_REQ` | out | `RES` | generic Kad lookup request | used |
-| `0x22` | `KADEMLIA2_HELLO_RES_ACK` | both | `HELLO_RES` | hello acknowledgement | codec |
+| `0x22` | `KADEMLIA2_HELLO_RES_ACK` | both | `HELLO_RES` | hello acknowledgement | used |
 | `0x29` | `KADEMLIA2_RES` | in | `REQ` | closest-contact response | used |
 | `0x33` | `KADEMLIA2_SEARCH_KEY_REQ` | out | `SEARCH_RES` | keyword search request | used |
 | `0x34` | `KADEMLIA2_SEARCH_SOURCE_REQ` | out | `SEARCH_RES` | file source search request | used |
@@ -97,15 +97,16 @@ Status legend:
 | `0x45` | `KADEMLIA2_PUBLISH_NOTES_REQ` | out | `PUBLISH_RES` | publish note/rating for a file | used |
 | `0x4B` | `KADEMLIA2_PUBLISH_RES` | in | publish requests | publish acknowledgement with load byte | used |
 | `0x4C` | `KADEMLIA2_PUBLISH_RES_ACK` | both | `PUBLISH_RES` | publish ack acknowledgement | codec |
-| `0x50` | `KADEMLIA2_FIREWALLED_REQ` | both | `FIREWALLED_RES` | firewall-related request carrying TCP port | codec |
-| `0x51` | `KADEMLIA2_FINDBUDDY_REQ` | both | `FINDBUDDY_RES` | buddy discovery for firewalled mode | reserved |
-| `0x52` | `KADEMLIA2_CALLBACK_REQ` | both | none | buddy callback request | reserved |
-| `0x58` | `KADEMLIA2_FIREWALLED_RES` | both | `FIREWALLED_REQ` | firewall-related response carrying IP | codec |
-| `0x59` | `KADEMLIA2_FIREWALLED_ACK_RES` | both | `FIREWALLED_RES` | empty acknowledgement | codec |
-| `0x5A` | `KADEMLIA2_FINDBUDDY_RES` | both | `FINDBUDDY_REQ` | buddy discovery response | reserved |
+| `0x50` | `KADEMLIA_FIREWALLED_REQ` | both | `FIREWALLED_RES` | firewall-related request carrying TCP port | used |
+| `0x51` | `KADEMLIA_FINDBUDDY_REQ` | both | `FINDBUDDY_RES` | buddy discovery for firewalled mode | codec |
+| `0x52` | `KADEMLIA_CALLBACK_REQ` | both | none | buddy callback request | codec |
+| `0x53` | `KADEMLIA_FIREWALLED2_REQ` | both | `FIREWALLED_RES` | extended firewall-related request for Kad v7+ peers | used |
+| `0x58` | `KADEMLIA_FIREWALLED_RES` | both | `FIREWALLED_REQ` | firewall-related response carrying IP | used |
+| `0x59` | `KADEMLIA_FIREWALLED_ACK_RES` | both | `FIREWALLED_RES` | empty acknowledgement | codec |
+| `0x5A` | `KADEMLIA_FINDBUDDY_RES` | both | `FINDBUDDY_REQ` | buddy discovery response | codec |
 | `0x60` | `KADEMLIA2_PING` | both | `PONG` | liveness check | used |
 | `0x61` | `KADEMLIA2_PONG` | both | `PING` | liveness response | used |
-| `0x62` | `KADEMLIA2_FIREWALLUDP` | both | none | UDP firewall test packet | codec |
+| `0x62` | `KADEMLIA2_FIREWALLUDP` | both | none | UDP firewall test packet | used |
 
 Notes:
 
@@ -369,6 +370,68 @@ Layout:
 |---|---:|---|
 | `target` | 16 | echoed publish target |
 | `load` | 1 | remote-side load / acceptance hint |
+
+### Firewall and Buddy Auxiliary Packets
+
+These packets use the mixed oracle naming from eMule `Opcodes.h`: the older
+firewall and buddy families keep the `KADEMLIA_` prefix, while ping/pong and
+`FIREWALLUDP` use `KADEMLIA2_`.
+
+### `KADEMLIA_FIREWALLED_REQ` (`0x50`)
+
+| Field | Size | Meaning |
+|---|---:|---|
+| `tcp_port` | 2 | sender TCP port for the firewall probe |
+
+### `KADEMLIA_FINDBUDDY_REQ` (`0x51`)
+
+| Field | Size | Meaning |
+|---|---:|---|
+| `buddy_id` | 16 | Kad search target used to find a relay node |
+| `client_hash` | 16 | requester eD2k client hash used for later callback routing |
+| `tcp_port` | 2 | requester TCP port |
+
+### `KADEMLIA_CALLBACK_REQ` (`0x52`)
+
+| Field | Size | Meaning |
+|---|---:|---|
+| `buddy_id` | 16 | buddy-search target originally used by the low-ID client |
+| `file_hash` | 16 | file hash that motivated the callback request |
+| `tcp_port` | 2 | requester TCP port |
+
+### `KADEMLIA_FIREWALLED2_REQ` (`0x53`)
+
+| Field | Size | Meaning |
+|---|---:|---|
+| `tcp_port` | 2 | sender TCP port for the firewall probe |
+| `user_hash` | 16 | sender user hash |
+| `connect_options` | 1 | connect-option flags for newer Kad peers |
+
+### `KADEMLIA_FIREWALLED_RES` (`0x58`)
+
+| Field | Size | Meaning |
+|---|---:|---|
+| `ip` | 4 | sender IP echoed by the responding peer |
+
+### `KADEMLIA_FIREWALLED_ACK_RES` (`0x59`)
+
+Empty payload.
+
+### `KADEMLIA_FINDBUDDY_RES` (`0x5A`)
+
+| Field | Size | Meaning |
+|---|---:|---|
+| `buddy_id` | 16 | same buddy-search target echoed back to the requester |
+| `client_hash` | 16 | relay node client hash |
+| `tcp_port` | 2 | relay node TCP port |
+| `connect_options` | 0 or 1 | optional connect-option flags on newer oracle builds |
+
+### `KADEMLIA2_FIREWALLUDP` (`0x62`)
+
+| Field | Size | Meaning |
+|---|---:|---|
+| `error_code` | 1 | firewall-test result code |
+| `udp_port` | 2 | UDP port observed by the helper |
 
 ### Search And Publish Runtime Notes
 

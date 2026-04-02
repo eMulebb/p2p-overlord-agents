@@ -20,9 +20,10 @@ pub use error::ProtoError;
 pub use hash::{Ed2kHash, KadUdpKey};
 pub use node_id::NodeId;
 pub use packet::{
-    BootstrapRes, ContactEntry, FirewallUdp, Firewalled2Req, FirewalledAckRes, FirewalledReq,
-    FirewalledRes, HelloReq, HelloRes, HelloResAck, KadPacket, PublishEntry, PublishKeyReq,
-    PublishNotesReq, PublishRes, PublishResAck, PublishSourceReq, Req, Res, SearchKeyReq,
-    SearchNotesReq, SearchRes, SearchResultEntry, SearchSourceReq,
+    BootstrapRes, CallbackReq, ContactEntry, FindBuddyReq, FindBuddyRes, FirewallUdp,
+    Firewalled2Req, FirewalledAckRes, FirewalledReq, FirewalledRes, HelloReq, HelloRes,
+    HelloResAck, KadPacket, PublishEntry, PublishKeyReq, PublishNotesReq, PublishRes,
+    PublishResAck, PublishSourceReq, Req, Res, SearchKeyReq, SearchNotesReq, SearchRes,
+    SearchResultEntry, SearchSourceReq,
 };
 pub use tag::{Tag, TagName, TagValue};

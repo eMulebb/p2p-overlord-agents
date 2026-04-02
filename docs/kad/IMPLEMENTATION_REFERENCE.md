@@ -238,6 +238,12 @@ For byte-level layouts, verified tag IDs, and packet-family notes, see `PROTOCOL
 | `KADEMLIA2_PUBLISH_SOURCE_REQ` | out | Publish source availability |
 | `KADEMLIA2_PUBLISH_NOTES_REQ` | out | Publish a note/rating |
 | `KADEMLIA2_PUBLISH_RES` | in | Publish acknowledgement |
+| `KADEMLIA_FIREWALLED_REQ` | both | Firewall TCP probe request |
+| `KADEMLIA_FIREWALLED2_REQ` | both | Extended firewall TCP probe request |
+| `KADEMLIA_FIREWALLED_RES` | in | Firewall probe response with external IP |
+| `KADEMLIA_FINDBUDDY_REQ` | both | Buddy discovery request |
+| `KADEMLIA_FINDBUDDY_RES` | in | Buddy discovery response |
+| `KADEMLIA_CALLBACK_REQ` | both | Buddy callback request |
 | `KADEMLIA2_PING` | out | Liveness check |
 | `KADEMLIA2_PONG` | in | Liveness response |
 | `KADEMLIA2_FIREWALLUDP` | both | UDP reachability test |
@@ -954,7 +960,7 @@ tokio-stream = "0.1"
 
 > **FUTURE(buddy)**: The FINDBUDDY / CALLBACK mechanism allows firewalled nodes to receive
 > incoming connections via a "buddy" relay node. Deferred to Phase 3. When implemented:
-> - `KADEMLIA2_FINDBUDDY_REQ/RES` packet types (already reserved in proto)
+> - `KADEMLIA_FINDBUDDY_REQ/RES` and `KADEMLIA_CALLBACK_REQ` are already modeled in the proto codec with oracle packet layouts
 > - Buddy selection logic in routing table
 > - Callback handling in the RPC layer
 > - Config: `[dht] buddy_enabled = true`

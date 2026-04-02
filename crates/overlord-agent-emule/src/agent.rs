@@ -4060,6 +4060,24 @@ async fn handle_unsolicited_packet(
                 FirewallUdpPacketOutcome::Ignored => {}
             }
         }
+        KadPacket::FindBuddyReq(req) => {
+            debug!(
+                "ignoring Kad find-buddy request from={} buddy_id={} tcp_port={} until buddy runtime is implemented",
+                from, req.buddy_id, req.tcp_port
+            );
+        }
+        KadPacket::FindBuddyRes(res) => {
+            debug!(
+                "ignoring unsolicited Kad find-buddy response from={} buddy_id={} tcp_port={} connect_options={:?}",
+                from, res.buddy_id, res.tcp_port, res.connect_options
+            );
+        }
+        KadPacket::CallbackReq(req) => {
+            debug!(
+                "ignoring Kad callback request from={} buddy_id={} file_hash={} tcp_port={} until buddy runtime is implemented",
+                from, req.buddy_id, req.file_hash, req.tcp_port
+            );
+        }
         KadPacket::HelloReq(req) => {
             if let Some(udp_key) = sender_verify_key {
                 dht.register_peer_key(from, udp_key);

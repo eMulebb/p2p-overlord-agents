@@ -60,11 +60,16 @@ pub mod opcode {
     pub const FIREWALLED_RES: u8 = 0x58;
     pub const FIREWALLED_ACK_RES: u8 = 0x59;
     pub const FIREWALLUDP: u8 = 0x62;
-    // KAD1_IGNORED: FINDBUDDY and CALLBACK are reserved for Phase 3 (buddy system).
-    // See KADKAD.md §20 Future Work.
+    /// Buddy-discovery request used by firewalled Kad clients.
     pub const FINDBUDDY_REQ: u8 = 0x51;
-    pub const FINDBUDDY_RES: u8 = 0x5A;
+    /// Buddy-callback request sent to the chosen relay node.
+    ///
+    /// The request shape is still part of the Kad2 oracle surface even though
+    /// the current Overlord runtime does not drive the full buddy state
+    /// machine yet.
     pub const CALLBACK_REQ: u8 = 0x52;
+    /// Buddy-discovery response returned by an accepted relay node.
+    pub const FINDBUDDY_RES: u8 = 0x5A;
     pub const PING: u8 = 0x60;
     pub const PONG: u8 = 0x61;
 }
@@ -93,4 +98,44 @@ pub mod tag_name {
     pub const SOURCEPORT: u8 = 0xFD;
     pub const SOURCEIP: u8 = 0xFE;
     pub const SOURCETYPE: u8 = 0xFF;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KAD_VERSION, opcode};
+
+    #[test]
+    fn kad_version_matches_local_oracle_build() {
+        assert_eq!(KAD_VERSION, 10);
+    }
+
+    #[test]
+    fn kad2_opcode_constants_match_emule_oracle() {
+        assert_eq!(opcode::BOOTSTRAP_REQ, 0x01);
+        assert_eq!(opcode::BOOTSTRAP_RES, 0x09);
+        assert_eq!(opcode::HELLO_REQ, 0x11);
+        assert_eq!(opcode::HELLO_RES, 0x19);
+        assert_eq!(opcode::REQ, 0x21);
+        assert_eq!(opcode::HELLO_RES_ACK, 0x22);
+        assert_eq!(opcode::RES, 0x29);
+        assert_eq!(opcode::SEARCH_KEY_REQ, 0x33);
+        assert_eq!(opcode::SEARCH_SOURCE_REQ, 0x34);
+        assert_eq!(opcode::SEARCH_NOTES_REQ, 0x35);
+        assert_eq!(opcode::SEARCH_RES, 0x3B);
+        assert_eq!(opcode::PUBLISH_KEY_REQ, 0x43);
+        assert_eq!(opcode::PUBLISH_SOURCE_REQ, 0x44);
+        assert_eq!(opcode::PUBLISH_NOTES_REQ, 0x45);
+        assert_eq!(opcode::PUBLISH_RES, 0x4B);
+        assert_eq!(opcode::PUBLISH_RES_ACK, 0x4C);
+        assert_eq!(opcode::FIREWALLED_REQ, 0x50);
+        assert_eq!(opcode::FINDBUDDY_REQ, 0x51);
+        assert_eq!(opcode::CALLBACK_REQ, 0x52);
+        assert_eq!(opcode::FIREWALLED2_REQ, 0x53);
+        assert_eq!(opcode::FIREWALLED_RES, 0x58);
+        assert_eq!(opcode::FIREWALLED_ACK_RES, 0x59);
+        assert_eq!(opcode::FINDBUDDY_RES, 0x5A);
+        assert_eq!(opcode::PING, 0x60);
+        assert_eq!(opcode::PONG, 0x61);
+        assert_eq!(opcode::FIREWALLUDP, 0x62);
+    }
 }

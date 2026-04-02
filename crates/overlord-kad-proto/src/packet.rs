@@ -357,6 +357,48 @@ pub struct FirewallUdp {
     pub udp_port: u16,
 }
 
+// ── FindBuddyReq / FindBuddyRes / CallbackReq ───────────────────────────────
+
+/// Buddy-discovery request sent by a firewalled Kad node.
+///
+/// Oracle semantics from eMule `Search.cpp` and `KademliaUDPListener.cpp`:
+/// `buddy_id` is the Kad search target used to find a relay node, while
+/// `client_hash` is the requester's eD2k client hash used for later TCP
+/// callback routing.
+#[derive(BinRead, BinWrite, Debug, Clone, PartialEq)]
+#[brw(little)]
+pub struct FindBuddyReq {
+    pub buddy_id: NodeId,
+    pub client_hash: Ed2kHash,
+    pub tcp_port: u16,
+}
+
+/// Buddy-discovery response returned by the selected relay candidate.
+///
+/// The optional `connect_options` byte is appended by newer oracle versions so
+/// the requester can decide whether future buddy traffic should prefer an
+/// obfuscated TCP connection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FindBuddyRes {
+    pub buddy_id: NodeId,
+    pub client_hash: Ed2kHash,
+    pub tcp_port: u16,
+    pub connect_options: Option<u8>,
+}
+
+/// Buddy callback request asking the relay node to initiate a TCP callback.
+///
+/// `buddy_id` is the buddy-search target originally used by the remote low-ID
+/// client, while `file_hash` identifies the shared file that motivated the
+/// callback in the common source-search flow.
+#[derive(BinRead, BinWrite, Debug, Clone, PartialEq)]
+#[brw(little)]
+pub struct CallbackReq {
+    pub buddy_id: NodeId,
+    pub file_hash: Ed2kHash,
+    pub tcp_port: u16,
+}
+
 // ── Ping / Pong ──────────────────────────────────────────────────────────────
 
 #[derive(BinRead, BinWrite, Debug, Clone, PartialEq)]
@@ -393,10 +435,12 @@ pub enum KadPacket {
     FirewalledRes(FirewalledRes),
     FirewalledAckRes,
     FirewallUdp(FirewallUdp),
+    FindBuddyReq(FindBuddyReq),
+    FindBuddyRes(FindBuddyRes),
+    CallbackReq(CallbackReq),
     Ping,
     Pong,
     // KAD1_IGNORED: Kad1 packets dropped silently. See KADKAD.md §6 Kad1 Policy.
-    // FUTURE(buddy): FindBuddyReq/Res and CallbackReq reserved for Phase 3.
     Unknown { opcode: u8, payload: Vec<u8> },
 }
 
@@ -508,6 +552,18 @@ impl KadPacket {
                 let p = cursor.read_le::<FirewallUdp>()?;
                 KadPacket::FirewallUdp(p)
             }
+            opcode::FINDBUDDY_REQ => {
+                let p = cursor.read_le::<FindBuddyReq>()?;
+                KadPacket::FindBuddyReq(p)
+            }
+            opcode::FINDBUDDY_RES => {
+                let p = read_find_buddy_res(&mut cursor)?;
+                KadPacket::FindBuddyRes(p)
+            }
+            opcode::CALLBACK_REQ => {
+                let p = cursor.read_le::<CallbackReq>()?;
+                KadPacket::CallbackReq(p)
+            }
             opcode::PING => KadPacket::Ping,
             opcode::PONG => KadPacket::Pong,
             other => KadPacket::Unknown {
@@ -549,6 +605,9 @@ impl KadPacket {
             KadPacket::Firewalled2Req(p) => buf.write_le(p)?,
             KadPacket::FirewalledRes(p) => buf.write_le(p)?,
             KadPacket::FirewallUdp(p) => buf.write_le(p)?,
+            KadPacket::FindBuddyReq(p) => buf.write_le(p)?,
+            KadPacket::FindBuddyRes(p) => write_find_buddy_res(&mut buf, p)?,
+            KadPacket::CallbackReq(p) => buf.write_le(p)?,
             KadPacket::BootstrapReq
             | KadPacket::PublishResAck
             | KadPacket::FirewalledAckRes
@@ -587,6 +646,9 @@ impl KadPacket {
             KadPacket::FirewalledRes(_) => opcode::FIREWALLED_RES,
             KadPacket::FirewalledAckRes => opcode::FIREWALLED_ACK_RES,
             KadPacket::FirewallUdp(_) => opcode::FIREWALLUDP,
+            KadPacket::FindBuddyReq(_) => opcode::FINDBUDDY_REQ,
+            KadPacket::FindBuddyRes(_) => opcode::FINDBUDDY_RES,
+            KadPacket::CallbackReq(_) => opcode::CALLBACK_REQ,
             KadPacket::Ping => opcode::PING,
             KadPacket::Pong => opcode::PONG,
             KadPacket::Unknown { opcode, .. } => *opcode,
@@ -625,6 +687,37 @@ fn read_search_res(cursor: &mut Cursor<&[u8]>) -> Result<SearchRes, ProtoError> 
         target,
         results,
     })
+}
+
+fn read_find_buddy_res(cursor: &mut Cursor<&[u8]>) -> Result<FindBuddyRes, ProtoError> {
+    let buddy_id = cursor.read_le::<NodeId>()?;
+    let client_hash = cursor.read_le::<Ed2kHash>()?;
+    let tcp_port = cursor.read_le::<u16>()?;
+    let connect_options = if cursor.position() < cursor.get_ref().len() as u64 {
+        Some(cursor.read_le::<u8>()?)
+    } else {
+        None
+    };
+
+    Ok(FindBuddyRes {
+        buddy_id,
+        client_hash,
+        tcp_port,
+        connect_options,
+    })
+}
+
+fn write_find_buddy_res(
+    cursor: &mut Cursor<Vec<u8>>,
+    packet: &FindBuddyRes,
+) -> Result<(), ProtoError> {
+    cursor.write_le(&packet.buddy_id)?;
+    cursor.write_le(&packet.client_hash)?;
+    cursor.write_le(&packet.tcp_port)?;
+    if let Some(connect_options) = packet.connect_options {
+        cursor.write_le(&connect_options)?;
+    }
+    Ok(())
 }
 
 fn read_search_key_req(cursor: &mut Cursor<&[u8]>) -> Result<SearchKeyReq, ProtoError> {
@@ -949,6 +1042,78 @@ mod tests {
             assert_eq!(f.tcp_port, 4662);
             assert_eq!(f.user_hash, Ed2kHash::from_bytes([0x11; 16]));
             assert_eq!(f.connect_options, 0x07);
+        } else {
+            panic!("wrong type");
+        }
+    }
+
+    #[test]
+    fn test_find_buddy_req_roundtrip() {
+        let pkt = KadPacket::FindBuddyReq(FindBuddyReq {
+            buddy_id: NodeId::from_bytes([0x21; 16]),
+            client_hash: Ed2kHash::from_bytes([0x42; 16]),
+            tcp_port: 4662,
+        });
+        let pkt2 = roundtrip(&pkt);
+        if let KadPacket::FindBuddyReq(req) = pkt2 {
+            assert_eq!(req.buddy_id, NodeId::from_bytes([0x21; 16]));
+            assert_eq!(req.client_hash, Ed2kHash::from_bytes([0x42; 16]));
+            assert_eq!(req.tcp_port, 4662);
+        } else {
+            panic!("wrong type");
+        }
+    }
+
+    #[test]
+    fn test_find_buddy_res_roundtrip_without_connect_options() {
+        let pkt = KadPacket::FindBuddyRes(FindBuddyRes {
+            buddy_id: NodeId::from_bytes([0x31; 16]),
+            client_hash: Ed2kHash::from_bytes([0x52; 16]),
+            tcp_port: 4662,
+            connect_options: None,
+        });
+        let pkt2 = roundtrip(&pkt);
+        if let KadPacket::FindBuddyRes(res) = pkt2 {
+            assert_eq!(res.buddy_id, NodeId::from_bytes([0x31; 16]));
+            assert_eq!(res.client_hash, Ed2kHash::from_bytes([0x52; 16]));
+            assert_eq!(res.tcp_port, 4662);
+            assert_eq!(res.connect_options, None);
+        } else {
+            panic!("wrong type");
+        }
+    }
+
+    #[test]
+    fn test_find_buddy_res_roundtrip_with_connect_options() {
+        let pkt = KadPacket::FindBuddyRes(FindBuddyRes {
+            buddy_id: NodeId::from_bytes([0x41; 16]),
+            client_hash: Ed2kHash::from_bytes([0x62; 16]),
+            tcp_port: 4662,
+            connect_options: Some(0x07),
+        });
+        let pkt2 = roundtrip(&pkt);
+        if let KadPacket::FindBuddyRes(res) = pkt2 {
+            assert_eq!(res.buddy_id, NodeId::from_bytes([0x41; 16]));
+            assert_eq!(res.client_hash, Ed2kHash::from_bytes([0x62; 16]));
+            assert_eq!(res.tcp_port, 4662);
+            assert_eq!(res.connect_options, Some(0x07));
+        } else {
+            panic!("wrong type");
+        }
+    }
+
+    #[test]
+    fn test_callback_req_roundtrip() {
+        let pkt = KadPacket::CallbackReq(CallbackReq {
+            buddy_id: NodeId::from_bytes([0x51; 16]),
+            file_hash: Ed2kHash::from_bytes([0x72; 16]),
+            tcp_port: 4662,
+        });
+        let pkt2 = roundtrip(&pkt);
+        if let KadPacket::CallbackReq(req) = pkt2 {
+            assert_eq!(req.buddy_id, NodeId::from_bytes([0x51; 16]));
+            assert_eq!(req.file_hash, Ed2kHash::from_bytes([0x72; 16]));
+            assert_eq!(req.tcp_port, 4662);
         } else {
             panic!("wrong type");
         }

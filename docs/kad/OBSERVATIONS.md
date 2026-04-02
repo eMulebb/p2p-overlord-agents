@@ -33,15 +33,15 @@ This document was produced by cross-reading `PROTOCOL_REFERENCE.md`, `PROTOCOL_D
 
 ## 2. Opcode Registry
 
-The Rust `constants::opcode` module defines 22 opcodes. All hex values match eMule `srchybrid/Opcodes.h` and aMule `include/protocol/kad2/Client2Client/UDP.h`. The table also notes one opcode (`FIREWALLED2_REQ = 0x53`) that is present in code but absent from the `PROTOCOL_REFERENCE.md` summary table; it corresponds to the Kad v7+ extended firewall-check path.
+The Rust `constants::opcode` module defines 25 opcodes. All hex values match eMule `srchybrid/Opcodes.h` and aMule `include/protocol/kad2/Client2Client/UDP.h`. The oracle keeps mixed naming for these families: the older firewall and buddy packets use `KADEMLIA_*`, while ping/pong and `FIREWALLUDP` keep the `KADEMLIA2_*` prefix.
 
 | Opcode | Hex | Rust Runtime Status | Protocol Role |
 |---|---|---|---|
 | `BOOTSTRAP_REQ` | `0x01` | used | Ask a node for bootstrap contacts |
 | `BOOTSTRAP_RES` | `0x09` | used | Bootstrap response with sender info and contacts |
-| `HELLO_REQ` | `0x11` | codec | Hello handshake and UDP-key exchange setup |
-| `HELLO_RES` | `0x19` | codec | Hello response |
-| `HELLO_RES_ACK` | `0x22` | codec | Hello acknowledgement (three-way handshake completion) |
+| `HELLO_REQ` | `0x11` | used | Hello handshake and UDP-key exchange setup |
+| `HELLO_RES` | `0x19` | used | Hello response |
+| `HELLO_RES_ACK` | `0x22` | used | Hello acknowledgement (three-way handshake completion) |
 | `REQ` | `0x21` | used | Generic iterative lookup request |
 | `RES` | `0x29` | used | Closest-contact response |
 | `SEARCH_KEY_REQ` | `0x33` | used | Keyword search request |
@@ -53,14 +53,14 @@ The Rust `constants::opcode` module defines 22 opcodes. All hex values match eMu
 | `PUBLISH_NOTES_REQ` | `0x45` | used | Publish note or rating for a file |
 | `PUBLISH_RES` | `0x4B` | used | Publish acknowledgement with load byte |
 | `PUBLISH_RES_ACK` | `0x4C` | codec | Publish ack acknowledgement |
-| `FIREWALLED_REQ` | `0x50` | codec | Firewall check request carrying TCP port |
-| `FIREWALLED2_REQ` | `0x53` | codec | Extended firewall check for Kad v7+ (not in PROTOCOL_REFERENCE.md table) |
-| `FIREWALLED_RES` | `0x58` | codec | Firewall response carrying external IP |
+| `FIREWALLED_REQ` | `0x50` | used | Firewall check request carrying TCP port |
+| `FIREWALLED2_REQ` | `0x53` | used | Extended firewall check for Kad v7+ |
+| `FIREWALLED_RES` | `0x58` | used | Firewall response carrying external IP |
 | `FIREWALLED_ACK_RES` | `0x59` | codec | Empty firewall acknowledgement |
-| `FIREWALLUDP` | `0x62` | codec | UDP reachability test packet |
-| `FINDBUDDY_REQ` | `0x51` | reserved | Buddy discovery for firewalled mode (Phase 3) |
-| `FINDBUDDY_RES` | `0x5A` | reserved | Buddy discovery response (Phase 3) |
-| `CALLBACK_REQ` | `0x52` | reserved | Buddy callback request (Phase 3) |
+| `FIREWALLUDP` | `0x62` | used | UDP reachability test packet |
+| `FINDBUDDY_REQ` | `0x51` | codec | Buddy discovery for firewalled mode |
+| `FINDBUDDY_RES` | `0x5A` | codec | Buddy discovery response |
+| `CALLBACK_REQ` | `0x52` | codec | Buddy callback request |
 | `PING` | `0x60` | used | Liveness check |
 | `PONG` | `0x61` | used | Liveness response |
 
@@ -301,7 +301,7 @@ Empty payload. Status: `Equivalent behavior`.
 
 ### 3.6 Firewall Family
 
-**`KADEMLIA2_FIREWALLED_REQ` (`0x50`)**
+**`KADEMLIA_FIREWALLED_REQ` (`0x50`)**
 
 | Field | Size | Meaning |
 |---|---:|---|
@@ -309,7 +309,7 @@ Empty payload. Status: `Equivalent behavior`.
 
 Status: `Equivalent behavior` for wire shape.
 
-**`KADEMLIA2_FIREWALLED2_REQ` (`0x53`)** — Kad v7+ extended variant
+**`KADEMLIA_FIREWALLED2_REQ` (`0x53`)** — Kad v7+ extended variant
 
 | Field | Size | Meaning |
 |---|---:|---|
@@ -317,9 +317,9 @@ Status: `Equivalent behavior` for wire shape.
 | `user_hash` | 16 | Sender's eD2k user hash |
 | `connect_options` | 1 | Connection capability flags |
 
-Status: Wire shape implemented. This opcode is not listed in the `PROTOCOL_REFERENCE.md` opcode table but is present in `constants.rs` and has a dedicated `Firewalled2Req` struct. Should be added to the protocol table for completeness.
+Status: `Equivalent behavior` for wire shape. Newer oracle peers use this Kad v7+ variant for the extended firewall check, and the current Rust runtime decodes and responds to it.
 
-**`KADEMLIA2_FIREWALLED_RES` (`0x58`)**
+**`KADEMLIA_FIREWALLED_RES` (`0x58`)**
 
 | Field | Size | Meaning |
 |---|---:|---|
@@ -327,9 +327,9 @@ Status: Wire shape implemented. This opcode is not listed in the `PROTOCOL_REFER
 
 Status: `Equivalent behavior`.
 
-**`KADEMLIA2_FIREWALLED_ACK_RES` (`0x59`)** and **`KADEMLIA2_FIREWALLUDP` (`0x62`)**
+**`KADEMLIA_FIREWALLED_ACK_RES` (`0x59`)** and **`KADEMLIA2_FIREWALLUDP` (`0x62`)**
 
-Both are implemented with correct wire shapes. Firewall flows are `codec` status — the wire structs exist but the full runtime behavior (firewall state machine, buddy integration) is not at oracle parity.
+Both are implemented with correct wire shapes. The current Rust runtime actively uses the firewall probe and `FIREWALLUDP` flows, but the larger firewall-plus-buddy state machine is still not at full oracle parity.
 
 ---
 
@@ -703,7 +703,7 @@ Ranked by severity for live network interoperability.
 | 6 | **Keyword expression serialization** | `start_position=0` only. Oracle expression-tree mode (`0x8000`) and numeric pagination not yet implemented. | Low |
 | 7 | **Source publish encryption and buddy tags** | Not audited against oracle send path for encryption capability tags and buddy/callback tag handling. | Low |
 | 8 | **Publish result load semantics** | `PUBLISH_RES.load` received but oracle load-tracking logic not modeled. | Low |
-| 9 | **`FIREWALLED2_REQ` in protocol docs** | Present in `constants.rs` and has a struct, but absent from `PROTOCOL_REFERENCE.md` opcode table. Documentation gap. | Trivial |
+| 9 | **Firewall and buddy inventory drift** | The mixed `KADEMLIA_*` and `KADEMLIA2_*` oracle naming previously drifted in the docs; the canonical protocol inventory now reflects the exact oracle constants and wire layouts. | Closed |
 | 10 | **ED2K full server protocol** | `OP_OFFERFILES` body, server search, peer callback, file transfer. Intentionally deferred to Phase 2+. | Out of scope |
 
 ---
