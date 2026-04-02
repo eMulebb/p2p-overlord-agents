@@ -4,6 +4,7 @@ pub mod rate_limit;
 pub mod rpc;
 pub mod tracker;
 pub mod transport;
+mod wire_dump;
 
 pub use error::NetError;
 pub use obfuscation::ObfuscationLayer;

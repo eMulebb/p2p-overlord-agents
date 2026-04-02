@@ -5,6 +5,7 @@ use crate::tracker::{
     OutboundRequestTracker, PacketTracker, PacketTrackerBucket, PacketTrackerKey,
 };
 use crate::transport::Transport;
+use crate::wire_dump::{KadUdpDumpSummary, dump_kad_udp_packet};
 use overlord_kad_proto::{KadPacket, NodeId, constants::opcode};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -142,6 +143,27 @@ impl RpcManager {
                         let packet = match KadPacket::decode(&plain) {
                             Ok(p) => p,
                             Err(e) => {
+                                dump_kad_udp_packet(
+                                    "recv",
+                                    from,
+                                    &data,
+                                    &plain,
+                                    KadUdpDumpSummary {
+                                        protocol: plain.first().copied().unwrap_or_default(),
+                                        opcode: plain.get(1).copied(),
+                                        opcode_name: None,
+                                        raw_obfuscated: was_obfuscated,
+                                        transport_mode: Some(inbound_transport_mode(
+                                            was_obfuscated,
+                                            receiver_verify_key_valid,
+                                        )),
+                                        requested_obfuscation: None,
+                                        receiver_verify_key: None,
+                                        sender_verify_key,
+                                        receiver_verify_key_valid: Some(receiver_verify_key_valid),
+                                        tracked_request_opcode: None,
+                                    },
+                                );
                                 info!(
                                     "kad recv decode-failed from={} obfuscated={} raw_len={} plain_len={} raw_prefix={} plain_prefix={} error={}",
                                     from,
@@ -267,6 +289,31 @@ impl RpcManager {
                             &inner.outbound_tracker,
                             from.ip(),
                             response_opcode,
+                        );
+                        let dump_request_opcode = matched
+                            .map(|(_, _, request_opcode, _)| request_opcode)
+                            .or(tracked_request_opcode);
+
+                        dump_kad_udp_packet(
+                            "recv",
+                            from,
+                            &data,
+                            &plain,
+                            KadUdpDumpSummary {
+                                protocol: plain.first().copied().unwrap_or_default(),
+                                opcode: Some(response_opcode),
+                                opcode_name: Some(opcode_name(response_opcode)),
+                                raw_obfuscated: was_obfuscated,
+                                transport_mode: Some(inbound_transport_mode(
+                                    was_obfuscated,
+                                    receiver_verify_key_valid,
+                                )),
+                                requested_obfuscation: None,
+                                receiver_verify_key: None,
+                                sender_verify_key,
+                                receiver_verify_key_valid: Some(receiver_verify_key_valid),
+                                tracked_request_opcode: dump_request_opcode.map(opcode_name),
+                            },
                         );
 
                         if is_publish_opcode(response_opcode) {
@@ -479,6 +526,30 @@ impl RpcManager {
                 crypt_target,
             );
         }
+        dump_kad_udp_packet(
+            "send",
+            addr,
+            &wire,
+            &encoded,
+            KadUdpDumpSummary {
+                protocol: encoded.first().copied().unwrap_or_default(),
+                opcode: Some(packet.opcode()),
+                opcode_name: Some(opcode_name(packet.opcode())),
+                raw_obfuscated: !matches!(
+                    outbound.mode,
+                    crate::obfuscation::OutboundKadEncryptionMode::Plaintext
+                ),
+                transport_mode: Some(outbound.mode.as_str()),
+                requested_obfuscation: Some(!matches!(
+                    outbound.mode,
+                    crate::obfuscation::OutboundKadEncryptionMode::Plaintext
+                )),
+                receiver_verify_key: outbound.receiver_verify_key,
+                sender_verify_key: outbound.sender_verify_key,
+                receiver_verify_key_valid: None,
+                tracked_request_opcode: None,
+            },
+        );
         self.inner.transport.send_raw(addr, &wire).await
     }
 
@@ -736,6 +807,16 @@ fn is_response_opcode(opcode_value: u8) -> bool {
             | opcode::FINDBUDDY_RES
             | opcode::PONG
     )
+}
+
+fn inbound_transport_mode(was_obfuscated: bool, receiver_verify_key_valid: bool) -> &'static str {
+    if !was_obfuscated {
+        "plaintext"
+    } else if receiver_verify_key_valid {
+        "receiver_verify_key"
+    } else {
+        "node_id"
+    }
 }
 
 fn tracked_request_opcode_for_response(
