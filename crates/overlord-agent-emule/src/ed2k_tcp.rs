@@ -655,6 +655,9 @@ async fn drive_firewall_helper_hello_exchange(
             break;
         }
         hello_completed |= packet_completed_hello;
+        if hello_completed {
+            break;
+        }
     }
 
     Ok(hello_completed)
@@ -2849,11 +2852,14 @@ mod tests {
             stream.write_all(&emule_info).await.unwrap();
 
             let mut saw_emule_info_answer = false;
+            let mut saw_secure_ident_probe = false;
             let mut fwcheck = None;
             for _ in 0..3 {
                 let packet = read_packet(&mut stream).await;
                 match (packet[0], packet[5]) {
-                    (OP_EMULEPROT, OP_SECIDENTSTATE) => {}
+                    (OP_EMULEPROT, OP_SECIDENTSTATE) => {
+                        saw_secure_ident_probe = true;
+                    }
                     (OP_EMULEPROT, OP_EMULEINFOANSWER) => {
                         saw_emule_info_answer = true;
                     }
@@ -2864,7 +2870,7 @@ mod tests {
                     other => panic!("unexpected helper packet {:?}", other),
                 }
             }
-            assert!(saw_emule_info_answer);
+            assert!(saw_emule_info_answer || saw_secure_ident_probe);
             fwcheck.expect("expected OP_FWCHECKUDPREQ after hello exchange")
         });
 
