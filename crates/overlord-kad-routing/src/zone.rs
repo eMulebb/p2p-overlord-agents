@@ -1,8 +1,9 @@
 use overlord_kad_proto::{KBASE, KK, NodeId};
+use tracing::info;
 
 use crate::bin::RoutingBin;
 use crate::contact::Contact;
-use crate::error::RoutingError;
+use crate::error::{RoutingError, RoutingSplitDeniedReason};
 
 // ── ZoneContent ───────────────────────────────────────────────────────────────
 
@@ -68,13 +69,22 @@ impl RoutingZone {
                     Ok(added) => Ok(added),
                     Err(RoutingError::TableFull { .. }) => {
                         // Attempt to split.
-                        if self.can_split(total_contacts, max_table_size) {
-                            self.split();
+                        let split_check = self.can_split(total_contacts, max_table_size);
+                        if split_check.is_ok() {
+                            info!(
+                                target: "kad_routing",
+                                depth = self.depth,
+                                zone_index = self.zone_index,
+                                total_contacts,
+                                max_table_size,
+                                "routing leaf split allowed by oracle can_split rule"
+                            );
+                            self.split()?;
                             // Retry after split.
                             self.add(contact, total_contacts, max_table_size)
                         } else {
-                            Err(RoutingError::TableFull {
-                                max: max_table_size,
+                            Err(RoutingError::SplitDenied {
+                                reason: split_check.expect_err("checked above"),
                             })
                         }
                     }
@@ -159,34 +169,38 @@ impl RoutingZone {
     }
 
     /// Whether this zone may be split.
-    fn can_split(&self, total_contacts: usize, max_table_size: usize) -> bool {
+    fn can_split(
+        &self,
+        total_contacts: usize,
+        max_table_size: usize,
+    ) -> Result<(), RoutingSplitDeniedReason> {
         // Condition 1: depth < 127
         if self.depth >= 127 {
-            return false;
+            return Err(RoutingSplitDeniedReason::DepthLimit);
         }
         // Condition 2: total < max
         if total_contacts >= max_table_size {
-            return false;
+            return Err(RoutingSplitDeniedReason::MaxTableSize);
         }
         // Condition 3: oracle `CanSplit` keeps splitting the low-index zones
         // and the whole tree up to `KBASE`, regardless of our own node ID.
         if self.depth < KBASE as u32 || self.zone_index < KK {
-            return true;
+            return Ok(());
         }
-        false
+        Err(RoutingSplitDeniedReason::ZoneIndexCap)
     }
 
     /// Split a leaf into two child zones, redistributing contacts.
-    fn split(&mut self) {
+    fn split(&mut self) -> Result<(), RoutingError> {
         let bin = match &mut self.content {
             ZoneContent::Leaf(b) => {
                 let mut drained = RoutingBin::new();
                 for c in b.drain() {
-                    let _ = drained.try_add(c);
+                    drained.try_add(c)?;
                 }
                 drained
             }
-            ZoneContent::Branch { .. } => return, // already split
+            ZoneContent::Branch { .. } => return Ok(()), // already split
         };
 
         let depth = self.depth;
@@ -202,14 +216,16 @@ impl RoutingZone {
         for c in bin.iter() {
             let bit = c.id.bit(depth);
             if bit {
-                // We use a large max_table_size here since we're just redistributing
-                let _ = right.add(c.clone(), 0, usize::MAX);
+                // Preserve existing contacts exactly during redistribution.
+                // Any failure here means the table already violated its own invariants.
+                right.add(c.clone(), 0, usize::MAX)?;
             } else {
-                let _ = left.add(c.clone(), 0, usize::MAX);
+                left.add(c.clone(), 0, usize::MAX)?;
             }
         }
 
         self.content = ZoneContent::Branch { left, right };
+        Ok(())
     }
 }
 
@@ -357,7 +373,28 @@ mod tests {
 
         let result = zone.add(extra, K, usize::MAX);
 
-        assert!(matches!(result, Err(RoutingError::TableFull { .. })));
+        assert!(matches!(
+            result,
+            Err(RoutingError::SplitDenied {
+                reason: RoutingSplitDeniedReason::ZoneIndexCap
+            })
+        ));
+        assert_eq!(zone.count(), K);
+    }
+
+    #[test]
+    fn test_max_table_size_blocks_split_with_explicit_reason() {
+        let mut zone = make_full_leaf(0, 0, 1);
+        let extra = make_contact(make_id_with_bit(0, true, 202), "23.1.0.1");
+
+        let result = zone.add(extra, K, K);
+
+        assert!(matches!(
+            result,
+            Err(RoutingError::SplitDenied {
+                reason: RoutingSplitDeniedReason::MaxTableSize
+            })
+        ));
         assert_eq!(zone.count(), K);
     }
 }

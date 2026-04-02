@@ -8,3 +8,4 @@ description = "Kad2 routing table — zone tree, k-buckets, contacts"
 [dependencies]
 overlord-kad-proto = { path = "../overlord-kad-proto" }
 thiserror = { workspace = true }
+tracing = { workspace = true }

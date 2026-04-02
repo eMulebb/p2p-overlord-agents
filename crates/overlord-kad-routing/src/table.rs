@@ -4,7 +4,7 @@ use std::net::Ipv4Addr;
 use overlord_kad_proto::NodeId;
 
 use crate::contact::{Contact, is_lan};
-use crate::error::RoutingError;
+use crate::error::{RoutingError, RoutingSubnetLimitScope};
 use crate::zone::RoutingZone;
 
 /// Default maximum contacts in the routing table.
@@ -63,7 +63,10 @@ impl RoutingTable {
             let existing_ip = self.root.get(&contact.id).map(|c| c.ip);
             let is_new_ip = existing_ip.map(|ip| ip != contact.ip).unwrap_or(true);
             if is_new_ip && subnet_count >= GLOBAL_MAX_PER_SUBNET24 {
-                return Err(RoutingError::SubnetLimitExceeded { prefix: 24 });
+                return Err(RoutingError::SubnetLimitExceeded {
+                    prefix: 24,
+                    scope: RoutingSubnetLimitScope::Global,
+                });
             }
         }
 
@@ -287,7 +290,31 @@ mod tests {
         id[0] = 3;
         let c = make_contact(id, "5.5.5.3");
         let err = table.add_contact(c);
-        assert!(matches!(err, Err(RoutingError::SubnetLimitExceeded { .. })));
+        assert!(matches!(
+            err,
+            Err(RoutingError::SubnetLimitExceeded {
+                prefix: 24,
+                scope: RoutingSubnetLimitScope::BinLocal
+            })
+        ));
+    }
+
+    #[test]
+    fn test_global_subnet_limit_reports_global_scope() {
+        let own_id = NodeId::from_bytes([0x00; 16]);
+        let mut table = RoutingTable::new(own_id);
+        table.subnet_counts.insert([6, 6, 6], 10);
+
+        let contact = make_contact([0x04; 16], "6.6.6.4");
+        let err = table.add_contact(contact);
+
+        assert!(matches!(
+            err,
+            Err(RoutingError::SubnetLimitExceeded {
+                prefix: 24,
+                scope: RoutingSubnetLimitScope::Global
+            })
+        ));
     }
 
     #[test]

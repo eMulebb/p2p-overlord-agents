@@ -4,7 +4,7 @@ use std::net::Ipv4Addr;
 use overlord_kad_proto::{K, NodeId};
 
 use crate::contact::{Contact, ContactType, is_lan};
-use crate::error::RoutingError;
+use crate::error::{RoutingError, RoutingSubnetLimitScope};
 
 /// Maximum contacts from one non-LAN `/24` inside a single bin.
 const MAX_PER_BIN_SUBNET24: usize = 2;
@@ -67,7 +67,10 @@ impl RoutingBin {
                 })
                 .count();
             if same_subnet_contacts >= MAX_PER_BIN_SUBNET24 {
-                return Err(RoutingError::SubnetLimitExceeded { prefix: 24 });
+                return Err(RoutingError::SubnetLimitExceeded {
+                    prefix: 24,
+                    scope: RoutingSubnetLimitScope::BinLocal,
+                });
             }
         }
 
@@ -204,7 +207,10 @@ mod tests {
         let third = make_contact(3, "5.5.5.3".parse().unwrap());
         assert!(matches!(
             bin.try_add(third),
-            Err(RoutingError::SubnetLimitExceeded { prefix: 24 })
+            Err(RoutingError::SubnetLimitExceeded {
+                prefix: 24,
+                scope: RoutingSubnetLimitScope::BinLocal
+            })
         ));
         assert_eq!(bin.len(), 2);
     }

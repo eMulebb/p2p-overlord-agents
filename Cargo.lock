@@ -1276,6 +1276,7 @@ version = "0.1.0"
 dependencies = [
  "overlord-kad-proto",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]

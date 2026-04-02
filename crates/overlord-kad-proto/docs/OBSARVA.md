@@ -422,14 +422,14 @@ Rust rule from `zone.rs fn can_split`:
 ```rust
 depth < 127
 AND total_contacts < max_table_size
-AND (depth < KBASE || on_own_side)
+AND (depth < KBASE || zone_index < KK)
 ```
 
-Status: **Verified difference**.
+Status: `Equivalent behavior` for the oracle split predicate, with one explicit local guard.
 
-- `on_own_side` (whether our own node ID routes into this zone) is not the same predicate as oracle `zone_index < KK` (whether the zone's absolute index is smaller than the peer selection parameter).
-- The extra `total_contacts < max_table_size` guard is a local Overlord limit absent from the oracle. This is `Repo policy` and should not be described as oracle routing behavior.
-- The resulting routing topology may diverge from the oracle under sustained load, because the zone tree will not split in exactly the same positions as eMule/aMule.
+- The earlier Rust `on_own_side` heuristic has been removed. The routing table now carries the absolute `zone_index` and applies the oracle predicate `depth < KBASE || zone_index < KK`.
+- The extra `total_contacts < max_table_size` guard remains a local Overlord table-size safety limit. This is `Repo policy`, not oracle behavior, and it now surfaces as an explicit split-denied reason instead of being silently folded into generic add failures.
+- Live validation on April 2, 2026 showed oracle-style split decisions during bootstrap, with routing logs recording the accepted split depth and `zone_index` as the table grew to 156 contacts while still returning live `ubuntu linux` search results.
 
 ### 6.3 IP and Subnet Limits
 
@@ -447,9 +447,9 @@ Rust status:
 | Global 1-per-IP | Implemented | Equivalent behavior |
 | Global 10-per-/24 | Implemented | Equivalent behavior |
 | LAN exemption | Implemented | Equivalent behavior |
-| Per-bin 2-per-/24 | **Not implemented** in `bin.rs` | Pending parity gap |
+| Per-bin 2-per-/24 | Implemented in `bin.rs` | Equivalent behavior |
 
-The per-bin anti-clustering cap is explicitly documented in the `bin.rs` tests as being treated as global-only. This means the Rust routing table is weaker than the oracle at resisting subnet-based clustering at the individual bucket level.
+The Rust routing layer now distinguishes global `/24` rejects from bin-local `/24` rejects and reports both paths explicitly. That makes the oracle-equivalent anti-clustering rule observable during live testing instead of only being implied by insertion behavior.
 
 ### 6.4 Contact Fields
 
@@ -705,15 +705,13 @@ Ranked by severity for live network interoperability.
 | 2 | **`PublishNotesReq.note_hash`** | Wrong type (`Ed2kHash` vs `NodeId`) and wrong name. Wire size is accidentally correct. Notes publish cannot be validated end-to-end until this is corrected to `publisher_id: NodeId`. | High |
 | 3 | **HELLO / obfuscation key registration** | Full three-way HELLO parity around obfuscation key exchange not yet audited. Blocking full obfuscation context build-up with peers. | High |
 | 4 | **Packet-tracking live validation** | Oracle-shaped per-opcode packet tracking is now in place, but live acceptance still needs repeated validation against the oracle with the new tracker counters and drop reasons. | Medium |
-| 5 | **Zone split `can_split` condition** | Rust uses `on_own_side` which is not the same predicate as oracle `zone_index < KK`. Routing topology diverges under load. | Medium |
-| 6 | **Per-bin `/24` subnet cap** | `RoutingBin` missing oracle two-per-`/24` anti-clustering limit. Global limits are correct; per-bucket granularity is weaker. | Medium |
-| 7 | **Kad notes result modeling** | Active Kad notes search is wired and live-validated, but coordinator result storage is still file-centric. Distinct note authors for the same file would collapse into one `FileRecord`. | Medium |
-| 8 | **`SearchRes.keyword_id` naming** | Misleading field name — the echoed target is not keyword-specific. Wire is correct; maintenance hazard. | Low (naming only) |
-| 9 | **Keyword expression serialization** | `start_position=0` only. Oracle expression-tree mode (`0x8000`) and numeric pagination not yet implemented. | Low |
-| 10 | **Source publish encryption and buddy tags** | Not audited against oracle send path for encryption capability tags and buddy/callback tag handling. | Low |
-| 11 | **Publish result load semantics** | `PUBLISH_RES.load` received but oracle load-tracking logic not modeled. | Low |
-| 12 | **`FIREWALLED2_REQ` in protocol docs** | Present in `constants.rs` and has a struct, but absent from `KAD_PROTOCOL.md` opcode table. Documentation gap. | Trivial |
-| 13 | **ED2K full server protocol** | `OP_OFFERFILES` body, server search, peer callback, file transfer. Intentionally deferred to Phase 2+. | Out of scope |
+| 5 | **Kad notes result modeling** | Active Kad notes search is wired and live-validated, but coordinator result storage is still file-centric. Distinct note authors for the same file would collapse into one `FileRecord`. | Medium |
+| 6 | **`SearchRes.keyword_id` naming** | Misleading field name — the echoed target is not keyword-specific. Wire is correct; maintenance hazard. | Low (naming only) |
+| 7 | **Keyword expression serialization** | `start_position=0` only. Oracle expression-tree mode (`0x8000`) and numeric pagination not yet implemented. | Low |
+| 8 | **Source publish encryption and buddy tags** | Not audited against oracle send path for encryption capability tags and buddy/callback tag handling. | Low |
+| 9 | **Publish result load semantics** | `PUBLISH_RES.load` received but oracle load-tracking logic not modeled. | Low |
+| 10 | **`FIREWALLED2_REQ` in protocol docs** | Present in `constants.rs` and has a struct, but absent from `KAD_PROTOCOL.md` opcode table. Documentation gap. | Trivial |
+| 11 | **ED2K full server protocol** | `OP_OFFERFILES` body, server search, peer callback, file transfer. Intentionally deferred to Phase 2+. | Out of scope |
 
 ---
 

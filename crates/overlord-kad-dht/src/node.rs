@@ -10,7 +10,9 @@ use overlord_kad_proto::{
     Ed2kHash, KadPacket, KadUdpKey, NodeId, SearchKeyReq, SearchSourceReq, Tag, constants::K,
     opcode,
 };
-use overlord_kad_routing::{Contact, RoutingTable};
+use overlord_kad_routing::{
+    Contact, RoutingError, RoutingSplitDeniedReason, RoutingSubnetLimitScope, RoutingTable,
+};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -240,8 +242,64 @@ impl DhtNode {
                 .rpc
                 .register_peer_key(addr, contact.udp_key.value());
         }
-        self.inner.routing_table.lock().await.add_contact(contact)?;
-        Ok(())
+        let contact_id = contact.id;
+        let contact_ip = contact.ip;
+        let contact_udp_port = contact.udp_port;
+        match self.inner.routing_table.lock().await.add_contact(contact) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                match &error {
+                    RoutingError::SubnetLimitExceeded { prefix, scope } => {
+                        warn!(
+                            target: "kad_routing",
+                            contact_id = %contact_id,
+                            contact_ip = %contact_ip,
+                            contact_udp_port,
+                            prefix = *prefix,
+                            scope = match scope {
+                                RoutingSubnetLimitScope::Global => "global",
+                                RoutingSubnetLimitScope::BinLocal => "bin_local",
+                            },
+                            "routing contact rejected by subnet limit"
+                        );
+                    }
+                    RoutingError::SplitDenied { reason } => {
+                        warn!(
+                            target: "kad_routing",
+                            contact_id = %contact_id,
+                            contact_ip = %contact_ip,
+                            contact_udp_port,
+                            reason = match reason {
+                                RoutingSplitDeniedReason::DepthLimit => "depth_limit",
+                                RoutingSplitDeniedReason::MaxTableSize => "max_table_size",
+                                RoutingSplitDeniedReason::ZoneIndexCap => "zone_index_cap",
+                            },
+                            "routing leaf split denied while inserting contact"
+                        );
+                    }
+                    RoutingError::IpLimitExceeded { .. } => {
+                        debug!(
+                            target: "kad_routing",
+                            contact_id = %contact_id,
+                            contact_ip = %contact_ip,
+                            contact_udp_port,
+                            "routing contact rejected by duplicate IP limit"
+                        );
+                    }
+                    RoutingError::TableFull { max } => {
+                        warn!(
+                            target: "kad_routing",
+                            contact_id = %contact_id,
+                            contact_ip = %contact_ip,
+                            contact_udp_port,
+                            max = *max,
+                            "routing table rejected contact because the destination bin is full"
+                        );
+                    }
+                }
+                Err(error.into())
+            }
+        }
     }
 
     /// Return the closest known contacts to the target.
