@@ -150,7 +150,7 @@ impl Tag {
         Tag::new_short(tag_name::FILETYPE, TagValue::String(t.into()))
     }
 
-    /// Create a `SOURCES` availability tag.
+    /// Create a `SOURCES` source-count tag.
     #[must_use]
     pub fn sources(n: u32) -> Self {
         Tag::new_short(tag_name::SOURCES, TagValue::UInt(u64::from(n)))

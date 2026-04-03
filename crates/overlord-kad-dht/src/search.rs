@@ -214,23 +214,23 @@ pub fn search_notes(
             let _ = run_traversal(&rpc, initial, config).await;
         });
 
-        let mut seen_authors = HashSet::new();
+        let mut seen_sources = HashSet::new();
         loop {
             let next = tokio::select! {
                 _ = cancel.cancelled() => break,
                 next = raw_rx.recv() => next,
             };
-            let Some((author_id, tags)) = next else {
+            let Some((source_id, tags)) = next else {
                 break;
             };
-            if seen_authors.len() >= result_cap {
+            if seen_sources.len() >= result_cap {
                 break;
             }
 
-            let Some(note) = NoteResult::from_tags(file_hash, author_id, tags) else {
+            let Some(note) = NoteResult::from_tags(file_hash, source_id, tags) else {
                 continue;
             };
-            if !seen_authors.insert(note.author_id) {
+            if !seen_sources.insert(note.source_id) {
                 continue;
             }
             if tx.send(note).await.is_err() {

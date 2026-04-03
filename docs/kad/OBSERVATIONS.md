@@ -210,11 +210,11 @@ Oracle anchors:
 
 | Field | Size | Meaning |
 |---|---:|---|
-| `hash` | 16 | Entry ID — file hash (keyword), source/client ID (source search), note author ID (notes search) |
+| `entry_id` | 16 | Entry ID — file hash (keyword), source/client ID (source search), note author/source ID (notes search) |
 | `tag_count` | 1 | Number of tags |
 | `tags[tag_count]` | variable | Typed Kad tags describing the result |
 
-Status: `Equivalent behavior` for wire shape. The Rust codec correctly encodes and decodes this layout, and the Rust field is now named `target` to match the echoed-target wire meaning across keyword, source, and notes search responses.
+Status: `Equivalent behavior` for wire shape. The Rust codec correctly encodes and decodes this layout, and the Rust field is now named `entry_id` to match the oracle's generic per-entry identity semantics.
 
 Oracle anchors:
 - eMule `srchybrid/kademlia/kademlia/Indexed.cpp SendValidKeywordResult`, `SendValidSourceResult`, `SendValidNoteResult`
@@ -358,7 +358,7 @@ All tag IDs are defined in `constants::tag_name` and verified against eMule `src
 | `0x03` | `FILETYPE` | string | Coarse file type | — |
 | `0x04` | `FILEFORMAT` | string | Format / subtype | — |
 | `0x0B` | `DESCRIPTION` | string | Note / comment text | Previously mapped as a "COMMENT" tag with a different ID |
-| `0x15` | `SOURCES` | uint32 | Source count (exposed in Rust as `availability`) | Previously confused with `FILERATING` |
+| `0x15` | `SOURCES` | uint32 | Source count (exposed in Rust as `source_count`) | Previously confused with `FILERATING` |
 | `0x3A` | `FILESIZE_HI` | uint32 | High 32 bits for files larger than 4 GiB | — |
 | `0xD0` | `MEDIA_ARTIST` | string | Artist metadata | — |
 | `0xD1` | `MEDIA_ALBUM` | string | Album metadata | — |
@@ -376,7 +376,7 @@ All tag IDs are defined in `constants::tag_name` and verified against eMule `src
 
 Notes:
 
-- `SOURCES (0x15)` carries the remote complete source count. The Rust public field is intentionally kept as `availability` to avoid churn in the wider API, but its wire origin is `TAG_SOURCES`.
+- `SOURCES (0x15)` carries the remote complete source count. The Rust public field is now named `source_count` so the code matches the oracle semantics directly.
 - `DESCRIPTION (0x0B)` is the tag used for note/comment text in both `SEARCH_RES` (notes results) and `PUBLISH_NOTES_REQ`. The old "COMMENT" mapping was wrong for Kad search/notes parsing.
 - Large-file sizes are split across `FILESIZE (0x02)` (low 32 bits) and `FILESIZE_HI (0x3A)` (high 32 bits). The `overlord-kad-dht` crate combines the two into one `u64`.
 - Source result tags (`0xFC–0xFF`) live in the high numeric range. Their previous incorrect mapping at `0x21–0x23` broke source result interoperability.
@@ -521,7 +521,7 @@ Notes results:
 
 - `entry_id` identifies the note author/source
 - Relevant tags: `DESCRIPTION`, `FILERATING`
-- The `entry_id` is persisted as `author_hash`, matching eMule's treatment of that field as source/author identity
+- The `entry_id` is persisted as note `source_id`, matching eMule's `uAnswer` / `m_uSourceID` treatment of that field as source/author identity
 - Acceptance condition: usable rating or non-empty comment
 
 ### 7.6 Search Result String Decoding

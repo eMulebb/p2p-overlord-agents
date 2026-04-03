@@ -1822,7 +1822,7 @@ fn map_note_result(result: &NoteResult, file_size: u64) -> FileRecord {
         tags: vec![TagEntry {
             key: "kad_note".to_string(),
             value: serde_json::json!({
-                "author_id": result.author_id.to_string(),
+                "source_id": result.source_id.to_string(),
                 "rating": result.rating,
                 "comment": result.comment,
             }),
@@ -2179,7 +2179,7 @@ async fn run_passive_notes_replay(
     request: &SearchNotesReq,
 ) -> PassiveReplayRunOutcome {
     let mut outcome = PassiveReplayRunOutcome::default();
-    let mut seen_authors = HashSet::new();
+    let mut seen_note_sources = HashSet::new();
     let mut files = Vec::new();
     let file_hash = Ed2kHash::from_bytes(request.target.0);
     let (batch_tx, batch_task) = spawn_passive_batch_poster(
@@ -2203,7 +2203,7 @@ async fn run_passive_notes_replay(
             CancellationToken::new(),
         );
         while let Some(result) = stream.next().await {
-            if !seen_authors.insert(result.author_id) {
+            if !seen_note_sources.insert(result.source_id) {
                 continue;
             }
             context.passive_result_count.fetch_add(1, Ordering::Relaxed);
@@ -3363,7 +3363,7 @@ fn map_search_result_for(dht: &DhtNode, result: &SearchResult) -> Result<FileRec
             address: dht.bind_addr()?.to_string(),
             extra: serde_json::json!({
                 "search_mode": "network",
-                "availability": result.availability,
+                "source_count": result.source_count,
             }),
         }],
     })

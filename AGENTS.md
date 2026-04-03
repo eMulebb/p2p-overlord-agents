@@ -2,7 +2,7 @@
 
 - Follow the shared workspace guidance from `../AGENTS.md` in addition to this file.
 - Use `docs/README.md` as the canonical agents docs home.
-- Use `../overlord-be/BACKLOG.md` as the canonical active backlog.
+- Use `../p2p-overlord-be/BACKLOG.md` as the canonical active backlog.
 - Use `scripts/windows/rust_quality.ps1` as the canonical local quality gate for this repo.
 - Before finishing Rust changes, run:
   - `cargo fmt --all --check`
@@ -18,7 +18,7 @@
   - Instrument both the Rust agent and the oracle as needed so the same scenario can be compared from structured dumps on both sides.
   - Treat JSONL dump support as reusable observability infrastructure, not one-off debug code.
 - Treat `rustfmt` output as canonical.
-- Keep reusable operational tooling in `../overlord-tooling`, not inline in issue-specific commands.
+- Keep reusable operational tooling in `../p2p-overlord-tooling`, not inline in issue-specific commands.
 - Keep the tracked-file privacy guard passing locally and in CI.
   - Do not commit local user-profile paths such as `C:\Users\...`, `C:/Users/...`, `/Users/...`, or `/home/...`.
   - Do not commit tracked filenames that embed configured personal identifiers.

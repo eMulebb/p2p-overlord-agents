@@ -292,7 +292,7 @@ Coordinator/Agent       US                          CLOSE_N
        |                   |       Combines FILESIZE_HI   |
        |                   |       and FILESIZE into u64. |
        |                   |       SOURCES becomes the    |
-       |                   |       public availability    |
+       |                   |       public source_count    |
        |                   |       field.                 |
        |                   |       String tags decoded    |
        |                   |       UTF-8 first, then      |
@@ -427,7 +427,7 @@ Coordinator/Agent       US                          CLOSE_N
        |                   |  results[0..count]:         |
        |                   |    hash:      [16 bytes]    |
        |                   |      note author/source ID  |
-       |                   |      (persisted as author_hash)
+       |                   |      (persisted as source_id)
        |                   |    tag_count: [1 byte]      |
        |                   |    tags[]:                  |
        |                   |      TAG_DESCRIPTION (0x0B) |
@@ -440,7 +440,7 @@ Coordinator/Agent       US                          CLOSE_N
        |                   |       it has a usable rating|
        |                   |       or non-empty comment. |
        |                   |       The entry hash is     |
-       |                   |       stored as author_hash.|
+       |                   |       stored as source_id.  |
        |                   |                             |
        | POST /results (batch)                           |
        | <---------------- |                             |

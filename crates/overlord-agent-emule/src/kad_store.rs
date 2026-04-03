@@ -198,7 +198,7 @@ impl KadLocalStore {
             .skip(offset)
             .take(limit)
             .map(|entry| SearchResultEntry {
-                hash: entry.file_hash,
+                entry_id: entry.file_hash,
                 tags: entry.tags.clone(),
             })
             .collect::<Vec<_>>();
@@ -231,7 +231,7 @@ impl KadLocalStore {
             .skip(offset)
             .take(limit)
             .map(|entry| SearchResultEntry {
-                hash: file_hash,
+                entry_id: file_hash,
                 tags: source_result_tags(entry),
             })
             .collect::<Vec<_>>();
@@ -261,7 +261,7 @@ impl KadLocalStore {
             })
             .take(limit)
             .map(|entry| SearchResultEntry {
-                hash: Ed2kHash::from_bytes(entry.publisher_id.0),
+                entry_id: Ed2kHash::from_bytes(entry.publisher_id.0),
                 tags: entry.tags.clone(),
             })
             .collect::<Vec<_>>();
@@ -606,7 +606,7 @@ mod tests {
             )
             .expect("source response");
         assert_eq!(response.results.len(), 2);
-        assert_eq!(response.results[0].hash, Ed2kHash::from_bytes(target.0));
+        assert_eq!(response.results[0].entry_id, Ed2kHash::from_bytes(target.0));
         assert!(response.results.iter().all(|entry| {
             entry
                 .tags
@@ -638,7 +638,7 @@ mod tests {
         assert_eq!(store.notes_entry_count(), 1);
         assert_eq!(response.results.len(), 1);
         assert_eq!(
-            response.results[0].hash,
+            response.results[0].entry_id,
             Ed2kHash::from_bytes(publisher_id.0)
         );
 

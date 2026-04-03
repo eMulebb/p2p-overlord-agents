@@ -285,6 +285,7 @@ Rust naming note:
 - the Rust struct names the echoed target field `target`
 - for keyword searches it carries the keyword hash
 - for source and notes searches it carries the echoed file-hash target
+- the Rust struct names the per-entry identity field `entry_id`
 
 Oracle anchors:
 
@@ -348,7 +349,7 @@ Verified wire shape in this repo and eMule send path:
 | Field | Size | Meaning |
 |---|---:|---|
 | `target` | 16 | file hash target |
-| `author_id` | 16 | publisher Kad ID |
+| `publisher_id` | 16 | publisher Kad ID |
 | `tag_count` | 1 | number of tags |
 | `tags[tag_count]` | variable | note tags |
 
@@ -472,11 +473,11 @@ The table below focuses on Kad tags that matter directly to this repo's current 
 Verified:
 
 - eMule and aMule use `TAG_SOURCES = 0x15`
-- this repo now parses that tag into `SearchResult.availability`
+- this repo now parses that tag into `SearchResult.source_count`
 
 Repo note:
 
-- the public Rust field is still named `availability` to avoid wider churn
+- the public Rust field is named `source_count` so the code matches the oracle meaning directly
 - the wire meaning comes from `TAG_SOURCES`
 
 #### `DESCRIPTION` is the note/comment tag
@@ -593,7 +594,7 @@ Notes results:
 
 - `entry_id` identifies the note author/source
 - relevant tags are `DESCRIPTION` and `FILERATING`
-- this repo now persists that `entry_id` as note `author_hash`
+- this repo now persists that `entry_id` as note `source_id`
 
 ### Search Tolerance
 
@@ -756,18 +757,18 @@ Reason:
 
 Policy:
 
-- `SearchResult.availability` stays named `availability`
+- `SearchResult.source_count` uses the oracle semantic name directly
 - its value comes from `TAG_SOURCES`
 
 Reason:
 
-- preserves the existing public Rust/API shape while correcting the wire semantics
+- public Rust Kad names should preserve oracle semantics; commentary explains behavior where needed
 
 ### Notes Result Persistence
 
 Policy:
 
-- the search-result entry ID for note searches is stored as `author_hash`
+- the search-result entry ID for note searches is stored as `source_id`
 
 Reason:
 

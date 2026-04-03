@@ -190,13 +190,18 @@ pub struct SearchNotesReq {
 // ── SearchResultEntry ────────────────────────────────────────────────────────
 //
 // eMule CEntry::WriteTagListInc writes: [tag_count:u8][tags...]
-// So each result in SearchRes is: [file_hash:16][tag_count:u8][tags...]
+// So each result in SearchRes is: [entry_id:16][tag_count:u8][tags...]
 
 #[binrw]
 #[brw(little)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResultEntry {
-    pub hash: Ed2kHash,
+    /// Generic per-entry identity from the oracle `SEARCH_RES` layout.
+    ///
+    /// Keyword results carry the file hash here. Source results carry the
+    /// source/client identity. Notes results carry the note author/source
+    /// identity.
+    pub entry_id: Ed2kHash,
     #[br(temp)]
     #[bw(calc = u8::try_from(tags.len()).expect("tag count exceeds u8"))]
     tag_count: u8,
@@ -678,7 +683,7 @@ fn read_search_res(cursor: &mut Cursor<&[u8]>) -> Result<SearchRes, ProtoError> 
     let mut results = Vec::with_capacity(count as usize);
 
     for _ in 0..count {
-        let hash = cursor.read_le::<Ed2kHash>()?;
+        let entry_id = cursor.read_le::<Ed2kHash>()?;
         let tag_count = cursor.read_le::<u8>()?;
         let mut tags = Vec::with_capacity(tag_count as usize);
         for _ in 0..tag_count {
@@ -688,7 +693,7 @@ fn read_search_res(cursor: &mut Cursor<&[u8]>) -> Result<SearchRes, ProtoError> 
                 StringDecodeMode::SearchResult,
             )?);
         }
-        results.push(SearchResultEntry { hash, tags });
+        results.push(SearchResultEntry { entry_id, tags });
     }
 
     Ok(SearchRes {
@@ -924,7 +929,7 @@ mod tests {
     #[test]
     fn test_search_res_roundtrip() {
         let entry = SearchResultEntry {
-            hash: Ed2kHash::from_bytes([0xAB; 16]),
+            entry_id: Ed2kHash::from_bytes([0xAB; 16]),
             tags: vec![Tag::filename("ubuntu.iso"), Tag::filesize(1_000_000_000)],
         };
         let pkt = KadPacket::SearchRes(SearchRes {

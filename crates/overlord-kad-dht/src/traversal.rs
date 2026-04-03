@@ -570,10 +570,10 @@ async fn collect_search_results_until(
                 );
                 for entry in sr.results {
                     if let Some(tx) = result_tx.as_ref() {
-                        let _ = tx.send((entry.hash, entry.tags.clone())).await;
+                        let _ = tx.send((entry.entry_id, entry.tags.clone())).await;
                     }
                     if collect_search_entries {
-                        search_entries.push((entry.hash, entry.tags));
+                        search_entries.push((entry.entry_id, entry.tags));
                     }
                 }
             }
@@ -980,7 +980,7 @@ mod tests {
                 sender_id: contact.id,
                 target,
                 results: vec![overlord_kad_proto::packet::SearchResultEntry {
-                    hash: Ed2kHash::from_bytes([1; 16]),
+                    entry_id: Ed2kHash::from_bytes([1; 16]),
                     tags: vec![],
                 }],
             });
@@ -994,7 +994,7 @@ mod tests {
                 sender_id: contact.id,
                 target,
                 results: vec![overlord_kad_proto::packet::SearchResultEntry {
-                    hash: Ed2kHash::from_bytes([2; 16]),
+                    entry_id: Ed2kHash::from_bytes([2; 16]),
                     tags: vec![],
                 }],
             });

@@ -7,7 +7,8 @@ pub struct SearchResult {
     pub hash: Ed2kHash,
     pub names: Vec<String>,
     pub size: Option<u64>,
-    pub availability: Option<u32>,
+    /// Remote complete-source count parsed from the oracle `TAG_SOURCES` tag.
+    pub source_count: Option<u32>,
     pub tags: Vec<Tag>,
 }
 
@@ -17,7 +18,7 @@ impl SearchResult {
         let mut size: Option<u64> = None;
         let mut size_low: Option<u32> = None;
         let mut size_high: Option<u32> = None;
-        let mut availability: Option<u32> = None;
+        let mut source_count: Option<u32> = None;
 
         for tag in &tags {
             match &tag.name {
@@ -42,10 +43,10 @@ impl SearchResult {
                     _ => {}
                 },
                 TagName::Short(n) if *n == tag_name::SOURCES => match &tag.value {
-                    TagValue::UInt(v) => availability = Some(*v as u32),
-                    TagValue::U32(v) => availability = Some(*v),
-                    TagValue::U16(v) => availability = Some((*v).into()),
-                    TagValue::U8(v) => availability = Some((*v).into()),
+                    TagValue::UInt(v) => source_count = Some(*v as u32),
+                    TagValue::U32(v) => source_count = Some(*v),
+                    TagValue::U16(v) => source_count = Some((*v).into()),
+                    TagValue::U8(v) => source_count = Some((*v).into()),
                     _ => {}
                 },
                 _ => {}
@@ -63,7 +64,7 @@ impl SearchResult {
             hash,
             names,
             size,
-            availability,
+            source_count,
             tags,
         }
     }
@@ -131,14 +132,15 @@ impl SourceResult {
 #[derive(Debug, Clone)]
 pub struct NoteResult {
     pub file_hash: Ed2kHash,
-    pub author_id: Ed2kHash,
+    /// Oracle-style note/source identity from the `SEARCH_RES` entry ID slot.
+    pub source_id: Ed2kHash,
     pub rating: Option<u8>,
     pub comment: Option<String>,
-    pub author_tags: Vec<Tag>,
+    pub source_tags: Vec<Tag>,
 }
 
 impl NoteResult {
-    pub fn from_tags(file_hash: Ed2kHash, author_id: Ed2kHash, tags: Vec<Tag>) -> Option<Self> {
+    pub fn from_tags(file_hash: Ed2kHash, source_id: Ed2kHash, tags: Vec<Tag>) -> Option<Self> {
         let mut rating = None;
         let mut comment = None;
 
@@ -178,10 +180,10 @@ impl NoteResult {
 
         Some(NoteResult {
             file_hash,
-            author_id,
+            source_id,
             rating,
             comment,
-            author_tags: tags,
+            source_tags: tags,
         })
     }
 }
@@ -202,7 +204,7 @@ mod tests {
         let result = SearchResult::from_tags(hash, tags);
         assert_eq!(result.names, vec!["test.mp3".to_string()]);
         assert_eq!(result.size, Some(1_000_000));
-        assert_eq!(result.availability, Some(5));
+        assert_eq!(result.source_count, Some(5));
     }
 
     #[test]
@@ -256,14 +258,14 @@ mod tests {
     #[test]
     fn test_note_result_from_emule_note_tags() {
         let file_hash = Ed2kHash::from_bytes([5u8; 16]);
-        let author_id = Ed2kHash::from_bytes([6u8; 16]);
+        let source_id = Ed2kHash::from_bytes([6u8; 16]);
         let tags = vec![
             Tag::new_short(tag_name::DESCRIPTION, TagValue::String("nice".to_string())),
             Tag::new_short(tag_name::FILERATING, TagValue::U8(4)),
         ];
-        let result = NoteResult::from_tags(file_hash, author_id, tags).expect("note result");
+        let result = NoteResult::from_tags(file_hash, source_id, tags).expect("note result");
         assert_eq!(result.file_hash, file_hash);
-        assert_eq!(result.author_id, author_id);
+        assert_eq!(result.source_id, source_id);
         assert_eq!(result.rating, Some(4));
         assert_eq!(result.comment.as_deref(), Some("nice"));
     }
@@ -271,11 +273,11 @@ mod tests {
     #[test]
     fn test_note_result_rejects_empty_payload() {
         let file_hash = Ed2kHash::from_bytes([8u8; 16]);
-        let author_id = Ed2kHash::from_bytes([9u8; 16]);
+        let source_id = Ed2kHash::from_bytes([9u8; 16]);
         let tags = vec![Tag::new_short(
             tag_name::DESCRIPTION,
             TagValue::String("   ".to_string()),
         )];
-        assert!(NoteResult::from_tags(file_hash, author_id, tags).is_none());
+        assert!(NoteResult::from_tags(file_hash, source_id, tags).is_none());
     }
 }

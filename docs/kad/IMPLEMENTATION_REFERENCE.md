@@ -377,8 +377,8 @@ because Kad source-search result tags do not carry a Kad version byte.
 
 Same pattern, `KADEMLIA2_SEARCH_NOTES_REQ`. Kad2 notes search also requires the file size on the
 wire, so the daemon uses the indexed size from the local `files` table and fails the API request if
-that size is unavailable. Notes results are stored in `notes`; the result entry hash is treated as
-the note author's Kad/source ID and is persisted as `author_hash`.
+that size is unavailable. Notes results are stored in `notes`; the result entry ID is treated as
+the note's Kad/source identity and is persisted as `source_id`.
 
 - `Equivalent behavior`: `crates/overlord-kad-dht/src/traversal.rs` emits `SearchNotesReq { target, size }`, matching eMule `kademlia/Search.cpp CSearch::StorePacket` and `net/KademliaUDPListener.cpp Process_KADEMLIA2_SEARCH_NOTES_REQ`, cross-checked against the aMule equivalents.
 - `Equivalent behavior`: `crates/overlord-agent-emule/src/agent.rs` now exposes coordinator-triggered Kad notes searches end to end; the remaining notes follow-up is richer result modeling for distinct note authors.
