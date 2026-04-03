@@ -19,7 +19,7 @@ use overlord_agent_nat::{
     AgentControlConfig, AgentEd2kConfig, AgentInterface, AgentKadConfig, AgentNatConfig,
     AgentNatP2pConfig, AgentNetworkReport, AgentNetworkingConfig, AgentP2pConfig,
     InterfaceBindingSelection, InterfaceSelectionState, MappingExposure, MappingSpec,
-    NatCapableAgent, NatManager, NatManagerBuilder, NatStatusSnapshot,
+    NatCapableAgent, NatManager, NatManagerBuilder, NatStatus, NatStatusSnapshot,
     ResolvedInterfaceBindingReport, TransportProtocol, build_interface_binding_report,
     built_in_upnp_port_mapping_providers, default_upnp_backend_order, detect_interfaces,
     recommend_interface, resolve_bind_ip,
@@ -69,7 +69,10 @@ use crate::ed2k_tcp::{
     Ed2kHelloIdentity, Ed2kSecureIdent, FirewallCheckUdpRequest, emule_connect_options,
     enrich_hello_identity, request_udp_firewall_check, run_ed2k_listener,
 };
-use crate::kad_firewall::{FirewallUdpPacketOutcome, FirewalledResponseOutcome, KadFirewallState};
+use crate::kad_firewall::{
+    ExternalPortDiscoveryOutcome, FirewallUdpPacketOutcome, FirewalledResponseOutcome,
+    KadFirewallState,
+};
 use crate::kad_store::{KadLocalStore, KadLocalStoreConfig};
 use crate::logging::current_log_file_status;
 use crate::snoop_queue::{ScheduledSnoopRequest, SnoopQueue, SnoopQueueFamilyCounts};
@@ -100,6 +103,8 @@ const PASSIVE_SOURCE_THIN_RESULT_THRESHOLD: usize = 3;
 const PASSIVE_NOTES_THIN_RESULT_THRESHOLD: usize = 3;
 const KAD_HELLO_INTRO_SECS: u64 = 30;
 const KAD_HELLO_INTRO_FANOUT: usize = 24;
+const KAD_EXTERNAL_PORT_DISCOVERY_MAX_ATTEMPTS: usize = 8;
+const KAD_EXTERNAL_PORT_DISCOVERY_QUERY_TIMEOUT_SECS: u64 = 3;
 const EMULE_LARGE_FILE_SIZE_THRESHOLD: u64 = u32::MAX as u64;
 const LOCAL_SEARCH_RESPONSE_LIMIT: usize = 64;
 const FIREWALLED_TCP_PROBE_TIMEOUT_SECS: u64 = 5;
@@ -3684,20 +3689,141 @@ async fn persist_nodes_dat_for(dht: &DhtNode, state_paths: &AgentStatePaths) -> 
     Ok(())
 }
 
-async fn active_udp_firewall_ports(nat: &NatManager, internal_udp_port: u16) -> Vec<u16> {
-    let status = nat.status().await;
-    let external_udp_port = status
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveUdpFirewallPorts {
+    internal: u16,
+    external: u16,
+}
+
+impl ActiveUdpFirewallPorts {
+    fn expected_ports(self) -> Vec<u16> {
+        let mut ports = vec![self.internal];
+        if self.external != 0 && self.external != self.internal {
+            ports.push(self.external);
+        }
+        ports
+    }
+}
+
+fn nat_external_udp_port(status: &NatStatus) -> Option<u16> {
+    status
         .mappings
         .iter()
         .find(|mapping| mapping.name == "kad" && mapping.protocol == TransportProtocol::Udp)
         .map(|mapping| mapping.external_addr.port())
-        .unwrap_or(internal_udp_port);
+}
 
-    let mut ports = vec![internal_udp_port];
-    if external_udp_port != 0 && external_udp_port != internal_udp_port {
-        ports.push(external_udp_port);
+async fn discover_external_kad_udp_port(
+    dht: &DhtNode,
+    kad_firewall: &Arc<Mutex<KadFirewallState>>,
+) -> u16 {
+    let bind_ip = match dht.bind_addr() {
+        Ok(bind_addr) => match bind_addr.ip() {
+            IpAddr::V4(ip) => ip,
+            IpAddr::V6(_) => return 0,
+        },
+        Err(_) => return 0,
+    };
+
+    {
+        let mut firewall = kad_firewall.lock().await;
+        firewall.begin_external_port_discovery(Utc::now());
     }
-    ports
+
+    let mut contacts = dht
+        .routing_contacts()
+        .await
+        .into_iter()
+        .filter(|contact| {
+            contact.kad_version >= 6 && contact.udp_port != 0 && contact.ip != bind_ip
+        })
+        .collect::<Vec<_>>();
+    contacts.shuffle(&mut rand::thread_rng());
+
+    for contact in contacts
+        .into_iter()
+        .take(KAD_EXTERNAL_PORT_DISCOVERY_MAX_ATTEMPTS)
+    {
+        let needs_discovery = {
+            let firewall = kad_firewall.lock().await;
+            firewall.needs_external_port_discovery()
+        };
+        if !needs_discovery {
+            break;
+        }
+
+        let addr = SocketAddr::new(IpAddr::V4(contact.ip), contact.udp_port);
+        match dht
+            .request_packet(
+                addr,
+                &KadPacket::Ping,
+                opcode::PONG,
+                Duration::from_secs(KAD_EXTERNAL_PORT_DISCOVERY_QUERY_TIMEOUT_SECS),
+            )
+            .await
+        {
+            Ok(KadPacket::Pong(pong)) => {
+                let outcome = {
+                    let mut firewall = kad_firewall.lock().await;
+                    firewall.record_external_port_candidate(addr.ip(), pong.udp_port, Utc::now())
+                };
+                match outcome {
+                    ExternalPortDiscoveryOutcome::Recorded => {
+                        debug!(
+                            "kad external UDP port candidate reporter={} reported_port={}",
+                            addr, pong.udp_port
+                        );
+                    }
+                    ExternalPortDiscoveryOutcome::Resolved(port) => {
+                        info!(
+                            "resolved external Kad UDP port reporter={} external_port={}",
+                            addr, port
+                        );
+                    }
+                    ExternalPortDiscoveryOutcome::Unreliable => {
+                        warn!(
+                            "external Kad UDP port discovery became unreliable after reporter={} reported_port={}",
+                            addr, pong.udp_port
+                        );
+                    }
+                    ExternalPortDiscoveryOutcome::Ignored => {}
+                }
+            }
+            Ok(other) => {
+                debug!(
+                    "unexpected Kad packet while probing external UDP port from {addr}: {other:?}"
+                );
+            }
+            Err(error) => {
+                debug!("failed Kad external UDP port probe against {addr}: {error}");
+            }
+        }
+    }
+
+    let mut firewall = kad_firewall.lock().await;
+    firewall.finish_external_port_discovery(Utc::now());
+    firewall.external_udp_port_for_request()
+}
+
+async fn active_udp_firewall_ports(
+    dht: &DhtNode,
+    nat: &NatManager,
+    kad_firewall: &Arc<Mutex<KadFirewallState>>,
+    internal_udp_port: u16,
+) -> ActiveUdpFirewallPorts {
+    let status = nat.status().await;
+    if let Some(external_udp_port) = nat_external_udp_port(&status) {
+        return ActiveUdpFirewallPorts {
+            internal: internal_udp_port,
+            external: external_udp_port,
+        };
+    }
+
+    let external_udp_port = discover_external_kad_udp_port(dht, kad_firewall).await;
+    ActiveUdpFirewallPorts {
+        internal: internal_udp_port,
+        external: external_udp_port,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -5330,7 +5456,9 @@ impl OverlordAgentEmule {
                         continue;
                     }
                 };
-                let expected_ports = active_udp_firewall_ports(&nat, bind_addr.port()).await;
+                let active_ports =
+                    active_udp_firewall_ports(&dht, &nat, &kad_firewall, bind_addr.port()).await;
+                let expected_ports = active_ports.expected_ports();
                 let started_at = Utc::now();
                 {
                     let mut firewall = kad_firewall.lock().await;
@@ -5343,8 +5471,8 @@ impl OverlordAgentEmule {
                     }
                 }
 
-                let internal_udp_port = bind_addr.port();
-                let external_udp_port = *expected_ports.last().unwrap_or(&bind_addr.port());
+                let internal_udp_port = active_ports.internal;
+                let external_udp_port = active_ports.external;
                 info!(
                     "starting kad udp firewall-check helpers={} internal_port={} external_port={}",
                     helper_contacts.len(),

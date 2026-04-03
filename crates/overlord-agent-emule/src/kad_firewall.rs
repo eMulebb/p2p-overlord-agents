@@ -47,6 +47,7 @@ enum HelperOutcome {
 }
 
 const TCP_FIREWALL_RECHECK_LIMIT: usize = 4;
+const EXTERNAL_PORT_DISCOVERY_REPORTERS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UdpFirewallCheckRound {
@@ -59,6 +60,12 @@ struct UdpFirewallCheckRound {
 struct TcpFirewallCheckRound {
     active_helpers: HashSet<IpAddr>,
     completed_checks: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalPortDiscoveryRound {
+    reporter_ips: HashSet<IpAddr>,
+    reported_ports: Vec<u16>,
 }
 
 /// Process-local Kad firewall verification state.
@@ -88,8 +95,16 @@ pub struct KadFirewallState {
     pub last_tcp_check_completed_at: Option<DateTime<Utc>>,
     /// External IP most recently reported by a `KADEMLIA_FIREWALLED_RES` helper.
     pub last_reported_external_ip: Option<String>,
+    /// Timestamp of the most recent external Kad UDP port discovery start.
+    pub last_external_port_probe_started_at: Option<DateTime<Utc>>,
+    /// Timestamp of the most recent completed external Kad UDP port discovery round.
+    pub last_external_port_probe_completed_at: Option<DateTime<Utc>>,
+    /// Most recent external Kad UDP port candidate reported by a PONG responder.
+    pub last_reported_external_udp_port: Option<u16>,
     active_round: Option<UdpFirewallCheckRound>,
     active_tcp_round: Option<TcpFirewallCheckRound>,
+    active_external_port_discovery: Option<ExternalPortDiscoveryRound>,
+    discovered_external_udp_port: Option<u16>,
 }
 
 /// Result of processing a `KADEMLIA2_FIREWALLUDP` packet for the active round.
@@ -114,7 +129,108 @@ pub enum FirewalledResponseOutcome {
     Ignored,
 }
 
+/// Result of processing one external Kad UDP port candidate from a PONG reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalPortDiscoveryOutcome {
+    /// The candidate was recorded, but more reporter IPs are still needed.
+    Recorded,
+    /// Two unique reporters agreed on the same external UDP port.
+    Resolved(u16),
+    /// Three unique reporters disagreed, so the external port is treated as unreliable.
+    Unreliable,
+    /// The candidate did not apply to an active discovery round.
+    Ignored,
+}
+
 impl KadFirewallState {
+    /// Start one oracle-style external Kad UDP port discovery round.
+    ///
+    /// The oracle samples up to three unique `KADEMLIA2_PONG` reporters and
+    /// accepts the external port once two reporters agree. Otherwise the
+    /// external port is treated as unreliable for the current firewall-check
+    /// round and helpers should only probe the internal UDP port.
+    pub fn begin_external_port_discovery(&mut self, started_at: DateTime<Utc>) {
+        self.last_external_port_probe_started_at = Some(started_at);
+        self.last_external_port_probe_completed_at = None;
+        self.last_reported_external_udp_port = None;
+        self.discovered_external_udp_port = None;
+        self.active_external_port_discovery = Some(ExternalPortDiscoveryRound {
+            reporter_ips: HashSet::new(),
+            reported_ports: Vec::new(),
+        });
+    }
+
+    /// Return whether the current firewall-check round is still waiting for
+    /// enough unique PONG reporters to settle the external UDP port.
+    #[must_use]
+    pub fn needs_external_port_discovery(&self) -> bool {
+        self.active_external_port_discovery.is_some()
+    }
+
+    /// Record one external UDP port candidate reported by a unique PONG responder.
+    pub fn record_external_port_candidate(
+        &mut self,
+        reporter_ip: IpAddr,
+        reported_port: u16,
+        observed_at: DateTime<Utc>,
+    ) -> ExternalPortDiscoveryOutcome {
+        if reported_port == 0 {
+            return ExternalPortDiscoveryOutcome::Ignored;
+        }
+        let Some(round) = &mut self.active_external_port_discovery else {
+            return ExternalPortDiscoveryOutcome::Ignored;
+        };
+        if !round.reporter_ips.insert(reporter_ip) {
+            return ExternalPortDiscoveryOutcome::Ignored;
+        }
+
+        self.last_helper_ip = Some(reporter_ip.to_string());
+        self.last_reported_external_udp_port = Some(reported_port);
+
+        if round.reported_ports.contains(&reported_port) {
+            self.discovered_external_udp_port = Some(reported_port);
+            self.last_external_port_probe_completed_at = Some(observed_at);
+            self.last_error = None;
+            self.active_external_port_discovery = None;
+            return ExternalPortDiscoveryOutcome::Resolved(reported_port);
+        }
+
+        round.reported_ports.push(reported_port);
+        if round.reporter_ips.len() >= EXTERNAL_PORT_DISCOVERY_REPORTERS {
+            self.discovered_external_udp_port = None;
+            self.last_external_port_probe_completed_at = Some(observed_at);
+            self.last_error =
+                Some("external Kad UDP port discovery returned inconsistent ports".to_string());
+            self.active_external_port_discovery = None;
+            return ExternalPortDiscoveryOutcome::Unreliable;
+        }
+
+        ExternalPortDiscoveryOutcome::Recorded
+    }
+
+    /// Finalize one external Kad UDP port discovery round after the caller
+    /// stops waiting for more PONG replies.
+    pub fn finish_external_port_discovery(&mut self, completed_at: DateTime<Utc>) {
+        if self.active_external_port_discovery.is_none() {
+            return;
+        }
+        self.last_external_port_probe_completed_at = Some(completed_at);
+        if self.discovered_external_udp_port.is_none() {
+            self.last_error = Some("external Kad UDP port discovery timed out".to_string());
+        }
+        self.active_external_port_discovery = None;
+    }
+
+    /// Return the external UDP port that should be written into
+    /// `OP_FWCHECKUDPREQ`.
+    ///
+    /// Returns `0` when the current firewall-check round could not establish a
+    /// reliable external UDP port, which matches the oracle's fallback.
+    #[must_use]
+    pub fn external_udp_port_for_request(&self) -> u16 {
+        self.discovered_external_udp_port.unwrap_or_default()
+    }
+
     /// Ensure the oracle-style TCP firewall/IP recheck loop matches the current
     /// local TCP-firewalled verdict.
     pub fn refresh_tcp_recheck(&mut self, tcp_firewalled: bool, started_at: DateTime<Utc>) {
@@ -147,6 +263,7 @@ impl KadFirewallState {
             return false;
         };
         if round.completed_checks >= TCP_FIREWALL_RECHECK_LIMIT
+            || round.active_helpers.len() >= TCP_FIREWALL_RECHECK_LIMIT
             || round.active_helpers.contains(&helper_ip)
         {
             return false;
@@ -385,7 +502,10 @@ fn finalize_round(
 
 #[cfg(test)]
 mod tests {
-    use super::{FirewallUdpPacketOutcome, FirewalledResponseOutcome, KadFirewallState};
+    use super::{
+        ExternalPortDiscoveryOutcome, FirewallUdpPacketOutcome, FirewalledResponseOutcome,
+        KadFirewallState,
+    };
     use chrono::{TimeZone, Utc};
 
     #[test]
@@ -445,6 +565,68 @@ mod tests {
             state.last_error.as_deref(),
             Some("all UDP firewall-check TCP requests failed")
         );
+    }
+
+    #[test]
+    fn external_port_discovery_resolves_after_two_matching_reporters() {
+        let mut state = KadFirewallState::default();
+        let started_at = Utc.with_ymd_and_hms(2026, 4, 3, 2, 0, 0).unwrap();
+        let observed_at = Utc.with_ymd_and_hms(2026, 4, 3, 2, 0, 2).unwrap();
+
+        state.begin_external_port_discovery(started_at);
+        assert_eq!(
+            state.record_external_port_candidate(
+                "203.0.113.10".parse().unwrap(),
+                52123,
+                observed_at
+            ),
+            ExternalPortDiscoveryOutcome::Recorded
+        );
+        assert_eq!(
+            state.record_external_port_candidate(
+                "203.0.113.11".parse().unwrap(),
+                52123,
+                observed_at
+            ),
+            ExternalPortDiscoveryOutcome::Resolved(52123)
+        );
+        assert_eq!(state.external_udp_port_for_request(), 52123);
+        assert!(!state.needs_external_port_discovery());
+    }
+
+    #[test]
+    fn external_port_discovery_marks_inconsistent_reports_unreliable() {
+        let mut state = KadFirewallState::default();
+        let started_at = Utc.with_ymd_and_hms(2026, 4, 3, 2, 1, 0).unwrap();
+        let observed_at = Utc.with_ymd_and_hms(2026, 4, 3, 2, 1, 3).unwrap();
+
+        state.begin_external_port_discovery(started_at);
+        assert_eq!(
+            state.record_external_port_candidate(
+                "203.0.113.10".parse().unwrap(),
+                52123,
+                observed_at
+            ),
+            ExternalPortDiscoveryOutcome::Recorded
+        );
+        assert_eq!(
+            state.record_external_port_candidate(
+                "203.0.113.11".parse().unwrap(),
+                52124,
+                observed_at
+            ),
+            ExternalPortDiscoveryOutcome::Recorded
+        );
+        assert_eq!(
+            state.record_external_port_candidate(
+                "203.0.113.12".parse().unwrap(),
+                52125,
+                observed_at
+            ),
+            ExternalPortDiscoveryOutcome::Unreliable
+        );
+        assert_eq!(state.external_udp_port_for_request(), 0);
+        assert!(!state.needs_external_port_discovery());
     }
 
     #[test]
