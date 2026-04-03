@@ -1985,11 +1985,7 @@ impl SearchExpressionParser {
 
     fn parse_expression(&mut self, min_precedence: u8) -> Result<SearchExprNode> {
         let mut lhs = self.parse_primary()?;
-        loop {
-            let (operator, precedence, implicit) = match self.peek_binary_operator() {
-                Some(operator) => operator,
-                None => break,
-            };
+        while let Some((operator, precedence, implicit)) = self.peek_binary_operator() {
             if precedence < min_precedence {
                 break;
             }
