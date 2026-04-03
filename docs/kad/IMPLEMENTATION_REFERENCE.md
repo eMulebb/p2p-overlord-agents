@@ -37,13 +37,16 @@ This file is maintained in the current Overlord workspace under `overlord-agents
 
 ## 1. Goals
 
-Build a fully wire-compatible eMule Kad2 core and Overlord agent integration in Rust that can:
+Build a fully wire-compatible eMule-family Kad2 and ED2K implementation in Rust
+that can:
 
 - Join and participate in the live eMule Kad2 DHT network
 - Search for files by keyword
 - Find sources (peers) for a known file hash
 - Fetch file notes (ratings/comments)
 - Publish file availability and keywords into the DHT
+- Maintain an ED2K server session with oracle-like search and source-search behavior
+- Progress toward native ED2K peer transfer parity for upload and download
 - Feed the coordinator with search and passive-crawl results
 - Expose agent control and status through the internal Overlord agent HTTP surface
 - Run as a foreground process (lifecycle managed by external tools)
@@ -58,9 +61,8 @@ See [§20 Future Work](#20-future-work) for detailed notes on each item.
 | Feature | Status |
 |---|---|
 | Kad1 (legacy protocol) | Intentionally omitted |
-| ed2k server protocol (TCP to central servers) | Phase 2+ |
-| ed2k peer TCP transfer (actual file download) | Phase 2 |
-| AICH hash tree computation | Phase 2 |
+| Full ED2K server and peer transfer parity | Staged active work, not out of scope |
+| AICH hash tree computation | Deferred behind initial transfer parity |
 | Firewall buddy system / NAT callback | Phase 3 |
 | IPv6 | Future |
 | GUI / system tray | Out of scope for this repo |
@@ -875,16 +877,20 @@ Crates: `overlord-agent-common`, `overlord-agent-emule`
 
 **Milestone**: Kad agent runs inside Overlord and exchanges results with the coordinator.
 
-### Phase 5+ — Download / ED2K (separate planning)
+### Phase 5+ — ED2K transfer and sharing parity
 
 Crate: TBD
 
-- ed2k peer TCP protocol
+- ED2K peer TCP protocol
 - Slot negotiation
 - Chunk request/response
 - MD4 + AICH verification
 - Download queue
-- Integration with index (mark files as downloaded)
+- Upload queue and shared-file serving
+- Integration with index (mark files as downloaded/shared)
+
+**Milestone**: Native ED2K searching, sharing, upload, and download behavior
+converges toward oracle parity without relying on an external downloader.
 
 ---
 
