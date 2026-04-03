@@ -10,6 +10,7 @@ parity, including searching, sharing, upload, and download behavior.
 ## Core Reference
 
 - [Implementation Reference](./IMPLEMENTATION_REFERENCE.md)
+- [KV6_001 Kad2 IPv6 Design](./KV6_001_KAD2_IPV6_DESIGN.md)
 - [Protocol Reference](./PROTOCOL_REFERENCE.md)
 - [Wire Sequences](./WIRE_SEQUENCES.md)
 

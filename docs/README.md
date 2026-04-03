@@ -11,6 +11,7 @@ direction is explicit.
 
 - [Kad Docs Landing Page](./kad/README.md)
 - [Implementation Reference](./kad/IMPLEMENTATION_REFERENCE.md)
+- [KV6_001 Kad2 IPv6 Design](./kad/KV6_001_KAD2_IPV6_DESIGN.md)
 - [Protocol Reference](./kad/PROTOCOL_REFERENCE.md)
 - [Parity Notes](./kad/PARITY_NOTES.md)
 - [Observations](./kad/OBSERVATIONS.md)
@@ -23,6 +24,7 @@ direction is explicit.
   reference set while parity is still being built out.
 - [Kad Docs Landing Page](./kad/README.md)
 - [Implementation Reference](./kad/IMPLEMENTATION_REFERENCE.md)
+- [KV6_001 Kad2 IPv6 Design](./kad/KV6_001_KAD2_IPV6_DESIGN.md)
 - [Protocol Reference](./kad/PROTOCOL_REFERENCE.md)
 - [Observations](./kad/OBSERVATIONS.md)
 - [Wire Sequences](./kad/WIRE_SEQUENCES.md)

@@ -976,6 +976,15 @@ tokio-stream = "0.1"
 > **FUTURE(ipv6)**: All address types currently use `Ipv4Addr`. IPv6 would require
 > dual-stack socket handling and separate routing table instances.
 
+### `KV6_001` — Kad2 IPv6-Compatible Overlay
+
+> **FUTURE(kv6_001)**: See [KV6_001 Kad2 IPv6 Design](./KV6_001_KAD2_IPV6_DESIGN.md).
+> The recommended model is a dual-overlay design:
+> - preserve classic `kad4` wire compatibility
+> - add a new IPv6-capable `kad6` overlay with Kad2-equivalent semantics
+> - share routing and lookup quality improvements across both overlays without
+>   breaking legacy packet compatibility
+
 ### AICH Hash Tree
 
 > **FUTURE(aich)**: The Advanced Intelligent Corruption Handler hash tree is needed for
