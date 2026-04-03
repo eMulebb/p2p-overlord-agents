@@ -1375,6 +1375,7 @@ pub async fn search_source_servers(
             hello_identity,
             shared_catalog,
             file_hash,
+            _file_size,
             idle_timeout,
             cancel,
         )
@@ -1536,12 +1537,14 @@ async fn search_keyword_on_server(
     Ok(results)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn search_sources_on_server(
     bind_ip: Ipv4Addr,
     server: &ResolvedServerEntry,
     hello_identity: Ed2kHelloIdentity,
     shared_catalog: &[PopularHash],
     file_hash: Ed2kHash,
+    file_size: u64,
     idle_timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<Vec<Ed2kFoundSource>> {
@@ -1614,11 +1617,15 @@ async fn search_sources_on_server(
                     ServerSessionPhase::SearchActive,
                     format!("dispatching source search file_hash={file_hash}"),
                 );
-                session.send_packet(OP_GETSOURCES, &file_hash.0).await?;
+                let source_request = encode_source_request(file_hash, file_size);
+                let opcode =
+                    source_request_opcode(login_identity.connect_options, session.server_flags);
+                session.send_packet(opcode, &source_request).await?;
             }
             OP_FOUNDSOURCES | OP_FOUNDSOURCES_OBFU => {
                 let results =
                     decode_found_sources(&packet.payload, packet.opcode == OP_FOUNDSOURCES_OBFU)?;
+                validate_found_sources(&results, file_hash)?;
                 session.set_phase(
                     ServerSessionPhase::Completed,
                     format!(
@@ -1996,6 +2003,19 @@ fn decode_found_sources(payload: &[u8], obfuscated: bool) -> Result<Vec<Ed2kFoun
     Ok(results)
 }
 
+fn validate_found_sources(results: &[Ed2kFoundSource], expected_file_hash: Ed2kHash) -> Result<()> {
+    for source in results {
+        if source.file_hash != expected_file_hash {
+            anyhow::bail!(
+                "ED2K found-sources reply referenced unexpected file hash {} expected {}",
+                source.file_hash,
+                expected_file_hash
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn clear_server_connection_state(state: &Arc<RwLock<Ed2kServerState>>) {
     let mut guard = state.write().await;
     guard.connected = false;
@@ -2132,6 +2152,32 @@ fn encode_search_string_param(payload: &mut Vec<u8>, value: &str) -> Result<()> 
     payload.extend_from_slice(&value_len.to_le_bytes());
     payload.extend_from_slice(value_bytes);
     Ok(())
+}
+
+/// Encode the oracle-shaped ED2K local-server source request payload.
+///
+/// Modern eMule sends the file hash plus file size in the TCP local-server
+/// source-request path. Large files use the `0` sentinel followed by a `u64`.
+fn encode_source_request(file_hash: Ed2kHash, file_size: u64) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(28);
+    payload.extend_from_slice(&file_hash.0);
+    if file_size > u64::from(u32::MAX) {
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&file_size.to_le_bytes());
+    } else {
+        payload.extend_from_slice(&(file_size as u32).to_le_bytes());
+    }
+    payload
+}
+
+fn source_request_opcode(connect_options: u8, server_flags: Option<u32>) -> u8 {
+    if connect_options != 0
+        && server_flags.unwrap_or_default() & SERVER_TCP_FLAG_TCPOBFUSCATION != 0
+    {
+        OP_GETSOURCES_OBFU
+    } else {
+        OP_GETSOURCES
+    }
 }
 
 fn offered_files_catalog(shared_catalog: &[PopularHash]) -> Vec<([u8; 16], String, u32, u8)> {
@@ -2935,15 +2981,17 @@ mod tests {
         EMULE_VERSION_MINOR, EMULE_VERSION_UPDATE, Ed2kFoundSource, Ed2kHash, Ed2kSearchFile,
         Ed2kServerState, FT_FILENAME, FT_FILESIZE, FT_FILETYPE, FT_SOURCES, HELLO_NICKNAME,
         OFFER_FILE_SAMPLE_HASH, OFFER_FILE_SAMPLE_NAME, OFFER_FILE_SAMPLE_SIZE, OP_EDONKEYPROT,
-        OP_GETSERVERLIST, OP_LOGINREQUEST, OP_OFFERFILES, OP_PACKEDPROT, ResolvedServerEntry,
-        SERVER_OBFUSCATION_PRIME_BYTES, SERVER_OBFUSCATION_PUBLIC_KEY_LEN,
-        SERVER_TCP_FLAG_COMPRESSION, SERVER_TCP_FLAG_LARGEFILES, SERVER_UDP_FLAG_UDPOBFUSCATION,
-        ST_DESCRIPTION, ST_SERVERNAME, ServerSession, TAG_SHORT_NAME_MASK, TAGTYPE_UINT32,
-        biguint_to_fixed_be, decode_found_sources, decode_search_result_page,
-        decode_search_results, decode_server_ident, decode_server_payload, derive_server_cipher,
-        encode_login_request, encode_offer_files_payload, encode_packet, encode_search_request,
+        OP_GETSERVERLIST, OP_GETSOURCES, OP_GETSOURCES_OBFU, OP_LOGINREQUEST, OP_OFFERFILES,
+        OP_PACKEDPROT, ResolvedServerEntry, SERVER_OBFUSCATION_PRIME_BYTES,
+        SERVER_OBFUSCATION_PUBLIC_KEY_LEN, SERVER_TCP_FLAG_COMPRESSION, SERVER_TCP_FLAG_LARGEFILES,
+        SERVER_TCP_FLAG_TCPOBFUSCATION, SERVER_UDP_FLAG_UDPOBFUSCATION, ST_DESCRIPTION,
+        ST_SERVERNAME, ServerSession, TAG_SHORT_NAME_MASK, TAGTYPE_UINT32, biguint_to_fixed_be,
+        decode_found_sources, decode_search_result_page, decode_search_results,
+        decode_server_ident, decode_server_payload, derive_server_cipher, encode_login_request,
+        encode_offer_files_payload, encode_packet, encode_search_request, encode_source_request,
         format_server_flags, login_identity_for_server_transport, new_ed2k_server_search_channel,
         search_keyword_via_background_session, server_capabilities, should_use_server_obfuscation,
+        source_request_opcode, validate_found_sources,
     };
     use crate::ed2k_tcp::{Ed2kHelloIdentity, emule_connect_options};
     use flate2::{Compression, write::ZlibEncoder};
@@ -3364,6 +3412,61 @@ mod tests {
                 user_hash: None,
             }]
         );
+    }
+
+    #[test]
+    fn source_request_encoding_includes_u32_size_for_small_files() {
+        let payload = encode_source_request(Ed2kHash([0xAB; 16]), 734_003_200);
+
+        assert_eq!(&payload[..16], &[0xAB; 16]);
+        assert_eq!(
+            u32::from_le_bytes(payload[16..20].try_into().unwrap()),
+            734_003_200
+        );
+        assert_eq!(payload.len(), 20);
+    }
+
+    #[test]
+    fn source_request_encoding_uses_large_file_sentinel() {
+        let payload = encode_source_request(Ed2kHash([0xCD; 16]), 4_294_967_301);
+
+        assert_eq!(&payload[..16], &[0xCD; 16]);
+        assert_eq!(u32::from_le_bytes(payload[16..20].try_into().unwrap()), 0);
+        assert_eq!(
+            u64::from_le_bytes(payload[20..28].try_into().unwrap()),
+            4_294_967_301
+        );
+    }
+
+    #[test]
+    fn source_request_opcode_uses_obfuscated_variant_when_supported() {
+        assert_eq!(
+            source_request_opcode(0x01, Some(SERVER_TCP_FLAG_TCPOBFUSCATION)),
+            OP_GETSOURCES_OBFU
+        );
+        assert_eq!(
+            source_request_opcode(0x00, Some(SERVER_TCP_FLAG_TCPOBFUSCATION)),
+            OP_GETSOURCES
+        );
+    }
+
+    #[test]
+    fn found_sources_validation_rejects_hash_mismatch() {
+        let error = validate_found_sources(
+            &[Ed2kFoundSource {
+                file_hash: Ed2kHash([0xAA; 16]),
+                ip: Ipv4Addr::new(1, 2, 3, 4),
+                tcp_port: 4662,
+                obfuscated: false,
+                obfuscation_options: None,
+                user_hash: None,
+            }],
+            Ed2kHash([0xBB; 16]),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("unexpected file hash"));
     }
 
     #[tokio::test]
