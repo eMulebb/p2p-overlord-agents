@@ -58,7 +58,7 @@ use overlord_kad_proto::{
     packet::ContactEntry,
     tag_name,
 };
-use overlord_kad_routing::Contact;
+use overlord_kad_routing::{Contact, ContactType};
 
 use crate::config::EmuleAgentConfig;
 use crate::ed2k_server::{
@@ -105,6 +105,7 @@ const KAD_HELLO_INTRO_SECS: u64 = 30;
 const KAD_HELLO_INTRO_FANOUT: usize = 24;
 const KAD_EXTERNAL_PORT_DISCOVERY_MAX_ATTEMPTS: usize = 8;
 const KAD_EXTERNAL_PORT_DISCOVERY_QUERY_TIMEOUT_SECS: u64 = 3;
+const UDP_FIREWALL_HELPER_CANDIDATE_MULTIPLIER: usize = 4;
 const EMULE_LARGE_FILE_SIZE_THRESHOLD: u64 = u32::MAX as u64;
 const LOCAL_SEARCH_RESPONSE_LIMIT: usize = 64;
 const FIREWALLED_TCP_PROBE_TIMEOUT_SECS: u64 = 5;
@@ -4075,10 +4076,12 @@ async fn select_udp_firewall_helpers(dht: &DhtNode, helper_count: usize) -> Resu
             contact.kad_version >= 6
                 && contact.tcp_port != 0
                 && contact.udp_port != 0
+                && contact.contact_type != ContactType::Dead
                 && IpAddr::V4(contact.ip) != local_ip
         })
         .collect::<Vec<_>>();
     contacts.shuffle(&mut rand::thread_rng());
+    contacts.sort_by_key(|contact| std::cmp::Reverse(score_udp_firewall_helper(contact)));
 
     let mut selected = Vec::with_capacity(helper_count);
     let mut seen_ips = std::collections::HashSet::new();
@@ -4091,6 +4094,17 @@ async fn select_udp_firewall_helpers(dht: &DhtNode, helper_count: usize) -> Resu
         }
     }
     Ok(selected)
+}
+
+fn score_udp_firewall_helper(contact: &Contact) -> (u8, u8, u8, u8, u8, u8) {
+    (
+        u8::from(contact.contact_type == ContactType::Active),
+        u8::from(contact.verified),
+        u8::from(!contact.tcp_firewalled),
+        u8::from(!contact.udp_firewalled),
+        u8::from(contact.udp_key != KadUdpKey::ZERO),
+        contact.kad_version,
+    )
 }
 
 async fn tcp_firewall_probe(addr: SocketAddr, timeout: Duration) -> Result<()> {
@@ -5435,15 +5449,19 @@ impl OverlordAgentEmule {
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
-                let helper_contacts =
-                    match select_udp_firewall_helpers(&dht, udp_firewall_check_contact_count).await
-                    {
-                        Ok(contacts) => contacts,
-                        Err(error) => {
-                            debug!("kad firewall-check helper selection failed: {error}");
-                            continue;
-                        }
-                    };
+                let helper_contacts = match select_udp_firewall_helpers(
+                    &dht,
+                    udp_firewall_check_contact_count
+                        .saturating_mul(UDP_FIREWALL_HELPER_CANDIDATE_MULTIPLIER),
+                )
+                .await
+                {
+                    Ok(contacts) => contacts,
+                    Err(error) => {
+                        debug!("kad firewall-check helper selection failed: {error}");
+                        continue;
+                    }
+                };
                 if helper_contacts.is_empty() {
                     debug!("kad firewall-check skipped: no helper contacts available");
                     continue;
@@ -5474,7 +5492,8 @@ impl OverlordAgentEmule {
                 let internal_udp_port = active_ports.internal;
                 let external_udp_port = active_ports.external;
                 info!(
-                    "starting kad udp firewall-check helpers={} internal_port={} external_port={}",
+                    "starting kad udp firewall-check target_helpers={} candidate_helpers={} internal_port={} external_port={}",
+                    udp_firewall_check_contact_count,
                     helper_contacts.len(),
                     internal_udp_port,
                     external_udp_port

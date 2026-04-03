@@ -65,6 +65,7 @@ const OP_SECIDENTSTATE: u8 = 0x87;
 const OP_FWCHECKUDPREQ: u8 = 0xA7;
 const TCP_PACKET_HEADER_LEN: usize = 6;
 const ED2K_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const FIREWALL_HELPER_POST_REQUEST_KEEPALIVE_SECS: u64 = 10;
 
 const EMULE_PROTOCOL_VERSION: u8 = 0x01;
 const EDONKEY_VERSION: u32 = 0x3C;
@@ -899,7 +900,10 @@ pub async fn request_udp_firewall_check(
     // Keep the helper TCP session around briefly so peers that finish their
     // hello side channel after receiving the request do not see an immediate
     // disconnect before scheduling the UDP callback.
-    let post_fwcheck_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let post_fwcheck_deadline = tokio::time::Instant::now()
+        + timeout.min(Duration::from_secs(
+            FIREWALL_HELPER_POST_REQUEST_KEEPALIVE_SECS,
+        ));
     while tokio::time::Instant::now() < post_fwcheck_deadline {
         let remaining =
             post_fwcheck_deadline.saturating_duration_since(tokio::time::Instant::now());
