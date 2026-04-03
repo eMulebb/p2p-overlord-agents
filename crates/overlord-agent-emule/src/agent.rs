@@ -65,6 +65,7 @@ use crate::ed2k_server::{
     Ed2kFoundSource, Ed2kSearchFile, Ed2kServerSearchHandle, Ed2kServerState, Ed2kSharedCatalog,
     new_ed2k_server_search_channel, run_ed2k_server_loop, search_keyword_servers,
     search_keyword_via_background_session, search_source_servers,
+    search_source_via_background_session,
 };
 use crate::ed2k_tcp::{
     Ed2kHelloIdentity, Ed2kSecureIdent, FirewallCheckUdpRequest, emule_connect_options,
@@ -2624,6 +2625,7 @@ async fn do_active_ed2k_source_search(
     shared_catalog: &[PopularHash],
     job: &SearchJob,
     config: &EmuleAgentConfig,
+    background_search: Option<Ed2kServerSearchHandle>,
     preferred_endpoint: Option<SocketAddr>,
     cancel: CancellationToken,
 ) -> Result<SearchRunStats> {
@@ -2640,21 +2642,88 @@ async fn do_active_ed2k_source_search(
     };
     let file_hash = search_file_hash(job)?;
     let file_size = search_file_size(job)?;
-    let files = search_source_servers(
-        bind_ip,
-        &config.p2p.ed2k,
-        hello_identity,
-        shared_catalog,
-        preferred_endpoint,
-        ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
-        file_hash,
-        file_size,
-        &cancel,
-    )
-    .await?
-    .into_iter()
-    .map(|result| map_ed2k_source_result(&result, file_size))
-    .collect();
+    let files = if let Some(background_search) = background_search {
+        match search_source_via_background_session(
+            &background_search,
+            file_hash,
+            file_size,
+            Duration::from_secs(config.p2p.ed2k.connect_timeout_secs.max(5)),
+            &cancel,
+        )
+        .await
+        {
+            Ok(results) if !results.is_empty() => {
+                info!(
+                    "ED2K active source search used background session endpoint={} file_hash={} source_count={}",
+                    preferred_endpoint
+                        .map(|endpoint| endpoint.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    file_hash,
+                    results.len()
+                );
+                results
+                    .into_iter()
+                    .map(|result| map_ed2k_source_result(&result, file_size))
+                    .collect()
+            }
+            Ok(_) => {
+                warn!(
+                    "ED2K background session source search returned no sources for file_hash={file_hash}; falling back to one-shot search"
+                );
+                search_source_servers(
+                    bind_ip,
+                    &config.p2p.ed2k,
+                    hello_identity,
+                    shared_catalog,
+                    preferred_endpoint,
+                    ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
+                    file_hash,
+                    file_size,
+                    &cancel,
+                )
+                .await?
+                .into_iter()
+                .map(|result| map_ed2k_source_result(&result, file_size))
+                .collect()
+            }
+            Err(error) => {
+                warn!(
+                    "ED2K background session source search failed for file_hash={file_hash}; falling back to one-shot search: {error}"
+                );
+                search_source_servers(
+                    bind_ip,
+                    &config.p2p.ed2k,
+                    hello_identity,
+                    shared_catalog,
+                    preferred_endpoint,
+                    ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
+                    file_hash,
+                    file_size,
+                    &cancel,
+                )
+                .await?
+                .into_iter()
+                .map(|result| map_ed2k_source_result(&result, file_size))
+                .collect()
+            }
+        }
+    } else {
+        search_source_servers(
+            bind_ip,
+            &config.p2p.ed2k,
+            hello_identity,
+            shared_catalog,
+            preferred_endpoint,
+            ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
+            file_hash,
+            file_size,
+            &cancel,
+        )
+        .await?
+        .into_iter()
+        .map(|result| map_ed2k_source_result(&result, file_size))
+        .collect()
+    };
     let mut stats = SearchRunStats::default();
     post_search_batch(
         &callback_client,
@@ -5002,12 +5071,13 @@ impl IndexerService for OverlordAgentEmule {
                     .await
                 }
                 (Protocol::Ed2k, SearchKind::Source) => {
-                    let preferred_endpoint = {
+                    let (preferred_endpoint, background_search) = {
                         let server_state = ed2k_server_state.read().await;
-                        server_state
-                            .connected
-                            .then_some(server_state.endpoint)
-                            .flatten()
+                        if server_state.connected {
+                            (server_state.endpoint, Some(ed2k_server_search.clone()))
+                        } else {
+                            (None, None)
+                        }
                     };
                     do_active_ed2k_source_search(
                         bind_ip,
@@ -5016,6 +5086,7 @@ impl IndexerService for OverlordAgentEmule {
                         &ed2k_shared_catalog,
                         &job,
                         &config_snapshot,
+                        background_search,
                         preferred_endpoint,
                         cancel.clone(),
                     )

@@ -10,6 +10,7 @@
 //!   transition so the server sees a credible `OP_OFFERFILES`
 //! - process `OP_IDCHANGE`, `OP_SERVERSTATUS`, and a few informational replies
 //! - execute keyword searches with oracle-style query trees and `More` paging
+//! - execute server source searches through the same long-lived TCP session
 //! - keep the TCP session alive with empty `OP_OFFERFILES` packets
 
 use std::{
@@ -420,33 +421,49 @@ pub struct Ed2kFoundSource {
 pub type Ed2kSharedCatalog = Arc<RwLock<Vec<PopularHash>>>;
 
 type BackgroundKeywordSearchResponse = std::result::Result<Vec<Ed2kSearchFile>, String>;
+type BackgroundSourceSearchResponse = std::result::Result<Vec<Ed2kFoundSource>, String>;
 
 /// Handle used by active jobs to execute a keyword search through the
 /// long-lived ED2K background session.
 #[derive(Clone)]
 pub struct Ed2kServerSearchHandle {
-    sender: mpsc::Sender<BackgroundKeywordSearchRequest>,
+    sender: mpsc::Sender<BackgroundServerSearchRequest>,
 }
 
 /// Inbox owned by the long-lived ED2K background server task.
 pub struct Ed2kServerSearchInbox {
-    receiver: mpsc::Receiver<BackgroundKeywordSearchRequest>,
+    receiver: mpsc::Receiver<BackgroundServerSearchRequest>,
 }
 
 #[derive(Debug)]
-struct BackgroundKeywordSearchRequest {
-    query: String,
-    timeout: Duration,
-    response: oneshot::Sender<BackgroundKeywordSearchResponse>,
+enum BackgroundServerSearchRequest {
+    Keyword {
+        query: String,
+        timeout: Duration,
+        response: oneshot::Sender<BackgroundKeywordSearchResponse>,
+    },
+    Source {
+        file_hash: Ed2kHash,
+        file_size: u64,
+        timeout: Duration,
+        response: oneshot::Sender<BackgroundSourceSearchResponse>,
+    },
 }
 
 #[derive(Debug)]
-struct PendingBackgroundKeywordSearch {
-    query: String,
-    deadline: TokioInstant,
-    results: Vec<Ed2kSearchFile>,
-    page_count: u32,
-    response: oneshot::Sender<BackgroundKeywordSearchResponse>,
+enum PendingBackgroundServerSearch {
+    Keyword {
+        query: String,
+        deadline: TokioInstant,
+        results: Vec<Ed2kSearchFile>,
+        page_count: u32,
+        response: oneshot::Sender<BackgroundKeywordSearchResponse>,
+    },
+    Source {
+        file_hash: Ed2kHash,
+        deadline: TokioInstant,
+        response: oneshot::Sender<BackgroundSourceSearchResponse>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -490,7 +507,7 @@ struct Ed2kServerDumpRecord<'a> {
     note: Option<String>,
 }
 
-/// Creates a bounded request channel for background-session ED2K keyword searches.
+/// Creates a bounded request channel for background-session ED2K server searches.
 #[must_use]
 pub fn new_ed2k_server_search_channel(
     capacity: usize,
@@ -515,7 +532,7 @@ pub async fn search_keyword_via_background_session(
     let (response, receive_response) = oneshot::channel();
     handle
         .sender
-        .send(BackgroundKeywordSearchRequest {
+        .send(BackgroundServerSearchRequest::Keyword {
             query: query.to_string(),
             timeout,
             response,
@@ -529,6 +546,40 @@ pub async fn search_keyword_via_background_session(
             let response = result
                 .with_context(|| format!("timed out waiting for ED2K background search response after {timeout:?}"))?
                 .context("ED2K background search responder dropped")?;
+            response.map_err(anyhow::Error::msg)
+        }
+    }
+}
+
+/// Requests a source search on the already-connected ED2K background session.
+///
+/// This keeps active source lookups on the same server TCP session shape as the
+/// oracle whenever that long-lived session is healthy.
+pub async fn search_source_via_background_session(
+    handle: &Ed2kServerSearchHandle,
+    file_hash: Ed2kHash,
+    file_size: u64,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<Vec<Ed2kFoundSource>> {
+    let (response, receive_response) = oneshot::channel();
+    handle
+        .sender
+        .send(BackgroundServerSearchRequest::Source {
+            file_hash,
+            file_size,
+            timeout,
+            response,
+        })
+        .await
+        .context("ED2K background search channel is closed")?;
+
+    tokio::select! {
+        _ = cancel.cancelled() => Ok(Vec::new()),
+        result = tokio::time::timeout(timeout, receive_response) => {
+            let response = result
+                .with_context(|| format!("timed out waiting for ED2K background source response after {timeout:?}"))?
+                .context("ED2K background source responder dropped")?;
             response.map_err(anyhow::Error::msg)
         }
     }
@@ -1097,32 +1148,55 @@ async fn run_one_server_session(
             request = search_inbox.receiver.recv(), if queued_background_search.is_none() && pending_background_search.is_none() => {
                 if let Some(request) = request {
                     if session.login_accepted {
-                        match start_background_keyword_search(&mut session, request).await {
+                        match start_background_server_search(
+                            &mut session,
+                            context.hello_identity.connect_options,
+                            request,
+                        )
+                        .await
+                        {
                             Ok(pending) => pending_background_search = Some(pending),
-                            Err(error) => warn!("failed to start ED2K background keyword search on {}: {error}", server.base_endpoint()),
+                            Err(error) => warn!("failed to start ED2K background server search on {}: {error}", server.base_endpoint()),
                         }
                     } else {
-                        info!(
-                            "queued ED2K background keyword search query={:?} endpoint={} trace_id={} awaiting login",
-                            request.query,
-                            session.endpoint,
-                            session.trace_id
-                        );
+                        match &request {
+                            BackgroundServerSearchRequest::Keyword { query, .. } => info!(
+                                "queued ED2K background keyword search query={query:?} endpoint={} trace_id={} awaiting login",
+                                session.endpoint,
+                                session.trace_id
+                            ),
+                            BackgroundServerSearchRequest::Source { file_hash, .. } => info!(
+                                "queued ED2K background source search file_hash={} endpoint={} trace_id={} awaiting login",
+                                file_hash,
+                                session.endpoint,
+                                session.trace_id
+                            ),
+                        }
                         queued_background_search = Some(request);
                     }
                 }
             }
             _ = async {
                 if let Some(pending) = pending_background_search.as_ref() {
-                    tokio::time::sleep_until(pending.deadline).await;
+                    let deadline = match pending {
+                        PendingBackgroundServerSearch::Keyword { deadline, .. }
+                        | PendingBackgroundServerSearch::Source { deadline, .. } => *deadline,
+                    };
+                    tokio::time::sleep_until(deadline).await;
                 } else {
                     std::future::pending::<()>().await;
                 }
             }, if pending_background_search.is_some() => {
-                fail_pending_background_search(
-                    &mut pending_background_search,
-                    "ED2K background session search timed out waiting for OP_SEARCHRESULT",
-                );
+                let timeout_error = match pending_background_search.as_ref() {
+                    Some(PendingBackgroundServerSearch::Keyword { .. }) => {
+                        "ED2K background session search timed out waiting for OP_SEARCHRESULT"
+                    }
+                    Some(PendingBackgroundServerSearch::Source { .. }) => {
+                        "ED2K background session search timed out waiting for OP_FOUNDSOURCES"
+                    }
+                    None => unreachable!("pending background search timeout without search"),
+                };
+                fail_pending_background_search(&mut pending_background_search, timeout_error);
             }
             packet = session.read_packet() => {
                 let Some(packet) = packet? else {
@@ -1142,44 +1216,88 @@ async fn run_one_server_session(
                         "{closed_error}"
                     );
                 };
-                if packet.opcode == OP_SEARCHRESULT
-                    && let Some(mut pending) = pending_background_search.take()
-                {
-                    let page = decode_search_result_page(&packet.payload)?;
-                    log_search_result_page(session.endpoint, &page.files);
-                    pending.page_count += 1;
-                    pending.results.extend(page.files);
-                    if page.more_results_available {
-                        session.set_phase(
-                            ServerSessionPhase::AwaitingMore,
-                            format!(
-                                "received background search page {} query={:?}; requesting more",
-                                pending.page_count, pending.query
-                            ),
-                        );
-                        session.send_packet(OP_QUERY_MORE_RESULT, &[]).await?;
-                        pending_background_search = Some(pending);
-                        continue;
+                if let Some(pending) = pending_background_search.take() {
+                    match (packet.opcode, pending) {
+                        (OP_SEARCHRESULT, PendingBackgroundServerSearch::Keyword {
+                            query,
+                            deadline,
+                            mut results,
+                            mut page_count,
+                            response,
+                        }) => {
+                            let page = decode_search_result_page(&packet.payload)?;
+                            log_search_result_page(session.endpoint, &page.files);
+                            page_count += 1;
+                            results.extend(page.files);
+                            if page.more_results_available {
+                                session.set_phase(
+                                    ServerSessionPhase::AwaitingMore,
+                                    format!(
+                                        "received background search page {} query={query:?}; requesting more",
+                                        page_count
+                                    ),
+                                );
+                                session.send_packet(OP_QUERY_MORE_RESULT, &[]).await?;
+                                pending_background_search = Some(PendingBackgroundServerSearch::Keyword {
+                                    query,
+                                    deadline,
+                                    results,
+                                    page_count,
+                                    response,
+                                });
+                                continue;
+                            }
+                            session.set_phase(
+                                ServerSessionPhase::Completed,
+                                format!(
+                                    "completed background keyword search query={query:?} pages={page_count} results={}",
+                                    results.len()
+                                ),
+                            );
+                            info!(
+                                "completed ED2K background keyword search query={:?} endpoint={} trace_id={} result_count={} pages={}",
+                                query,
+                                session.endpoint,
+                                session.trace_id,
+                                results.len(),
+                                page_count
+                            );
+                            let _ = response.send(Ok(results));
+                            continue;
+                        }
+                        (OP_FOUNDSOURCES | OP_FOUNDSOURCES_OBFU, PendingBackgroundServerSearch::Source {
+                            file_hash,
+                            response,
+                            ..
+                        }) => {
+                            let results = decode_found_sources(
+                                &packet.payload,
+                                packet.opcode == OP_FOUNDSOURCES_OBFU,
+                            )?;
+                            validate_found_sources(&results, file_hash)?;
+                            session.set_phase(
+                                ServerSessionPhase::Completed,
+                                format!(
+                                    "completed background source search file_hash={} sources={}",
+                                    file_hash,
+                                    results.len()
+                                ),
+                            );
+                            info!(
+                                "completed ED2K background source search file_hash={} endpoint={} trace_id={} source_count={} obfuscated={}",
+                                file_hash,
+                                session.endpoint,
+                                session.trace_id,
+                                results.len(),
+                                packet.opcode == OP_FOUNDSOURCES_OBFU
+                            );
+                            let _ = response.send(Ok(results));
+                            continue;
+                        }
+                        (_, pending) => {
+                            pending_background_search = Some(pending);
+                        }
                     }
-                    session.set_phase(
-                        ServerSessionPhase::Completed,
-                        format!(
-                            "completed background keyword search query={:?} pages={} results={}",
-                            pending.query,
-                            pending.page_count,
-                            pending.results.len()
-                        ),
-                    );
-                    info!(
-                        "completed ED2K background keyword search query={:?} endpoint={} trace_id={} result_count={} pages={}",
-                        pending.query,
-                        session.endpoint,
-                        session.trace_id,
-                        pending.results.len(),
-                        pending.page_count
-                    );
-                    let _ = pending.response.send(Ok(pending.results));
-                    continue;
                 }
                 handle_server_packet(
                     &mut session,
@@ -1192,9 +1310,15 @@ async fn run_one_server_session(
                     && pending_background_search.is_none()
                     && let Some(request) = queued_background_search.take()
                 {
-                    match start_background_keyword_search(&mut session, request).await {
+                    match start_background_server_search(
+                        &mut session,
+                        context.hello_identity.connect_options,
+                        request,
+                    )
+                    .await
+                    {
                         Ok(pending) => pending_background_search = Some(pending),
-                        Err(error) => warn!("failed to start ED2K background keyword search on {}: {error}", server.base_endpoint()),
+                        Err(error) => warn!("failed to start ED2K background server search on {}: {error}", server.base_endpoint()),
                     }
                 }
             }
@@ -1864,54 +1988,98 @@ async fn handle_server_packet(
 }
 
 fn fail_background_search_request(
-    request: &mut Option<BackgroundKeywordSearchRequest>,
+    request: &mut Option<BackgroundServerSearchRequest>,
     error: &str,
 ) {
     if let Some(request) = request.take() {
-        let _ = request.response.send(Err(error.to_string()));
+        match request {
+            BackgroundServerSearchRequest::Keyword { response, .. } => {
+                let _ = response.send(Err(error.to_string()));
+            }
+            BackgroundServerSearchRequest::Source { response, .. } => {
+                let _ = response.send(Err(error.to_string()));
+            }
+        }
     }
 }
 
 fn fail_pending_background_search(
-    request: &mut Option<PendingBackgroundKeywordSearch>,
+    request: &mut Option<PendingBackgroundServerSearch>,
     error: &str,
 ) {
     if let Some(request) = request.take() {
-        let _ = request.response.send(Err(error.to_string()));
+        match request {
+            PendingBackgroundServerSearch::Keyword { response, .. } => {
+                let _ = response.send(Err(error.to_string()));
+            }
+            PendingBackgroundServerSearch::Source { response, .. } => {
+                let _ = response.send(Err(error.to_string()));
+            }
+        }
     }
 }
 
-async fn start_background_keyword_search(
+async fn start_background_server_search(
     session: &mut ServerSession,
-    request: BackgroundKeywordSearchRequest,
-) -> Result<PendingBackgroundKeywordSearch> {
-    let search_payload = encode_search_request(&request.query)?;
-    if search_payload.is_empty() {
-        let _ = request.response.send(Ok(Vec::new()));
-        anyhow::bail!("ED2K background keyword search payload was unexpectedly empty");
+    connect_options: u8,
+    request: BackgroundServerSearchRequest,
+) -> Result<PendingBackgroundServerSearch> {
+    match request {
+        BackgroundServerSearchRequest::Keyword {
+            query,
+            timeout,
+            response,
+        } => {
+            let search_payload = encode_search_request(&query)?;
+            if search_payload.is_empty() {
+                let _ = response.send(Ok(Vec::new()));
+                anyhow::bail!("ED2K background keyword search payload was unexpectedly empty");
+            }
+            wait_for_offer_files_settle(session).await;
+            session.set_phase(
+                ServerSessionPhase::SearchActive,
+                format!("dispatching background keyword search query={query:?}"),
+            );
+            session
+                .send_packet(OP_SEARCHREQUEST, &search_payload)
+                .await?;
+            info!(
+                "sent ED2K background keyword search query={:?} endpoint={} trace_id={} role={}",
+                query, session.endpoint, session.trace_id, session.trace_role
+            );
+            Ok(PendingBackgroundServerSearch::Keyword {
+                query,
+                deadline: TokioInstant::now() + timeout,
+                results: Vec::new(),
+                page_count: 0,
+                response,
+            })
+        }
+        BackgroundServerSearchRequest::Source {
+            file_hash,
+            file_size,
+            timeout,
+            response,
+        } => {
+            wait_for_offer_files_settle(session).await;
+            session.set_phase(
+                ServerSessionPhase::SearchActive,
+                format!("dispatching background source search file_hash={file_hash}"),
+            );
+            let source_request = encode_source_request(file_hash, file_size);
+            let opcode = source_request_opcode(connect_options, session.server_flags);
+            session.send_packet(opcode, &source_request).await?;
+            info!(
+                "sent ED2K background source search file_hash={} endpoint={} trace_id={} role={} opcode=0x{:02X}",
+                file_hash, session.endpoint, session.trace_id, session.trace_role, opcode
+            );
+            Ok(PendingBackgroundServerSearch::Source {
+                file_hash,
+                deadline: TokioInstant::now() + timeout,
+                response,
+            })
+        }
     }
-    wait_for_offer_files_settle(session).await;
-    session.set_phase(
-        ServerSessionPhase::SearchActive,
-        format!(
-            "dispatching background keyword search query={:?}",
-            request.query
-        ),
-    );
-    session
-        .send_packet(OP_SEARCHREQUEST, &search_payload)
-        .await?;
-    info!(
-        "sent ED2K background keyword search query={:?} endpoint={} trace_id={} role={}",
-        request.query, session.endpoint, session.trace_id, session.trace_role
-    );
-    Ok(PendingBackgroundKeywordSearch {
-        query: request.query,
-        deadline: TokioInstant::now() + request.timeout,
-        results: Vec::new(),
-        page_count: 0,
-        response: request.response,
-    })
 }
 
 fn log_search_result_page(endpoint: SocketAddr, results: &[Ed2kSearchFile]) {
@@ -2975,14 +3143,14 @@ fn is_low_id(client_id: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CT_EMULE_VERSION, CT_NAME, CT_SERVER_FLAGS, CT_VERSION, ConfiguredServerEntry,
-        EDONKEY_VERSION, EMULE_ENCRYPTION_METHOD_OBFUSCATION, EMULE_TCP_CRYPT_MAGIC_REQUESTER,
-        EMULE_TCP_CRYPT_MAGIC_SERVER, EMULE_TCP_CRYPT_MAGIC_SYNC, EMULE_VERSION_MAJOR,
-        EMULE_VERSION_MINOR, EMULE_VERSION_UPDATE, Ed2kFoundSource, Ed2kHash, Ed2kSearchFile,
-        Ed2kServerState, FT_FILENAME, FT_FILESIZE, FT_FILETYPE, FT_SOURCES, HELLO_NICKNAME,
-        OFFER_FILE_SAMPLE_HASH, OFFER_FILE_SAMPLE_NAME, OFFER_FILE_SAMPLE_SIZE, OP_EDONKEYPROT,
-        OP_GETSERVERLIST, OP_GETSOURCES, OP_GETSOURCES_OBFU, OP_LOGINREQUEST, OP_OFFERFILES,
-        OP_PACKEDPROT, ResolvedServerEntry, SERVER_OBFUSCATION_PRIME_BYTES,
+        BackgroundServerSearchRequest, CT_EMULE_VERSION, CT_NAME, CT_SERVER_FLAGS, CT_VERSION,
+        ConfiguredServerEntry, EDONKEY_VERSION, EMULE_ENCRYPTION_METHOD_OBFUSCATION,
+        EMULE_TCP_CRYPT_MAGIC_REQUESTER, EMULE_TCP_CRYPT_MAGIC_SERVER, EMULE_TCP_CRYPT_MAGIC_SYNC,
+        EMULE_VERSION_MAJOR, EMULE_VERSION_MINOR, EMULE_VERSION_UPDATE, Ed2kFoundSource, Ed2kHash,
+        Ed2kSearchFile, Ed2kServerState, FT_FILENAME, FT_FILESIZE, FT_FILETYPE, FT_SOURCES,
+        HELLO_NICKNAME, OFFER_FILE_SAMPLE_HASH, OFFER_FILE_SAMPLE_NAME, OFFER_FILE_SAMPLE_SIZE,
+        OP_EDONKEYPROT, OP_GETSERVERLIST, OP_GETSOURCES, OP_GETSOURCES_OBFU, OP_LOGINREQUEST,
+        OP_OFFERFILES, OP_PACKEDPROT, ResolvedServerEntry, SERVER_OBFUSCATION_PRIME_BYTES,
         SERVER_OBFUSCATION_PUBLIC_KEY_LEN, SERVER_TCP_FLAG_COMPRESSION, SERVER_TCP_FLAG_LARGEFILES,
         SERVER_TCP_FLAG_TCPOBFUSCATION, SERVER_UDP_FLAG_UDPOBFUSCATION, ST_DESCRIPTION,
         ST_SERVERNAME, ServerSession, TAG_SHORT_NAME_MASK, TAGTYPE_UINT32, biguint_to_fixed_be,
@@ -2990,8 +3158,9 @@ mod tests {
         decode_server_ident, decode_server_payload, derive_server_cipher, encode_login_request,
         encode_offer_files_payload, encode_packet, encode_search_request, encode_source_request,
         format_server_flags, login_identity_for_server_transport, new_ed2k_server_search_channel,
-        search_keyword_via_background_session, server_capabilities, should_use_server_obfuscation,
-        source_request_opcode, validate_found_sources,
+        search_keyword_via_background_session, search_source_via_background_session,
+        server_capabilities, should_use_server_obfuscation, source_request_opcode,
+        validate_found_sources,
     };
     use crate::ed2k_tcp::{Ed2kHelloIdentity, emule_connect_options};
     use flate2::{Compression, write::ZlibEncoder};
@@ -3484,13 +3653,66 @@ mod tests {
 
         let responder = tokio::spawn(async move {
             let request = inbox.receiver.recv().await.unwrap();
-            assert_eq!(request.query, "ubuntu linux");
-            let _ = request.response.send(Ok(vec![expected_for_task]));
+            match request {
+                BackgroundServerSearchRequest::Keyword {
+                    query, response, ..
+                } => {
+                    assert_eq!(query, "ubuntu linux");
+                    let _ = response.send(Ok(vec![expected_for_task]));
+                }
+                other => panic!("unexpected background request: {other:?}"),
+            }
         });
 
         let results = search_keyword_via_background_session(
             &handle,
             "ubuntu linux",
+            Duration::from_secs(1),
+            &cancel,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results, vec![expected]);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_source_search_channel_round_trips_results() {
+        let (handle, mut inbox) = new_ed2k_server_search_channel(1);
+        let cancel = CancellationToken::new();
+        let file_hash = Ed2kHash([0x51; 16]);
+        let expected = Ed2kFoundSource {
+            file_hash,
+            ip: Ipv4Addr::new(10, 20, 30, 40),
+            tcp_port: 4662,
+            obfuscated: true,
+            obfuscation_options: Some(0x03),
+            user_hash: Some([0x61; 16]),
+        };
+        let expected_for_task = expected.clone();
+
+        let responder = tokio::spawn(async move {
+            let request = inbox.receiver.recv().await.unwrap();
+            match request {
+                BackgroundServerSearchRequest::Source {
+                    file_hash: requested_hash,
+                    file_size,
+                    response,
+                    ..
+                } => {
+                    assert_eq!(requested_hash, file_hash);
+                    assert_eq!(file_size, 42);
+                    let _ = response.send(Ok(vec![expected_for_task]));
+                }
+                other => panic!("unexpected background request: {other:?}"),
+            }
+        });
+
+        let results = search_source_via_background_session(
+            &handle,
+            file_hash,
+            42,
             Duration::from_secs(1),
             &cancel,
         )
