@@ -62,8 +62,9 @@ use overlord_kad_routing::{Contact, ContactType};
 
 use crate::config::EmuleAgentConfig;
 use crate::ed2k_server::{
-    Ed2kSearchFile, Ed2kServerSearchHandle, Ed2kServerState, new_ed2k_server_search_channel,
-    run_ed2k_server_loop, search_keyword_servers, search_keyword_via_background_session,
+    Ed2kFoundSource, Ed2kSearchFile, Ed2kServerSearchHandle, Ed2kServerState, Ed2kSharedCatalog,
+    new_ed2k_server_search_channel, run_ed2k_server_loop, search_keyword_servers,
+    search_keyword_via_background_session, search_source_servers,
 };
 use crate::ed2k_tcp::{
     Ed2kHelloIdentity, Ed2kSecureIdent, FirewallCheckUdpRequest, emule_connect_options,
@@ -746,6 +747,7 @@ struct AgentNetworkRuntime {
     bind_ip: Ipv4Addr,
     dht: DhtNode,
     ed2k_listener: Arc<TcpListener>,
+    ed2k_shared_catalog: Ed2kSharedCatalog,
     ed2k_server_search: Ed2kServerSearchHandle,
     ed2k_server_search_inbox: Arc<Mutex<Option<crate::ed2k_server::Ed2kServerSearchInbox>>>,
     ed2k_server_state: Arc<RwLock<Ed2kServerState>>,
@@ -1697,11 +1699,13 @@ impl OverlordAgentEmule {
             })?);
         let (ed2k_server_search, ed2k_server_search_inbox) =
             new_ed2k_server_search_channel(ED2K_BACKGROUND_SEARCH_QUEUE_CAPACITY);
+        let ed2k_shared_catalog = Arc::new(RwLock::new(synthetic_popular_hashes()));
 
         Ok(AgentNetworkRuntime {
             bind_ip: bind_ipv4,
             dht,
             ed2k_listener,
+            ed2k_shared_catalog,
             ed2k_server_search,
             ed2k_server_search_inbox: Arc::new(Mutex::new(Some(ed2k_server_search_inbox))),
             ed2k_server_state: Arc::new(RwLock::new(Ed2kServerState::default())),
@@ -2476,11 +2480,32 @@ fn map_ed2k_keyword_result(result: &Ed2kSearchFile) -> FileRecord {
     }
 }
 
+fn map_ed2k_source_result(result: &Ed2kFoundSource, file_size: u64) -> FileRecord {
+    FileRecord {
+        hashes: vec![HashType::Ed2k(result.file_hash.to_string())],
+        names: Vec::new(),
+        size: Some(file_size),
+        content_type: None,
+        tags: Vec::new(),
+        sources: vec![Source {
+            protocol: Protocol::Ed2k,
+            address: format!("{}:{}", result.ip, result.tcp_port),
+            extra: serde_json::json!({
+                "search_mode": "server_source",
+                "obfuscated": result.obfuscated,
+                "obfuscation_options": result.obfuscation_options,
+                "user_hash": result.user_hash.map(hex::encode),
+            }),
+        }],
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn do_active_ed2k_keyword_search(
     bind_ip: Ipv4Addr,
     indexer_id: Uuid,
     ed2k_user_hash: [u8; 16],
+    shared_catalog: &[PopularHash],
     job: &SearchJob,
     config: &EmuleAgentConfig,
     background_search: Option<Ed2kServerSearchHandle>,
@@ -2531,6 +2556,7 @@ async fn do_active_ed2k_keyword_search(
                     bind_ip,
                     &config.p2p.ed2k,
                     hello_identity,
+                    shared_catalog,
                     preferred_endpoint,
                     ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
                     query,
@@ -2549,6 +2575,7 @@ async fn do_active_ed2k_keyword_search(
                     bind_ip,
                     &config.p2p.ed2k,
                     hello_identity,
+                    shared_catalog,
                     preferred_endpoint,
                     ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
                     query,
@@ -2565,6 +2592,7 @@ async fn do_active_ed2k_keyword_search(
             bind_ip,
             &config.p2p.ed2k,
             hello_identity,
+            shared_catalog,
             preferred_endpoint,
             ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
             query,
@@ -2575,6 +2603,58 @@ async fn do_active_ed2k_keyword_search(
         .map(|result| map_ed2k_keyword_result(&result))
         .collect()
     };
+    let mut stats = SearchRunStats::default();
+    post_search_batch(
+        &callback_client,
+        job.job_id,
+        indexer_id,
+        Protocol::Ed2k,
+        files,
+        &mut stats,
+    )
+    .await?;
+    Ok(stats)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn do_active_ed2k_source_search(
+    bind_ip: Ipv4Addr,
+    indexer_id: Uuid,
+    ed2k_user_hash: [u8; 16],
+    shared_catalog: &[PopularHash],
+    job: &SearchJob,
+    config: &EmuleAgentConfig,
+    preferred_endpoint: Option<SocketAddr>,
+    cancel: CancellationToken,
+) -> Result<SearchRunStats> {
+    let callback_client = CoordinatorClient::new(&job.callback_url)?;
+    let hello_identity = Ed2kHelloIdentity {
+        user_hash: ed2k_user_hash,
+        client_id: 0,
+        tcp_port: config.p2p.ed2k.listen_port,
+        udp_port: config.p2p.kad.listen_port,
+        server_ip: 0,
+        server_port: 0,
+        connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
+        direct_udp_callback: false,
+    };
+    let file_hash = search_file_hash(job)?;
+    let file_size = search_file_size(job)?;
+    let files = search_source_servers(
+        bind_ip,
+        &config.p2p.ed2k,
+        hello_identity,
+        shared_catalog,
+        preferred_endpoint,
+        ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
+        file_hash,
+        file_size,
+        &cancel,
+    )
+    .await?
+    .into_iter()
+    .map(|result| map_ed2k_source_result(&result, file_size))
+    .collect();
     let mut stats = SearchRunStats::default();
     post_search_batch(
         &callback_client,
@@ -2618,6 +2698,15 @@ fn synthetic_popular_hash(index: usize, seed: &SyntheticPopularSeed) -> PopularH
         size: seed.size,
         source_count: seed.source_count,
     }
+}
+
+async fn refresh_ed2k_shared_catalog(shared_catalog: &Ed2kSharedCatalog, hashes: &[PopularHash]) {
+    let mut guard = shared_catalog.write().await;
+    *guard = if hashes.is_empty() {
+        synthetic_popular_hashes()
+    } else {
+        hashes.to_vec()
+    };
 }
 
 /// Static settings that make source publishes look like a stable eMule-style
@@ -2688,6 +2777,7 @@ async fn seed_popular_from_source(
     source_publish_settings: SourcePublishSettings,
     source: PublishSeedSource,
     hashes: Vec<PopularHash>,
+    shared_catalog: &Ed2kSharedCatalog,
     context: PublishExecutionContext<'_>,
 ) -> Result<()> {
     info!(
@@ -2696,6 +2786,7 @@ async fn seed_popular_from_source(
         hashes.len(),
         context.notes_publish_enabled
     );
+    refresh_ed2k_shared_catalog(shared_catalog, &hashes).await;
     seed_popular_impl(
         dht,
         source_publish_identity,
@@ -2716,6 +2807,7 @@ async fn seed_popular_from_coordinator_or_fallback(
     source_publish_identity: NodeId,
     source_publish_settings: SourcePublishSettings,
     coordinator: &CoordinatorClient,
+    shared_catalog: &Ed2kSharedCatalog,
     context: PublishExecutionContext<'_>,
 ) -> Result<()> {
     let (source, hashes) = fetch_popular_hashes_for_seeding(coordinator).await;
@@ -2738,6 +2830,7 @@ async fn seed_popular_from_coordinator_or_fallback(
         source_publish_settings,
         source,
         hashes,
+        shared_catalog,
         PublishExecutionContext {
             activity_key: Some(activity_key.as_str()),
             ..context
@@ -4820,6 +4913,7 @@ impl IndexerService for OverlordAgentEmule {
         let ed2k_user_hash = self.ed2k_user_hash;
         let ed2k_server_search = runtime.ed2k_server_search.clone();
         let ed2k_server_state = Arc::clone(&runtime.ed2k_server_state);
+        let ed2k_shared_catalog = runtime.ed2k_shared_catalog.read().await.clone();
         let indexer_id = self.indexer_id;
         let config = self.config.clone();
         let callback_client = self.coordinator.clone();
@@ -4898,6 +4992,7 @@ impl IndexerService for OverlordAgentEmule {
                         bind_ip,
                         indexer_id,
                         ed2k_user_hash,
+                        &ed2k_shared_catalog,
                         &job,
                         &config_snapshot,
                         background_search,
@@ -4907,7 +5002,24 @@ impl IndexerService for OverlordAgentEmule {
                     .await
                 }
                 (Protocol::Ed2k, SearchKind::Source) => {
-                    Err(anyhow::anyhow!("ED2K source search is not wired yet"))
+                    let preferred_endpoint = {
+                        let server_state = ed2k_server_state.read().await;
+                        server_state
+                            .connected
+                            .then_some(server_state.endpoint)
+                            .flatten()
+                    };
+                    do_active_ed2k_source_search(
+                        bind_ip,
+                        indexer_id,
+                        ed2k_user_hash,
+                        &ed2k_shared_catalog,
+                        &job,
+                        &config_snapshot,
+                        preferred_endpoint,
+                        cancel.clone(),
+                    )
+                    .await
                 }
                 (Protocol::Ed2k, SearchKind::Notes) => {
                     Err(anyhow::anyhow!("ED2K notes search is not wired yet"))
@@ -5089,6 +5201,7 @@ impl IndexerService for OverlordAgentEmule {
             anyhow::bail!("agent networking is waiting for interface selection");
         };
         let source_publish_identity = source_publish_client_hash(self.indexer_id);
+        let ed2k_shared_catalog = Arc::clone(&runtime.ed2k_shared_catalog);
         let config = self.config.read().await;
         let source_publish_settings = SourcePublishSettings {
             tcp_port: config.p2p.ed2k.listen_port,
@@ -5108,6 +5221,7 @@ impl IndexerService for OverlordAgentEmule {
             activity_snapshot,
         )
         .await;
+        refresh_ed2k_shared_catalog(&ed2k_shared_catalog, &hashes).await;
         let seed_result = seed_popular_impl(
             &runtime.dht,
             source_publish_identity,
@@ -5210,6 +5324,7 @@ impl OverlordAgentEmule {
         let local_store = Arc::clone(&self.local_store);
         let publish_observability = Arc::clone(&self.publish_observability);
         let agent_activity = Arc::clone(&self.agent_activity);
+        let ed2k_shared_catalog = Arc::clone(&runtime.ed2k_shared_catalog);
         let source_publish_identity = source_publish_client_hash(self.indexer_id);
         let source_publish_settings = SourcePublishSettings {
             tcp_port: config.p2p.ed2k.listen_port,
@@ -5238,6 +5353,7 @@ impl OverlordAgentEmule {
                             source_publish_identity,
                             source_publish_settings,
                             &coordinator,
+                            &ed2k_shared_catalog,
                             PublishExecutionContext {
                                 local_store: &local_store,
                                 publish_observability: &publish_observability,
@@ -5354,6 +5470,7 @@ impl OverlordAgentEmule {
         let nat = Arc::clone(&runtime.nat);
         let shutdown = Arc::clone(&runtime.shutdown);
         let ed2k_server_state = Arc::clone(&runtime.ed2k_server_state);
+        let ed2k_shared_catalog = Arc::clone(&runtime.ed2k_shared_catalog);
         let ed2k_server_search_inbox = runtime.ed2k_server_search_inbox.lock().await.take();
         let kad_firewall = Arc::clone(&runtime.kad_firewall);
         let ed2k_server_config = config.p2p.ed2k.clone();
@@ -5375,6 +5492,7 @@ impl OverlordAgentEmule {
                     nat,
                     ed2k_server_config,
                     ed2k_hello_identity,
+                    ed2k_shared_catalog,
                     ed2k_server_state,
                     ed2k_server_search_inbox,
                     kad_firewall,
@@ -6458,6 +6576,7 @@ impl OverlordAgentEmule {
         let local_store = Arc::clone(&self.local_store);
         let publish_observability = Arc::clone(&self.publish_observability);
         let agent_activity = Arc::clone(&self.agent_activity);
+        let ed2k_shared_catalog = Arc::clone(&runtime.ed2k_shared_catalog);
         let source_publish_identity = source_publish_client_hash(self.indexer_id);
         let source_publish_settings = SourcePublishSettings {
             tcp_port: config.p2p.ed2k.listen_port,
@@ -6475,6 +6594,7 @@ impl OverlordAgentEmule {
                     source_publish_identity,
                     source_publish_settings,
                     &coordinator,
+                    &ed2k_shared_catalog,
                     PublishExecutionContext {
                         local_store: &local_store,
                         publish_observability: &publish_observability,

@@ -16,6 +16,7 @@ use std::{
     fs, io,
     io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    str::FromStr,
     sync::{
         Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -39,6 +40,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use overlord_agent_common::PopularHash;
 use overlord_agent_nat::NatManager;
 use overlord_kad_proto::Ed2kHash;
 
@@ -55,6 +57,8 @@ const OP_REJECT: u8 = 0x05;
 const OP_GETSERVERLIST: u8 = 0x14;
 const OP_OFFERFILES: u8 = 0x15;
 const OP_SEARCHREQUEST: u8 = 0x16;
+const OP_GETSOURCES: u8 = 0x19;
+const OP_GETSOURCES_OBFU: u8 = 0x23;
 const OP_QUERY_MORE_RESULT: u8 = 0x21;
 const OP_SERVERLIST: u8 = 0x32;
 const OP_SEARCHRESULT: u8 = 0x33;
@@ -64,6 +68,8 @@ const OP_CALLBACK_FAIL: u8 = 0x36;
 const OP_SERVERMESSAGE: u8 = 0x38;
 const OP_IDCHANGE: u8 = 0x40;
 const OP_SERVERIDENT: u8 = 0x41;
+const OP_FOUNDSOURCES: u8 = 0x42;
+const OP_FOUNDSOURCES_OBFU: u8 = 0x44;
 const OP_PACKEDPROT: u8 = 0xD4;
 const TCP_PACKET_HEADER_LEN: usize = 6;
 const MAX_SERVER_DECOMPRESSED_PACKET_LEN: usize = 250_000;
@@ -118,6 +124,10 @@ const FT_FILETYPE: u8 = 0x03;
 const FT_SOURCES: u8 = 0x15;
 const FT_FILESIZE_HI: u8 = 0x3A;
 const ED2K_FILETYPE_PROGRAM: u8 = 0x04;
+const ED2K_FILETYPE_DOCUMENT: u8 = 0x05;
+const ED2K_FILETYPE_ARCHIVE: u8 = 0x06;
+const ED2K_FILETYPE_AUDIO: u8 = 0x07;
+const ED2K_FILETYPE_VIDEO: u8 = 0x08;
 
 const OFFER_FILE_COMPLETE_SENTINEL_CLIENT_ID: u32 = 0xFBFB_FBFB;
 const OFFER_FILE_COMPLETE_SENTINEL_CLIENT_PORT: u16 = 0xFBFB;
@@ -267,6 +277,7 @@ struct ServerSessionContext {
     nat: Arc<NatManager>,
     hello_identity: Ed2kHelloIdentity,
     probe_search_term: Option<String>,
+    shared_catalog: Ed2kSharedCatalog,
     state: Arc<RwLock<Ed2kServerState>>,
     kad_firewall: Arc<Mutex<KadFirewallState>>,
     keepalive_interval: Duration,
@@ -387,6 +398,26 @@ pub struct Ed2kSearchFile {
     /// Server-reported source availability, when present.
     pub source_count: Option<u32>,
 }
+
+/// One decoded ED2K server source-search entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ed2kFoundSource {
+    /// File hash referenced by the source reply.
+    pub file_hash: Ed2kHash,
+    /// Source IPv4 address reported by the ED2K server.
+    pub ip: Ipv4Addr,
+    /// Source TCP port reported by the ED2K server.
+    pub tcp_port: u16,
+    /// Whether the server used the obfuscated `OP_FOUNDSOURCES_OBFU` family.
+    pub obfuscated: bool,
+    /// Optional per-source obfuscation settings byte from the oracle wire shape.
+    pub obfuscation_options: Option<u8>,
+    /// Optional user hash present when the source advertises it in the obfuscated shape.
+    pub user_hash: Option<[u8; 16]>,
+}
+
+/// Shared ED2K advertised file catalog used by the long-lived server session.
+pub type Ed2kSharedCatalog = Arc<RwLock<Vec<PopularHash>>>;
 
 type BackgroundKeywordSearchResponse = std::result::Result<Vec<Ed2kSearchFile>, String>;
 
@@ -617,6 +648,8 @@ fn server_opcode_name(opcode: u8) -> &'static str {
         OP_GETSERVERLIST => "OP_GETSERVERLIST",
         OP_OFFERFILES => "OP_OFFERFILES",
         OP_SEARCHREQUEST => "OP_SEARCHREQUEST",
+        OP_GETSOURCES => "OP_GETSOURCES",
+        OP_GETSOURCES_OBFU => "OP_GETSOURCES_OBFU",
         OP_QUERY_MORE_RESULT => "OP_QUERY_MORE_RESULT",
         OP_SERVERLIST => "OP_SERVERLIST",
         OP_SEARCHRESULT => "OP_SEARCHRESULT",
@@ -626,6 +659,8 @@ fn server_opcode_name(opcode: u8) -> &'static str {
         OP_SERVERMESSAGE => "OP_SERVERMESSAGE",
         OP_IDCHANGE => "OP_IDCHANGE",
         OP_SERVERIDENT => "OP_SERVERIDENT",
+        OP_FOUNDSOURCES => "OP_FOUNDSOURCES",
+        OP_FOUNDSOURCES_OBFU => "OP_FOUNDSOURCES_OBFU",
         OP_REJECT => "OP_REJECT",
         _ => "UNKNOWN",
     }
@@ -879,6 +914,7 @@ pub async fn run_ed2k_server_loop(
     nat: Arc<NatManager>,
     config: Ed2kConfig,
     hello_identity: Ed2kHelloIdentity,
+    shared_catalog: Ed2kSharedCatalog,
     state: Arc<RwLock<Ed2kServerState>>,
     mut search_inbox: Ed2kServerSearchInbox,
     kad_firewall: Arc<Mutex<KadFirewallState>>,
@@ -890,6 +926,7 @@ pub async fn run_ed2k_server_loop(
         nat,
         hello_identity,
         probe_search_term: config.probe_search_term.clone(),
+        shared_catalog,
         state: Arc::clone(&state),
         kad_firewall,
         keepalive_interval: Duration::from_secs(config.keepalive_secs.max(1)),
@@ -1177,10 +1214,12 @@ async fn run_one_server_session(
 /// server connection pool exists. The function prefers the currently connected
 /// background server when one is available, caps how many configured servers it
 /// will probe, and returns the first non-empty result page it receives.
+#[allow(clippy::too_many_arguments)]
 pub async fn search_keyword_servers(
     bind_ip: Ipv4Addr,
     config: &Ed2kConfig,
     hello_identity: Ed2kHelloIdentity,
+    shared_catalog: &[PopularHash],
     preferred_endpoint: Option<SocketAddr>,
     max_attempts: usize,
     query: &str,
@@ -1241,6 +1280,7 @@ pub async fn search_keyword_servers(
             bind_ip,
             &resolved_server,
             hello_identity,
+            shared_catalog,
             &search_payload,
             idle_timeout,
             cancel,
@@ -1267,10 +1307,103 @@ pub async fn search_keyword_servers(
     Ok(Vec::new())
 }
 
+/// Executes a one-shot ED2K server source search for one file hash and size.
+///
+/// The ED2K server protocol uses `OP_GETSOURCES`/`OP_FOUNDSOURCES` rather than
+/// the generic search-query tree used for keyword searches, so this path stays
+/// separate from `search_keyword_servers`.
+#[allow(clippy::too_many_arguments)]
+pub async fn search_source_servers(
+    bind_ip: Ipv4Addr,
+    config: &Ed2kConfig,
+    hello_identity: Ed2kHelloIdentity,
+    shared_catalog: &[PopularHash],
+    preferred_endpoint: Option<SocketAddr>,
+    max_attempts: usize,
+    file_hash: Ed2kHash,
+    _file_size: u64,
+    cancel: &CancellationToken,
+) -> Result<Vec<Ed2kFoundSource>> {
+    let mut configured_servers = configured_server_entries(config)?;
+    if configured_servers.is_empty() {
+        anyhow::bail!("ED2K source search requires at least one configured server");
+    }
+    if let Some(preferred_endpoint) = preferred_endpoint
+        && let Some(index) = configured_servers.iter().position(|entry| {
+            entry.host == preferred_endpoint.ip().to_string()
+                && entry.port == preferred_endpoint.port()
+        })
+    {
+        let preferred = configured_servers.remove(index);
+        configured_servers.insert(0, preferred);
+    }
+
+    let idle_timeout = Duration::from_secs(config.connect_timeout_secs.max(5));
+    let mut last_error = None;
+
+    for (attempt_index, configured_server) in configured_servers
+        .into_iter()
+        .take(max_attempts.max(1))
+        .enumerate()
+    {
+        if cancel.is_cancelled() {
+            return Ok(Vec::new());
+        }
+        let resolved_server = match resolve_server_entry(&configured_server).await {
+            Ok(server) => server,
+            Err(error) => {
+                warn!(
+                    "failed to resolve ED2K source-search server {} name={}: {error}",
+                    configured_server.base_endpoint_text(),
+                    configured_server.display_name()
+                );
+                last_error = Some(error);
+                continue;
+            }
+        };
+        info!(
+            "ED2K source search attempt={}/{} endpoint={} name={} file_hash={}",
+            attempt_index + 1,
+            max_attempts.max(1),
+            resolved_server.base_endpoint(),
+            resolved_server.entry.display_name(),
+            file_hash
+        );
+        match search_sources_on_server(
+            bind_ip,
+            &resolved_server,
+            hello_identity,
+            shared_catalog,
+            file_hash,
+            idle_timeout,
+            cancel,
+        )
+        .await
+        {
+            Ok(results) if !results.is_empty() => return Ok(results),
+            Ok(_) => continue,
+            Err(error) => {
+                warn!(
+                    "ED2K source search failed for {} name={}: {error}",
+                    resolved_server.base_endpoint(),
+                    resolved_server.entry.display_name()
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+
+    if let Some(error) = last_error {
+        return Err(error);
+    }
+    Ok(Vec::new())
+}
+
 async fn search_keyword_on_server(
     bind_ip: Ipv4Addr,
     server: &ResolvedServerEntry,
     hello_identity: Ed2kHelloIdentity,
+    shared_catalog: &[PopularHash],
     search_payload: &[u8],
     idle_timeout: Duration,
     cancel: &CancellationToken,
@@ -1351,7 +1484,13 @@ async fn search_keyword_on_server(
                     Some(u32::from_le_bytes(packet.payload[..4].try_into().unwrap()));
                 session.server_flags = (packet.payload.len() >= 8)
                     .then(|| u32::from_le_bytes(packet.payload[4..8].try_into().unwrap()));
-                send_connected_server_startup(&mut session, hello_identity.tcp_port).await?;
+                let active_catalog = Arc::new(RwLock::new(shared_catalog.to_vec()));
+                send_connected_server_startup(
+                    &mut session,
+                    &active_catalog,
+                    hello_identity.tcp_port,
+                )
+                .await?;
                 wait_for_offer_files_settle(&session).await;
                 session.set_phase(
                     ServerSessionPhase::SearchActive,
@@ -1395,6 +1534,111 @@ async fn search_keyword_on_server(
     }
 
     Ok(results)
+}
+
+async fn search_sources_on_server(
+    bind_ip: Ipv4Addr,
+    server: &ResolvedServerEntry,
+    hello_identity: Ed2kHelloIdentity,
+    shared_catalog: &[PopularHash],
+    file_hash: Ed2kHash,
+    idle_timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<Vec<Ed2kFoundSource>> {
+    let use_server_obfuscation =
+        should_use_server_obfuscation(hello_identity.connect_options, server);
+    let login_identity =
+        login_identity_for_server_transport(hello_identity, use_server_obfuscation);
+    let transport_endpoint = server.transport_endpoint(use_server_obfuscation);
+    let mut session = ServerSession::connect(
+        bind_ip,
+        transport_endpoint,
+        Arc::new(RwLock::new(Ed2kServerState::default())),
+        "active_sources",
+        idle_timeout,
+    )
+    .await?;
+    let login_request = encode_packet(OP_LOGINREQUEST, &encode_login_request(login_identity));
+    if use_server_obfuscation {
+        session
+            .negotiate_obfuscation_and_send(&login_request)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to negotiate ED2K server obfuscation with {}",
+                    transport_endpoint
+                )
+            })?;
+    } else {
+        session
+            .send_packet(OP_LOGINREQUEST, &encode_login_request(login_identity))
+            .await?;
+    }
+    session.last_tx = Instant::now();
+    session.set_phase(
+        ServerSessionPhase::AwaitingIdChange,
+        "login request sent; awaiting OP_IDCHANGE for source search",
+    );
+    let active_catalog = Arc::new(RwLock::new(shared_catalog.to_vec()));
+
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(Vec::new());
+        }
+        let packet = tokio::time::timeout(idle_timeout, session.read_packet())
+            .await
+            .with_context(|| {
+                format!(
+                    "timed out waiting for ED2K server source-search reply from {transport_endpoint}"
+                )
+            })??;
+        let Some(packet) = packet else {
+            break;
+        };
+        match packet.opcode {
+            OP_IDCHANGE => {
+                if packet.payload.len() < 4 {
+                    anyhow::bail!("short OP_IDCHANGE payload from {transport_endpoint}");
+                }
+                session.assigned_client_id =
+                    Some(u32::from_le_bytes(packet.payload[..4].try_into().unwrap()));
+                session.server_flags = (packet.payload.len() >= 8)
+                    .then(|| u32::from_le_bytes(packet.payload[4..8].try_into().unwrap()));
+                send_connected_server_startup(
+                    &mut session,
+                    &active_catalog,
+                    hello_identity.tcp_port,
+                )
+                .await?;
+                session.set_phase(
+                    ServerSessionPhase::SearchActive,
+                    format!("dispatching source search file_hash={file_hash}"),
+                );
+                session.send_packet(OP_GETSOURCES, &file_hash.0).await?;
+            }
+            OP_FOUNDSOURCES | OP_FOUNDSOURCES_OBFU => {
+                let results =
+                    decode_found_sources(&packet.payload, packet.opcode == OP_FOUNDSOURCES_OBFU)?;
+                session.set_phase(
+                    ServerSessionPhase::Completed,
+                    format!(
+                        "completed source search file_hash={} sources={}",
+                        file_hash,
+                        results.len()
+                    ),
+                );
+                return Ok(results);
+            }
+            OP_REJECT => {
+                anyhow::bail!(
+                    "ED2K server {transport_endpoint} rejected the source-search session"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    Ok(Vec::new())
 }
 
 async fn maybe_send_probe_search(
@@ -1464,7 +1708,12 @@ async fn handle_server_packet(
             session.assigned_client_id = Some(client_id);
             session.server_flags = server_flags;
             session.login_accepted = true;
-            send_connected_server_startup(session, context.hello_identity.tcp_port).await?;
+            send_connected_server_startup(
+                session,
+                &context.shared_catalog,
+                context.hello_identity.tcp_port,
+            )
+            .await?;
             if allow_probe_search {
                 maybe_send_probe_search(session, context).await?;
             }
@@ -1695,6 +1944,58 @@ fn decode_callback_request(payload: &[u8]) -> Result<Option<CallbackRequest>> {
     }))
 }
 
+fn decode_found_sources(payload: &[u8], obfuscated: bool) -> Result<Vec<Ed2kFoundSource>> {
+    if payload.len() < 17 {
+        anyhow::bail!("short ED2K found-sources payload");
+    }
+    let file_hash = Ed2kHash(payload[..16].try_into().unwrap());
+    let count = usize::from(payload[16]);
+    let mut cursor = &payload[17..];
+    let mut results = Vec::with_capacity(count);
+    for _ in 0..count {
+        if cursor.len() < 6 {
+            anyhow::bail!("short ED2K found-sources entry");
+        }
+        let ip = Ipv4Addr::from(u32::from_le_bytes(cursor[..4].try_into().unwrap()));
+        let tcp_port = u16::from_le_bytes(cursor[4..6].try_into().unwrap());
+        cursor = &cursor[6..];
+        let mut obfuscation_options = None;
+        let mut user_hash = None;
+        if obfuscated {
+            if cursor.is_empty() {
+                anyhow::bail!("short ED2K obfuscated source options");
+            }
+            let options = cursor[0];
+            cursor = &cursor[1..];
+            obfuscation_options = Some(options);
+            if options & 0x08 != 0 {
+                if cursor.len() < 16 {
+                    anyhow::bail!("short ED2K obfuscated source user hash");
+                }
+                let mut hash = [0u8; 16];
+                hash.copy_from_slice(&cursor[..16]);
+                cursor = &cursor[16..];
+                user_hash = Some(hash);
+            }
+        }
+        results.push(Ed2kFoundSource {
+            file_hash,
+            ip,
+            tcp_port,
+            obfuscated,
+            obfuscation_options,
+            user_hash,
+        });
+    }
+    if !cursor.is_empty() {
+        anyhow::bail!(
+            "unexpected ED2K found-sources trailing data len={}",
+            cursor.len()
+        );
+    }
+    Ok(results)
+}
+
 async fn clear_server_connection_state(state: &Arc<RwLock<Ed2kServerState>>) {
     let mut guard = state.write().await;
     guard.connected = false;
@@ -1781,13 +2082,14 @@ fn login_identity_for_server_transport(
 }
 
 fn encode_offer_files_payload(
+    shared_catalog: &[PopularHash],
     client_id: Option<u32>,
     tcp_port: u16,
     server_flags: Option<u32>,
 ) -> Vec<u8> {
     let (advertised_client_id, advertised_client_port) =
         advertised_client_endpoint_for_offer_file(client_id, tcp_port, server_flags);
-    let offered_files = offered_files_catalog();
+    let offered_files = offered_files_catalog(shared_catalog);
     let mut payload = Vec::with_capacity(80 * offered_files.len());
     payload.extend_from_slice(
         &u32::try_from(offered_files.len())
@@ -1799,7 +2101,7 @@ fn encode_offer_files_payload(
         payload.extend_from_slice(&advertised_client_id.to_le_bytes());
         payload.extend_from_slice(&advertised_client_port.to_le_bytes());
         payload.extend_from_slice(&3u32.to_le_bytes());
-        push_short_string_tag(&mut payload, FT_FILENAME, file_name);
+        push_short_string_tag(&mut payload, FT_FILENAME, &file_name);
         push_short_u32_tag(&mut payload, FT_FILESIZE, file_size);
         push_short_u8_tag(&mut payload, FT_FILETYPE, file_type);
     }
@@ -1832,13 +2134,49 @@ fn encode_search_string_param(payload: &mut Vec<u8>, value: &str) -> Result<()> 
     Ok(())
 }
 
-fn offered_files_catalog() -> [([u8; 16], &'static str, u32, u8); 1] {
-    [(
-        OFFER_FILE_SAMPLE_HASH,
-        OFFER_FILE_SAMPLE_NAME,
-        OFFER_FILE_SAMPLE_SIZE,
-        ED2K_FILETYPE_PROGRAM,
-    )]
+fn offered_files_catalog(shared_catalog: &[PopularHash]) -> Vec<([u8; 16], String, u32, u8)> {
+    let mut offered_files = shared_catalog
+        .iter()
+        .filter_map(popular_hash_offer_file)
+        .take(200)
+        .collect::<Vec<_>>();
+    if offered_files.is_empty() {
+        offered_files.push((
+            OFFER_FILE_SAMPLE_HASH,
+            OFFER_FILE_SAMPLE_NAME.to_string(),
+            OFFER_FILE_SAMPLE_SIZE,
+            ED2K_FILETYPE_PROGRAM,
+        ));
+    }
+    offered_files
+}
+
+fn popular_hash_offer_file(hash: &PopularHash) -> Option<([u8; 16], String, u32, u8)> {
+    let file_hash = match &hash.hash {
+        overlord_agent_common::HashType::Ed2k(value) => Ed2kHash::from_str(value).ok()?,
+    };
+    let file_size = u32::try_from(hash.size).unwrap_or(u32::MAX);
+    Some((
+        file_hash.0,
+        hash.canonical_name.clone(),
+        file_size,
+        ed2k_offer_file_type(&hash.canonical_name),
+    ))
+}
+
+fn ed2k_offer_file_type(file_name: &str) -> u8 {
+    match file_name
+        .rsplit('.')
+        .next()
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("avi" | "mp4" | "mkv" | "mov" | "wmv" | "mpeg" | "mpg") => ED2K_FILETYPE_VIDEO,
+        Some("mp3" | "flac" | "ogg" | "wav" | "aac" | "m4a") => ED2K_FILETYPE_AUDIO,
+        Some("zip" | "rar" | "7z" | "tar" | "gz" | "bz2") => ED2K_FILETYPE_ARCHIVE,
+        Some("pdf" | "doc" | "docx" | "txt" | "rtf" | "epub") => ED2K_FILETYPE_DOCUMENT,
+        _ => ED2K_FILETYPE_PROGRAM,
+    }
 }
 
 fn encode_search_expression(payload: &mut Vec<u8>, expression: &SearchExprNode) -> Result<()> {
@@ -2126,12 +2464,21 @@ fn encode_packet(opcode: u8, payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
-async fn send_offer_files_advertisement(session: &mut ServerSession, tcp_port: u16) -> Result<()> {
+async fn send_offer_files_advertisement(
+    session: &mut ServerSession,
+    shared_catalog: &Ed2kSharedCatalog,
+    tcp_port: u16,
+) -> Result<()> {
     if session.offer_files_sent {
         return Ok(());
     }
-    let payload =
-        encode_offer_files_payload(session.assigned_client_id, tcp_port, session.server_flags);
+    let shared_catalog = shared_catalog.read().await.clone();
+    let payload = encode_offer_files_payload(
+        &shared_catalog,
+        session.assigned_client_id,
+        tcp_port,
+        session.server_flags,
+    );
     session.send_packet(OP_OFFERFILES, &payload).await?;
     session.offer_files_sent = true;
     session.offer_files_sent_at = Some(Instant::now());
@@ -2139,7 +2486,7 @@ async fn send_offer_files_advertisement(session: &mut ServerSession, tcp_port: u
         ServerSessionPhase::OfferFilesSent,
         format!(
             "sent offer-files advertisement entries={}",
-            offered_files_catalog().len()
+            offered_files_catalog(&shared_catalog).len()
         ),
     );
     debug!(
@@ -2149,12 +2496,16 @@ async fn send_offer_files_advertisement(session: &mut ServerSession, tcp_port: u
     Ok(())
 }
 
-async fn send_connected_server_startup(session: &mut ServerSession, tcp_port: u16) -> Result<()> {
+async fn send_connected_server_startup(
+    session: &mut ServerSession,
+    shared_catalog: &Ed2kSharedCatalog,
+    tcp_port: u16,
+) -> Result<()> {
     session.set_phase(
         ServerSessionPhase::Connected,
         "server session accepted after OP_IDCHANGE",
     );
-    send_offer_files_advertisement(session, tcp_port).await?;
+    send_offer_files_advertisement(session, shared_catalog, tcp_port).await?;
     send_server_list_request(session).await?;
     Ok(())
 }
@@ -2581,22 +2932,24 @@ mod tests {
         CT_EMULE_VERSION, CT_NAME, CT_SERVER_FLAGS, CT_VERSION, ConfiguredServerEntry,
         EDONKEY_VERSION, EMULE_ENCRYPTION_METHOD_OBFUSCATION, EMULE_TCP_CRYPT_MAGIC_REQUESTER,
         EMULE_TCP_CRYPT_MAGIC_SERVER, EMULE_TCP_CRYPT_MAGIC_SYNC, EMULE_VERSION_MAJOR,
-        EMULE_VERSION_MINOR, EMULE_VERSION_UPDATE, Ed2kHash, Ed2kSearchFile, Ed2kServerState,
-        FT_FILENAME, FT_FILESIZE, FT_FILETYPE, FT_SOURCES, HELLO_NICKNAME, OP_EDONKEYPROT,
+        EMULE_VERSION_MINOR, EMULE_VERSION_UPDATE, Ed2kFoundSource, Ed2kHash, Ed2kSearchFile,
+        Ed2kServerState, FT_FILENAME, FT_FILESIZE, FT_FILETYPE, FT_SOURCES, HELLO_NICKNAME,
+        OFFER_FILE_SAMPLE_HASH, OFFER_FILE_SAMPLE_NAME, OFFER_FILE_SAMPLE_SIZE, OP_EDONKEYPROT,
         OP_GETSERVERLIST, OP_LOGINREQUEST, OP_OFFERFILES, OP_PACKEDPROT, ResolvedServerEntry,
         SERVER_OBFUSCATION_PRIME_BYTES, SERVER_OBFUSCATION_PUBLIC_KEY_LEN,
         SERVER_TCP_FLAG_COMPRESSION, SERVER_TCP_FLAG_LARGEFILES, SERVER_UDP_FLAG_UDPOBFUSCATION,
         ST_DESCRIPTION, ST_SERVERNAME, ServerSession, TAG_SHORT_NAME_MASK, TAGTYPE_UINT32,
-        biguint_to_fixed_be, decode_search_result_page, decode_search_results, decode_server_ident,
-        decode_server_payload, derive_server_cipher, encode_login_request,
-        encode_offer_files_payload, encode_packet, encode_search_request, format_server_flags,
-        login_identity_for_server_transport, new_ed2k_server_search_channel,
+        biguint_to_fixed_be, decode_found_sources, decode_search_result_page,
+        decode_search_results, decode_server_ident, decode_server_payload, derive_server_cipher,
+        encode_login_request, encode_offer_files_payload, encode_packet, encode_search_request,
+        format_server_flags, login_identity_for_server_transport, new_ed2k_server_search_channel,
         search_keyword_via_background_session, server_capabilities, should_use_server_obfuscation,
     };
     use crate::ed2k_tcp::{Ed2kHelloIdentity, emule_connect_options};
     use flate2::{Compression, write::ZlibEncoder};
     use hex::decode;
     use num_bigint::BigUint;
+    use overlord_agent_common::{HashType, PopularHash};
     use std::{io::Write, net::Ipv4Addr, sync::Arc, time::Duration};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -2901,9 +3254,16 @@ mod tests {
 
     #[test]
     fn offer_files_payload_matches_oracle_search_session_sample() {
+        let shared_catalog = vec![PopularHash {
+            hash: HashType::Ed2k(hex::encode(OFFER_FILE_SAMPLE_HASH)),
+            canonical_name: OFFER_FILE_SAMPLE_NAME.to_string(),
+            size: u64::from(OFFER_FILE_SAMPLE_SIZE),
+            source_count: 12,
+        }];
         let packet = encode_packet(
             OP_OFFERFILES,
             &encode_offer_files_payload(
+                &shared_catalog,
                 Some(0x521B_5895),
                 46671,
                 Some(SERVER_TCP_FLAG_COMPRESSION),
@@ -2981,6 +3341,29 @@ mod tests {
         let error = decode_search_result_page(&payload).unwrap_err().to_string();
 
         assert!(error.contains("More marker"));
+    }
+
+    #[test]
+    fn found_sources_decoder_extracts_plain_sources() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0xAA; 16]);
+        payload.push(1);
+        payload.extend_from_slice(&u32::from(Ipv4Addr::new(10, 20, 30, 40)).to_le_bytes());
+        payload.extend_from_slice(&4662u16.to_le_bytes());
+
+        let sources = decode_found_sources(&payload, false).unwrap();
+
+        assert_eq!(
+            sources,
+            vec![Ed2kFoundSource {
+                file_hash: Ed2kHash([0xAA; 16]),
+                ip: Ipv4Addr::new(10, 20, 30, 40),
+                tcp_port: 4662,
+                obfuscated: false,
+                obfuscation_options: None,
+                user_hash: None,
+            }]
+        );
     }
 
     #[tokio::test]
