@@ -6,27 +6,30 @@
 //! `ServerSocket` flow that matter for parity today:
 //! - connect from the VPN-bound interface to one configured ED2K server
 //! - send an oracle-shaped `OP_LOGINREQUEST`
-//! - advertise one minimal shared file before searching, matching the oracle's
-//!   initial `OP_OFFERFILES` session shape closely enough for parity
+//! - advertise a minimal oracle-shaped shared-file catalog during the connected
+//!   transition so the server sees a credible `OP_OFFERFILES`
 //! - process `OP_IDCHANGE`, `OP_SERVERSTATUS`, and a few informational replies
+//! - execute keyword searches with oracle-style query trees and `More` paging
 //! - keep the TCP session alive with empty `OP_OFFERFILES` packets
 
 use std::{
-    io,
+    fs, io,
     io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
+use chrono::SecondsFormat;
 use flate2::read::ZlibDecoder;
 use md5::compute as md5_compute;
 use num_bigint::BigUint;
 use rand::{Rng, RngCore};
+use serde::Serialize;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpSocket, TcpStream, lookup_host},
@@ -49,10 +52,10 @@ const OP_EDONKEYPROT: u8 = 0xE3;
 const OP_EMULEPROT: u8 = 0xC5;
 const OP_LOGINREQUEST: u8 = 0x01;
 const OP_REJECT: u8 = 0x05;
-#[cfg(test)]
 const OP_GETSERVERLIST: u8 = 0x14;
 const OP_OFFERFILES: u8 = 0x15;
 const OP_SEARCHREQUEST: u8 = 0x16;
+const OP_QUERY_MORE_RESULT: u8 = 0x21;
 const OP_SERVERLIST: u8 = 0x32;
 const OP_SEARCHRESULT: u8 = 0x33;
 const OP_SERVERSTATUS: u8 = 0x34;
@@ -213,6 +216,31 @@ struct Ed2kPacket {
     payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerSessionPhase {
+    Connecting,
+    AwaitingIdChange,
+    Connected,
+    OfferFilesSent,
+    SearchActive,
+    AwaitingMore,
+    Completed,
+}
+
+impl ServerSessionPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Connecting => "connecting",
+            Self::AwaitingIdChange => "awaiting_idchange",
+            Self::Connected => "connected",
+            Self::OfferFilesSent => "offer_files_sent",
+            Self::SearchActive => "search_active",
+            Self::AwaitingMore => "awaiting_more",
+            Self::Completed => "completed",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ServerSession {
     stream: TcpStream,
@@ -229,6 +257,8 @@ struct ServerSession {
     offer_files_sent_at: Option<Instant>,
     assigned_client_id: Option<u32>,
     server_flags: Option<u32>,
+    server_list_requested: bool,
+    phase: ServerSessionPhase,
 }
 
 #[derive(Clone)]
@@ -383,7 +413,50 @@ struct BackgroundKeywordSearchRequest {
 struct PendingBackgroundKeywordSearch {
     query: String,
     deadline: TokioInstant,
+    results: Vec<Ed2kSearchFile>,
+    page_count: u32,
     response: oneshot::Sender<BackgroundKeywordSearchResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchResultPage {
+    files: Vec<Ed2kSearchFile>,
+    more_results_available: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SearchExprNode {
+    Term(String),
+    And(Box<SearchExprNode>, Box<SearchExprNode>),
+    Or(Box<SearchExprNode>, Box<SearchExprNode>),
+    Not(Box<SearchExprNode>, Box<SearchExprNode>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SearchToken {
+    Term(String),
+    And,
+    Or,
+    Not,
+    OpenParen,
+    CloseParen,
+}
+
+#[derive(Debug, Serialize)]
+struct Ed2kServerDumpRecord<'a> {
+    schema: &'static str,
+    ts_utc: String,
+    trace_id: u64,
+    role: &'a str,
+    phase: &'a str,
+    direction: &'a str,
+    endpoint: String,
+    transport: &'a str,
+    opcode: Option<String>,
+    opcode_name: Option<&'static str>,
+    payload_len: Option<usize>,
+    payload_hex: Option<String>,
+    note: Option<String>,
 }
 
 /// Creates a bounded request channel for background-session ED2K keyword searches.
@@ -451,6 +524,113 @@ fn should_use_server_obfuscation(connect_options: u8, server: &ResolvedServerEnt
     connect_options != 0 && server.entry.supports_obfuscation_tcp()
 }
 
+fn ed2k_server_dump_file() -> &'static StdMutex<Option<fs::File>> {
+    static DUMP_FILE: OnceLock<StdMutex<Option<fs::File>>> = OnceLock::new();
+    DUMP_FILE.get_or_init(|| {
+        let file = std::env::var("OVERLORD_LOG_DIR")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .and_then(|dir| {
+                fs::create_dir_all(&dir).ok()?;
+                let path = dir.join(format!(
+                    "agent-ed2k-server-dump-{}.jsonl",
+                    chrono::Utc::now().format("%Y.%m.%d-%H.%M.%S")
+                ));
+                fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .ok()
+            });
+        StdMutex::new(file)
+    })
+}
+
+fn dump_ed2k_server_record(record: &Ed2kServerDumpRecord<'_>) {
+    let Ok(line) = serde_json::to_string(record) else {
+        return;
+    };
+    let Ok(mut guard) = ed2k_server_dump_file().lock() else {
+        return;
+    };
+    let Some(file) = guard.as_mut() else {
+        return;
+    };
+    let _ = std::io::Write::write_all(file, line.as_bytes());
+    let _ = std::io::Write::write_all(file, b"\n");
+}
+
+fn dump_ed2k_server_meta(session: &ServerSession, note: impl Into<String>) {
+    let record = Ed2kServerDumpRecord {
+        schema: "ed2k_server_session_v1",
+        ts_utc: chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        trace_id: session.trace_id,
+        role: session.trace_role,
+        phase: session.phase.as_str(),
+        direction: "meta",
+        endpoint: session.endpoint.to_string(),
+        transport: if session.send_cipher.is_some() {
+            "obfuscated"
+        } else {
+            "plaintext"
+        },
+        opcode: None,
+        opcode_name: None,
+        payload_len: None,
+        payload_hex: None,
+        note: Some(note.into()),
+    };
+    dump_ed2k_server_record(&record);
+}
+
+fn dump_ed2k_server_packet(
+    session: &ServerSession,
+    direction: &'static str,
+    opcode: u8,
+    payload: &[u8],
+) {
+    let record = Ed2kServerDumpRecord {
+        schema: "ed2k_server_session_v1",
+        ts_utc: chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        trace_id: session.trace_id,
+        role: session.trace_role,
+        phase: session.phase.as_str(),
+        direction,
+        endpoint: session.endpoint.to_string(),
+        transport: if session.send_cipher.is_some() {
+            "obfuscated"
+        } else {
+            "plaintext"
+        },
+        opcode: Some(format!("0x{opcode:02X}")),
+        opcode_name: Some(server_opcode_name(opcode)),
+        payload_len: Some(payload.len()),
+        payload_hex: Some(hex::encode(payload)),
+        note: None,
+    };
+    dump_ed2k_server_record(&record);
+}
+
+fn server_opcode_name(opcode: u8) -> &'static str {
+    match opcode {
+        OP_LOGINREQUEST => "OP_LOGINREQUEST",
+        OP_GETSERVERLIST => "OP_GETSERVERLIST",
+        OP_OFFERFILES => "OP_OFFERFILES",
+        OP_SEARCHREQUEST => "OP_SEARCHREQUEST",
+        OP_QUERY_MORE_RESULT => "OP_QUERY_MORE_RESULT",
+        OP_SERVERLIST => "OP_SERVERLIST",
+        OP_SEARCHRESULT => "OP_SEARCHRESULT",
+        OP_SERVERSTATUS => "OP_SERVERSTATUS",
+        OP_CALLBACKREQUESTED => "OP_CALLBACKREQUESTED",
+        OP_CALLBACK_FAIL => "OP_CALLBACK_FAIL",
+        OP_SERVERMESSAGE => "OP_SERVERMESSAGE",
+        OP_IDCHANGE => "OP_IDCHANGE",
+        OP_SERVERIDENT => "OP_SERVERIDENT",
+        OP_REJECT => "OP_REJECT",
+        _ => "UNKNOWN",
+    }
+}
+
 impl ServerSession {
     async fn connect(
         bind_ip: Ipv4Addr,
@@ -485,20 +665,29 @@ impl ServerSession {
             offer_files_sent_at: None,
             assigned_client_id: None,
             server_flags: None,
+            server_list_requested: false,
+            phase: ServerSessionPhase::Connecting,
         })
+    }
+
+    fn set_phase(&mut self, phase: ServerSessionPhase, note: impl Into<String>) {
+        self.phase = phase;
+        dump_ed2k_server_meta(self, note);
     }
 
     async fn send_packet(&mut self, opcode: u8, payload: &[u8]) -> Result<()> {
         let mut packet = encode_packet(opcode, payload);
         debug!(
-            "ED2K trace id={} role={} dir=tx endpoint={} opcode=0x{:02X} payload_len={} wire_len={}",
+            "ED2K trace id={} role={} phase={} dir=tx endpoint={} opcode=0x{:02X} payload_len={} wire_len={}",
             self.trace_id,
             self.trace_role,
+            self.phase.as_str(),
             self.endpoint,
             opcode,
             payload.len(),
             packet.len()
         );
+        dump_ed2k_server_packet(self, "tx", opcode, payload);
         if let Some(cipher) = self.send_cipher.as_mut() {
             cipher.apply(&mut packet);
         }
@@ -618,6 +807,7 @@ impl ServerSession {
         self.receive_cipher = Some(receive_cipher);
         self.send_cipher = Some(send_cipher);
         self.last_tx = Instant::now();
+        dump_ed2k_server_meta(self, "server obfuscation negotiated");
         Ok(())
     }
 
@@ -627,9 +817,13 @@ impl ServerSession {
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
                 debug!(
-                    "ED2K trace id={} role={} dir=rx endpoint={} eof=true",
-                    self.trace_id, self.trace_role, self.endpoint
+                    "ED2K trace id={} role={} phase={} dir=rx endpoint={} eof=true",
+                    self.trace_id,
+                    self.trace_role,
+                    self.phase.as_str(),
+                    self.endpoint
                 );
+                dump_ed2k_server_meta(self, "server socket reached eof");
                 return Ok(None);
             }
             Err(error) => return Err(error.into()),
@@ -661,14 +855,16 @@ impl ServerSession {
             format!("failed to decode ED2K server packet from {}", self.endpoint)
         })?;
         debug!(
-            "ED2K trace id={} role={} dir=rx endpoint={} prot=0x{:02X} opcode=0x{:02X} payload_len={}",
+            "ED2K trace id={} role={} phase={} dir=rx endpoint={} prot=0x{:02X} opcode=0x{:02X} payload_len={}",
             self.trace_id,
             self.trace_role,
+            self.phase.as_str(),
             self.endpoint,
             header[0],
             header[5],
             payload.len()
         );
+        dump_ed2k_server_packet(self, "rx", header[5], &payload);
         Ok(Some(Ed2kPacket {
             opcode: header[5],
             payload,
@@ -812,6 +1008,10 @@ async fn run_one_server_session(
     } else {
         session.send_packet(OP_LOGINREQUEST, &login_payload).await?;
     }
+    session.set_phase(
+        ServerSessionPhase::AwaitingIdChange,
+        "login request sent; awaiting OP_IDCHANGE",
+    );
 
     let rotation_deadline = context
         .rotation_interval
@@ -906,18 +1106,42 @@ async fn run_one_server_session(
                     );
                 };
                 if packet.opcode == OP_SEARCHRESULT
-                    && let Some(pending) = pending_background_search.take()
+                    && let Some(mut pending) = pending_background_search.take()
                 {
-                    let results = decode_search_result_files(&packet.payload)?;
-                    log_search_result_page(session.endpoint, &results);
+                    let page = decode_search_result_page(&packet.payload)?;
+                    log_search_result_page(session.endpoint, &page.files);
+                    pending.page_count += 1;
+                    pending.results.extend(page.files);
+                    if page.more_results_available {
+                        session.set_phase(
+                            ServerSessionPhase::AwaitingMore,
+                            format!(
+                                "received background search page {} query={:?}; requesting more",
+                                pending.page_count, pending.query
+                            ),
+                        );
+                        session.send_packet(OP_QUERY_MORE_RESULT, &[]).await?;
+                        pending_background_search = Some(pending);
+                        continue;
+                    }
+                    session.set_phase(
+                        ServerSessionPhase::Completed,
+                        format!(
+                            "completed background keyword search query={:?} pages={} results={}",
+                            pending.query,
+                            pending.page_count,
+                            pending.results.len()
+                        ),
+                    );
                     info!(
-                        "completed ED2K background keyword search query={:?} endpoint={} trace_id={} result_count={}",
+                        "completed ED2K background keyword search query={:?} endpoint={} trace_id={} result_count={} pages={}",
                         pending.query,
                         session.endpoint,
                         session.trace_id,
-                        results.len()
+                        pending.results.len(),
+                        pending.page_count
                     );
-                    let _ = pending.response.send(Ok(results));
+                    let _ = pending.response.send(Ok(pending.results));
                     continue;
                 }
                 handle_server_packet(
@@ -1096,10 +1320,13 @@ async fn search_keyword_on_server(
             })?;
     }
     session.last_tx = Instant::now();
+    session.set_phase(
+        ServerSessionPhase::AwaitingIdChange,
+        "login request sent; awaiting OP_IDCHANGE",
+    );
 
     let mut results = Vec::new();
-    let mut login_accepted = false;
-    let mut search_sent = false;
+    let mut page_count = 0u32;
 
     loop {
         if cancel.is_cancelled() {
@@ -1124,35 +1351,46 @@ async fn search_keyword_on_server(
                     Some(u32::from_le_bytes(packet.payload[..4].try_into().unwrap()));
                 session.server_flags = (packet.payload.len() >= 8)
                     .then(|| u32::from_le_bytes(packet.payload[4..8].try_into().unwrap()));
-                send_offer_files_advertisement(&mut session, hello_identity.tcp_port).await?;
-                login_accepted = true;
-            }
-            OP_SERVERMESSAGE | OP_SERVERIDENT | OP_SERVERLIST => {
-                if login_accepted && !search_sent {
-                    wait_for_offer_files_settle(&session).await;
-                    session
-                        .send_packet(OP_SEARCHREQUEST, search_payload)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed to send ED2K keyword search request to {transport_endpoint}"
-                            )
-                        })?;
-                    search_sent = true;
-                }
+                send_connected_server_startup(&mut session, hello_identity.tcp_port).await?;
+                wait_for_offer_files_settle(&session).await;
+                session.set_phase(
+                    ServerSessionPhase::SearchActive,
+                    "dispatching active keyword search request",
+                );
+                session
+                    .send_packet(OP_SEARCHREQUEST, search_payload)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to send ED2K keyword search request to {transport_endpoint}"
+                        )
+                    })?;
             }
             OP_SEARCHRESULT => {
-                let mut page = decode_search_result_files(&packet.payload)?;
-                results.append(&mut page);
+                let page = decode_search_result_page(&packet.payload)?;
+                page_count += 1;
+                results.extend(page.files);
+                if page.more_results_available {
+                    session.set_phase(
+                        ServerSessionPhase::AwaitingMore,
+                        format!("received active result page {page_count}; requesting more"),
+                    );
+                    session.send_packet(OP_QUERY_MORE_RESULT, &[]).await?;
+                } else {
+                    session.set_phase(
+                        ServerSessionPhase::Completed,
+                        format!(
+                            "completed active keyword search pages={page_count} results={}",
+                            results.len()
+                        ),
+                    );
+                    break;
+                }
             }
             OP_REJECT => {
                 anyhow::bail!("ED2K server {transport_endpoint} rejected the search session");
             }
             _ => {}
-        }
-
-        if search_sent && !results.is_empty() {
-            break;
         }
     }
 
@@ -1174,6 +1412,10 @@ async fn maybe_send_probe_search(
         return Ok(());
     }
     wait_for_offer_files_settle(session).await;
+    session.set_phase(
+        ServerSessionPhase::SearchActive,
+        format!("dispatching probe keyword search term={term:?}"),
+    );
     session
         .send_packet(OP_SEARCHREQUEST, &search_payload)
         .await?;
@@ -1222,11 +1464,26 @@ async fn handle_server_packet(
             session.assigned_client_id = Some(client_id);
             session.server_flags = server_flags;
             session.login_accepted = true;
-            send_offer_files_advertisement(session, context.hello_identity.tcp_port).await?;
+            send_connected_server_startup(session, context.hello_identity.tcp_port).await?;
+            if allow_probe_search {
+                maybe_send_probe_search(session, context).await?;
+            }
         }
         OP_SEARCHRESULT => {
-            let results = decode_search_result_files(&packet.payload)?;
-            log_search_result_page(session.endpoint, &results);
+            let page = decode_search_result_page(&packet.payload)?;
+            log_search_result_page(session.endpoint, &page.files);
+            if page.more_results_available {
+                session.set_phase(
+                    ServerSessionPhase::AwaitingMore,
+                    "probe search reported more results; requesting another page",
+                );
+                session.send_packet(OP_QUERY_MORE_RESULT, &[]).await?;
+            } else if session.probe_search_sent {
+                session.set_phase(
+                    ServerSessionPhase::Completed,
+                    "probe search completed without additional pages",
+                );
+            }
         }
         OP_SERVERSTATUS => {
             if packet.payload.len() >= 8 {
@@ -1378,6 +1635,13 @@ async fn start_background_keyword_search(
         anyhow::bail!("ED2K background keyword search payload was unexpectedly empty");
     }
     wait_for_offer_files_settle(session).await;
+    session.set_phase(
+        ServerSessionPhase::SearchActive,
+        format!(
+            "dispatching background keyword search query={:?}",
+            request.query
+        ),
+    );
     session
         .send_packet(OP_SEARCHREQUEST, &search_payload)
         .await?;
@@ -1388,6 +1652,8 @@ async fn start_background_keyword_search(
     Ok(PendingBackgroundKeywordSearch {
         query: request.query,
         deadline: TokioInstant::now() + request.timeout,
+        results: Vec::new(),
+        page_count: 0,
         response: request.response,
     })
 }
@@ -1491,17 +1757,16 @@ fn encode_login_request(identity: Ed2kHelloIdentity) -> Vec<u8> {
 }
 
 fn encode_search_request(term: &str) -> Result<Vec<u8>> {
-    let normalized = term
-        .split_whitespace()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if normalized.is_empty() {
+    let Some(expression) = parse_search_expression(term)? else {
         return Ok(Vec::new());
-    }
+    };
 
     let mut payload = Vec::new();
-    encode_search_string_param(&mut payload, &normalized)?;
+    if let Some(joined_terms) = flatten_and_terms(&expression) {
+        encode_search_string_param(&mut payload, &joined_terms.join(" "))?;
+    } else {
+        encode_search_expression(&mut payload, &expression)?;
+    }
     Ok(payload)
 }
 
@@ -1522,15 +1787,22 @@ fn encode_offer_files_payload(
 ) -> Vec<u8> {
     let (advertised_client_id, advertised_client_port) =
         advertised_client_endpoint_for_offer_file(client_id, tcp_port, server_flags);
-    let mut payload = Vec::with_capacity(80);
-    payload.extend_from_slice(&1u32.to_le_bytes());
-    payload.extend_from_slice(&OFFER_FILE_SAMPLE_HASH);
-    payload.extend_from_slice(&advertised_client_id.to_le_bytes());
-    payload.extend_from_slice(&advertised_client_port.to_le_bytes());
-    payload.extend_from_slice(&3u32.to_le_bytes());
-    push_short_string_tag(&mut payload, FT_FILENAME, OFFER_FILE_SAMPLE_NAME);
-    push_short_u32_tag(&mut payload, FT_FILESIZE, OFFER_FILE_SAMPLE_SIZE);
-    push_short_u8_tag(&mut payload, FT_FILETYPE, ED2K_FILETYPE_PROGRAM);
+    let offered_files = offered_files_catalog();
+    let mut payload = Vec::with_capacity(80 * offered_files.len());
+    payload.extend_from_slice(
+        &u32::try_from(offered_files.len())
+            .expect("offered file count fits in u32")
+            .to_le_bytes(),
+    );
+    for (file_hash, file_name, file_size, file_type) in offered_files {
+        payload.extend_from_slice(&file_hash);
+        payload.extend_from_slice(&advertised_client_id.to_le_bytes());
+        payload.extend_from_slice(&advertised_client_port.to_le_bytes());
+        payload.extend_from_slice(&3u32.to_le_bytes());
+        push_short_string_tag(&mut payload, FT_FILENAME, file_name);
+        push_short_u32_tag(&mut payload, FT_FILESIZE, file_size);
+        push_short_u8_tag(&mut payload, FT_FILETYPE, file_type);
+    }
     payload
 }
 
@@ -1558,6 +1830,217 @@ fn encode_search_string_param(payload: &mut Vec<u8>, value: &str) -> Result<()> 
     payload.extend_from_slice(&value_len.to_le_bytes());
     payload.extend_from_slice(value_bytes);
     Ok(())
+}
+
+fn offered_files_catalog() -> [([u8; 16], &'static str, u32, u8); 1] {
+    [(
+        OFFER_FILE_SAMPLE_HASH,
+        OFFER_FILE_SAMPLE_NAME,
+        OFFER_FILE_SAMPLE_SIZE,
+        ED2K_FILETYPE_PROGRAM,
+    )]
+}
+
+fn encode_search_expression(payload: &mut Vec<u8>, expression: &SearchExprNode) -> Result<()> {
+    match expression {
+        SearchExprNode::Term(value) => encode_search_string_param(payload, value),
+        SearchExprNode::And(left, right) => {
+            payload.push(0);
+            payload.push(0x00);
+            encode_search_expression(payload, left)?;
+            encode_search_expression(payload, right)
+        }
+        SearchExprNode::Or(left, right) => {
+            payload.push(0);
+            payload.push(0x01);
+            encode_search_expression(payload, left)?;
+            encode_search_expression(payload, right)
+        }
+        SearchExprNode::Not(left, right) => {
+            payload.push(0);
+            payload.push(0x02);
+            encode_search_expression(payload, left)?;
+            encode_search_expression(payload, right)
+        }
+    }
+}
+
+fn flatten_and_terms(expression: &SearchExprNode) -> Option<Vec<String>> {
+    let mut terms = Vec::new();
+    if collect_flat_and_terms(expression, &mut terms) {
+        Some(terms)
+    } else {
+        None
+    }
+}
+
+fn collect_flat_and_terms(expression: &SearchExprNode, terms: &mut Vec<String>) -> bool {
+    match expression {
+        SearchExprNode::Term(value) => {
+            terms.push(value.clone());
+            true
+        }
+        SearchExprNode::And(left, right) => {
+            collect_flat_and_terms(left, terms) && collect_flat_and_terms(right, terms)
+        }
+        SearchExprNode::Or(_, _) | SearchExprNode::Not(_, _) => false,
+    }
+}
+
+fn parse_search_expression(input: &str) -> Result<Option<SearchExprNode>> {
+    let tokens = tokenize_search_expression(input)?;
+    if tokens.is_empty() {
+        return Ok(None);
+    }
+    let mut parser = SearchExpressionParser::new(tokens);
+    let expression = parser.parse_expression(1)?;
+    if parser.peek().is_some() {
+        anyhow::bail!("unexpected trailing ED2K search tokens");
+    }
+    Ok(Some(expression))
+}
+
+fn tokenize_search_expression(input: &str) -> Result<Vec<SearchToken>> {
+    let mut tokens = Vec::new();
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.peek().copied() {
+        match ch {
+            c if c.is_whitespace() => {
+                chars.next();
+            }
+            '(' => {
+                chars.next();
+                tokens.push(SearchToken::OpenParen);
+            }
+            ')' => {
+                chars.next();
+                tokens.push(SearchToken::CloseParen);
+            }
+            '"' => {
+                chars.next();
+                let mut phrase = String::new();
+                let mut closed = false;
+                for next in chars.by_ref() {
+                    if next == '"' {
+                        closed = true;
+                        break;
+                    }
+                    phrase.push(next);
+                }
+                if !closed {
+                    anyhow::bail!("unterminated quoted ED2K search phrase");
+                }
+                let phrase = phrase.trim();
+                if !phrase.is_empty() {
+                    tokens.push(SearchToken::Term(phrase.to_string()));
+                }
+            }
+            _ => {
+                let mut word = String::new();
+                while let Some(next) = chars.peek().copied() {
+                    if next.is_whitespace() || matches!(next, '(' | ')' | '"') {
+                        break;
+                    }
+                    word.push(next);
+                    chars.next();
+                }
+                if word.is_empty() {
+                    continue;
+                }
+                let uppercase = word.to_ascii_uppercase();
+                match uppercase.as_str() {
+                    "AND" => tokens.push(SearchToken::And),
+                    "OR" => tokens.push(SearchToken::Or),
+                    "NOT" => tokens.push(SearchToken::Not),
+                    _ => tokens.push(SearchToken::Term(word)),
+                }
+            }
+        }
+    }
+    Ok(tokens)
+}
+
+struct SearchExpressionParser {
+    tokens: Vec<SearchToken>,
+    position: usize,
+}
+
+impl SearchExpressionParser {
+    fn new(tokens: Vec<SearchToken>) -> Self {
+        Self {
+            tokens,
+            position: 0,
+        }
+    }
+
+    fn peek(&self) -> Option<&SearchToken> {
+        self.tokens.get(self.position)
+    }
+
+    fn next(&mut self) -> Option<SearchToken> {
+        let token = self.tokens.get(self.position).cloned()?;
+        self.position += 1;
+        Some(token)
+    }
+
+    fn parse_expression(&mut self, min_precedence: u8) -> Result<SearchExprNode> {
+        let mut lhs = self.parse_primary()?;
+        loop {
+            let (operator, precedence, implicit) = match self.peek_binary_operator() {
+                Some(operator) => operator,
+                None => break,
+            };
+            if precedence < min_precedence {
+                break;
+            }
+            if !implicit {
+                let _ = self.next();
+            }
+            let rhs = self.parse_expression(precedence + 1)?;
+            lhs = match operator {
+                SearchBinaryOperator::And => SearchExprNode::And(Box::new(lhs), Box::new(rhs)),
+                SearchBinaryOperator::Or => SearchExprNode::Or(Box::new(lhs), Box::new(rhs)),
+                SearchBinaryOperator::Not => SearchExprNode::Not(Box::new(lhs), Box::new(rhs)),
+            };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_primary(&mut self) -> Result<SearchExprNode> {
+        match self.next() {
+            Some(SearchToken::Term(value)) => Ok(SearchExprNode::Term(value)),
+            Some(SearchToken::OpenParen) => {
+                let expression = self.parse_expression(1)?;
+                match self.next() {
+                    Some(SearchToken::CloseParen) => Ok(expression),
+                    _ => anyhow::bail!("missing closing parenthesis in ED2K search expression"),
+                }
+            }
+            Some(
+                SearchToken::And | SearchToken::Or | SearchToken::Not | SearchToken::CloseParen,
+            )
+            | None => anyhow::bail!("invalid ED2K search expression"),
+        }
+    }
+
+    fn peek_binary_operator(&self) -> Option<(SearchBinaryOperator, u8, bool)> {
+        match self.peek() {
+            Some(SearchToken::And) => Some((SearchBinaryOperator::And, 1, false)),
+            Some(SearchToken::Or) => Some((SearchBinaryOperator::Or, 2, false)),
+            Some(SearchToken::Not) => Some((SearchBinaryOperator::Not, 3, false)),
+            Some(SearchToken::Term(_) | SearchToken::OpenParen) => {
+                Some((SearchBinaryOperator::And, 1, true))
+            }
+            Some(SearchToken::CloseParen) | None => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchBinaryOperator {
+    And,
+    Or,
+    Not,
 }
 
 fn server_capabilities(connect_options: u8) -> u32 {
@@ -1656,10 +2139,37 @@ async fn send_offer_files_advertisement(session: &mut ServerSession, tcp_port: u
     session.send_packet(OP_OFFERFILES, &payload).await?;
     session.offer_files_sent = true;
     session.offer_files_sent_at = Some(Instant::now());
+    session.set_phase(
+        ServerSessionPhase::OfferFilesSent,
+        format!(
+            "sent offer-files advertisement entries={}",
+            offered_files_catalog().len()
+        ),
+    );
     debug!(
         "sent ED2K offer-files advertisement to {}",
         session.endpoint
     );
+    Ok(())
+}
+
+async fn send_connected_server_startup(session: &mut ServerSession, tcp_port: u16) -> Result<()> {
+    session.set_phase(
+        ServerSessionPhase::Connected,
+        "server session accepted after OP_IDCHANGE",
+    );
+    send_offer_files_advertisement(session, tcp_port).await?;
+    send_server_list_request(session).await?;
+    Ok(())
+}
+
+async fn send_server_list_request(session: &mut ServerSession) -> Result<()> {
+    if session.server_list_requested {
+        return Ok(());
+    }
+    session.send_packet(OP_GETSERVERLIST, &[]).await?;
+    session.server_list_requested = true;
+    dump_ed2k_server_meta(session, "requested server list after connected transition");
     Ok(())
 }
 
@@ -1779,19 +2289,20 @@ fn decode_server_ident(payload: &[u8]) -> Result<(Option<String>, Option<String>
 
 #[cfg(test)]
 fn decode_search_results(payload: &[u8]) -> Result<SearchResultSummary> {
-    let files = decode_search_result_files(payload)?;
-    let sample_names = files
+    let page = decode_search_result_page(payload)?;
+    let sample_names = page
+        .files
         .iter()
         .filter_map(|file| file.file_name.clone())
         .take(3)
         .collect::<Vec<_>>();
     Ok(SearchResultSummary {
-        count: u32::try_from(files.len()).expect("search result count fits in u32"),
+        count: u32::try_from(page.files.len()).expect("search result count fits in u32"),
         sample_names,
     })
 }
 
-fn decode_search_result_files(payload: &[u8]) -> Result<Vec<Ed2kSearchFile>> {
+fn decode_search_result_page(payload: &[u8]) -> Result<SearchResultPage> {
     if payload.len() < 4 {
         anyhow::bail!("short ED2K search results payload");
     }
@@ -1856,7 +2367,20 @@ fn decode_search_result_files(payload: &[u8]) -> Result<Vec<Ed2kSearchFile>> {
         });
     }
 
-    Ok(files)
+    let more_results_available = match cursor {
+        [] => false,
+        [marker @ (0x00 | 0x01)] => *marker != 0,
+        [marker] => anyhow::bail!("invalid ED2K search More marker 0x{marker:02X}"),
+        _ => anyhow::bail!(
+            "unexpected ED2K search trailing data len={} after result page",
+            cursor.len()
+        ),
+    };
+
+    Ok(SearchResultPage {
+        files,
+        more_results_available,
+    })
 }
 
 fn decode_tag(bytes: &[u8]) -> Result<(Option<u8>, Option<String>, &[u8])> {
@@ -2067,8 +2591,8 @@ mod tests {
         SERVER_OBFUSCATION_PRIME_BYTES, SERVER_OBFUSCATION_PUBLIC_KEY_LEN,
         SERVER_TCP_FLAG_COMPRESSION, SERVER_TCP_FLAG_LARGEFILES, SERVER_UDP_FLAG_UDPOBFUSCATION,
         ST_DESCRIPTION, ST_SERVERNAME, ServerSession, TAG_SHORT_NAME_MASK, TAGTYPE_UINT32,
-        biguint_to_fixed_be, decode_search_result_files, decode_search_results,
-        decode_server_ident, decode_server_payload, derive_server_cipher, encode_login_request,
+        biguint_to_fixed_be, decode_search_result_page, decode_search_results, decode_server_ident,
+        decode_server_payload, derive_server_cipher, encode_login_request,
         encode_offer_files_payload, encode_packet, encode_search_request, format_server_flags,
         login_identity_for_server_transport, new_ed2k_server_search_channel,
         search_keyword_via_background_session, server_capabilities, should_use_server_obfuscation,
@@ -2347,6 +2871,20 @@ mod tests {
     }
 
     #[test]
+    fn search_probe_encoding_preserves_boolean_query_tree_shape() {
+        let payload = encode_search_request("ubuntu OR linux").unwrap();
+
+        assert_eq!(payload[0], 0);
+        assert_eq!(payload[1], 0x01);
+        assert_eq!(payload[2], 1);
+        assert_eq!(u16::from_le_bytes([payload[3], payload[4]]), 6);
+        assert_eq!(&payload[5..11], b"ubuntu");
+        assert_eq!(payload[11], 1);
+        assert_eq!(u16::from_le_bytes([payload[12], payload[13]]), 5);
+        assert_eq!(&payload[14..19], b"linux");
+    }
+
+    #[test]
     fn plaintext_server_sessions_clear_crypt_capability_bits() {
         let identity = login_identity_for_server_transport(
             Ed2kHelloIdentity {
@@ -2395,6 +2933,7 @@ mod tests {
         payload.push(TAG_SHORT_NAME_MASK | (super::TAGTYPE_STR1 + 9));
         payload.push(FT_FILENAME);
         payload.extend_from_slice(b"ubuntu.iso");
+        payload.push(0x00);
 
         let summary = decode_search_results(&payload).unwrap();
 
@@ -2424,14 +2963,28 @@ mod tests {
         payload.extend_from_slice(&1u16.to_le_bytes());
         payload.push(FT_SOURCES);
         payload.extend_from_slice(&12u32.to_le_bytes());
+        payload.push(0x01);
 
-        let files = decode_search_result_files(&payload).unwrap();
+        let page = decode_search_result_page(&payload).unwrap();
+        let files = page.files;
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].file_name.as_deref(), Some("ubuntu.iso"));
         assert_eq!(files[0].file_size, Some(4_294_967_300));
         assert_eq!(files[0].file_type.as_deref(), Some("Video"));
         assert_eq!(files[0].source_count, Some(12));
+        assert!(page.more_results_available);
+    }
+
+    #[test]
+    fn search_results_decoder_rejects_invalid_more_marker() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.push(0x7F);
+
+        let error = decode_search_result_page(&payload).unwrap_err().to_string();
+
+        assert!(error.contains("More marker"));
     }
 
     #[tokio::test]
