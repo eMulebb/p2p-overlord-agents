@@ -18,3 +18,4 @@ Thumbs.db
 
 .idea/
 .vscode/
+scripts/windows/tracked_file_privacy_guard_policy.local.json

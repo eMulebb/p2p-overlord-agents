@@ -11,3 +11,8 @@ Canonical documentation home for `overlord-agents`.
 - [Observations](./kad/OBSERVATIONS.md)
 - [Wire Sequences](./kad/WIRE_SEQUENCES.md)
 - [Oracle Differences](./kad/PROTOCOL_DIFFS.md)
+
+## Repo Guards
+
+- `../scripts/windows/tracked_file_privacy_guard.ps1` validates tracked files
+  for local user-profile path leaks and configured personal-name filename leaks.

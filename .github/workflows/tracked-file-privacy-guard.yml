@@ -1,0 +1,35 @@
+name: Tracked File Privacy Guard
+
+on:
+  push:
+    paths:
+      - ".github/workflows/tracked-file-privacy-guard.yml"
+      - "AGENTS.md"
+      - "docs/**"
+      - "scripts/windows/tracked_file_privacy_guard.ps1"
+      - "scripts/windows/tracked_file_privacy_guard_policy.v1.json"
+      - "crates/**"
+      - "*.toml"
+      - "*.md"
+  pull_request:
+    paths:
+      - ".github/workflows/tracked-file-privacy-guard.yml"
+      - "AGENTS.md"
+      - "docs/**"
+      - "scripts/windows/tracked_file_privacy_guard.ps1"
+      - "scripts/windows/tracked_file_privacy_guard_policy.v1.json"
+      - "crates/**"
+      - "*.toml"
+      - "*.md"
+
+jobs:
+  tracked-file-privacy-guard:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run tracked-file privacy guard
+        shell: pwsh
+        run: ./scripts/windows/tracked_file_privacy_guard.ps1
