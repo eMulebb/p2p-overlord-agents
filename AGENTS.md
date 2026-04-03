@@ -18,7 +18,7 @@
   - Instrument both the Rust agent and the oracle as needed so the same scenario can be compared from structured dumps on both sides.
   - Treat JSONL dump support as reusable observability infrastructure, not one-off debug code.
 - Treat `rustfmt` output as canonical.
-- Keep reusable operational tooling in `../overlord-helpers`, not inline in issue-specific commands.
+- Keep reusable operational tooling in `../overlord-tooling`, not inline in issue-specific commands.
 - Respect the workspace line-ending policy:
   - tracked text files use LF by default
   - `.ps1`, `.cmd`, and `.bat` may use CRLF
