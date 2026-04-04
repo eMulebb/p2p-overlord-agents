@@ -27,3 +27,13 @@
 - Respect the workspace line-ending policy:
   - tracked text files use LF by default
   - `.ps1`, `.cmd`, and `.bat` may use CRLF
+- Make granular commits while working on protocol/runtime slices.
+  - Prefer one small commit per coherent transfer, listener, server-session, or observability change.
+  - Make WIP commits as intermediate slices land instead of carrying large uncommitted protocol work.
+- When launching `overlord-agent-emule` interactively for local runs:
+  - ensure no dangling `overlord-agent-emule` processes remain from earlier launches before starting a new one
+  - launch the agent in a hidden window
+- Treat ED2K server/client IPv4 tokens as little-endian wire values unless the protocol path clearly proves otherwise.
+  - `client_id` values and server-reported IPv4 fields on the ED2K wire are not normal big-endian IPv4 integers.
+  - When converting those wire tokens to `Ipv4Addr`, use little-endian byte order.
+  - If a decoded “direct peer” lands in impossible/bogus ranges such as multicast-looking `236.x.x.x`, check endianness first.
