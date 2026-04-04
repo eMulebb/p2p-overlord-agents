@@ -16,6 +16,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -299,7 +300,7 @@ impl Ed2kTransferRuntime {
             })?;
         let manifest_path = transfer_dir.join(MANIFEST_FILE_NAME);
         if tokio::fs::try_exists(&manifest_path).await? {
-            return self.load_manifest(&job.file_hash).await;
+            return self.load_manifest_or_rebuild(job).await;
         }
         let manifest = Ed2kResumeManifest::new(job);
         self.store_manifest(&manifest).await?;
@@ -517,6 +518,23 @@ impl Ed2kTransferRuntime {
         self.load_manifest(file_hash).await
     }
 
+    async fn load_manifest_or_rebuild(&self, job: &Ed2kTransferJob) -> Result<Ed2kResumeManifest> {
+        match self.load_manifest(&job.file_hash).await {
+            Ok(manifest) => Ok(manifest),
+            Err(error) => {
+                let manifest_path = self.transfer_dir(&job.file_hash).join(MANIFEST_FILE_NAME);
+                quarantine_corrupt_manifest(&manifest_path).await?;
+                let manifest = Ed2kResumeManifest::new(job);
+                self.store_manifest(&manifest).await?;
+                tracing::warn!(
+                    "rebuilt ED2K manifest after corrupt state for {}: {error}",
+                    job.file_hash
+                );
+                Ok(manifest)
+            }
+        }
+    }
+
     async fn upsert_verified_catalog_entry(&self, manifest: &Ed2kResumeManifest) {
         let mut entries = self.shared_catalog.write().await;
         entries.retain(|entry| entry.file_hash != manifest.file_hash || entry.compatibility_hint);
@@ -572,8 +590,16 @@ fn load_catalog_from_manifests(root_dir: &Path) -> Result<Vec<Ed2kSharedEntry>> 
         }
         let bytes = fs::read(&manifest_path)
             .with_context(|| format!("failed to read {}", manifest_path.display()))?;
-        let manifest: Ed2kResumeManifest = serde_json::from_slice(&bytes)
-            .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+        let manifest: Ed2kResumeManifest = match serde_json::from_slice(&bytes) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                tracing::warn!(
+                    "skipping malformed ED2K manifest {} during catalog load: {error}",
+                    manifest_path.display()
+                );
+                continue;
+            }
+        };
         if manifest.completed {
             entries.push(Ed2kSharedEntry::from_manifest(&manifest));
         }
@@ -591,6 +617,26 @@ fn dedupe_entries(entries: Vec<Ed2kSharedEntry>) -> Vec<Ed2kSharedEntry> {
     }
     deduped.reverse();
     deduped
+}
+
+async fn quarantine_corrupt_manifest(path: &Path) -> Result<()> {
+    if !tokio::fs::try_exists(path).await? {
+        return Ok(());
+    }
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let quarantine_path = path.with_extension(format!("json.corrupt-{suffix}"));
+    tokio::fs::rename(path, &quarantine_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to quarantine corrupt ED2K manifest {} -> {}",
+                path.display(),
+                quarantine_path.display()
+            )
+        })
 }
 
 fn piece_count(file_size: u64, piece_size: u64) -> u32 {
