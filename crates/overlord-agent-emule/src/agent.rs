@@ -25,11 +25,13 @@ use overlord_agent_nat::{
     recommend_interface, resolve_bind_ip,
 };
 use rand::{RngCore, seq::SliceRandom};
+use serde::Deserialize;
+use serde_json::Value;
 use sha1::Sha1;
 use tokio::{
     net::TcpListener,
     sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore, mpsc},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
 };
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -62,14 +64,18 @@ use overlord_kad_routing::{Contact, ContactType};
 
 use crate::config::EmuleAgentConfig;
 use crate::ed2k_server::{
-    Ed2kFoundSource, Ed2kSearchFile, Ed2kServerSearchHandle, Ed2kServerState, Ed2kSharedCatalog,
-    new_ed2k_server_search_channel, run_ed2k_server_loop, search_keyword_servers,
-    search_keyword_via_background_session, search_source_servers,
+    Ed2kFoundSource, Ed2kSearchFile, Ed2kServerSearchHandle, Ed2kServerState,
+    new_ed2k_server_search_channel, request_callback_via_background_session, run_ed2k_server_loop,
+    search_keyword_servers, search_keyword_via_background_session, search_source_servers,
     search_source_via_background_session,
 };
 use crate::ed2k_tcp::{
-    Ed2kHelloIdentity, Ed2kSecureIdent, FirewallCheckUdpRequest, emule_connect_options,
-    enrich_hello_identity, request_udp_firewall_check, run_ed2k_listener,
+    Ed2kHelloIdentity, Ed2kSecureIdent, FirewallCheckUdpRequest, download_file_from_peer,
+    emule_connect_options, enrich_hello_identity, request_udp_firewall_check, run_ed2k_listener,
+};
+use crate::ed2k_transfer::{
+    Ed2kCallbackIntent, Ed2kSharedCatalog, Ed2kSharedEntry, Ed2kSourceHint, Ed2kTransferRuntime,
+    new_transfer_job,
 };
 use crate::kad_firewall::{
     ExternalPortDiscoveryOutcome, FirewallUdpPacketOutcome, FirewalledResponseOutcome,
@@ -739,6 +745,7 @@ struct AgentStatePaths {
     udp_key_path: PathBuf,
     ed2k_user_hash_path: PathBuf,
     ed2k_secure_ident_path: PathBuf,
+    ed2k_transfer_root: PathBuf,
     nodes_dat_path: PathBuf,
     networking_config_path: PathBuf,
 }
@@ -749,6 +756,7 @@ struct AgentNetworkRuntime {
     dht: DhtNode,
     ed2k_listener: Arc<TcpListener>,
     ed2k_shared_catalog: Ed2kSharedCatalog,
+    ed2k_transfer: Arc<Ed2kTransferRuntime>,
     ed2k_server_search: Ed2kServerSearchHandle,
     ed2k_server_search_inbox: Arc<Mutex<Option<crate::ed2k_server::Ed2kServerSearchInbox>>>,
     ed2k_server_state: Arc<RwLock<Ed2kServerState>>,
@@ -769,6 +777,62 @@ struct ControlServerRuntime {
 #[derive(Clone)]
 struct ActiveSearchHandle {
     cancel: CancellationToken,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnrichEd2kDownloadSource {
+    ip: Ipv4Addr,
+    #[serde(alias = "tcp_port")]
+    tcp_port: u16,
+    #[serde(default, alias = "client_id")]
+    client_id: Option<u32>,
+    #[serde(default, alias = "low_id")]
+    low_id: Option<bool>,
+    #[serde(default, alias = "obfuscation_options")]
+    obfuscation_options: Option<u8>,
+    #[serde(default, alias = "user_hash")]
+    user_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnrichEd2kDownloadRequest {
+    kind: String,
+    #[serde(alias = "file_hash")]
+    file_hash: String,
+    #[serde(alias = "file_name", alias = "canonical_name")]
+    file_name: String,
+    #[serde(alias = "file_size")]
+    file_size: u64,
+    #[serde(default)]
+    sources: Vec<EnrichEd2kDownloadSource>,
+}
+
+impl EnrichEd2kDownloadSource {
+    fn into_found_source(self, file_hash: Ed2kHash) -> Result<Ed2kFoundSource> {
+        let user_hash = self
+            .user_hash
+            .map(|value| -> Result<[u8; 16]> {
+                let bytes = hex::decode(&value)
+                    .with_context(|| format!("invalid source user hash {value}"))?;
+                let bytes: [u8; 16] = bytes
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("source user hash must be 16 bytes"))?;
+                Ok(bytes)
+            })
+            .transpose()?;
+        Ok(Ed2kFoundSource {
+            file_hash,
+            ip: self.ip,
+            tcp_port: self.tcp_port,
+            client_id: self.client_id.unwrap_or_else(|| u32::from(self.ip)),
+            low_id: self.low_id.unwrap_or(false),
+            obfuscated: self.obfuscation_options.is_some(),
+            obfuscation_options: self.obfuscation_options,
+            user_hash,
+        })
+    }
 }
 
 pub struct OverlordAgentEmule {
@@ -1032,6 +1096,12 @@ impl OverlordAgentEmule {
         ensure_parent_dir(&state_paths.udp_key_path)?;
         ensure_parent_dir(&state_paths.ed2k_user_hash_path)?;
         ensure_parent_dir(&state_paths.ed2k_secure_ident_path)?;
+        fs::create_dir_all(&state_paths.ed2k_transfer_root).with_context(|| {
+            format!(
+                "failed to create ED2K transfer root {}",
+                state_paths.ed2k_transfer_root.display()
+            )
+        })?;
         ensure_parent_dir(&state_paths.nodes_dat_path)?;
         ensure_parent_dir(&state_paths.networking_config_path)?;
         let ed2k_user_hash = load_or_create_ed2k_user_hash(&state_paths.ed2k_user_hash_path)?;
@@ -1700,13 +1770,20 @@ impl OverlordAgentEmule {
             })?);
         let (ed2k_server_search, ed2k_server_search_inbox) =
             new_ed2k_server_search_channel(ED2K_BACKGROUND_SEARCH_QUEUE_CAPACITY);
-        let ed2k_shared_catalog = Arc::new(RwLock::new(synthetic_popular_hashes()));
+        let ed2k_transfer = Arc::new(Ed2kTransferRuntime::load_or_create(
+            &self.state_paths.ed2k_transfer_root,
+        )?);
+        ed2k_transfer
+            .replace_catalog_hints(&synthetic_popular_hashes())
+            .await;
+        let ed2k_shared_catalog = ed2k_transfer.shared_catalog();
 
         Ok(AgentNetworkRuntime {
             bind_ip: bind_ipv4,
             dht,
             ed2k_listener,
             ed2k_shared_catalog,
+            ed2k_transfer,
             ed2k_server_search,
             ed2k_server_search_inbox: Arc::new(Mutex::new(Some(ed2k_server_search_inbox))),
             ed2k_server_state: Arc::new(RwLock::new(Ed2kServerState::default())),
@@ -2493,6 +2570,9 @@ fn map_ed2k_source_result(result: &Ed2kFoundSource, file_size: u64) -> FileRecor
             address: format!("{}:{}", result.ip, result.tcp_port),
             extra: serde_json::json!({
                 "search_mode": "server_source",
+                "client_id": result.client_id,
+                "direct_dialable": result.is_direct_dialable(),
+                "low_id": result.low_id,
                 "obfuscated": result.obfuscated,
                 "obfuscation_options": result.obfuscation_options,
                 "user_hash": result.user_hash.map(hex::encode),
@@ -2506,7 +2586,7 @@ async fn do_active_ed2k_keyword_search(
     bind_ip: Ipv4Addr,
     indexer_id: Uuid,
     ed2k_user_hash: [u8; 16],
-    shared_catalog: &[PopularHash],
+    shared_catalog: &[Ed2kSharedEntry],
     job: &SearchJob,
     config: &EmuleAgentConfig,
     background_search: Option<Ed2kServerSearchHandle>,
@@ -2622,7 +2702,7 @@ async fn do_active_ed2k_source_search(
     bind_ip: Ipv4Addr,
     indexer_id: Uuid,
     ed2k_user_hash: [u8; 16],
-    shared_catalog: &[PopularHash],
+    shared_catalog: &[Ed2kSharedEntry],
     job: &SearchJob,
     config: &EmuleAgentConfig,
     background_search: Option<Ed2kServerSearchHandle>,
@@ -2771,11 +2851,17 @@ fn synthetic_popular_hash(index: usize, seed: &SyntheticPopularSeed) -> PopularH
 
 async fn refresh_ed2k_shared_catalog(shared_catalog: &Ed2kSharedCatalog, hashes: &[PopularHash]) {
     let mut guard = shared_catalog.write().await;
-    *guard = if hashes.is_empty() {
+    guard.retain(|entry| !entry.compatibility_hint);
+    let replacements = if hashes.is_empty() {
         synthetic_popular_hashes()
     } else {
         hashes.to_vec()
     };
+    guard.extend(
+        replacements
+            .iter()
+            .filter_map(crate::ed2k_transfer::Ed2kSharedEntry::from_popular_hash),
+    );
 }
 
 /// Static settings that make source publishes look like a stable eMule-style
@@ -4814,6 +4900,7 @@ impl AgentStatePaths {
             udp_key_path: state_dir.join("overlord-kad.udp-key"),
             ed2k_user_hash_path: state_dir.join("overlord-ed2k.user-hash.bin"),
             ed2k_secure_ident_path: state_dir.join("overlord-ed2k.secident.pkcs8.der"),
+            ed2k_transfer_root: state_dir.join("overlord-ed2k-transfer"),
             nodes_dat_path,
             networking_config_path: state_dir.join("overlord-agent.networking.json"),
         }
@@ -5266,6 +5353,12 @@ impl IndexerService for OverlordAgentEmule {
         }
     }
 
+    async fn enrich(&self, payload: Value) -> Result<()> {
+        let request: EnrichEd2kDownloadRequest = serde_json::from_value(payload)
+            .context("invalid enrich payload for overlord-agent-emule")?;
+        self.start_native_ed2k_download(request).await
+    }
+
     async fn seed_popular(&self, hashes: Vec<PopularHash>) -> Result<()> {
         let runtime = self.runtime.lock().await.clone();
         let Some(runtime) = runtime else {
@@ -5336,6 +5429,316 @@ impl IndexerService for OverlordAgentEmule {
 }
 
 impl OverlordAgentEmule {
+    async fn native_ed2k_download_sources(
+        &self,
+        runtime: &AgentNetworkRuntime,
+        config: &EmuleAgentConfig,
+        file_hash: Ed2kHash,
+        file_size: u64,
+    ) -> Result<Vec<Ed2kFoundSource>> {
+        let cancel = CancellationToken::new();
+        let mut sources = Vec::new();
+        let shared_catalog = runtime.ed2k_shared_catalog.read().await.clone();
+        let hello_identity = Ed2kHelloIdentity {
+            user_hash: self.ed2k_user_hash,
+            client_id: 0,
+            tcp_port: config.p2p.ed2k.listen_port,
+            udp_port: config.p2p.kad.listen_port,
+            server_ip: 0,
+            server_port: 0,
+            connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
+            direct_udp_callback: false,
+        };
+        let (preferred_endpoint, background_search) = {
+            let server_state = runtime.ed2k_server_state.read().await;
+            if server_state.connected {
+                (
+                    server_state.endpoint,
+                    Some(runtime.ed2k_server_search.clone()),
+                )
+            } else {
+                (None, None)
+            }
+        };
+
+        if let Some(background_search) = background_search {
+            match search_source_via_background_session(
+                &background_search,
+                file_hash,
+                file_size,
+                Duration::from_secs(config.p2p.ed2k.connect_timeout_secs.max(5)),
+                &cancel,
+            )
+            .await
+            {
+                Ok(results) if !results.is_empty() => merge_download_sources(&mut sources, results),
+                Ok(_) => {
+                    warn!(
+                        "native ED2K download background source search returned no sources for file_hash={file_hash}"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        "native ED2K download background source search failed for file_hash={file_hash}: {error}"
+                    );
+                }
+            }
+        }
+
+        let server_results = search_source_servers(
+            runtime.bind_ip,
+            &config.p2p.ed2k,
+            hello_identity,
+            &shared_catalog,
+            preferred_endpoint,
+            ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
+            file_hash,
+            file_size,
+            &cancel,
+        )
+        .await?;
+        merge_download_sources(&mut sources, server_results);
+        Ok(sources)
+    }
+
+    async fn start_native_ed2k_download(&self, request: EnrichEd2kDownloadRequest) -> Result<()> {
+        if request.kind != "ed2k_download" {
+            anyhow::bail!("unsupported enrich kind {}", request.kind);
+        }
+
+        let file_hash = Ed2kHash::from_str(&request.file_hash)
+            .with_context(|| format!("invalid ED2K file hash {}", request.file_hash))?;
+        let runtime = self.runtime.lock().await.clone();
+        let Some(runtime) = runtime else {
+            anyhow::bail!("agent networking is waiting for interface selection");
+        };
+        let config = self.config.read().await.clone();
+        runtime
+            .ed2k_transfer
+            .ensure_job(&new_transfer_job(
+                file_hash.clone(),
+                request.file_name.clone(),
+                request.file_size,
+            ))
+            .await?;
+        let hello_identity = Ed2kHelloIdentity {
+            user_hash: self.ed2k_user_hash,
+            client_id: 0,
+            tcp_port: config.p2p.ed2k.listen_port,
+            udp_port: config.p2p.kad.listen_port,
+            server_ip: 0,
+            server_port: 0,
+            connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
+            direct_udp_callback: false,
+        };
+        let mut sources = if request.sources.is_empty() {
+            self.native_ed2k_download_sources(&runtime, &config, file_hash, request.file_size)
+                .await?
+        } else {
+            request
+                .sources
+                .into_iter()
+                .map(|source| source.into_found_source(file_hash))
+                .collect::<Result<Vec<_>>>()?
+        };
+        if sources.is_empty() {
+            anyhow::bail!("no ED2K sources available for {}", request.file_hash);
+        }
+
+        // Prefer sources with user-hash metadata first so obfuscation-capable
+        // peers get the first attempt without blocking on more complex ranking.
+        sources.sort_by_key(|source| {
+            (
+                !source.is_direct_dialable(),
+                source.user_hash.is_none(),
+                source.obfuscation_options.is_none(),
+            )
+        });
+
+        let callback_only_sources: Vec<_> = sources
+            .iter()
+            .filter(|source| source.low_id)
+            .cloned()
+            .collect();
+        let skipped_low_id_sources = callback_only_sources.len();
+        if skipped_low_id_sources != 0 {
+            info!(
+                "native ED2K download filtered callback-only sources file_hash={} skipped_low_id_sources={}",
+                request.file_hash, skipped_low_id_sources
+            );
+        }
+        sources.retain(Ed2kFoundSource::is_direct_dialable);
+        let mut last_error: Option<anyhow::Error> = None;
+        if !sources.is_empty() {
+            const MAX_PARALLEL_DOWNLOAD_PEERS: usize = 3;
+            let bind_ip = runtime.bind_ip;
+            let connect_timeout = Duration::from_secs(config.p2p.ed2k.connect_timeout_secs.max(10));
+            let file_size = request.file_size;
+            let mut source_iter = sources.into_iter();
+            let mut active_downloads = JoinSet::new();
+
+            while active_downloads.len() < MAX_PARALLEL_DOWNLOAD_PEERS {
+                let Some(source) = source_iter.next() else {
+                    break;
+                };
+                let transfer_runtime = Arc::clone(&runtime.ed2k_transfer);
+                let file_name = request.file_name.clone();
+                let file_hash_hex = request.file_hash.clone();
+                info!(
+                    "native ED2K download attempt file_hash={} peer={}:{} client_id={} obfuscated={} has_user_hash={}",
+                    file_hash_hex,
+                    source.ip,
+                    source.tcp_port,
+                    source.client_id,
+                    source.obfuscated,
+                    source.user_hash.is_some()
+                );
+                active_downloads.spawn(async move {
+                    let peer_addr = SocketAddr::new(IpAddr::V4(source.ip), source.tcp_port);
+                    let result = download_file_from_peer(
+                        bind_ip,
+                        &source,
+                        hello_identity,
+                        transfer_runtime.as_ref(),
+                        file_name,
+                        file_size,
+                        connect_timeout,
+                    )
+                    .await;
+                    (peer_addr, result)
+                });
+            }
+
+            while let Some(joined) = active_downloads.join_next().await {
+                let (peer_addr, result) = joined.context("native ED2K download worker panicked")?;
+                match result {
+                    Ok(()) => {
+                        let manifest = runtime.ed2k_transfer.manifest(&request.file_hash).await?;
+                        if manifest.completed {
+                            active_downloads.abort_all();
+                            while active_downloads.join_next().await.is_some() {}
+                            info!(
+                                "native ED2K download completed file_hash={} file_name={} size={}",
+                                request.file_hash, request.file_name, request.file_size
+                            );
+                            return Ok(());
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            "native ED2K download peer failed file_hash={} peer={}: {error}",
+                            request.file_hash, peer_addr
+                        );
+                        last_error = Some(error);
+                    }
+                }
+
+                while active_downloads.len() < MAX_PARALLEL_DOWNLOAD_PEERS {
+                    let Some(source) = source_iter.next() else {
+                        break;
+                    };
+                    let transfer_runtime = Arc::clone(&runtime.ed2k_transfer);
+                    let file_name = request.file_name.clone();
+                    let file_hash_hex = request.file_hash.clone();
+                    info!(
+                        "native ED2K download attempt file_hash={} peer={}:{} client_id={} obfuscated={} has_user_hash={}",
+                        file_hash_hex,
+                        source.ip,
+                        source.tcp_port,
+                        source.client_id,
+                        source.obfuscated,
+                        source.user_hash.is_some()
+                    );
+                    active_downloads.spawn(async move {
+                        let peer_addr = SocketAddr::new(IpAddr::V4(source.ip), source.tcp_port);
+                        let result = download_file_from_peer(
+                            bind_ip,
+                            &source,
+                            hello_identity,
+                            transfer_runtime.as_ref(),
+                            file_name,
+                            file_size,
+                            connect_timeout,
+                        )
+                        .await;
+                        (peer_addr, result)
+                    });
+                }
+            }
+        }
+
+        if last_error.is_none() && !callback_only_sources.is_empty() {
+            let cancel = CancellationToken::new();
+            for source in &callback_only_sources {
+                runtime
+                    .ed2k_transfer
+                    .register_callback_intent(Ed2kCallbackIntent {
+                        client_id: source.client_id,
+                        file_hash: request.file_hash.clone(),
+                        canonical_name: request.file_name.clone(),
+                        file_size: request.file_size,
+                        source: Ed2kSourceHint {
+                            ip: source.ip.to_string(),
+                            tcp_port: source.tcp_port,
+                            user_hash: source.user_hash.map(hex::encode),
+                        },
+                    })
+                    .await;
+                info!(
+                    "native ED2K download requesting server callback file_hash={} client_id={} tcp_port={}",
+                    request.file_hash, source.client_id, source.tcp_port
+                );
+                match request_callback_via_background_session(
+                    &runtime.ed2k_server_search,
+                    source.client_id,
+                    Duration::from_secs(config.p2p.ed2k.connect_timeout_secs.max(10)),
+                    &cancel,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(error) => warn!(
+                        "native ED2K server callback request failed file_hash={} client_id={}: {error}",
+                        request.file_hash, source.client_id
+                    ),
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(
+                config.p2p.ed2k.connect_timeout_secs.max(10),
+            ))
+            .await;
+            let manifest = runtime.ed2k_transfer.manifest(&request.file_hash).await?;
+            if manifest.completed {
+                return Ok(());
+            }
+        }
+
+        if last_error.is_none() {
+            anyhow::bail!(
+                "native ED2K download found only callback-only or otherwise non-dialable sources for {}",
+                request.file_hash
+            );
+        }
+
+        if let Some(error) = last_error {
+            return Err(error).with_context(|| {
+                format!(
+                    "native ED2K download did not complete for {} after trying discovered sources",
+                    request.file_hash
+                )
+            });
+        }
+
+        let manifest = runtime.ed2k_transfer.manifest(&request.file_hash).await?;
+        if manifest.completed {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "native ED2K download for {} did not complete and no peer reported a concrete error",
+            request.file_hash
+        );
+    }
+
     async fn spawn_background_tasks(
         &self,
         runtime: &AgentNetworkRuntime,
@@ -5512,6 +5915,7 @@ impl OverlordAgentEmule {
         let ed2k_server_state = Arc::clone(&runtime.ed2k_server_state);
         let kad_firewall = Arc::clone(&runtime.kad_firewall);
         let ed2k_secure_ident = Arc::clone(&runtime.ed2k_secure_ident);
+        let ed2k_transfer = Arc::clone(&runtime.ed2k_transfer);
         let shutdown = Arc::clone(&runtime.shutdown);
         let ed2k_user_hash = self.ed2k_user_hash;
         let ed2k_hello_identity = Ed2kHelloIdentity {
@@ -5531,6 +5935,7 @@ impl OverlordAgentEmule {
                 ed2k_server_state,
                 kad_firewall,
                 ed2k_secure_ident,
+                ed2k_transfer,
                 ed2k_hello_identity,
                 shutdown,
             )
@@ -6680,6 +7085,23 @@ impl OverlordAgentEmule {
                 }
             }
         }));
+    }
+}
+
+fn merge_download_sources(
+    aggregated_sources: &mut Vec<Ed2kFoundSource>,
+    new_sources: Vec<Ed2kFoundSource>,
+) {
+    for source in new_sources {
+        if aggregated_sources.iter().any(|existing| {
+            existing.ip == source.ip
+                && existing.tcp_port == source.tcp_port
+                && existing.obfuscation_options == source.obfuscation_options
+                && existing.user_hash == source.user_hash
+        }) {
+            continue;
+        }
+        aggregated_sources.push(source);
     }
 }
 
