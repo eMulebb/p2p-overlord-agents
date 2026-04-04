@@ -2709,9 +2709,9 @@ fn encode_udp_source_request(
             OP_GLOBGETSOURCES2,
             encode_source_request(file_hash, file_size),
         )
-    } else if server.entry.udp_flags & SERVER_UDP_FLAG_EXT_GETSOURCES != 0 {
-        (OP_GLOBGETSOURCES, file_hash.0.to_vec())
     } else {
+        let _supports_legacy_getsources =
+            server.entry.udp_flags & SERVER_UDP_FLAG_EXT_GETSOURCES != 0;
         (OP_GLOBGETSOURCES, file_hash.0.to_vec())
     }
 }
