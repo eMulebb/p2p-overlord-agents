@@ -22,7 +22,7 @@ use std::{
 use anyhow::{Context, Result};
 use md4::{Digest, Md4};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use overlord_agent_common::{HashType, PopularHash};
 use overlord_kad_proto::Ed2kHash;
@@ -230,6 +230,7 @@ pub struct Ed2kTransferRuntime {
     root_dir: PathBuf,
     shared_catalog: Ed2kSharedCatalog,
     callback_intents: Arc<RwLock<Vec<Ed2kCallbackIntent>>>,
+    manifest_io: Arc<Mutex<()>>,
 }
 
 impl Ed2kTransferRuntime {
@@ -244,6 +245,7 @@ impl Ed2kTransferRuntime {
             root_dir: root_dir.to_path_buf(),
             shared_catalog,
             callback_intents: Arc::new(RwLock::new(Vec::new())),
+            manifest_io: Arc::new(Mutex::new(())),
         })
     }
 
@@ -289,6 +291,7 @@ impl Ed2kTransferRuntime {
 
     /// Ensure a transfer manifest exists for the provided job.
     pub async fn ensure_job(&self, job: &Ed2kTransferJob) -> Result<Ed2kResumeManifest> {
+        let _guard = self.manifest_io.lock().await;
         let transfer_dir = self.transfer_dir(&job.file_hash);
         tokio::fs::create_dir_all(&transfer_dir)
             .await
@@ -300,10 +303,10 @@ impl Ed2kTransferRuntime {
             })?;
         let manifest_path = transfer_dir.join(MANIFEST_FILE_NAME);
         if tokio::fs::try_exists(&manifest_path).await? {
-            return self.load_manifest_or_rebuild(job).await;
+            return self.load_manifest_or_rebuild_unlocked(job).await;
         }
         let manifest = Ed2kResumeManifest::new(job);
-        self.store_manifest(&manifest).await?;
+        self.store_manifest_unlocked(&manifest).await?;
         Ok(manifest)
     }
 
@@ -314,7 +317,8 @@ impl Ed2kTransferRuntime {
         file_hash: &str,
         md4_hashset: Vec<[u8; 16]>,
     ) -> Result<Ed2kResumeManifest> {
-        let mut manifest = self.load_manifest(file_hash).await?;
+        let _guard = self.manifest_io.lock().await;
+        let mut manifest = self.load_manifest_unlocked(file_hash).await?;
         let expected_hash_count = expected_md4_hash_count(manifest.file_size);
         if md4_hashset.len() != usize::from(expected_hash_count) {
             anyhow::bail!(
@@ -327,16 +331,17 @@ impl Ed2kTransferRuntime {
         validate_md4_hashset(file_hash, &md4_hashset)?;
         manifest.md4_hashset = md4_hashset.iter().map(hex::encode).collect();
         manifest.md4_hashset_acquired = true;
-        self.store_manifest(&manifest).await?;
+        self.store_manifest_unlocked(&manifest).await?;
         Ok(manifest)
     }
 
     /// Record one remembered source hint for a job.
     pub async fn remember_source(&self, file_hash: &str, source: Ed2kSourceHint) -> Result<()> {
-        let mut manifest = self.load_manifest(file_hash).await?;
+        let _guard = self.manifest_io.lock().await;
+        let mut manifest = self.load_manifest_unlocked(file_hash).await?;
         if !manifest.sources.contains(&source) {
             manifest.sources.push(source);
-            self.store_manifest(&manifest).await?;
+            self.store_manifest_unlocked(&manifest).await?;
         }
         Ok(())
     }
@@ -344,7 +349,8 @@ impl Ed2kTransferRuntime {
     /// Mark a specific missing piece as requested.
     #[cfg(test)]
     pub async fn mark_piece_requested(&self, file_hash: &str, piece_index: u32) -> Result<bool> {
-        let mut manifest = self.load_manifest(file_hash).await?;
+        let _guard = self.manifest_io.lock().await;
+        let mut manifest = self.load_manifest_unlocked(file_hash).await?;
         let piece = manifest
             .pieces
             .iter_mut()
@@ -352,7 +358,7 @@ impl Ed2kTransferRuntime {
             .with_context(|| format!("missing piece index {piece_index} in {file_hash}"))?;
         if piece.state == Ed2kTransferState::Missing {
             piece.state = Ed2kTransferState::Requested;
-            self.store_manifest(&manifest).await?;
+            self.store_manifest_unlocked(&manifest).await?;
             return Ok(true);
         }
         Ok(false)
@@ -360,7 +366,8 @@ impl Ed2kTransferRuntime {
 
     /// Claim the next missing part atomically for one peer session.
     pub async fn claim_next_missing_part(&self, file_hash: &str) -> Result<Option<u32>> {
-        let mut manifest = self.load_manifest(file_hash).await?;
+        let _guard = self.manifest_io.lock().await;
+        let mut manifest = self.load_manifest_unlocked(file_hash).await?;
         let Some(piece) = manifest
             .pieces
             .iter_mut()
@@ -370,13 +377,14 @@ impl Ed2kTransferRuntime {
         };
         piece.state = Ed2kTransferState::Requested;
         let piece_index = piece.piece_index;
-        self.store_manifest(&manifest).await?;
+        self.store_manifest_unlocked(&manifest).await?;
         Ok(Some(piece_index))
     }
 
     /// Release a previously requested part back to the missing pool.
     pub async fn release_piece_request(&self, file_hash: &str, piece_index: u32) -> Result<()> {
-        let mut manifest = self.load_manifest(file_hash).await?;
+        let _guard = self.manifest_io.lock().await;
+        let mut manifest = self.load_manifest_unlocked(file_hash).await?;
         let piece = manifest
             .pieces
             .iter_mut()
@@ -385,7 +393,7 @@ impl Ed2kTransferRuntime {
         if piece.state == Ed2kTransferState::Requested {
             piece.state = Ed2kTransferState::Missing;
             piece.bytes_written = 0;
-            self.store_manifest(&manifest).await?;
+            self.store_manifest_unlocked(&manifest).await?;
         }
         Ok(())
     }
@@ -397,7 +405,8 @@ impl Ed2kTransferRuntime {
         piece_index: u32,
         data: &[u8],
     ) -> Result<()> {
-        let mut manifest = self.load_manifest(file_hash).await?;
+        let _guard = self.manifest_io.lock().await;
+        let mut manifest = self.load_manifest_unlocked(file_hash).await?;
         let piece_size = manifest.piece_size;
         let expected_piece_len =
             expected_piece_length(manifest.file_size, piece_size, u64::from(piece_index));
@@ -441,7 +450,7 @@ impl Ed2kTransferRuntime {
         rebuild_verified_ranges(&mut manifest);
         manifest.completed = manifest.is_fully_verified();
         self.upsert_verified_catalog_entry(&manifest).await;
-        self.store_manifest(&manifest).await
+        self.store_manifest_unlocked(&manifest).await
     }
 
     /// Read a fully verified range for upload serving.
@@ -452,7 +461,8 @@ impl Ed2kTransferRuntime {
         end: u64,
     ) -> Result<Option<Vec<u8>>> {
         let hash_hex = file_hash.to_string();
-        let manifest = self.load_manifest(&hash_hex).await?;
+        let _guard = self.manifest_io.lock().await;
+        let manifest = self.load_manifest_unlocked(&hash_hex).await?;
         if !manifest
             .verified_ranges
             .iter()
@@ -481,7 +491,8 @@ impl Ed2kTransferRuntime {
         if !tokio::fs::try_exists(&path).await? {
             return Ok(None);
         }
-        let manifest = self.load_manifest(&hash_hex).await?;
+        let _guard = self.manifest_io.lock().await;
+        let manifest = self.load_manifest_unlocked(&hash_hex).await?;
         Ok(Some(Ed2kSharedEntry::from_manifest(&manifest)))
     }
 
@@ -492,7 +503,8 @@ impl Ed2kTransferRuntime {
         if !tokio::fs::try_exists(&path).await? {
             return Ok(None);
         }
-        let manifest = self.load_manifest(&hash_hex).await?;
+        let _guard = self.manifest_io.lock().await;
+        let manifest = self.load_manifest_unlocked(&hash_hex).await?;
         if !manifest.md4_hashset_acquired {
             return Ok(None);
         }
@@ -515,17 +527,21 @@ impl Ed2kTransferRuntime {
     /// Returns the persisted manifest for orchestration code that needs to read
     /// the current verification or hashset state.
     pub async fn manifest(&self, file_hash: &str) -> Result<Ed2kResumeManifest> {
-        self.load_manifest(file_hash).await
+        let _guard = self.manifest_io.lock().await;
+        self.load_manifest_unlocked(file_hash).await
     }
 
-    async fn load_manifest_or_rebuild(&self, job: &Ed2kTransferJob) -> Result<Ed2kResumeManifest> {
-        match self.load_manifest(&job.file_hash).await {
+    async fn load_manifest_or_rebuild_unlocked(
+        &self,
+        job: &Ed2kTransferJob,
+    ) -> Result<Ed2kResumeManifest> {
+        match self.load_manifest_unlocked(&job.file_hash).await {
             Ok(manifest) => Ok(manifest),
             Err(error) => {
                 let manifest_path = self.transfer_dir(&job.file_hash).join(MANIFEST_FILE_NAME);
                 quarantine_corrupt_manifest(&manifest_path).await?;
                 let manifest = Ed2kResumeManifest::new(job);
-                self.store_manifest(&manifest).await?;
+                self.store_manifest_unlocked(&manifest).await?;
                 tracing::warn!(
                     "rebuilt ED2K manifest after corrupt state for {}: {error}",
                     job.file_hash
@@ -544,7 +560,7 @@ impl Ed2kTransferRuntime {
         *entries = dedupe_entries(entries.clone());
     }
 
-    async fn load_manifest(&self, file_hash: &str) -> Result<Ed2kResumeManifest> {
+    async fn load_manifest_unlocked(&self, file_hash: &str) -> Result<Ed2kResumeManifest> {
         let path = self.transfer_dir(file_hash).join(MANIFEST_FILE_NAME);
         let bytes = tokio::fs::read(&path)
             .await
@@ -553,7 +569,7 @@ impl Ed2kTransferRuntime {
             .with_context(|| format!("failed to decode ED2K manifest {}", path.display()))
     }
 
-    async fn store_manifest(&self, manifest: &Ed2kResumeManifest) -> Result<()> {
+    async fn store_manifest_unlocked(&self, manifest: &Ed2kResumeManifest) -> Result<()> {
         let transfer_dir = self.transfer_dir(&manifest.file_hash);
         tokio::fs::create_dir_all(&transfer_dir)
             .await
