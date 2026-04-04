@@ -1100,8 +1100,8 @@ async fn drive_download_session(
     timeout: Duration,
     send_initial_requests: bool,
 ) -> Result<()> {
-    let mut pending_part: Option<u32> = None;
-    let mut pending_range: Option<(u64, u64)> = None;
+    const MAX_INFLIGHT_PARTS_PER_PEER: usize = 2;
+    let mut pending_parts: Vec<(u32, u64, u64)> = Vec::new();
     let mut manifest = transfer_runtime.manifest(file_hash_hex).await?;
     let mut startup_requested = false;
     let mut filename_confirmed = false;
@@ -1129,12 +1129,14 @@ async fn drive_download_session(
                 return Ok(());
             }
 
-            if manifest.md4_hashset_acquired && pending_part.is_none() {
+            while manifest.md4_hashset_acquired
+                && pending_parts.len() < MAX_INFLIGHT_PARTS_PER_PEER
+            {
                 let Some(next_part) = transfer_runtime
                     .claim_next_missing_part(file_hash_hex)
                     .await?
                 else {
-                    return Ok(());
+                    break;
                 };
                 let start = u64::from(next_part) * ED2K_PART_SIZE;
                 let end = (start + ED2K_PART_SIZE).min(file_size);
@@ -1142,8 +1144,7 @@ async fn drive_download_session(
                     .write_all(&encode_request_parts(&file_hash, start, end)?)
                     .await
                     .with_context(|| format!("failed to send OP_REQUESTPARTS to {peer_addr}"))?;
-                pending_part = Some(next_part);
-                pending_range = Some((start, end));
+                pending_parts.push((next_part, start, end));
             }
 
             let packet = tokio::time::timeout(timeout, transport.read_packet())
@@ -1236,18 +1237,19 @@ async fn drive_download_session(
                     if returned_hash != file_hash {
                         continue;
                     }
-                    let Some(expected_part) = pending_part else {
+                    let Some(pending_index) = pending_parts
+                        .iter()
+                        .position(|(_, expected_start, expected_end)| {
+                            *expected_start == start && *expected_end == end
+                        })
+                    else {
                         continue;
                     };
-                    if Some((start, end)) != pending_range {
-                        continue;
-                    }
+                    let (expected_part, _, _) = pending_parts.remove(pending_index);
                     transfer_runtime
                         .store_piece_data(file_hash_hex, expected_part, &bytes)
                         .await?;
                     manifest = transfer_runtime.manifest(file_hash_hex).await?;
-                    pending_part = None;
-                    pending_range = None;
                 }
                 _ => {}
             }
@@ -1255,7 +1257,7 @@ async fn drive_download_session(
     }
     .await;
 
-    if let Some(piece_index) = pending_part {
+    for (piece_index, _, _) in pending_parts {
         transfer_runtime
             .release_piece_request(file_hash_hex, piece_index)
             .await?;
