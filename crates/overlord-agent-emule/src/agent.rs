@@ -5620,6 +5620,7 @@ impl OverlordAgentEmule {
                     break;
                 };
                 let transfer_runtime = Arc::clone(&runtime.ed2k_transfer);
+                let secure_ident = Arc::clone(&runtime.ed2k_secure_ident);
                 let file_name = request.file_name.clone();
                 let file_hash_hex = request.file_hash.clone();
                 info!(
@@ -5637,6 +5638,7 @@ impl OverlordAgentEmule {
                         bind_ip,
                         &source,
                         hello_identity,
+                        &secure_ident,
                         transfer_runtime.as_ref(),
                         file_name,
                         file_size,
@@ -5676,6 +5678,7 @@ impl OverlordAgentEmule {
                         break;
                     };
                     let transfer_runtime = Arc::clone(&runtime.ed2k_transfer);
+                    let secure_ident = Arc::clone(&runtime.ed2k_secure_ident);
                     let file_name = request.file_name.clone();
                     let file_hash_hex = request.file_hash.clone();
                     info!(
@@ -5693,6 +5696,7 @@ impl OverlordAgentEmule {
                             bind_ip,
                             &source,
                             hello_identity,
+                            &secure_ident,
                             transfer_runtime.as_ref(),
                             file_name,
                             file_size,

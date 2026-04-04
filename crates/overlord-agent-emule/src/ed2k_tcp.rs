@@ -1030,12 +1030,23 @@ pub(crate) async fn connect_callback_peer(
 
 /// Executes a minimal outbound native ED2K download session against one peer.
 ///
-/// This slice intentionally keeps scheduling simple: acquire the canonical
-/// hashset if needed, then request one missing ED2K part at a time.
+/// A successful public-peer oracle capture showed a startup sequence that
+/// public peers accept more readily than our earlier minimal flow:
+///
+/// `OP_HELLO -> OP_HELLOANSWER -> secure-ident -> OP_HASHSETREQUEST/ANSWER ->
+/// OP_STARTUPLOADREQ -> OP_ACCEPTUPLOADREQ -> OP_REQUESTPARTS`
+///
+/// The same capture did not send an unsolicited outbound `OP_EMULEINFO`,
+/// `OP_REQUESTFILENAME`, or `OP_SETREQFILEID` before the transfer was already
+/// established. Public peers that the oracle downloaded from were closing on
+/// our earlier startup sequence, so the downloader now follows the observed
+/// order instead of the more speculative "send everything early" flow.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn download_file_from_peer(
     bind_ip: Ipv4Addr,
     peer: &Ed2kFoundSource,
     hello_identity: Ed2kHelloIdentity,
+    secure_ident: &Arc<Ed2kSecureIdent>,
     transfer_runtime: &Ed2kTransferRuntime,
     canonical_name: String,
     file_size: u64,
@@ -1075,6 +1086,7 @@ pub(crate) async fn download_file_from_peer(
             &mut transport,
             peer_addr,
             hello_identity,
+            secure_ident.as_ref(),
             transfer_runtime,
             file_hash,
             &file_hash_hex,
@@ -1092,6 +1104,7 @@ async fn drive_download_session(
     transport: &mut Ed2kTransport,
     peer_addr: SocketAddr,
     hello_identity: Ed2kHelloIdentity,
+    secure_ident: &Ed2kSecureIdent,
     transfer_runtime: &Ed2kTransferRuntime,
     file_hash: Ed2kHash,
     file_hash_hex: &str,
@@ -1102,25 +1115,12 @@ async fn drive_download_session(
     const MAX_INFLIGHT_PARTS_PER_PEER: usize = 2;
     let mut pending_parts: Vec<(u32, u64, u64)> = Vec::new();
     let mut manifest = transfer_runtime.manifest(file_hash_hex).await?;
-    let mut startup_requested = false;
-    let mut filename_confirmed = false;
-
-    if send_initial_requests {
-        transport
-            .write_all(&encode_emule_info_request(hello_identity.udp_port))
-            .await
-            .with_context(|| format!("failed to send OP_EMULEINFO to {peer_addr}"))?;
-        transport
-            .write_all(&encode_request_filename(&file_hash))
-            .await
-            .with_context(|| format!("failed to send OP_REQUESTFILENAME to {peer_addr}"))?;
-        if file_size > ED2K_PART_SIZE {
-            transport
-                .write_all(&encode_set_req_file_id(&file_hash))
-                .await
-                .with_context(|| format!("failed to send OP_SETREQFILEID to {peer_addr}"))?;
-        }
-    }
+    let mut peer_secure_ident = Ed2kPeerSecureIdentState::default();
+    let mut hello_complete = false;
+    let mut secure_ident_started = false;
+    let mut hashset_requested = false;
+    let mut upload_requested = false;
+    let mut upload_accepted = false;
 
     let session_result = async {
         loop {
@@ -1128,21 +1128,73 @@ async fn drive_download_session(
                 return Ok(());
             }
 
-            while manifest.md4_hashset_acquired && pending_parts.len() < MAX_INFLIGHT_PARTS_PER_PEER
-            {
-                let Some(next_part) = transfer_runtime
-                    .claim_next_missing_part(file_hash_hex)
-                    .await?
-                else {
-                    break;
-                };
-                let start = u64::from(next_part) * ED2K_PART_SIZE;
-                let end = (start + ED2K_PART_SIZE).min(file_size);
+            if send_initial_requests && hello_complete && !secure_ident_started {
+                let secure_ident_probe = begin_secure_ident_probe(&mut peer_secure_ident);
                 transport
-                    .write_all(&encode_request_parts(&file_hash, start, end)?)
+                    .write_all(&secure_ident_probe)
                     .await
-                    .with_context(|| format!("failed to send OP_REQUESTPARTS to {peer_addr}"))?;
-                pending_parts.push((next_part, start, end));
+                    .with_context(|| format!("failed to send OP_SECIDENTSTATE to {peer_addr}"))?;
+                secure_ident_started = true;
+            }
+
+            if send_initial_requests
+                && hello_complete
+                && !manifest.md4_hashset_acquired
+                && !hashset_requested
+            {
+                if file_size <= ED2K_PART_SIZE {
+                    manifest = transfer_runtime
+                        .store_md4_hashset(file_hash_hex, Vec::new())
+                        .await?;
+                } else {
+                    transport
+                        .write_all(&encode_hashset_request(&file_hash))
+                        .await
+                        .with_context(|| {
+                            format!("failed to send OP_HASHSETREQUEST to {peer_addr}")
+                        })?;
+                    hashset_requested = true;
+                }
+            }
+
+            if send_initial_requests
+                && hello_complete
+                && manifest.md4_hashset_acquired
+                && !upload_requested
+            {
+                transport
+                    .write_all(&encode_start_upload_req(&file_hash))
+                    .await
+                    .with_context(|| format!("failed to send OP_STARTUPLOADREQ to {peer_addr}"))?;
+                upload_requested = true;
+            }
+
+            if manifest.md4_hashset_acquired
+                && upload_accepted
+                && pending_parts.len() < MAX_INFLIGHT_PARTS_PER_PEER
+            {
+                let target_request_count = MAX_INFLIGHT_PARTS_PER_PEER - pending_parts.len();
+                let mut requested_ranges = Vec::with_capacity(target_request_count);
+                while requested_ranges.len() < target_request_count {
+                    let Some(next_part) = transfer_runtime
+                        .claim_next_missing_part(file_hash_hex)
+                        .await?
+                    else {
+                        break;
+                    };
+                    let start = u64::from(next_part) * ED2K_PART_SIZE;
+                    let end = (start + ED2K_PART_SIZE).min(file_size);
+                    pending_parts.push((next_part, start, end));
+                    requested_ranges.push((start, end));
+                }
+                if !requested_ranges.is_empty() {
+                    transport
+                        .write_all(&encode_request_parts_batch(&file_hash, &requested_ranges)?)
+                        .await
+                        .with_context(|| {
+                            format!("failed to send OP_REQUESTPARTS to {peer_addr}")
+                        })?;
+                }
             }
 
             let packet = tokio::time::timeout(timeout, transport.read_packet())
@@ -1154,45 +1206,43 @@ async fn drive_download_session(
 
             match (packet.protocol, packet.opcode) {
                 (OP_EDONKEYPROT, OP_HELLO) => {
+                    let is_mule_hello = is_mule_hello(&packet.payload)?;
                     for reply in build_hello_responses(&packet.payload, hello_identity)? {
                         transport.write_all(&reply).await.with_context(|| {
                             format!("failed to reply to OP_HELLO during download with {peer_addr}")
                         })?;
                     }
-                }
-                (OP_EDONKEYPROT, OP_HELLOANSWER) | (OP_EDONKEYPROT, OP_ACCEPTUPLOADREQ) => {}
-                (OP_EDONKEYPROT, OP_REQFILENAMEANSWER) => {
-                    let (returned_hash, _name) = decode_request_filename_answer(&packet.payload)?;
-                    if returned_hash != file_hash {
-                        anyhow::bail!(
-                            "peer {peer_addr} returned filename for unexpected file {}",
-                            returned_hash
-                        );
-                    }
-                    filename_confirmed = true;
-                    if !manifest.md4_hashset_acquired {
-                        if file_size <= ED2K_PART_SIZE {
-                            manifest = transfer_runtime
-                                .store_md4_hashset(file_hash_hex, Vec::new())
-                                .await?;
-                        } else {
-                            transport
-                                .write_all(&encode_hashset_request(&file_hash))
-                                .await
-                                .with_context(|| {
-                                    format!("failed to send OP_HASHSETREQUEST to {peer_addr}")
-                                })?;
-                        }
-                    }
-                    if manifest.md4_hashset_acquired && !startup_requested {
+                    hello_complete = true;
+                    if is_mule_hello && !peer_secure_ident.requested_peer_key {
+                        let secure_ident_probe = begin_secure_ident_probe(&mut peer_secure_ident);
                         transport
-                            .write_all(&encode_start_upload_req(&file_hash))
+                            .write_all(&secure_ident_probe)
                             .await
                             .with_context(|| {
-                                format!("failed to send OP_STARTUPLOADREQ to {peer_addr}")
+                                format!("failed to send OP_SECIDENTSTATE to {peer_addr}")
                             })?;
-                        startup_requested = true;
+                        secure_ident_started = true;
                     }
+                }
+                (OP_EDONKEYPROT, OP_HELLOANSWER) => {
+                    hello_complete = true;
+                    let is_mule_hello = is_mule_hello_answer(&packet.payload)?;
+                    if send_initial_requests
+                        && is_mule_hello
+                        && !peer_secure_ident.requested_peer_key
+                    {
+                        let secure_ident_probe = begin_secure_ident_probe(&mut peer_secure_ident);
+                        transport
+                            .write_all(&secure_ident_probe)
+                            .await
+                            .with_context(|| {
+                                format!("failed to send OP_SECIDENTSTATE to {peer_addr}")
+                            })?;
+                        secure_ident_started = true;
+                    }
+                }
+                (OP_EDONKEYPROT, OP_ACCEPTUPLOADREQ) => {
+                    upload_accepted = true;
                 }
                 (OP_EMULEPROT, OP_EMULEINFO) => {
                     transport
@@ -1203,6 +1253,54 @@ async fn drive_download_session(
                         })?;
                 }
                 (OP_EMULEPROT, OP_EMULEINFOANSWER) => {}
+                (OP_EMULEPROT, OP_SECIDENTSTATE) => {
+                    let (state, challenge) = decode_secident_state(&packet.payload)?;
+                    peer_secure_ident.peer_challenge_from = Some(challenge);
+                    if state != 0 {
+                        peer_secure_ident.pending_signature = true;
+                    }
+                    if state == ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED {
+                        let public_key = encode_packet(
+                            OP_EMULEPROT,
+                            OP_PUBLICKEY,
+                            &secure_ident.public_key_payload()?,
+                        );
+                        transport.write_all(&public_key).await.with_context(|| {
+                            format!("failed to send OP_PUBLICKEY to {peer_addr}")
+                        })?;
+                    }
+                    if !try_send_secure_ident_signature(
+                        transport,
+                        peer_addr,
+                        secure_ident,
+                        &mut peer_secure_ident,
+                    )
+                    .await?
+                        && state == ED2K_SECURE_IDENT_SIGNATURE_NEEDED
+                        && !peer_secure_ident.requested_peer_key
+                    {
+                        let secure_ident_probe = begin_secure_ident_probe(&mut peer_secure_ident);
+                        transport
+                            .write_all(&secure_ident_probe)
+                            .await
+                            .with_context(|| {
+                                format!("failed to send fallback OP_SECIDENTSTATE to {peer_addr}")
+                            })?;
+                        secure_ident_started = true;
+                    }
+                }
+                (OP_EMULEPROT, OP_PUBLICKEY) => {
+                    peer_secure_ident.peer_public_key =
+                        Some(decode_public_key_payload(&packet.payload)?);
+                    let _ = try_send_secure_ident_signature(
+                        transport,
+                        peer_addr,
+                        secure_ident,
+                        &mut peer_secure_ident,
+                    )
+                    .await?;
+                }
+                (OP_EMULEPROT, OP_SIGNATURE) => {}
                 (OP_EDONKEYPROT, OP_HASHSETANSWER) => {
                     let (returned_hash, hashset) = decode_hashset_answer(&packet.payload)?;
                     if returned_hash != file_hash {
@@ -1214,15 +1312,11 @@ async fn drive_download_session(
                     manifest = transfer_runtime
                         .store_md4_hashset(file_hash_hex, hashset)
                         .await?;
-                    if filename_confirmed && !startup_requested {
-                        transport
-                            .write_all(&encode_start_upload_req(&file_hash))
-                            .await
-                            .with_context(|| {
-                                format!("failed to send OP_STARTUPLOADREQ to {peer_addr}")
-                            })?;
-                        startup_requested = true;
-                    }
+                }
+                (OP_EDONKEYPROT, OP_REQFILENAMEANSWER) | (OP_EDONKEYPROT, OP_SETREQFILEID) => {
+                    // The downloader no longer relies on these startup messages for
+                    // public peers, but keep the session tolerant when a callback or
+                    // non-oracle peer still sends them.
                 }
                 (OP_EDONKEYPROT, OP_FILEREQANSNOFIL) => {
                     anyhow::bail!("peer {peer_addr} does not serve requested file {file_hash_hex}");
@@ -1988,6 +2082,7 @@ async fn handle_connection(
                         &mut transport,
                         peer_addr,
                         response_identity,
+                        secure_ident.as_ref(),
                         transfer_runtime,
                         file_hash,
                         &callback_intent.file_hash,
@@ -2349,14 +2444,6 @@ fn encode_accept_upload_req() -> Vec<u8> {
     encode_packet(OP_EDONKEYPROT, OP_ACCEPTUPLOADREQ, &[])
 }
 
-fn encode_request_filename(file_hash: &Ed2kHash) -> Vec<u8> {
-    encode_packet(OP_EDONKEYPROT, OP_REQUESTFILENAME, &file_hash.0)
-}
-
-fn encode_set_req_file_id(file_hash: &Ed2kHash) -> Vec<u8> {
-    encode_packet(OP_EDONKEYPROT, OP_SETREQFILEID, &file_hash.0)
-}
-
 fn encode_start_upload_req(file_hash: &Ed2kHash) -> Vec<u8> {
     encode_packet(OP_EDONKEYPROT, OP_STARTUPLOADREQ, &file_hash.0)
 }
@@ -2390,27 +2477,6 @@ fn encode_request_filename_answer(file_hash: &Ed2kHash, file_name: &str) -> Resu
         OP_REQFILENAMEANSWER,
         &payload,
     ))
-}
-
-fn decode_request_filename_answer(payload: &[u8]) -> Result<(Ed2kHash, String)> {
-    if payload.len() < 20 {
-        anyhow::bail!("short OP_REQFILENAMEANSWER payload {}", payload.len());
-    }
-    let mut hash = [0u8; 16];
-    hash.copy_from_slice(&payload[..16]);
-    let name_len = usize::try_from(u32::from_le_bytes(payload[16..20].try_into().unwrap()))
-        .context("OP_REQFILENAMEANSWER name length exceeds usize")?;
-    let expected = 20 + name_len;
-    if payload.len() < expected {
-        anyhow::bail!(
-            "short OP_REQFILENAMEANSWER payload {} expected at least {}",
-            payload.len(),
-            expected
-        );
-    }
-    let file_name = String::from_utf8(payload[20..expected].to_vec())
-        .context("invalid UTF-8 in OP_REQFILENAMEANSWER payload")?;
-    Ok((Ed2kHash::from_bytes(hash), file_name))
 }
 
 fn decode_request_parts_payload(
@@ -2468,26 +2534,40 @@ fn decode_request_parts_payload(
     Ok((Ed2kHash::from_bytes(hash), ranges))
 }
 
-fn encode_request_parts(file_hash: &Ed2kHash, start: u64, end: u64) -> Result<Vec<u8>> {
-    let use_i64 = end > u64::from(u32::MAX);
+/// Encode one ED2K `OP_REQUESTPARTS` packet with up to three ranges.
+///
+/// The successful public oracle capture used rolling multi-range requests
+/// instead of emitting one separate request packet per range, so the native
+/// downloader batches adjacent work into one packet to stay closer to that
+/// accepted wire shape.
+fn encode_request_parts_batch(file_hash: &Ed2kHash, ranges: &[(u64, u64)]) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        !ranges.is_empty() && ranges.len() <= 3,
+        "OP_REQUESTPARTS expects between one and three ranges"
+    );
+    let use_i64 = ranges.iter().any(|(_, end)| *end > u64::from(u32::MAX));
     let mut payload = Vec::with_capacity(16 + if use_i64 { 48 } else { 24 });
     payload.extend_from_slice(&file_hash.0);
     if use_i64 {
-        for value in [start, 0, 0] {
-            payload.extend_from_slice(&value.to_le_bytes());
+        for index in 0..3usize {
+            let start = ranges.get(index).map_or(0, |(start, _)| *start);
+            payload.extend_from_slice(&start.to_le_bytes());
         }
-        for value in [end, 0, 0] {
-            payload.extend_from_slice(&value.to_le_bytes());
+        for index in 0..3usize {
+            let end = ranges.get(index).map_or(0, |(_, end)| *end);
+            payload.extend_from_slice(&end.to_le_bytes());
         }
         return Ok(encode_packet(OP_EMULEPROT, OP_REQUESTPARTS_I64, &payload));
     }
-    let start = u32::try_from(start).context("start offset exceeds OP_REQUESTPARTS limit")?;
-    let end = u32::try_from(end).context("end offset exceeds OP_REQUESTPARTS limit")?;
-    for value in [start, 0, 0] {
-        payload.extend_from_slice(&value.to_le_bytes());
+    for index in 0..3usize {
+        let start = ranges.get(index).map_or(0, |(start, _)| *start);
+        let start = u32::try_from(start).context("start offset exceeds OP_REQUESTPARTS limit")?;
+        payload.extend_from_slice(&start.to_le_bytes());
     }
-    for value in [end, 0, 0] {
-        payload.extend_from_slice(&value.to_le_bytes());
+    for index in 0..3usize {
+        let end = ranges.get(index).map_or(0, |(_, end)| *end);
+        let end = u32::try_from(end).context("end offset exceeds OP_REQUESTPARTS limit")?;
+        payload.extend_from_slice(&end.to_le_bytes());
     }
     Ok(encode_packet(OP_EDONKEYPROT, OP_REQUESTPARTS, &payload))
 }
