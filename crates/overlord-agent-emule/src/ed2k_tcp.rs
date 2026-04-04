@@ -1057,7 +1057,7 @@ pub(crate) async fn download_file_from_peer(
         .await?;
 
     let peer_addr = SocketAddr::new(IpAddr::V4(peer.ip), peer.tcp_port);
-    let session_result = async {
+    async {
         let mut transport = Ed2kTransport::connect_outgoing(
             bind_ip,
             peer_addr,
@@ -1084,11 +1084,10 @@ pub(crate) async fn download_file_from_peer(
         )
         .await
     }
-    .await;
-
-    session_result
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drive_download_session(
     transport: &mut Ed2kTransport,
     peer_addr: SocketAddr,
@@ -1129,8 +1128,7 @@ async fn drive_download_session(
                 return Ok(());
             }
 
-            while manifest.md4_hashset_acquired
-                && pending_parts.len() < MAX_INFLIGHT_PARTS_PER_PEER
+            while manifest.md4_hashset_acquired && pending_parts.len() < MAX_INFLIGHT_PARTS_PER_PEER
             {
                 let Some(next_part) = transfer_runtime
                     .claim_next_missing_part(file_hash_hex)
@@ -1162,8 +1160,7 @@ async fn drive_download_session(
                         })?;
                     }
                 }
-                (OP_EDONKEYPROT, OP_HELLOANSWER)
-                | (OP_EDONKEYPROT, OP_ACCEPTUPLOADREQ) => {}
+                (OP_EDONKEYPROT, OP_HELLOANSWER) | (OP_EDONKEYPROT, OP_ACCEPTUPLOADREQ) => {}
                 (OP_EDONKEYPROT, OP_REQFILENAMEANSWER) => {
                     let (returned_hash, _name) = decode_request_filename_answer(&packet.payload)?;
                     if returned_hash != file_hash {
@@ -1237,11 +1234,12 @@ async fn drive_download_session(
                     if returned_hash != file_hash {
                         continue;
                     }
-                    let Some(pending_index) = pending_parts
-                        .iter()
-                        .position(|(_, expected_start, expected_end)| {
-                            *expected_start == start && *expected_end == end
-                        })
+                    let Some(pending_index) =
+                        pending_parts
+                            .iter()
+                            .position(|(_, expected_start, expected_end)| {
+                                *expected_start == start && *expected_end == end
+                            })
                     else {
                         continue;
                     };
@@ -1975,8 +1973,8 @@ async fn handle_connection(
                     .claim_callback_intent(remote_hello.client_id)
                     .await
                 {
-                    let file_hash = Ed2kHash::from_str(&callback_intent.file_hash)
-                        .with_context(|| {
+                    let file_hash =
+                        Ed2kHash::from_str(&callback_intent.file_hash).with_context(|| {
                             format!(
                                 "invalid callback file hash {} for client_id={}",
                                 callback_intent.file_hash, callback_intent.client_id

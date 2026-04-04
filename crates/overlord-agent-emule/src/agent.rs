@@ -5516,7 +5516,7 @@ impl OverlordAgentEmule {
         runtime
             .ed2k_transfer
             .ensure_job(&new_transfer_job(
-                file_hash.clone(),
+                file_hash,
                 request.file_name.clone(),
                 request.file_size,
             ))
