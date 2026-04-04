@@ -15,9 +15,8 @@
 
 use std::{
     fs, io,
-    io::Read,
+    io::{Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    str::FromStr,
     sync::{
         Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -28,26 +27,27 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::SecondsFormat;
 use flate2::read::ZlibDecoder;
+use flate2::{Compression, write::ZlibEncoder};
 use md5::compute as md5_compute;
 use num_bigint::BigUint;
 use rand::{Rng, RngCore};
 use serde::Serialize;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpSocket, TcpStream, lookup_host},
+    net::{TcpSocket, TcpStream, UdpSocket, lookup_host},
     sync::{Mutex, RwLock, mpsc, oneshot},
     time::Instant as TokioInstant,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use overlord_agent_common::PopularHash;
 use overlord_agent_nat::NatManager;
 use overlord_kad_proto::Ed2kHash;
 
 use crate::{
     config::{Ed2kConfig, Ed2kServerEntry},
     ed2k_tcp::{Ed2kHelloIdentity, connect_callback_peer, enrich_hello_identity},
+    ed2k_transfer::{Ed2kSharedCatalog, Ed2kSharedEntry},
     kad_firewall::KadFirewallState,
 };
 
@@ -59,8 +59,18 @@ const OP_GETSERVERLIST: u8 = 0x14;
 const OP_OFFERFILES: u8 = 0x15;
 const OP_SEARCHREQUEST: u8 = 0x16;
 const OP_GETSOURCES: u8 = 0x19;
+const OP_CALLBACKREQUEST: u8 = 0x1C;
 const OP_GETSOURCES_OBFU: u8 = 0x23;
 const OP_QUERY_MORE_RESULT: u8 = 0x21;
+const OP_GLOBSEARCHREQ3: u8 = 0x90;
+const OP_GLOBSEARCHREQ2: u8 = 0x92;
+const OP_GLOBGETSOURCES2: u8 = 0x94;
+const OP_GLOBSERVSTATREQ: u8 = 0x96;
+const OP_GLOBSERVSTATRES: u8 = 0x97;
+const OP_GLOBSEARCHREQ: u8 = 0x98;
+const OP_GLOBSEARCHRES: u8 = 0x99;
+const OP_GLOBGETSOURCES: u8 = 0x9A;
+const OP_GLOBFOUNDSOURCES: u8 = 0x9B;
 const OP_SERVERLIST: u8 = 0x32;
 const OP_SEARCHRESULT: u8 = 0x33;
 const OP_SERVERSTATUS: u8 = 0x34;
@@ -95,6 +105,7 @@ const TAGTYPE_STR1: u8 = 0x11;
 const TAG_SHORT_NAME_MASK: u8 = 0x80;
 
 const CT_NAME: u8 = 0x01;
+const CT_SERVER_UDPSEARCH_FLAGS: u8 = 0x0E;
 const CT_VERSION: u8 = 0x11;
 const CT_SERVER_FLAGS: u8 = 0x20;
 const CT_EMULE_VERSION: u8 = 0xFB;
@@ -106,6 +117,7 @@ const SRVCAP_LARGEFILES: u32 = 0x0100;
 const SRVCAP_SUPPORTCRYPT: u32 = 0x0200;
 const SRVCAP_REQUESTCRYPT: u32 = 0x0400;
 const SRVCAP_REQUIRECRYPT: u32 = 0x0800;
+const SRVCAP_UDP_NEWTAGS_LARGEFILES: u32 = 0x0001;
 
 const SERVER_TCP_FLAG_COMPRESSION: u32 = 0x0000_0001;
 const SERVER_TCP_FLAG_NEWTAGS: u32 = 0x0000_0008;
@@ -114,6 +126,10 @@ const SERVER_TCP_FLAG_RELATEDSEARCH: u32 = 0x0000_0040;
 const SERVER_TCP_FLAG_TYPETAGINTEGER: u32 = 0x0000_0080;
 const SERVER_TCP_FLAG_LARGEFILES: u32 = 0x0000_0100;
 const SERVER_TCP_FLAG_TCPOBFUSCATION: u32 = 0x0000_0400;
+const SERVER_UDP_FLAG_EXT_GETSOURCES: u32 = 0x0000_0001;
+const SERVER_UDP_FLAG_EXT_GETFILES: u32 = 0x0000_0002;
+const SERVER_UDP_FLAG_EXT_GETSOURCES2: u32 = 0x0000_0020;
+const SERVER_UDP_FLAG_LARGEFILES: u32 = 0x0000_0100;
 const SERVER_UDP_FLAG_UDPOBFUSCATION: u32 = 0x0000_0200;
 const SERVER_UDP_FLAG_TCPOBFUSCATION: u32 = 0x0000_0400;
 
@@ -378,6 +394,13 @@ struct CallbackRequest {
     user_hash: Option<[u8; 16]>,
 }
 
+#[derive(Debug)]
+struct ServerUdpPacket {
+    opcode: u8,
+    payload: Vec<u8>,
+    from: SocketAddr,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SearchResultSummary {
@@ -405,10 +428,17 @@ pub struct Ed2kSearchFile {
 pub struct Ed2kFoundSource {
     /// File hash referenced by the source reply.
     pub file_hash: Ed2kHash,
-    /// Source IPv4 address reported by the ED2K server.
+    /// Source IPv4 address reported by the ED2K server when the source is a
+    /// direct-dial HighID peer. For LowID peers this is the server-reported
+    /// client-id rendered as IPv4, which is not directly dialable.
     pub ip: Ipv4Addr,
     /// Source TCP port reported by the ED2K server.
     pub tcp_port: u16,
+    /// Raw client-id token reported by the ED2K server.
+    pub client_id: u32,
+    /// Whether the server source entry refers to a LowID peer that requires a
+    /// callback path instead of direct TCP dialing.
+    pub low_id: bool,
     /// Whether the server used the obfuscated `OP_FOUNDSOURCES_OBFU` family.
     pub obfuscated: bool,
     /// Optional per-source obfuscation settings byte from the oracle wire shape.
@@ -417,11 +447,17 @@ pub struct Ed2kFoundSource {
     pub user_hash: Option<[u8; 16]>,
 }
 
-/// Shared ED2K advertised file catalog used by the long-lived server session.
-pub type Ed2kSharedCatalog = Arc<RwLock<Vec<PopularHash>>>;
+impl Ed2kFoundSource {
+    /// Returns `true` when this source can be dialed directly over TCP.
+    #[must_use]
+    pub fn is_direct_dialable(&self) -> bool {
+        !self.low_id
+    }
+}
 
 type BackgroundKeywordSearchResponse = std::result::Result<Vec<Ed2kSearchFile>, String>;
 type BackgroundSourceSearchResponse = std::result::Result<Vec<Ed2kFoundSource>, String>;
+type BackgroundCallbackRequestResponse = std::result::Result<(), String>;
 
 /// Handle used by active jobs to execute a keyword search through the
 /// long-lived ED2K background session.
@@ -447,6 +483,10 @@ enum BackgroundServerSearchRequest {
         file_size: u64,
         timeout: Duration,
         response: oneshot::Sender<BackgroundSourceSearchResponse>,
+    },
+    Callback {
+        client_id: u32,
+        response: oneshot::Sender<BackgroundCallbackRequestResponse>,
     },
 }
 
@@ -580,6 +620,35 @@ pub async fn search_source_via_background_session(
             let response = result
                 .with_context(|| format!("timed out waiting for ED2K background source response after {timeout:?}"))?
                 .context("ED2K background source responder dropped")?;
+            response.map_err(anyhow::Error::msg)
+        }
+    }
+}
+
+/// Requests an ED2K server callback for a LowID peer on the current
+/// background server session.
+pub async fn request_callback_via_background_session(
+    handle: &Ed2kServerSearchHandle,
+    client_id: u32,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let (response, receive_response) = oneshot::channel();
+    handle
+        .sender
+        .send(BackgroundServerSearchRequest::Callback {
+            client_id,
+            response,
+        })
+        .await
+        .context("ED2K background callback channel is closed")?;
+
+    tokio::select! {
+        _ = cancel.cancelled() => Ok(()),
+        result = tokio::time::timeout(timeout, receive_response) => {
+            let response = result
+                .with_context(|| format!("timed out waiting for ED2K background callback response after {timeout:?}"))?
+                .context("ED2K background callback responder dropped")?;
             response.map_err(anyhow::Error::msg)
         }
     }
@@ -762,16 +831,18 @@ impl ServerSession {
     }
 
     async fn send_packet(&mut self, opcode: u8, payload: &[u8]) -> Result<()> {
-        let mut packet = encode_packet(opcode, payload);
+        let use_compression = self.server_supports_compression();
+        let mut packet = encode_packet(opcode, payload, use_compression)?;
         debug!(
-            "ED2K trace id={} role={} phase={} dir=tx endpoint={} opcode=0x{:02X} payload_len={} wire_len={}",
+            "ED2K trace id={} role={} phase={} dir=tx endpoint={} opcode=0x{:02X} payload_len={} wire_len={} compressed={}",
             self.trace_id,
             self.trace_role,
             self.phase.as_str(),
             self.endpoint,
             opcode,
             payload.len(),
-            packet.len()
+            packet.len(),
+            use_compression
         );
         dump_ed2k_server_packet(self, "tx", opcode, payload);
         if let Some(cipher) = self.send_cipher.as_mut() {
@@ -782,6 +853,10 @@ impl ServerSession {
         })?;
         self.last_tx = Instant::now();
         Ok(())
+    }
+
+    fn server_supports_compression(&self) -> bool {
+        self.server_flags.unwrap_or_default() & SERVER_TCP_FLAG_COMPRESSION != 0
     }
 
     async fn negotiate_obfuscation_and_send(&mut self, first_packet: &[u8]) -> Result<()> {
@@ -1059,6 +1134,24 @@ async fn run_one_server_session(
         context.connect_timeout,
     )
     .await?;
+    let server_udp_socket = match bind_server_udp_socket(context.bind_ip).await {
+        Ok(socket) => {
+            info!(
+                "bound ED2K server UDP helper local={} remote={} trace_id={}",
+                socket.local_addr()?,
+                server_udp_endpoint(server),
+                session.trace_id
+            );
+            Some(socket)
+        }
+        Err(error) => {
+            warn!(
+                "failed to bind ED2K server UDP helper for {}: {error}",
+                server.base_endpoint()
+            );
+            None
+        }
+    };
     {
         let mut guard = context.state.write().await;
         guard.endpoint = Some(server.base_endpoint());
@@ -1090,8 +1183,9 @@ async fn run_one_server_session(
         transport_endpoint.port(),
     );
     if use_server_obfuscation {
+        let login_request = encode_packet(OP_LOGINREQUEST, &login_payload, false)?;
         session
-            .negotiate_obfuscation_and_send(&encode_packet(OP_LOGINREQUEST, &login_payload))
+            .negotiate_obfuscation_and_send(&login_request)
             .await?;
     } else {
         session.send_packet(OP_LOGINREQUEST, &login_payload).await?;
@@ -1150,12 +1244,14 @@ async fn run_one_server_session(
                     if session.login_accepted {
                         match start_background_server_search(
                             &mut session,
+                            server,
+                            server_udp_socket.as_ref(),
                             context.hello_identity.connect_options,
                             request,
                         )
                         .await
                         {
-                            Ok(pending) => pending_background_search = Some(pending),
+                            Ok(pending) => pending_background_search = pending,
                             Err(error) => warn!("failed to start ED2K background server search on {}: {error}", server.base_endpoint()),
                         }
                     } else {
@@ -1168,6 +1264,12 @@ async fn run_one_server_session(
                             BackgroundServerSearchRequest::Source { file_hash, .. } => info!(
                                 "queued ED2K background source search file_hash={} endpoint={} trace_id={} awaiting login",
                                 file_hash,
+                                session.endpoint,
+                                session.trace_id
+                            ),
+                            BackgroundServerSearchRequest::Callback { client_id, .. } => info!(
+                                "queued ED2K background callback request client_id={} endpoint={} trace_id={} awaiting login",
+                                client_id,
                                 session.endpoint,
                                 session.trace_id
                             ),
@@ -1312,20 +1414,46 @@ async fn run_one_server_session(
                 {
                     match start_background_server_search(
                         &mut session,
+                        server,
+                        server_udp_socket.as_ref(),
                         context.hello_identity.connect_options,
                         request,
                     )
                     .await
                     {
-                        Ok(pending) => pending_background_search = Some(pending),
+                        Ok(pending) => pending_background_search = pending,
                         Err(error) => warn!("failed to start ED2K background server search on {}: {error}", server.base_endpoint()),
                     }
+                }
+            }
+            udp_packet = async {
+                if let Some(socket) = server_udp_socket.as_ref() {
+                    read_server_udp_packet(socket).await
+                } else {
+                    std::future::pending::<Result<Option<ServerUdpPacket>>>().await
+                }
+            } => {
+                if let Some(packet) = udp_packet? {
+                    handle_background_udp_packet(
+                        server,
+                        &packet,
+                        &mut pending_background_search,
+                        &context.state,
+                    )?;
                 }
             }
             _ = tokio::time::sleep(context.keepalive_interval) => {
                 if session.last_tx.elapsed() >= context.keepalive_interval {
                     session.send_packet(OP_OFFERFILES, &0u32.to_le_bytes()).await?;
                     debug!("sent ED2K server keepalive to {}", server.base_endpoint());
+                }
+                if let Some(socket) = server_udp_socket.as_ref()
+                    && let Err(error) = send_server_udp_status_request(socket, server).await
+                {
+                    warn!(
+                        "failed to send ED2K server UDP status request to {}: {error}",
+                        server.base_endpoint()
+                    );
                 }
             }
         }
@@ -1343,7 +1471,7 @@ pub async fn search_keyword_servers(
     bind_ip: Ipv4Addr,
     config: &Ed2kConfig,
     hello_identity: Ed2kHelloIdentity,
-    shared_catalog: &[PopularHash],
+    shared_catalog: &[Ed2kSharedEntry],
     preferred_endpoint: Option<SocketAddr>,
     max_attempts: usize,
     query: &str,
@@ -1441,7 +1569,7 @@ pub async fn search_source_servers(
     bind_ip: Ipv4Addr,
     config: &Ed2kConfig,
     hello_identity: Ed2kHelloIdentity,
-    shared_catalog: &[PopularHash],
+    shared_catalog: &[Ed2kSharedEntry],
     preferred_endpoint: Option<SocketAddr>,
     max_attempts: usize,
     file_hash: Ed2kHash,
@@ -1464,6 +1592,7 @@ pub async fn search_source_servers(
 
     let idle_timeout = Duration::from_secs(config.connect_timeout_secs.max(5));
     let mut last_error = None;
+    let mut aggregated_results: Vec<Ed2kFoundSource> = Vec::new();
 
     for (attempt_index, configured_server) in configured_servers
         .into_iter()
@@ -1505,7 +1634,9 @@ pub async fn search_source_servers(
         )
         .await
         {
-            Ok(results) if !results.is_empty() => return Ok(results),
+            Ok(results) if !results.is_empty() => {
+                merge_found_sources(&mut aggregated_results, results);
+            }
             Ok(_) => continue,
             Err(error) => {
                 warn!(
@@ -1518,6 +1649,10 @@ pub async fn search_source_servers(
         }
     }
 
+    if !aggregated_results.is_empty() {
+        return Ok(aggregated_results);
+    }
+
     if let Some(error) = last_error {
         return Err(error);
     }
@@ -1528,7 +1663,7 @@ async fn search_keyword_on_server(
     bind_ip: Ipv4Addr,
     server: &ResolvedServerEntry,
     hello_identity: Ed2kHelloIdentity,
-    shared_catalog: &[PopularHash],
+    shared_catalog: &[Ed2kSharedEntry],
     search_payload: &[u8],
     idle_timeout: Duration,
     cancel: &CancellationToken,
@@ -1557,7 +1692,11 @@ async fn search_keyword_on_server(
         },
         search_payload.len()
     );
-    let login_request = encode_packet(OP_LOGINREQUEST, &encode_login_request(login_identity));
+    let login_request = encode_packet(
+        OP_LOGINREQUEST,
+        &encode_login_request(login_identity),
+        false,
+    )?;
     if use_server_obfuscation {
         session
             .negotiate_obfuscation_and_send(&login_request)
@@ -1666,7 +1805,7 @@ async fn search_sources_on_server(
     bind_ip: Ipv4Addr,
     server: &ResolvedServerEntry,
     hello_identity: Ed2kHelloIdentity,
-    shared_catalog: &[PopularHash],
+    shared_catalog: &[Ed2kSharedEntry],
     file_hash: Ed2kHash,
     file_size: u64,
     idle_timeout: Duration,
@@ -1685,7 +1824,11 @@ async fn search_sources_on_server(
         idle_timeout,
     )
     .await?;
-    let login_request = encode_packet(OP_LOGINREQUEST, &encode_login_request(login_identity));
+    let login_request = encode_packet(
+        OP_LOGINREQUEST,
+        &encode_login_request(login_identity),
+        false,
+    )?;
     if use_server_obfuscation {
         session
             .negotiate_obfuscation_and_send(&login_request)
@@ -1742,8 +1885,11 @@ async fn search_sources_on_server(
                     format!("dispatching source search file_hash={file_hash}"),
                 );
                 let source_request = encode_source_request(file_hash, file_size);
-                let opcode =
-                    source_request_opcode(login_identity.connect_options, session.server_flags);
+                let opcode = source_request_opcode(
+                    login_identity.connect_options,
+                    session.server_flags,
+                    use_server_obfuscation,
+                );
                 session.send_packet(opcode, &source_request).await?;
             }
             OP_FOUNDSOURCES | OP_FOUNDSOURCES_OBFU => {
@@ -1817,7 +1963,7 @@ async fn handle_server_packet(
             let server_flags = (packet.payload.len() >= 8)
                 .then(|| u32::from_le_bytes(packet.payload[4..8].try_into().unwrap()));
             let reported_client_ip = (packet.payload.len() >= 16).then(|| {
-                Ipv4Addr::from(u32::from_le_bytes(
+                ipv4_from_client_id(u32::from_le_bytes(
                     packet.payload[12..16].try_into().unwrap(),
                 ))
             });
@@ -1987,6 +2133,79 @@ async fn handle_server_packet(
     Ok(())
 }
 
+fn handle_background_udp_packet(
+    server: &ResolvedServerEntry,
+    packet: &ServerUdpPacket,
+    pending_background_search: &mut Option<PendingBackgroundServerSearch>,
+    state: &Arc<RwLock<Ed2kServerState>>,
+) -> Result<()> {
+    if packet.from.ip() != IpAddr::V4(server.ip) {
+        return Ok(());
+    }
+    match packet.opcode {
+        OP_GLOBSEARCHRES => {
+            let Some(PendingBackgroundServerSearch::Keyword {
+                query,
+                mut results,
+                response,
+                ..
+            }) = pending_background_search.take()
+            else {
+                return Ok(());
+            };
+            for page in decode_udp_search_result_pages(&packet.payload)? {
+                log_search_result_page(server.base_endpoint(), &page.files);
+                results.extend(page.files);
+            }
+            info!(
+                "completed ED2K background UDP keyword search query={:?} endpoint={} source=udp result_count={}",
+                query,
+                server.base_endpoint(),
+                results.len()
+            );
+            let _ = response.send(Ok(results));
+        }
+        OP_GLOBFOUNDSOURCES => {
+            let Some(PendingBackgroundServerSearch::Source {
+                file_hash,
+                response,
+                ..
+            }) = pending_background_search.take()
+            else {
+                return Ok(());
+            };
+            let mut aggregated_results = Vec::new();
+            for results in decode_udp_found_source_sets(&packet.payload)? {
+                validate_found_sources(&results, file_hash)?;
+                merge_found_sources(&mut aggregated_results, results);
+            }
+            info!(
+                "completed ED2K background UDP source search file_hash={} endpoint={} source=udp source_count={}",
+                file_hash,
+                server.base_endpoint(),
+                aggregated_results.len()
+            );
+            let _ = response.send(Ok(aggregated_results));
+        }
+        OP_GLOBSERVSTATRES => {
+            if packet.payload.len() >= 8 {
+                let users = u32::from_le_bytes(packet.payload[..4].try_into().unwrap());
+                let files = u32::from_le_bytes(packet.payload[4..8].try_into().unwrap());
+                if let Ok(mut guard) = state.try_write() {
+                    guard.server_users = Some(users);
+                    guard.server_files = Some(files);
+                }
+                debug!(
+                    "ED2K server UDP status from {} users={} files={}",
+                    packet.from, users, files
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn fail_background_search_request(
     request: &mut Option<BackgroundServerSearchRequest>,
     error: &str,
@@ -1997,6 +2216,9 @@ fn fail_background_search_request(
                 let _ = response.send(Err(error.to_string()));
             }
             BackgroundServerSearchRequest::Source { response, .. } => {
+                let _ = response.send(Err(error.to_string()));
+            }
+            BackgroundServerSearchRequest::Callback { response, .. } => {
                 let _ = response.send(Err(error.to_string()));
             }
         }
@@ -2021,9 +2243,11 @@ fn fail_pending_background_search(
 
 async fn start_background_server_search(
     session: &mut ServerSession,
+    server: &ResolvedServerEntry,
+    server_udp_socket: Option<&UdpSocket>,
     connect_options: u8,
     request: BackgroundServerSearchRequest,
-) -> Result<PendingBackgroundServerSearch> {
+) -> Result<Option<PendingBackgroundServerSearch>> {
     match request {
         BackgroundServerSearchRequest::Keyword {
             query,
@@ -2043,17 +2267,26 @@ async fn start_background_server_search(
             session
                 .send_packet(OP_SEARCHREQUEST, &search_payload)
                 .await?;
+            if let Some(socket) = server_udp_socket
+                && let Err(error) = send_udp_keyword_search(socket, server, &search_payload).await
+            {
+                warn!(
+                    "failed to send ED2K background UDP keyword search query={:?} endpoint={}: {error}",
+                    query,
+                    server.base_endpoint()
+                );
+            }
             info!(
                 "sent ED2K background keyword search query={:?} endpoint={} trace_id={} role={}",
                 query, session.endpoint, session.trace_id, session.trace_role
             );
-            Ok(PendingBackgroundServerSearch::Keyword {
+            Ok(Some(PendingBackgroundServerSearch::Keyword {
                 query,
                 deadline: TokioInstant::now() + timeout,
                 results: Vec::new(),
                 page_count: 0,
                 response,
-            })
+            }))
         }
         BackgroundServerSearchRequest::Source {
             file_hash,
@@ -2067,17 +2300,50 @@ async fn start_background_server_search(
                 format!("dispatching background source search file_hash={file_hash}"),
             );
             let source_request = encode_source_request(file_hash, file_size);
-            let opcode = source_request_opcode(connect_options, session.server_flags);
+            let opcode = source_request_opcode(
+                connect_options,
+                session.server_flags,
+                session.send_cipher.is_some(),
+            );
             session.send_packet(opcode, &source_request).await?;
+            if let Some(socket) = server_udp_socket
+                && let Err(error) =
+                    send_udp_source_search(socket, server, file_hash, file_size).await
+            {
+                warn!(
+                    "failed to send ED2K background UDP source search file_hash={} endpoint={}: {error}",
+                    file_hash,
+                    server.base_endpoint()
+                );
+            }
             info!(
                 "sent ED2K background source search file_hash={} endpoint={} trace_id={} role={} opcode=0x{:02X}",
                 file_hash, session.endpoint, session.trace_id, session.trace_role, opcode
             );
-            Ok(PendingBackgroundServerSearch::Source {
+            Ok(Some(PendingBackgroundServerSearch::Source {
                 file_hash,
                 deadline: TokioInstant::now() + timeout,
                 response,
-            })
+            }))
+        }
+        BackgroundServerSearchRequest::Callback {
+            client_id,
+            response,
+        } => {
+            wait_for_offer_files_settle(session).await;
+            session.set_phase(
+                ServerSessionPhase::SearchActive,
+                format!("dispatching background callback request client_id={client_id}"),
+            );
+            session
+                .send_packet(OP_CALLBACKREQUEST, &client_id.to_le_bytes())
+                .await?;
+            info!(
+                "sent ED2K background callback request client_id={} endpoint={} trace_id={} role={}",
+                client_id, session.endpoint, session.trace_id, session.trace_role
+            );
+            let _ = response.send(Ok(()));
+            Ok(None)
         }
     }
 }
@@ -2104,7 +2370,7 @@ fn decode_callback_request(payload: &[u8]) -> Result<Option<CallbackRequest>> {
     if payload.len() < 6 {
         return Ok(None);
     }
-    let ip = Ipv4Addr::from(u32::from_le_bytes(payload[..4].try_into().unwrap()));
+    let ip = ipv4_from_client_id(u32::from_le_bytes(payload[..4].try_into().unwrap()));
     let port = u16::from_le_bytes(payload[4..6].try_into().unwrap());
     let connect_options = payload.get(6).copied();
     let user_hash = (payload.len() >= 23).then(|| {
@@ -2119,56 +2385,30 @@ fn decode_callback_request(payload: &[u8]) -> Result<Option<CallbackRequest>> {
     }))
 }
 
+fn decode_udp_found_source_sets(payload: &[u8]) -> Result<Vec<Vec<Ed2kFoundSource>>> {
+    let mut cursor = payload;
+    let mut sets = Vec::new();
+    while !cursor.is_empty() {
+        let (sources, rest) = decode_found_sources_from(cursor, false)?;
+        sets.push(sources);
+        cursor = rest;
+    }
+    Ok(sets)
+}
+
 fn decode_found_sources(payload: &[u8], obfuscated: bool) -> Result<Vec<Ed2kFoundSource>> {
-    if payload.len() < 17 {
-        anyhow::bail!("short ED2K found-sources payload");
-    }
-    let file_hash = Ed2kHash(payload[..16].try_into().unwrap());
-    let count = usize::from(payload[16]);
-    let mut cursor = &payload[17..];
-    let mut results = Vec::with_capacity(count);
-    for _ in 0..count {
-        if cursor.len() < 6 {
-            anyhow::bail!("short ED2K found-sources entry");
-        }
-        let ip = Ipv4Addr::from(u32::from_le_bytes(cursor[..4].try_into().unwrap()));
-        let tcp_port = u16::from_le_bytes(cursor[4..6].try_into().unwrap());
-        cursor = &cursor[6..];
-        let mut obfuscation_options = None;
-        let mut user_hash = None;
-        if obfuscated {
-            if cursor.is_empty() {
-                anyhow::bail!("short ED2K obfuscated source options");
-            }
-            let options = cursor[0];
-            cursor = &cursor[1..];
-            obfuscation_options = Some(options);
-            if options & 0x08 != 0 {
-                if cursor.len() < 16 {
-                    anyhow::bail!("short ED2K obfuscated source user hash");
-                }
-                let mut hash = [0u8; 16];
-                hash.copy_from_slice(&cursor[..16]);
-                cursor = &cursor[16..];
-                user_hash = Some(hash);
-            }
-        }
-        results.push(Ed2kFoundSource {
-            file_hash,
-            ip,
-            tcp_port,
-            obfuscated,
-            obfuscation_options,
-            user_hash,
-        });
-    }
-    if !cursor.is_empty() {
+    let (results, rest) = decode_found_sources_from(payload, obfuscated)?;
+    if !rest.is_empty() {
         anyhow::bail!(
             "unexpected ED2K found-sources trailing data len={}",
-            cursor.len()
+            rest.len()
         );
     }
     Ok(results)
+}
+
+fn ipv4_from_client_id(client_id: u32) -> Ipv4Addr {
+    Ipv4Addr::from(client_id.to_le_bytes())
 }
 
 fn validate_found_sources(results: &[Ed2kFoundSource], expected_file_hash: Ed2kHash) -> Result<()> {
@@ -2182,6 +2422,23 @@ fn validate_found_sources(results: &[Ed2kFoundSource], expected_file_hash: Ed2kH
         }
     }
     Ok(())
+}
+
+fn merge_found_sources(
+    aggregated_results: &mut Vec<Ed2kFoundSource>,
+    new_results: Vec<Ed2kFoundSource>,
+) {
+    for source in new_results {
+        if aggregated_results.iter().any(|existing| {
+            existing.ip == source.ip
+                && existing.tcp_port == source.tcp_port
+                && existing.obfuscation_options == source.obfuscation_options
+                && existing.user_hash == source.user_hash
+        }) {
+            continue;
+        }
+        aggregated_results.push(source);
+    }
 }
 
 async fn clear_server_connection_state(state: &Arc<RwLock<Ed2kServerState>>) {
@@ -2228,6 +2485,90 @@ async fn resolve_server_entry(entry: &ConfiguredServerEntry) -> Result<ResolvedS
     })
 }
 
+async fn bind_server_udp_socket(bind_ip: Ipv4Addr) -> Result<UdpSocket> {
+    UdpSocket::bind(SocketAddr::new(IpAddr::V4(bind_ip), 0))
+        .await
+        .with_context(|| format!("failed to bind ED2K server UDP helper on {bind_ip}:0"))
+}
+
+fn server_udp_endpoint(server: &ResolvedServerEntry) -> SocketAddr {
+    SocketAddr::new(
+        IpAddr::V4(server.ip),
+        if server.entry.port <= u16::MAX - 4 {
+            server.entry.port + 4
+        } else {
+            server.entry.port
+        },
+    )
+}
+
+async fn send_server_udp_packet(
+    socket: &UdpSocket,
+    server: &ResolvedServerEntry,
+    opcode: u8,
+    payload: &[u8],
+) -> Result<()> {
+    let mut packet = Vec::with_capacity(2 + payload.len());
+    packet.push(OP_EDONKEYPROT);
+    packet.push(opcode);
+    packet.extend_from_slice(payload);
+    socket
+        .send_to(&packet, server_udp_endpoint(server))
+        .await
+        .with_context(|| {
+            format!(
+                "failed to send ED2K server UDP opcode=0x{opcode:02X} to {}",
+                server_udp_endpoint(server)
+            )
+        })?;
+    Ok(())
+}
+
+async fn send_server_udp_status_request(
+    socket: &UdpSocket,
+    server: &ResolvedServerEntry,
+) -> Result<()> {
+    send_server_udp_packet(socket, server, OP_GLOBSERVSTATREQ, &[]).await
+}
+
+async fn send_udp_keyword_search(
+    socket: &UdpSocket,
+    server: &ResolvedServerEntry,
+    search_payload: &[u8],
+) -> Result<()> {
+    let (opcode, payload) = encode_udp_search_request(server, search_payload);
+    send_server_udp_packet(socket, server, opcode, &payload).await
+}
+
+async fn send_udp_source_search(
+    socket: &UdpSocket,
+    server: &ResolvedServerEntry,
+    file_hash: Ed2kHash,
+    file_size: u64,
+) -> Result<()> {
+    let (opcode, payload) = encode_udp_source_request(server, file_hash, file_size);
+    send_server_udp_packet(socket, server, opcode, &payload).await
+}
+
+async fn read_server_udp_packet(socket: &UdpSocket) -> Result<Option<ServerUdpPacket>> {
+    let mut buffer = vec![0u8; 65_535];
+    let (len, from) = socket
+        .recv_from(&mut buffer)
+        .await
+        .context("failed to receive ED2K server UDP datagram")?;
+    if len < 2 {
+        return Ok(None);
+    }
+    if buffer[0] != OP_EDONKEYPROT {
+        return Ok(None);
+    }
+    Ok(Some(ServerUdpPacket {
+        opcode: buffer[1],
+        payload: buffer[2..len].to_vec(),
+        from,
+    }))
+}
+
 fn encode_login_request(identity: Ed2kHelloIdentity) -> Vec<u8> {
     let mut payload = Vec::with_capacity(96);
     payload.extend_from_slice(&identity.user_hash);
@@ -2270,7 +2611,7 @@ fn login_identity_for_server_transport(
 }
 
 fn encode_offer_files_payload(
-    shared_catalog: &[PopularHash],
+    shared_catalog: &[Ed2kSharedEntry],
     client_id: Option<u32>,
     tcp_port: u16,
     server_flags: Option<u32>,
@@ -2338,8 +2679,50 @@ fn encode_source_request(file_hash: Ed2kHash, file_size: u64) -> Vec<u8> {
     payload
 }
 
-fn source_request_opcode(connect_options: u8, server_flags: Option<u32>) -> u8 {
+fn encode_udp_search_request(server: &ResolvedServerEntry, search_payload: &[u8]) -> (u8, Vec<u8>) {
+    if server.entry.udp_flags & SERVER_UDP_FLAG_EXT_GETFILES != 0
+        && server.entry.udp_flags & SERVER_UDP_FLAG_LARGEFILES != 0
+    {
+        let mut payload = Vec::with_capacity(search_payload.len() + 11);
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        push_u32_tag(
+            &mut payload,
+            CT_SERVER_UDPSEARCH_FLAGS,
+            SRVCAP_UDP_NEWTAGS_LARGEFILES,
+        );
+        payload.extend_from_slice(search_payload);
+        (OP_GLOBSEARCHREQ3, payload)
+    } else if server.entry.udp_flags & SERVER_UDP_FLAG_EXT_GETFILES != 0 {
+        (OP_GLOBSEARCHREQ2, search_payload.to_vec())
+    } else {
+        (OP_GLOBSEARCHREQ, search_payload.to_vec())
+    }
+}
+
+fn encode_udp_source_request(
+    server: &ResolvedServerEntry,
+    file_hash: Ed2kHash,
+    file_size: u64,
+) -> (u8, Vec<u8>) {
+    if server.entry.udp_flags & SERVER_UDP_FLAG_EXT_GETSOURCES2 != 0 {
+        (
+            OP_GLOBGETSOURCES2,
+            encode_source_request(file_hash, file_size),
+        )
+    } else if server.entry.udp_flags & SERVER_UDP_FLAG_EXT_GETSOURCES != 0 {
+        (OP_GLOBGETSOURCES, file_hash.0.to_vec())
+    } else {
+        (OP_GLOBGETSOURCES, file_hash.0.to_vec())
+    }
+}
+
+fn source_request_opcode(
+    connect_options: u8,
+    server_flags: Option<u32>,
+    use_obfuscated_transport: bool,
+) -> u8 {
     if connect_options != 0
+        && use_obfuscated_transport
         && server_flags.unwrap_or_default() & SERVER_TCP_FLAG_TCPOBFUSCATION != 0
     {
         OP_GETSOURCES_OBFU
@@ -2348,7 +2731,7 @@ fn source_request_opcode(connect_options: u8, server_flags: Option<u32>) -> u8 {
     }
 }
 
-fn offered_files_catalog(shared_catalog: &[PopularHash]) -> Vec<([u8; 16], String, u32, u8)> {
+fn offered_files_catalog(shared_catalog: &[Ed2kSharedEntry]) -> Vec<([u8; 16], String, u32, u8)> {
     let mut offered_files = shared_catalog
         .iter()
         .filter_map(popular_hash_offer_file)
@@ -2365,11 +2748,9 @@ fn offered_files_catalog(shared_catalog: &[PopularHash]) -> Vec<([u8; 16], Strin
     offered_files
 }
 
-fn popular_hash_offer_file(hash: &PopularHash) -> Option<([u8; 16], String, u32, u8)> {
-    let file_hash = match &hash.hash {
-        overlord_agent_common::HashType::Ed2k(value) => Ed2kHash::from_str(value).ok()?,
-    };
-    let file_size = u32::try_from(hash.size).unwrap_or(u32::MAX);
+fn popular_hash_offer_file(hash: &Ed2kSharedEntry) -> Option<([u8; 16], String, u32, u8)> {
+    let file_hash = hash.parsed_hash().ok()?;
+    let file_size = u32::try_from(hash.file_size).unwrap_or(u32::MAX);
     Some((
         file_hash.0,
         hash.canonical_name.clone(),
@@ -2667,15 +3048,35 @@ fn push_short_string_tag(payload: &mut Vec<u8>, name: u8, value: &str) {
     payload.extend_from_slice(value_bytes);
 }
 
-fn encode_packet(opcode: u8, payload: &[u8]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(TCP_PACKET_HEADER_LEN + payload.len());
-    bytes.push(OP_EDONKEYPROT);
+fn encode_packet(opcode: u8, payload: &[u8], use_compression: bool) -> Result<Vec<u8>> {
+    let protocol = if use_compression {
+        OP_PACKEDPROT
+    } else {
+        OP_EDONKEYPROT
+    };
+    let encoded_payload = if use_compression {
+        encode_packed_payload(payload)?
+    } else {
+        payload.to_vec()
+    };
+    let mut bytes = Vec::with_capacity(TCP_PACKET_HEADER_LEN + encoded_payload.len());
+    bytes.push(protocol);
     bytes.extend_from_slice(
-        &(u32::try_from(payload.len() + 1).expect("payload too large")).to_le_bytes(),
+        &(u32::try_from(encoded_payload.len() + 1).context("payload too large")?).to_le_bytes(),
     );
     bytes.push(opcode);
-    bytes.extend_from_slice(payload);
-    bytes
+    bytes.extend_from_slice(&encoded_payload);
+    Ok(bytes)
+}
+
+fn encode_packed_payload(payload: &[u8]) -> Result<Vec<u8>> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(payload)
+        .context("failed to deflate ED2K server payload")?;
+    encoder
+        .finish()
+        .context("failed to finalize ED2K server payload compression")
 }
 
 async fn send_offer_files_advertisement(
@@ -2864,6 +3265,28 @@ fn decode_search_results(payload: &[u8]) -> Result<SearchResultSummary> {
 }
 
 fn decode_search_result_page(payload: &[u8]) -> Result<SearchResultPage> {
+    let (page, rest) = decode_search_result_page_from(payload)?;
+    if !rest.is_empty() {
+        anyhow::bail!(
+            "unexpected ED2K search trailing data len={} after result page",
+            rest.len()
+        );
+    }
+    Ok(page)
+}
+
+fn decode_udp_search_result_pages(payload: &[u8]) -> Result<Vec<SearchResultPage>> {
+    let mut cursor = payload;
+    let mut pages = Vec::new();
+    while !cursor.is_empty() {
+        let (page, rest) = decode_search_result_page_from(cursor)?;
+        pages.push(page);
+        cursor = rest;
+    }
+    Ok(pages)
+}
+
+fn decode_search_result_page_from(payload: &[u8]) -> Result<(SearchResultPage, &[u8])> {
     if payload.len() < 4 {
         anyhow::bail!("short ED2K search results payload");
     }
@@ -2928,9 +3351,13 @@ fn decode_search_result_page(payload: &[u8]) -> Result<SearchResultPage> {
         });
     }
 
-    let more_results_available = match cursor {
-        [] => false,
-        [marker @ (0x00 | 0x01)] => *marker != 0,
+    let (more_results_available, rest) = match cursor {
+        [] => (false, &[][..]),
+        [marker @ (0x00 | 0x01)] => (*marker != 0, &[][..]),
+        [marker @ (0x00 | 0x01), rest @ ..] if udp_chain_matches(rest, OP_GLOBSEARCHRES) => {
+            (*marker != 0, &rest[2..])
+        }
+        rest if udp_chain_matches(rest, OP_GLOBSEARCHRES) => (false, &rest[2..]),
         [marker] => anyhow::bail!("invalid ED2K search More marker 0x{marker:02X}"),
         _ => anyhow::bail!(
             "unexpected ED2K search trailing data len={} after result page",
@@ -2938,10 +3365,76 @@ fn decode_search_result_page(payload: &[u8]) -> Result<SearchResultPage> {
         ),
     };
 
-    Ok(SearchResultPage {
-        files,
-        more_results_available,
-    })
+    Ok((
+        SearchResultPage {
+            files,
+            more_results_available,
+        },
+        rest,
+    ))
+}
+
+fn decode_found_sources_from(
+    payload: &[u8],
+    obfuscated: bool,
+) -> Result<(Vec<Ed2kFoundSource>, &[u8])> {
+    if payload.len() < 17 {
+        anyhow::bail!("short ED2K found-sources payload");
+    }
+    let file_hash = Ed2kHash(payload[..16].try_into().unwrap());
+    let count = usize::from(payload[16]);
+    let mut cursor = &payload[17..];
+    let mut results = Vec::with_capacity(count);
+    for _ in 0..count {
+        if cursor.len() < 6 {
+            anyhow::bail!("short ED2K found-sources entry");
+        }
+        let client_id = u32::from_le_bytes(cursor[..4].try_into().unwrap());
+        let ip = ipv4_from_client_id(client_id);
+        let tcp_port = u16::from_le_bytes(cursor[4..6].try_into().unwrap());
+        let low_id = is_low_id(client_id);
+        cursor = &cursor[6..];
+        let mut obfuscation_options = None;
+        let mut user_hash = None;
+        if obfuscated {
+            if cursor.is_empty() {
+                anyhow::bail!("short ED2K obfuscated source options");
+            }
+            let options = cursor[0];
+            cursor = &cursor[1..];
+            obfuscation_options = Some(options);
+            if options & 0x08 != 0 {
+                if cursor.len() < 16 {
+                    anyhow::bail!("short ED2K obfuscated source user hash");
+                }
+                let mut hash = [0u8; 16];
+                hash.copy_from_slice(&cursor[..16]);
+                cursor = &cursor[16..];
+                user_hash = Some(hash);
+            }
+        }
+        results.push(Ed2kFoundSource {
+            file_hash,
+            ip,
+            tcp_port,
+            client_id,
+            low_id,
+            obfuscated,
+            obfuscation_options,
+            user_hash,
+        });
+    }
+
+    let rest = if udp_chain_matches(cursor, OP_GLOBFOUNDSOURCES) {
+        &cursor[2..]
+    } else {
+        cursor
+    };
+    Ok((results, rest))
+}
+
+fn udp_chain_matches(payload: &[u8], opcode: u8) -> bool {
+    payload.len() >= 2 && payload[0] == OP_EDONKEYPROT && payload[1] == opcode
 }
 
 fn decode_tag(bytes: &[u8]) -> Result<(Option<u8>, Option<String>, &[u8])> {
@@ -3157,16 +3650,18 @@ mod tests {
         decode_found_sources, decode_search_result_page, decode_search_results,
         decode_server_ident, decode_server_payload, derive_server_cipher, encode_login_request,
         encode_offer_files_payload, encode_packet, encode_search_request, encode_source_request,
-        format_server_flags, login_identity_for_server_transport, new_ed2k_server_search_channel,
-        search_keyword_via_background_session, search_source_via_background_session,
-        server_capabilities, should_use_server_obfuscation, source_request_opcode,
-        validate_found_sources,
+        format_server_flags, ipv4_from_client_id, login_identity_for_server_transport,
+        new_ed2k_server_search_channel, search_keyword_via_background_session,
+        search_source_via_background_session, server_capabilities, should_use_server_obfuscation,
+        source_request_opcode, validate_found_sources,
     };
-    use crate::ed2k_tcp::{Ed2kHelloIdentity, emule_connect_options};
+    use crate::{
+        ed2k_tcp::{Ed2kHelloIdentity, emule_connect_options},
+        ed2k_transfer::Ed2kSharedEntry,
+    };
     use flate2::{Compression, write::ZlibEncoder};
     use hex::decode;
     use num_bigint::BigUint;
-    use overlord_agent_common::{HashType, PopularHash};
     use std::{io::Write, net::Ipv4Addr, sync::Arc, time::Duration};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -3299,7 +3794,9 @@ mod tests {
                 connect_options: emule_connect_options(false),
                 direct_udp_callback: false,
             }),
-        );
+            false,
+        )
+        .unwrap();
 
         let expected = decode(
             "e3520000000173bec566140e7e6083c450c9af026f83000000004fb60400000002010001190068747470733a2f2f656d756c652d70726f6a6563742e6e6574030100113c0000000301002019010000030100fb80f10000",
@@ -3326,7 +3823,9 @@ mod tests {
                 connect_options: emule_connect_options(true),
                 direct_udp_callback: false,
             }),
-        );
+            false,
+        )
+        .unwrap();
 
         let expected = decode(
             "e3520000000173bec566140e7e6083c450c9af026f83000000004fb60400000002010001190068747470733a2f2f656d756c652d70726f6a6563742e6e6574030100113c0000000301002019070000030100fb80f10000",
@@ -3354,7 +3853,7 @@ mod tests {
 
     #[test]
     fn packet_encoder_uses_ed2k_framing() {
-        let packet = encode_packet(OP_GETSERVERLIST, &[]);
+        let packet = encode_packet(OP_GETSERVERLIST, &[], false).unwrap();
         assert_eq!(packet[0], 0xE3);
         assert_eq!(
             u32::from_le_bytes([packet[1], packet[2], packet[3], packet[4]]),
@@ -3421,6 +3920,15 @@ mod tests {
     }
 
     #[test]
+    fn packet_encoder_uses_packed_framing_when_requested() {
+        let packet = encode_packet(OP_GETSERVERLIST, &[], true).unwrap();
+        assert_eq!(packet[0], OP_PACKEDPROT);
+        let decoded = decode_server_payload(OP_PACKEDPROT, packet[6..].to_vec()).unwrap();
+        assert!(decoded.is_empty());
+        assert_eq!(packet[5], OP_GETSERVERLIST);
+    }
+
+    #[test]
     fn server_flag_formatter_lists_known_capabilities() {
         let text = format_server_flags(SERVER_TCP_FLAG_COMPRESSION | SERVER_TCP_FLAG_LARGEFILES);
         assert!(text.contains("compression"));
@@ -3471,11 +3979,14 @@ mod tests {
 
     #[test]
     fn offer_files_payload_matches_oracle_search_session_sample() {
-        let shared_catalog = vec![PopularHash {
-            hash: HashType::Ed2k(hex::encode(OFFER_FILE_SAMPLE_HASH)),
+        let shared_catalog = vec![Ed2kSharedEntry {
+            file_hash: hex::encode(OFFER_FILE_SAMPLE_HASH),
             canonical_name: OFFER_FILE_SAMPLE_NAME.to_string(),
-            size: u64::from(OFFER_FILE_SAMPLE_SIZE),
-            source_count: 12,
+            file_size: u64::from(OFFER_FILE_SAMPLE_SIZE),
+            verified_complete: false,
+            verified_ranges: Vec::new(),
+            compatibility_hint: true,
+            source_count_hint: Some(12),
         }];
         let packet = encode_packet(
             OP_OFFERFILES,
@@ -3485,7 +3996,9 @@ mod tests {
                 46671,
                 Some(SERVER_TCP_FLAG_COMPRESSION),
             ),
-        );
+            false,
+        )
+        .unwrap();
 
         let expected = decode(
             "e34a00000015010000009f3c23db7651efbac9a837a8a0ae3ed9fbfbfbfbfbfb0300000082011e007562756e74752d6c696e75782d6f7261636c652d73616d706c652e69736f830200002000890304",
@@ -3565,10 +4078,11 @@ mod tests {
         let mut payload = Vec::new();
         payload.extend_from_slice(&[0xAA; 16]);
         payload.push(1);
-        payload.extend_from_slice(&u32::from(Ipv4Addr::new(10, 20, 30, 40)).to_le_bytes());
+        payload.extend_from_slice(&[10, 20, 30, 40]);
         payload.extend_from_slice(&4662u16.to_le_bytes());
 
         let sources = decode_found_sources(&payload, false).unwrap();
+        let client_id = u32::from_le_bytes([10, 20, 30, 40]);
 
         assert_eq!(
             sources,
@@ -3576,11 +4090,31 @@ mod tests {
                 file_hash: Ed2kHash([0xAA; 16]),
                 ip: Ipv4Addr::new(10, 20, 30, 40),
                 tcp_port: 4662,
+                client_id,
+                low_id: false,
                 obfuscated: false,
                 obfuscation_options: None,
                 user_hash: None,
             }]
         );
+    }
+
+    #[test]
+    fn found_sources_decoder_marks_low_id_sources_as_callback_only() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0xAB; 16]);
+        payload.push(1);
+        payload.extend_from_slice(&34254u32.to_le_bytes());
+        payload.extend_from_slice(&4662u16.to_le_bytes());
+
+        let sources = decode_found_sources(&payload, false).unwrap();
+        let client_id = 34254u32;
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].client_id, client_id);
+        assert_eq!(sources[0].ip, ipv4_from_client_id(client_id));
+        assert!(sources[0].low_id);
+        assert!(!sources[0].is_direct_dialable());
     }
 
     #[test]
@@ -3610,11 +4144,15 @@ mod tests {
     #[test]
     fn source_request_opcode_uses_obfuscated_variant_when_supported() {
         assert_eq!(
-            source_request_opcode(0x01, Some(SERVER_TCP_FLAG_TCPOBFUSCATION)),
+            source_request_opcode(0x01, Some(SERVER_TCP_FLAG_TCPOBFUSCATION), true),
             OP_GETSOURCES_OBFU
         );
         assert_eq!(
-            source_request_opcode(0x00, Some(SERVER_TCP_FLAG_TCPOBFUSCATION)),
+            source_request_opcode(0x00, Some(SERVER_TCP_FLAG_TCPOBFUSCATION), true),
+            OP_GETSOURCES
+        );
+        assert_eq!(
+            source_request_opcode(0x01, Some(SERVER_TCP_FLAG_TCPOBFUSCATION), false),
             OP_GETSOURCES
         );
     }
@@ -3626,6 +4164,8 @@ mod tests {
                 file_hash: Ed2kHash([0xAA; 16]),
                 ip: Ipv4Addr::new(1, 2, 3, 4),
                 tcp_port: 4662,
+                client_id: u32::from(Ipv4Addr::new(1, 2, 3, 4)),
+                low_id: false,
                 obfuscated: false,
                 obfuscation_options: None,
                 user_hash: None,
@@ -3686,6 +4226,8 @@ mod tests {
             file_hash,
             ip: Ipv4Addr::new(10, 20, 30, 40),
             tcp_port: 4662,
+            client_id: u32::from_le_bytes([10, 20, 30, 40]),
+            low_id: false,
             obfuscated: true,
             obfuscation_options: Some(0x03),
             user_hash: Some([0x61; 16]),
@@ -3737,7 +4279,12 @@ mod tests {
             connect_options: emule_connect_options(true),
             direct_udp_callback: false,
         };
-        let expected_login = encode_packet(OP_LOGINREQUEST, &encode_login_request(hello_identity));
+        let expected_login = encode_packet(
+            OP_LOGINREQUEST,
+            &encode_login_request(hello_identity),
+            false,
+        )
+        .unwrap();
         let expected_login_for_server = expected_login.clone();
 
         let server = tokio::spawn(async move {
