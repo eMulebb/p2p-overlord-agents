@@ -884,6 +884,7 @@ Crate: TBD
 - ED2K peer TCP protocol
 - Slot negotiation
 - Chunk request/response
+- Piece-store payload layout + durable resume manifest
 - MD4 + AICH verification
 - Download queue
 - Upload queue and shared-file serving
