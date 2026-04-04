@@ -2064,7 +2064,7 @@ async fn handle_connection(
                 let is_i64 = packet.opcode == OP_REQUESTPARTS_I64;
                 let (requested, ranges) = decode_request_parts_payload(&packet.payload, is_i64)?;
                 requested_file_hash = Some(requested);
-                if transfer_runtime.verified_entry(&requested).await.is_none() {
+                if transfer_runtime.local_entry(&requested).await?.is_none() {
                     let reply = encode_file_req_ans_nofil(&requested);
                     dump_ed2k_tcp_listener_send(
                         peer_addr,

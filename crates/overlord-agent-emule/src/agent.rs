@@ -5567,10 +5567,48 @@ impl OverlordAgentEmule {
                 request.file_hash, skipped_low_id_sources
             );
         }
+        let callback_timeout = Duration::from_secs(config.p2p.ed2k.connect_timeout_secs.max(10));
+        if !callback_only_sources.is_empty() {
+            let cancel = CancellationToken::new();
+            for source in &callback_only_sources {
+                runtime
+                    .ed2k_transfer
+                    .register_callback_intent(Ed2kCallbackIntent {
+                        client_id: source.client_id,
+                        file_hash: request.file_hash.clone(),
+                        canonical_name: request.file_name.clone(),
+                        file_size: request.file_size,
+                        source: Ed2kSourceHint {
+                            ip: source.ip.to_string(),
+                            tcp_port: source.tcp_port,
+                            user_hash: source.user_hash.map(hex::encode),
+                        },
+                    })
+                    .await;
+                info!(
+                    "native ED2K download requesting server callback file_hash={} client_id={} tcp_port={}",
+                    request.file_hash, source.client_id, source.tcp_port
+                );
+                match request_callback_via_background_session(
+                    &runtime.ed2k_server_search,
+                    source.client_id,
+                    callback_timeout,
+                    &cancel,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(error) => warn!(
+                        "native ED2K server callback request failed file_hash={} client_id={}: {error}",
+                        request.file_hash, source.client_id
+                    ),
+                }
+            }
+        }
         sources.retain(Ed2kFoundSource::is_direct_dialable);
         let mut last_error: Option<anyhow::Error> = None;
         if !sources.is_empty() {
-            const MAX_PARALLEL_DOWNLOAD_PEERS: usize = 3;
+            const MAX_PARALLEL_DOWNLOAD_PEERS: usize = 5;
             let bind_ip = runtime.bind_ip;
             let connect_timeout = Duration::from_secs(config.p2p.ed2k.connect_timeout_secs.max(10));
             let file_size = request.file_size;
@@ -5667,46 +5705,8 @@ impl OverlordAgentEmule {
             }
         }
 
-        if last_error.is_none() && !callback_only_sources.is_empty() {
-            let cancel = CancellationToken::new();
-            for source in &callback_only_sources {
-                runtime
-                    .ed2k_transfer
-                    .register_callback_intent(Ed2kCallbackIntent {
-                        client_id: source.client_id,
-                        file_hash: request.file_hash.clone(),
-                        canonical_name: request.file_name.clone(),
-                        file_size: request.file_size,
-                        source: Ed2kSourceHint {
-                            ip: source.ip.to_string(),
-                            tcp_port: source.tcp_port,
-                            user_hash: source.user_hash.map(hex::encode),
-                        },
-                    })
-                    .await;
-                info!(
-                    "native ED2K download requesting server callback file_hash={} client_id={} tcp_port={}",
-                    request.file_hash, source.client_id, source.tcp_port
-                );
-                match request_callback_via_background_session(
-                    &runtime.ed2k_server_search,
-                    source.client_id,
-                    Duration::from_secs(config.p2p.ed2k.connect_timeout_secs.max(10)),
-                    &cancel,
-                )
-                .await
-                {
-                    Ok(()) => {}
-                    Err(error) => warn!(
-                        "native ED2K server callback request failed file_hash={} client_id={}: {error}",
-                        request.file_hash, source.client_id
-                    ),
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(
-                config.p2p.ed2k.connect_timeout_secs.max(10),
-            ))
-            .await;
+        if !callback_only_sources.is_empty() {
+            tokio::time::sleep(callback_timeout).await;
             let manifest = runtime.ed2k_transfer.manifest(&request.file_hash).await?;
             if manifest.completed {
                 return Ok(());

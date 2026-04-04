@@ -470,16 +470,6 @@ impl Ed2kTransferRuntime {
         Ok(Some(bytes))
     }
 
-    /// Return one verified shared entry for the requested hash, if available.
-    pub async fn verified_entry(&self, file_hash: &Ed2kHash) -> Option<Ed2kSharedEntry> {
-        let hash_hex = file_hash.to_string();
-        let guard = self.shared_catalog.read().await;
-        guard
-            .iter()
-            .find(|entry| entry.file_hash == hash_hex && entry.verified_complete)
-            .cloned()
-    }
-
     /// Return local manifest-backed file metadata even when only part of the
     /// payload has been verified already.
     pub async fn local_entry(&self, file_hash: &Ed2kHash) -> Result<Option<Ed2kSharedEntry>> {
