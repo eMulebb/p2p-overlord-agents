@@ -122,6 +122,7 @@ const FIREWALLED_TCP_PROBE_TIMEOUT_SECS: u64 = 5;
 const KAD_FIREWALLED_RESPONSE_TIMEOUT_SECS: u64 = 10;
 const ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS: usize = 3;
 const ED2K_BACKGROUND_SEARCH_QUEUE_CAPACITY: usize = 4;
+const ED2K_DOWNLOAD_KAD_SOURCE_CAP: usize = 64;
 const ACTIVITY_KEY_STARTING: &str = "starting";
 const ACTIVITY_KEY_BOOTSTRAPPING: &str = "bootstrapping";
 const ACTIVITY_KEY_FLUSHING_SNOOPS: &str = "flushing_snoops";
@@ -2594,6 +2595,57 @@ fn map_ed2k_source_result(result: &Ed2kFoundSource, file_size: u64) -> FileRecor
 /// than the generic connect timeout.
 fn ed2k_source_search_timeout(config: &Ed2kConfig) -> Duration {
     Duration::from_secs(config.connect_timeout_secs.max(15))
+}
+
+/// Kad source search remains a viable fallback when ED2K servers accept login
+/// traffic but never answer `OP_GETSOURCES` for a concrete file.
+fn kad_source_result_to_ed2k_found_source(result: SourceResult) -> Ed2kFoundSource {
+    Ed2kFoundSource {
+        file_hash: result.file_hash,
+        ip: result.ip,
+        tcp_port: result.tcp_port,
+        client_id: u32::from(result.ip),
+        low_id: false,
+        obfuscated: false,
+        obfuscation_options: None,
+        user_hash: None,
+    }
+}
+
+/// Collects Kad-advertised ED2K sources for a bounded window so downloads can
+/// proceed even when server-assisted source discovery is flaky.
+async fn collect_kad_ed2k_sources(
+    dht: &DhtNode,
+    file_hash: Ed2kHash,
+    file_size: u64,
+    timeout: Duration,
+) -> Vec<Ed2kFoundSource> {
+    let cancel = CancellationToken::new();
+    let mut stream = dht.search_sources_with_cancel(file_hash, file_size, cancel.clone());
+    let sleep = tokio::time::sleep(timeout);
+    tokio::pin!(sleep);
+    let mut sources = Vec::new();
+
+    loop {
+        tokio::select! {
+            _ = &mut sleep => break,
+            result = stream.next() => {
+                let Some(result) = result else {
+                    break;
+                };
+                merge_download_sources(
+                    &mut sources,
+                    vec![kad_source_result_to_ed2k_found_source(result)],
+                );
+                if sources.len() >= ED2K_DOWNLOAD_KAD_SOURCE_CAP {
+                    break;
+                }
+            }
+        }
+    }
+
+    cancel.cancel();
+    sources
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5715,6 +5767,19 @@ impl OverlordAgentEmule {
         )
         .await?;
         merge_download_sources(&mut sources, server_results);
+        if sources.is_empty() {
+            let kad_sources =
+                collect_kad_ed2k_sources(&runtime.dht, file_hash, file_size, source_search_timeout)
+                    .await;
+            if !kad_sources.is_empty() {
+                info!(
+                    "native ED2K download Kad source fallback produced file_hash={} source_count={}",
+                    file_hash,
+                    kad_sources.len()
+                );
+                merge_download_sources(&mut sources, kad_sources);
+            }
+        }
         Ok(sources)
     }
 
