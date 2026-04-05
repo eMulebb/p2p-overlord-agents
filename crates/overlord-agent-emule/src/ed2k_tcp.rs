@@ -4685,6 +4685,7 @@ mod tests {
                 obfuscated: false,
                 obfuscation_options: None,
                 user_hash: None,
+                source_server: None,
             },
             Ed2kHelloIdentity {
                 user_hash: [0x11; 16],
@@ -4843,6 +4844,7 @@ mod tests {
                 obfuscated: false,
                 obfuscation_options: None,
                 user_hash: None,
+                source_server: None,
             },
             Ed2kHelloIdentity {
                 user_hash: [0x11; 16],
@@ -4983,6 +4985,7 @@ mod tests {
                 obfuscated: false,
                 obfuscation_options: None,
                 user_hash: None,
+                source_server: None,
             },
             Ed2kHelloIdentity {
                 user_hash: [0x11; 16],
@@ -5186,6 +5189,7 @@ mod tests {
                 obfuscated: false,
                 obfuscation_options: None,
                 user_hash: None,
+                source_server: None,
             },
             Ed2kHelloIdentity {
                 user_hash: [0x11; 16],
@@ -5301,6 +5305,7 @@ mod tests {
                 obfuscated: false,
                 obfuscation_options: None,
                 user_hash: None,
+                source_server: None,
             },
             Ed2kHelloIdentity {
                 user_hash: [0x11; 16],
@@ -5470,6 +5475,7 @@ mod tests {
                 obfuscated: false,
                 obfuscation_options: None,
                 user_hash: None,
+                source_server: None,
             },
             Ed2kHelloIdentity {
                 user_hash: [0x11; 16],
@@ -5836,6 +5842,7 @@ mod tests {
                 obfuscated: false,
                 obfuscation_options: None,
                 user_hash: None,
+                source_server: None,
             },
             Ed2kHelloIdentity {
                 user_hash: [0x11; 16],
@@ -5977,6 +5984,7 @@ mod tests {
                 obfuscated: false,
                 obfuscation_options: None,
                 user_hash: None,
+                source_server: None,
             },
             Ed2kHelloIdentity {
                 user_hash: [0x11; 16],

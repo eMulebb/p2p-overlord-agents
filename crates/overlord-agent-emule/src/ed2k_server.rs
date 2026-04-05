@@ -445,6 +445,8 @@ pub struct Ed2kFoundSource {
     pub obfuscation_options: Option<u8>,
     /// Optional user hash present when the source advertises it in the obfuscated shape.
     pub user_hash: Option<[u8; 16]>,
+    /// ED2K server endpoint that reported this source, when known.
+    pub source_server: Option<SocketAddr>,
 }
 
 impl Ed2kFoundSource {
@@ -671,6 +673,108 @@ pub async fn request_callback_via_background_session(
                 .with_context(|| format!("timed out waiting for ED2K background callback response after {timeout:?}"))?
                 .context("ED2K background callback responder dropped")?;
             response.map_err(anyhow::Error::msg)
+        }
+    }
+}
+
+/// Requests an ED2K server callback for a LowID peer on one explicit server.
+///
+/// This keeps callback routing aligned with the server that reported the
+/// callback-only source whenever that provenance is available.
+#[allow(clippy::too_many_arguments)]
+pub async fn request_callback_on_server(
+    bind_ip: Ipv4Addr,
+    config: &Ed2kConfig,
+    hello_identity: Ed2kHelloIdentity,
+    shared_catalog: &[Ed2kSharedEntry],
+    server_endpoint: SocketAddr,
+    client_id: u32,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let resolved_server = resolve_callback_server_entry(config, server_endpoint).await?;
+    let use_server_obfuscation =
+        should_use_server_obfuscation(hello_identity.connect_options, &resolved_server);
+    let login_identity =
+        login_identity_for_server_transport(hello_identity, use_server_obfuscation);
+    let transport_endpoint = resolved_server.transport_endpoint(use_server_obfuscation);
+    let mut session = ServerSession::connect(
+        bind_ip,
+        transport_endpoint,
+        Arc::new(RwLock::new(Ed2kServerState::default())),
+        "active_callback",
+        timeout,
+    )
+    .await?;
+    let login_payload = encode_login_request(login_identity);
+    if use_server_obfuscation {
+        let login_request = encode_packet(OP_LOGINREQUEST, &login_payload, false)?;
+        session
+            .negotiate_obfuscation_and_send(&login_request)
+            .await?;
+    } else {
+        session.send_packet(OP_LOGINREQUEST, &login_payload).await?;
+    }
+    session.set_phase(
+        ServerSessionPhase::AwaitingIdChange,
+        "login request sent; awaiting OP_IDCHANGE for callback request",
+    );
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        let packet = tokio::time::timeout(timeout, session.read_packet())
+            .await
+            .with_context(|| {
+                format!("timed out waiting for ED2K callback-ready login on {transport_endpoint}")
+            })??;
+        let Some(packet) = packet else {
+            anyhow::bail!("ED2K server {transport_endpoint} closed before callback dispatch");
+        };
+        match packet.opcode {
+            OP_IDCHANGE => {
+                if packet.payload.len() < 4 {
+                    anyhow::bail!("short OP_IDCHANGE payload from {transport_endpoint}");
+                }
+                session.assigned_client_id =
+                    Some(u32::from_le_bytes(packet.payload[..4].try_into().unwrap()));
+                session.server_flags = (packet.payload.len() >= 8)
+                    .then(|| u32::from_le_bytes(packet.payload[4..8].try_into().unwrap()));
+                send_connected_server_startup(
+                    &mut session,
+                    &Arc::new(RwLock::new(shared_catalog.to_vec())),
+                    hello_identity.tcp_port,
+                )
+                .await?;
+                wait_for_offer_files_settle(&mut session).await;
+                session.set_phase(
+                    ServerSessionPhase::SearchActive,
+                    format!("dispatching callback request client_id={client_id}"),
+                );
+                session
+                    .send_packet(OP_CALLBACKREQUEST, &client_id.to_le_bytes())
+                    .await?;
+                info!(
+                    "sent ED2K targeted callback request client_id={} endpoint={} trace_id={} transport={}",
+                    client_id,
+                    session.endpoint,
+                    session.trace_id,
+                    if use_server_obfuscation {
+                        "obfuscated"
+                    } else {
+                        "plaintext"
+                    }
+                );
+                session.set_phase(
+                    ServerSessionPhase::Completed,
+                    format!("completed callback request client_id={client_id}"),
+                );
+                return Ok(());
+            }
+            OP_REJECT => {
+                anyhow::bail!("ED2K server {transport_endpoint} rejected the callback request");
+            }
+            _ => {}
         }
     }
 }
@@ -1403,10 +1507,13 @@ async fn run_one_server_session(
                             response,
                             ..
                         }) => {
-                            let results = decode_found_sources(
-                                &packet.payload,
-                                packet.opcode == OP_FOUNDSOURCES_OBFU,
-                            )?;
+                            let results = annotate_found_sources_server(
+                                decode_found_sources(
+                                    &packet.payload,
+                                    packet.opcode == OP_FOUNDSOURCES_OBFU,
+                                )?,
+                                session.endpoint,
+                            );
                             validate_found_sources(&results, file_hash)?;
                             session.set_phase(
                                 ServerSessionPhase::Completed,
@@ -1924,8 +2031,10 @@ async fn search_sources_on_server(
                 session.send_packet(opcode, &source_request).await?;
             }
             OP_FOUNDSOURCES | OP_FOUNDSOURCES_OBFU => {
-                let results =
-                    decode_found_sources(&packet.payload, packet.opcode == OP_FOUNDSOURCES_OBFU)?;
+                let results = annotate_found_sources_server(
+                    decode_found_sources(&packet.payload, packet.opcode == OP_FOUNDSOURCES_OBFU)?,
+                    server.base_endpoint(),
+                );
                 validate_found_sources(&results, file_hash)?;
                 session.set_phase(
                     ServerSessionPhase::Completed,
@@ -2445,6 +2554,16 @@ fn decode_found_sources(payload: &[u8], obfuscated: bool) -> Result<Vec<Ed2kFoun
     Ok(results)
 }
 
+fn annotate_found_sources_server(
+    mut results: Vec<Ed2kFoundSource>,
+    server_endpoint: SocketAddr,
+) -> Vec<Ed2kFoundSource> {
+    for source in &mut results {
+        source.source_server = Some(server_endpoint);
+    }
+    results
+}
+
 fn ipv4_from_client_id(client_id: u32) -> Ipv4Addr {
     Ipv4Addr::from(client_id.to_le_bytes())
 }
@@ -2467,16 +2586,43 @@ fn merge_found_sources(
     new_results: Vec<Ed2kFoundSource>,
 ) {
     for source in new_results {
-        if aggregated_results.iter().any(|existing| {
+        if let Some(existing) = aggregated_results.iter_mut().find(|existing| {
             existing.ip == source.ip
                 && existing.tcp_port == source.tcp_port
                 && existing.obfuscation_options == source.obfuscation_options
                 && existing.user_hash == source.user_hash
         }) {
+            if existing.source_server.is_none() && source.source_server.is_some() {
+                existing.source_server = source.source_server;
+            }
             continue;
         }
         aggregated_results.push(source);
     }
+}
+
+async fn resolve_callback_server_entry(
+    config: &Ed2kConfig,
+    server_endpoint: SocketAddr,
+) -> Result<ResolvedServerEntry> {
+    let endpoint_v4 = match server_endpoint {
+        SocketAddr::V4(endpoint) => endpoint,
+        SocketAddr::V6(_) => {
+            anyhow::bail!("ED2K callback server endpoint must be IPv4, got {server_endpoint}")
+        }
+    };
+
+    for configured_server in configured_server_entries(config)? {
+        let resolved_server = resolve_server_entry(&configured_server).await?;
+        if resolved_server.base_endpoint() == SocketAddr::V4(endpoint_v4) {
+            return Ok(resolved_server);
+        }
+    }
+
+    Ok(ResolvedServerEntry {
+        entry: ConfiguredServerEntry::from_endpoint_text(&server_endpoint.to_string())?,
+        ip: *endpoint_v4.ip(),
+    })
 }
 
 async fn clear_server_connection_state(state: &Arc<RwLock<Ed2kServerState>>) {
@@ -3460,6 +3606,7 @@ fn decode_found_sources_from(
             obfuscated,
             obfuscation_options,
             user_hash,
+            source_server: None,
         });
     }
 
@@ -4133,6 +4280,7 @@ mod tests {
                 obfuscated: false,
                 obfuscation_options: None,
                 user_hash: None,
+                source_server: None,
             }]
         );
     }
@@ -4207,6 +4355,7 @@ mod tests {
                 obfuscated: false,
                 obfuscation_options: None,
                 user_hash: None,
+                source_server: None,
             }],
             Ed2kHash([0xBB; 16]),
         )
@@ -4269,6 +4418,7 @@ mod tests {
             obfuscated: true,
             obfuscation_options: Some(0x03),
             user_hash: Some([0x61; 16]),
+            source_server: None,
         };
         let expected_for_task = expected.clone();
 

@@ -66,8 +66,9 @@ use overlord_kad_routing::{Contact, ContactType};
 use crate::config::{Ed2kConfig, EmuleAgentConfig};
 use crate::ed2k_server::{
     Ed2kFoundSource, Ed2kSearchFile, Ed2kServerSearchHandle, Ed2kServerState,
-    new_ed2k_server_search_channel, request_callback_via_background_session, run_ed2k_server_loop,
-    search_keyword_servers, search_keyword_via_background_session, search_source_servers,
+    new_ed2k_server_search_channel, request_callback_on_server,
+    request_callback_via_background_session, run_ed2k_server_loop, search_keyword_servers,
+    search_keyword_via_background_session, search_source_servers,
     search_source_via_background_session,
 };
 use crate::ed2k_tcp::{
@@ -840,6 +841,7 @@ impl EnrichEd2kDownloadSource {
             obfuscated: self.obfuscation_options.is_some(),
             obfuscation_options: self.obfuscation_options,
             user_hash,
+            source_server: None,
         })
     }
 }
@@ -2609,6 +2611,7 @@ fn kad_source_result_to_ed2k_found_source(result: SourceResult) -> Ed2kFoundSour
         obfuscated: false,
         obfuscation_options: None,
         user_hash: None,
+        source_server: None,
     }
 }
 
@@ -5802,6 +5805,7 @@ impl OverlordAgentEmule {
             anyhow::bail!("agent networking is waiting for interface selection");
         };
         let config = self.config.read().await.clone();
+        let shared_catalog = runtime.ed2k_shared_catalog.read().await.clone();
         runtime
             .ed2k_transfer
             .ensure_job(&new_transfer_job(
@@ -5877,21 +5881,44 @@ impl OverlordAgentEmule {
                     })
                     .await;
                 info!(
-                    "native ED2K download requesting server callback file_hash={} client_id={} tcp_port={}",
-                    request.file_hash, source.client_id, source.tcp_port
-                );
-                match request_callback_via_background_session(
-                    &runtime.ed2k_server_search,
+                    "native ED2K download requesting server callback file_hash={} client_id={} tcp_port={} source_server={}",
+                    request.file_hash,
                     source.client_id,
-                    callback_timeout,
-                    &cancel,
-                )
-                .await
-                {
+                    source.tcp_port,
+                    source
+                        .source_server
+                        .map_or_else(|| "-".to_string(), |endpoint| endpoint.to_string())
+                );
+                let callback_result = if let Some(source_server) = source.source_server {
+                    request_callback_on_server(
+                        runtime.bind_ip,
+                        &config.p2p.ed2k,
+                        hello_identity,
+                        &shared_catalog,
+                        source_server,
+                        source.client_id,
+                        callback_timeout,
+                        &cancel,
+                    )
+                    .await
+                } else {
+                    request_callback_via_background_session(
+                        &runtime.ed2k_server_search,
+                        source.client_id,
+                        callback_timeout,
+                        &cancel,
+                    )
+                    .await
+                };
+                match callback_result {
                     Ok(()) => {}
                     Err(error) => warn!(
-                        "native ED2K server callback request failed file_hash={} client_id={}: {error}",
-                        request.file_hash, source.client_id
+                        "native ED2K server callback request failed file_hash={} client_id={} source_server={}: {error}",
+                        request.file_hash,
+                        source.client_id,
+                        source
+                            .source_server
+                            .map_or_else(|| "-".to_string(), |endpoint| endpoint.to_string())
                     ),
                 }
             }
@@ -7642,6 +7669,7 @@ mod tests {
                     obfuscated: false,
                     obfuscation_options: None,
                     user_hash: None,
+                    source_server: None,
                 },
                 Ed2kFoundSource {
                     file_hash,
@@ -7652,6 +7680,7 @@ mod tests {
                     obfuscated: false,
                     obfuscation_options: None,
                     user_hash: None,
+                    source_server: None,
                 },
             ],
             Duration::from_secs(1),
@@ -7742,6 +7771,7 @@ mod tests {
                     obfuscated: false,
                     obfuscation_options: None,
                     user_hash: None,
+                    source_server: None,
                 },
                 Ed2kFoundSource {
                     file_hash,
@@ -7752,6 +7782,7 @@ mod tests {
                     obfuscated: false,
                     obfuscation_options: None,
                     user_hash: None,
+                    source_server: None,
                 },
             ],
             Duration::from_secs(1),
