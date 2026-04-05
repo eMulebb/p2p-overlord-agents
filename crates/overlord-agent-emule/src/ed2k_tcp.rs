@@ -17,7 +17,7 @@
 use std::{
     collections::VecDeque,
     fs,
-    io::{self, Read, Write},
+    io::{self, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     str::FromStr,
@@ -30,7 +30,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::SecondsFormat;
-use flate2::read::ZlibDecoder;
+use flate2::{Decompress, FlushDecompress, Status};
 use md5::compute as md5_compute;
 use rand::Rng;
 use rsa::{
@@ -302,6 +302,22 @@ struct Ed2kPeerSecureIdentState {
     pending_signature: bool,
     peer_signature_received: bool,
     requested_peer_key: bool,
+}
+
+/// Incremental inflate state for one pending compressed part stream.
+///
+/// Real eMule peers can split one compressed block across multiple
+/// `OP_COMPRESSEDPART` frames. The per-packet header repeats the block start
+/// and the total compressed stream length, while the payload only carries one
+/// fragment of the zlib stream.
+struct PendingCompressedPart {
+    piece_index: u32,
+    start: u64,
+    end: u64,
+    advertised_compressed_len: usize,
+    compressed_received: usize,
+    uncompressed_written: u64,
+    inflater: Decompress,
 }
 
 /// Immutable session metadata shared by one outgoing TCP helper exchange.
@@ -1248,6 +1264,7 @@ async fn drive_download_session(
     const QUEUE_RANK_GRACE: Duration = Duration::from_secs(20);
     const PART_RESPONSE_GRACE: Duration = Duration::from_secs(20);
     let mut pending_parts: Vec<(u32, u64, u64)> = Vec::new();
+    let mut pending_compressed_parts: Vec<PendingCompressedPart> = Vec::new();
     let mut manifest = transfer_runtime.manifest(file_hash_hex).await?;
     let mut peer_secure_ident = Ed2kPeerSecureIdentState::default();
     let mut hello_complete = initial_hello_complete;
@@ -1767,47 +1784,164 @@ async fn drive_download_session(
                 | (OP_EMULEPROT, OP_COMPRESSEDPART_I64) => {
                     let use_i64 =
                         packet.opcode == OP_SENDINGPART_I64 || packet.opcode == OP_COMPRESSEDPART_I64;
-                    let (returned_hash, start, end, bytes) = if packet.opcode == OP_COMPRESSEDPART
-                        || packet.opcode == OP_COMPRESSEDPART_I64
-                    {
-                        decode_compressed_part_payload(&packet.payload, use_i64)?
-                    } else {
-                        decode_sending_part_payload(&packet.payload, use_i64)?
-                    };
-                    if returned_hash != file_hash {
-                        dump_ed2k_tcp_download_meta(
-                            peer_addr,
-                            Some(transport.mode),
-                            "unexpected_part_hash",
-                            format!(
-                                "expected_file_hash={file_hash_hex} returned_file_hash={returned_hash} start={start} end={end}"
-                            ),
-                        );
-                        continue;
-                    }
-                    let Some(pending_index) =
-                        pending_parts
+                    if packet.opcode == OP_COMPRESSEDPART || packet.opcode == OP_COMPRESSEDPART_I64 {
+                        let (returned_hash, start, advertised_compressed_len, compressed_fragment) =
+                            decode_compressed_part_fragment(&packet.payload, use_i64)?;
+                        if returned_hash != file_hash {
+                            dump_ed2k_tcp_download_meta(
+                                peer_addr,
+                                Some(transport.mode),
+                                "unexpected_part_hash",
+                                format!(
+                                    "expected_file_hash={file_hash_hex} returned_file_hash={returned_hash} start={start} compressed_len={advertised_compressed_len}"
+                                ),
+                            );
+                            continue;
+                        }
+                        let Some(pending_index) = pending_parts.iter().position(
+                            |(_, expected_start, expected_end)| {
+                                *expected_start == start && *expected_end > *expected_start
+                            },
+                        ) else {
+                            dump_ed2k_tcp_download_meta(
+                                peer_addr,
+                                Some(transport.mode),
+                                "unexpected_compressed_part_range",
+                                format!(
+                                    "file_hash={file_hash_hex} start={start} compressed_len={advertised_compressed_len} pending={:?}",
+                                    pending_parts
+                                ),
+                            );
+                            continue;
+                        };
+                        let (expected_part, expected_start, expected_end) =
+                            pending_parts[pending_index];
+                        let compressed_index = if let Some(index) = pending_compressed_parts
                             .iter()
-                            .position(|(_, expected_start, expected_end)| {
-                                *expected_start == start && *expected_end == end
-                            })
-                    else {
-                        dump_ed2k_tcp_download_meta(
-                            peer_addr,
-                            Some(transport.mode),
-                            "unexpected_part_range",
-                            format!(
-                                "file_hash={file_hash_hex} start={start} end={end} pending={:?}",
-                                pending_parts
-                            ),
-                        );
-                        continue;
-                    };
-                    let (expected_part, _, _) = pending_parts.remove(pending_index);
-                    if pending_parts.is_empty() {
-                        part_response_deadline = None;
-                    }
-                    if single_part_block_mode {
+                            .position(|pending| pending.piece_index == expected_part)
+                        {
+                            let pending = &pending_compressed_parts[index];
+                            if pending.start != expected_start
+                                || pending.end != expected_end
+                                || pending.advertised_compressed_len != advertised_compressed_len
+                            {
+                                anyhow::bail!(
+                                    "peer {peer_addr} changed compressed-part framing for piece {expected_part} start={}..{} advertised={} expected={}..{} advertised={}",
+                                    pending.start,
+                                    pending.end,
+                                    pending.advertised_compressed_len,
+                                    expected_start,
+                                    expected_end,
+                                    advertised_compressed_len
+                                );
+                            }
+                            index
+                        } else {
+                            pending_compressed_parts.push(PendingCompressedPart {
+                                piece_index: expected_part,
+                                start: expected_start,
+                                end: expected_end,
+                                advertised_compressed_len,
+                                compressed_received: 0,
+                                uncompressed_written: 0,
+                                inflater: Decompress::new(true),
+                            });
+                            pending_compressed_parts.len() - 1
+                        };
+                        let (bytes, finished) = {
+                            let pending = &mut pending_compressed_parts[compressed_index];
+                            inflate_compressed_part_fragment(pending, compressed_fragment)?
+                        };
+                        let stream_end = {
+                            let pending = &pending_compressed_parts[compressed_index];
+                            pending.start + pending.uncompressed_written
+                        };
+                        if !bytes.is_empty() {
+                            let stream_start = stream_end
+                                .checked_sub(u64::try_from(bytes.len()).unwrap_or(0))
+                                .unwrap_or(start);
+                            let piece_completed = transfer_runtime
+                                .append_piece_block(
+                                    file_hash_hex,
+                                    expected_part,
+                                    stream_start,
+                                    stream_end,
+                                    &bytes,
+                                )
+                                .await?;
+                            manifest = transfer_runtime.manifest(file_hash_hex).await?;
+                            if piece_completed {
+                                single_part_active_piece = None;
+                            }
+                            dump_ed2k_tcp_download_meta(
+                                peer_addr,
+                                Some(transport.mode),
+                                "compressed_piece_fragment_stored",
+                                format!(
+                                    "file_hash={file_hash_hex} piece_index={expected_part} start={stream_start} end={stream_end} completed={}",
+                                    manifest.completed
+                                ),
+                            );
+                        }
+                        let piece_len = expected_end - expected_start;
+                        let pending = &pending_compressed_parts[compressed_index];
+                        if pending.uncompressed_written > piece_len {
+                            anyhow::bail!(
+                                "peer {peer_addr} decompressed beyond requested piece boundary for piece {expected_part}: wrote {} expected {}",
+                                pending.uncompressed_written,
+                                piece_len
+                            );
+                        }
+                        if finished && pending.uncompressed_written != piece_len {
+                            anyhow::bail!(
+                                "peer {peer_addr} ended compressed stream early for piece {expected_part}: wrote {} expected {}",
+                                pending.uncompressed_written,
+                                piece_len
+                            );
+                        }
+                        if pending.uncompressed_written == piece_len {
+                            pending_parts.remove(pending_index);
+                            pending_compressed_parts.remove(compressed_index);
+                            if pending_parts.is_empty() {
+                                part_response_deadline = None;
+                            }
+                        }
+                    } else {
+                        let (returned_hash, start, end, bytes) =
+                            decode_sending_part_payload(&packet.payload, use_i64)?;
+                        if returned_hash != file_hash {
+                            dump_ed2k_tcp_download_meta(
+                                peer_addr,
+                                Some(transport.mode),
+                                "unexpected_part_hash",
+                                format!(
+                                    "expected_file_hash={file_hash_hex} returned_file_hash={returned_hash} start={start} end={end}"
+                                ),
+                            );
+                            continue;
+                        }
+                        let Some(pending_index) =
+                            pending_parts
+                                .iter()
+                                .position(|(_, expected_start, expected_end)| {
+                                    *expected_start == start && *expected_end == end
+                                })
+                        else {
+                            dump_ed2k_tcp_download_meta(
+                                peer_addr,
+                                Some(transport.mode),
+                                "unexpected_part_range",
+                                format!(
+                                    "file_hash={file_hash_hex} start={start} end={end} pending={:?}",
+                                    pending_parts
+                                ),
+                            );
+                            continue;
+                        };
+                        let (expected_part, _, _) = pending_parts.remove(pending_index);
+                        if pending_parts.is_empty() {
+                            part_response_deadline = None;
+                        }
                         let piece_completed = transfer_runtime
                             .append_piece_block(file_hash_hex, expected_part, start, end, &bytes)
                             .await?;
@@ -1815,21 +1949,16 @@ async fn drive_download_session(
                         if piece_completed {
                             single_part_active_piece = None;
                         }
-                    } else {
-                        transfer_runtime
-                            .store_piece_data(file_hash_hex, expected_part, &bytes)
-                            .await?;
-                        manifest = transfer_runtime.manifest(file_hash_hex).await?;
+                        dump_ed2k_tcp_download_meta(
+                            peer_addr,
+                            Some(transport.mode),
+                            "piece_stored",
+                            format!(
+                                "file_hash={file_hash_hex} piece_index={expected_part} start={start} end={end} completed={}",
+                                manifest.completed
+                            ),
+                        );
                     }
-                    dump_ed2k_tcp_download_meta(
-                        peer_addr,
-                        Some(transport.mode),
-                        "piece_stored",
-                        format!(
-                            "file_hash={file_hash_hex} piece_index={expected_part} start={start} end={end} completed={}",
-                            manifest.completed
-                        ),
-                    );
                 }
                 _ => {}
             }
@@ -3209,48 +3338,118 @@ fn decode_sending_part_payload(
     Ok((Ed2kHash::from_bytes(hash), start, end, bytes))
 }
 
-fn decode_compressed_part_payload(
+fn decode_compressed_part_fragment(
     payload: &[u8],
     use_i64: bool,
-) -> Result<(Ed2kHash, u64, u64, Vec<u8>)> {
+) -> Result<(Ed2kHash, u64, usize, &[u8])> {
     let header_len = 16 + if use_i64 { 12 } else { 8 };
     if payload.len() < header_len {
         anyhow::bail!("short OP_COMPRESSEDPART payload {}", payload.len());
     }
     let mut hash = [0u8; 16];
     hash.copy_from_slice(&payload[..16]);
-    let (start, expected_uncompressed_len) = if use_i64 {
+    let (start, advertised_compressed_len) = if use_i64 {
         let start = u64::from_le_bytes(payload[16..24].try_into().expect("u64 width"));
-        let expected_uncompressed_len = usize::try_from(u32::from_le_bytes(
+        let advertised_compressed_len = usize::try_from(u32::from_le_bytes(
             payload[24..28].try_into().expect("u32 width"),
         ))
         .unwrap_or(usize::MAX);
-        (start, expected_uncompressed_len)
+        (start, advertised_compressed_len)
     } else {
         let start = u64::from(u32::from_le_bytes(
             payload[16..20].try_into().expect("u32 width"),
         ));
-        let expected_uncompressed_len = usize::try_from(u32::from_le_bytes(
+        let advertised_compressed_len = usize::try_from(u32::from_le_bytes(
             payload[20..24].try_into().expect("u32 width"),
         ))
         .unwrap_or(usize::MAX);
-        (start, expected_uncompressed_len)
+        (start, advertised_compressed_len)
     };
-    let compressed = &payload[header_len..];
-    let mut decoder = ZlibDecoder::new(compressed);
+    Ok((
+        Ed2kHash::from_bytes(hash),
+        start,
+        advertised_compressed_len,
+        &payload[header_len..],
+    ))
+}
+
+fn inflate_compressed_part_fragment(
+    pending: &mut PendingCompressedPart,
+    compressed_fragment: &[u8],
+) -> Result<(Vec<u8>, bool)> {
+    let mut remaining = compressed_fragment;
     let mut bytes = Vec::new();
-    decoder
-        .read_to_end(&mut bytes)
-        .context("failed to inflate OP_COMPRESSEDPART payload")?;
-    if bytes.len() != expected_uncompressed_len {
+    let mut finished = false;
+
+    while !remaining.is_empty() {
+        let mut output = [0u8; 16 * 1024];
+        let total_in_before = pending.inflater.total_in();
+        let total_out_before = pending.inflater.total_out();
+        let status = pending
+            .inflater
+            .decompress(remaining, &mut output, FlushDecompress::Sync)
+            .context("failed to inflate OP_COMPRESSEDPART fragment")?;
+        let consumed = usize::try_from(pending.inflater.total_in() - total_in_before).unwrap_or(0);
+        let produced =
+            usize::try_from(pending.inflater.total_out() - total_out_before).unwrap_or(0);
+        if produced != 0 {
+            bytes.extend_from_slice(&output[..produced]);
+        }
+        remaining = &remaining[consumed..];
+        match status {
+            Status::StreamEnd => {
+                finished = true;
+                break;
+            }
+            Status::Ok => {
+                if consumed == 0 && produced == 0 {
+                    anyhow::bail!("OP_COMPRESSEDPART inflate made no progress");
+                }
+            }
+            Status::BufError => {
+                if consumed == 0 && produced == 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    pending.compressed_received += compressed_fragment.len();
+    if pending.compressed_received > pending.advertised_compressed_len {
         anyhow::bail!(
-            "OP_COMPRESSEDPART inflated length {} does not match advertised {}",
-            bytes.len(),
-            expected_uncompressed_len
+            "OP_COMPRESSEDPART received {} compressed bytes, above advertised {}",
+            pending.compressed_received,
+            pending.advertised_compressed_len
         );
     }
-    let end = start + u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    Ok((Ed2kHash::from_bytes(hash), start, end, bytes))
+    if pending.compressed_received == pending.advertised_compressed_len && !finished {
+        loop {
+            let mut output = [0u8; 16 * 1024];
+            let total_out_before = pending.inflater.total_out();
+            let status = pending
+                .inflater
+                .decompress(&[], &mut output, FlushDecompress::Finish)
+                .context("failed to finish OP_COMPRESSEDPART inflate stream")?;
+            let produced =
+                usize::try_from(pending.inflater.total_out() - total_out_before).unwrap_or(0);
+            if produced != 0 {
+                bytes.extend_from_slice(&output[..produced]);
+            }
+            match status {
+                Status::StreamEnd => {
+                    finished = true;
+                    break;
+                }
+                Status::Ok | Status::BufError if produced == 0 => {
+                    finished = true;
+                    break;
+                }
+                Status::Ok | Status::BufError => {}
+            }
+        }
+    }
+    pending.uncompressed_written += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    Ok((bytes, finished))
 }
 
 fn encode_sending_part(
@@ -3563,7 +3762,7 @@ mod tests {
     }
 
     #[test]
-    fn compressed_part_payload_roundtrip_inflates_zlib_body() {
+    fn compressed_part_fragment_roundtrip_preserves_header_shape() {
         let file_hash = Ed2kHash([0xAB; 16]);
         let start = 0u64;
         let bytes = vec![0x5A; 32_768];
@@ -3574,15 +3773,44 @@ mod tests {
         let mut payload = Vec::with_capacity(16 + 4 + 4 + compressed.len());
         payload.extend_from_slice(&file_hash.0);
         payload.extend_from_slice(&(u32::try_from(start).unwrap()).to_le_bytes());
-        payload.extend_from_slice(&(u32::try_from(bytes.len()).unwrap()).to_le_bytes());
+        payload.extend_from_slice(&(u32::try_from(compressed.len()).unwrap()).to_le_bytes());
         payload.extend_from_slice(&compressed);
 
-        let (decoded_hash, decoded_start, decoded_end, decoded_bytes) =
-            super::decode_compressed_part_payload(&payload, false).unwrap();
+        let (decoded_hash, decoded_start, advertised_compressed_len, decoded_fragment) =
+            super::decode_compressed_part_fragment(&payload, false).unwrap();
         assert_eq!(decoded_hash, file_hash);
         assert_eq!(decoded_start, start);
-        assert_eq!(decoded_end, start + bytes.len() as u64);
-        assert_eq!(decoded_bytes, bytes);
+        assert_eq!(advertised_compressed_len, compressed.len());
+        assert_eq!(decoded_fragment, compressed);
+    }
+
+    #[test]
+    fn compressed_part_fragments_inflate_across_multiple_packets() {
+        let bytes = vec![0x5A; 32_768];
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&bytes).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let split_at = compressed.len() / 2;
+        let mut pending = super::PendingCompressedPart {
+            piece_index: 0,
+            start: 0,
+            end: bytes.len() as u64,
+            advertised_compressed_len: compressed.len(),
+            compressed_received: 0,
+            uncompressed_written: 0,
+            inflater: flate2::Decompress::new(true),
+        };
+
+        let (first_bytes, first_finished) =
+            super::inflate_compressed_part_fragment(&mut pending, &compressed[..split_at]).unwrap();
+        let (second_bytes, second_finished) =
+            super::inflate_compressed_part_fragment(&mut pending, &compressed[split_at..]).unwrap();
+
+        assert!(!first_finished);
+        assert!(second_finished);
+        assert_eq!(pending.compressed_received, compressed.len());
+        assert_eq!(pending.uncompressed_written, bytes.len() as u64);
+        assert_eq!([first_bytes, second_bytes].concat(), bytes);
     }
 
     #[test]
