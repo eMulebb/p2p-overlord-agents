@@ -2349,19 +2349,26 @@ async fn start_background_server_search(
 }
 
 fn log_search_result_page(endpoint: SocketAddr, results: &[Ed2kSearchFile]) {
-    let sample_names = results
+    let sample_hits = results
         .iter()
-        .filter_map(|file| file.file_name.as_deref())
-        .take(3)
+        .take(5)
+        .map(|file| {
+            let file_name = file.file_name.as_deref().unwrap_or("-");
+            let file_size = file
+                .file_size
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            format!("{file_name} [hash={} size={}]", file.file_hash, file_size)
+        })
         .collect::<Vec<_>>();
     info!(
-        "ED2K search results from {}: count={} sample_names={}",
+        "ED2K search results from {}: count={} sample_hits={}",
         endpoint,
         results.len(),
-        if sample_names.is_empty() {
+        if sample_hits.is_empty() {
             "-".to_string()
         } else {
-            sample_names.join(" | ")
+            sample_hits.join(" | ")
         }
     );
 }
