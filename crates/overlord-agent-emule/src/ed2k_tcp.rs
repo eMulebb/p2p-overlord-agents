@@ -1092,14 +1092,13 @@ pub(crate) async fn connect_callback_peer(
 /// A successful public-peer oracle capture showed a startup sequence that
 /// public peers accept more readily than our earlier minimal flow:
 ///
-/// `OP_HELLO -> OP_HELLOANSWER -> secure-ident -> OP_HASHSETREQUEST/ANSWER ->
-/// OP_STARTUPLOADREQ -> OP_ACCEPTUPLOADREQ -> OP_REQUESTPARTS`
+/// `OP_HELLO -> OP_HELLOANSWER -> secure-ident -> OP_REQUESTFILENAME ->
+/// OP_SETREQFILEID -> OP_HASHSETREQUEST/ANSWER -> OP_STARTUPLOADREQ ->
+/// OP_ACCEPTUPLOADREQ -> OP_REQUESTPARTS`
 ///
-/// The same capture did not send an unsolicited outbound `OP_EMULEINFO`,
-/// `OP_REQUESTFILENAME`, or `OP_SETREQFILEID` before the transfer was already
-/// established. Public peers that the oracle downloaded from were closing on
-/// our earlier startup sequence, so the downloader now follows the observed
-/// order instead of the more speculative "send everything early" flow.
+/// Public peers that the oracle downloaded from were closing on our earlier
+/// startup sequence, so the downloader now follows the observed file-startup
+/// shape instead of the more speculative minimal flow.
 ///
 /// Some real peers still acknowledge upload intent before they return a
 /// hashset. The downloader keeps the captured hashset-first path as the
@@ -1228,6 +1227,7 @@ async fn drive_download_session(
     let mut peer_secure_ident = Ed2kPeerSecureIdentState::default();
     let mut hello_complete = initial_hello_complete;
     let mut secure_ident_started = initial_secure_ident_started;
+    let mut startup_file_requests_sent = false;
     let mut hashset_requested = false;
     let mut hashset_requested_at = None;
     let mut upload_requested = false;
@@ -1259,6 +1259,43 @@ async fn drive_download_session(
                     .await
                     .with_context(|| format!("failed to send OP_SECIDENTSTATE to {peer_addr}"))?;
                 secure_ident_started = true;
+            }
+
+            if send_initial_requests
+                && hello_complete
+                && !startup_file_requests_sent
+                && !waiting_for_peer_secure_ident
+            {
+                let request_filename = encode_request_filename(&file_hash);
+                dump_ed2k_tcp_download_send(
+                    peer_addr,
+                    transport.mode,
+                    "request_filename",
+                    &request_filename,
+                );
+                transport
+                    .write_all(&request_filename)
+                    .await
+                    .with_context(|| {
+                        format!("failed to send OP_REQUESTFILENAME to {peer_addr}")
+                    })?;
+
+                if file_size > ED2K_PART_SIZE {
+                    let set_req_file_id = encode_set_req_file_id(&file_hash);
+                    dump_ed2k_tcp_download_send(
+                        peer_addr,
+                        transport.mode,
+                        "set_req_file_id",
+                        &set_req_file_id,
+                    );
+                    transport
+                        .write_all(&set_req_file_id)
+                        .await
+                        .with_context(|| {
+                            format!("failed to send OP_SETREQFILEID to {peer_addr}")
+                        })?;
+                }
+                startup_file_requests_sent = true;
             }
 
             if send_initial_requests
@@ -2736,6 +2773,14 @@ fn encode_start_upload_req(file_hash: &Ed2kHash) -> Vec<u8> {
     encode_packet(OP_EDONKEYPROT, OP_STARTUPLOADREQ, &file_hash.0)
 }
 
+fn encode_request_filename(file_hash: &Ed2kHash) -> Vec<u8> {
+    encode_packet(OP_EDONKEYPROT, OP_REQUESTFILENAME, &file_hash.0)
+}
+
+fn encode_set_req_file_id(file_hash: &Ed2kHash) -> Vec<u8> {
+    encode_packet(OP_EDONKEYPROT, OP_SETREQFILEID, &file_hash.0)
+}
+
 fn encode_hashset_request(file_hash: &Ed2kHash) -> Vec<u8> {
     encode_packet(OP_EDONKEYPROT, OP_HASHSETREQUEST, &file_hash.0)
 }
@@ -3921,6 +3966,11 @@ mod tests {
             assert_eq!(signature[0], OP_EMULEPROT);
             assert_eq!(signature[5], super::OP_SIGNATURE);
 
+            let request_filename = read_packet(&mut stream).await;
+            assert_eq!(request_filename[0], OP_EDONKEYPROT);
+            assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
+            assert_eq!(&request_filename[6..22], &file_hash.0);
+
             let start_upload = read_packet(&mut stream).await;
             assert_eq!(start_upload[0], OP_EDONKEYPROT);
             assert_eq!(start_upload[5], super::OP_STARTUPLOADREQ);
@@ -4058,6 +4108,8 @@ mod tests {
             stream.write_all(&peer_public_key_packet).await.unwrap();
 
             let _signature = read_packet(&mut stream).await;
+            let request_filename = read_packet(&mut stream).await;
+            assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
             let _start_upload = read_packet(&mut stream).await;
             stream.write_all(&encode_accept_upload_req()).await.unwrap();
 
@@ -4198,6 +4250,16 @@ mod tests {
             let signature = read_packet(&mut stream).await;
             assert_eq!(signature[0], OP_EMULEPROT);
             assert_eq!(signature[5], super::OP_SIGNATURE);
+
+            let request_filename = read_packet(&mut stream).await;
+            assert_eq!(request_filename[0], OP_EDONKEYPROT);
+            assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
+            assert_eq!(&request_filename[6..22], &file_hash.0);
+
+            let set_req_file_id = read_packet(&mut stream).await;
+            assert_eq!(set_req_file_id[0], OP_EDONKEYPROT);
+            assert_eq!(set_req_file_id[5], super::OP_SETREQFILEID);
+            assert_eq!(&set_req_file_id[6..22], &file_hash.0);
 
             let hashset_request = read_packet(&mut stream).await;
             assert_eq!(hashset_request[0], OP_EDONKEYPROT);
@@ -4474,6 +4536,9 @@ mod tests {
             let signature = read_packet(&mut stream).await;
             assert_eq!(signature[5], super::OP_SIGNATURE);
 
+            let request_filename = read_packet(&mut stream).await;
+            assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
+
             let start_upload = read_packet(&mut stream).await;
             assert_eq!(start_upload[5], super::OP_STARTUPLOADREQ);
 
@@ -4611,6 +4676,14 @@ mod tests {
                 .unwrap();
             assert_eq!(signature[0], OP_EMULEPROT);
             assert_eq!(signature[5], super::OP_SIGNATURE);
+
+            let request_filename =
+                tokio::time::timeout(Duration::from_secs(3), read_packet(&mut stream))
+                    .await
+                    .unwrap();
+            assert_eq!(request_filename[0], OP_EDONKEYPROT);
+            assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
+            assert_eq!(&request_filename[6..22], &file_hash.0);
 
             let start_upload =
                 tokio::time::timeout(Duration::from_secs(3), read_packet(&mut stream))
@@ -4751,6 +4824,16 @@ mod tests {
             let signature = read_packet(&mut stream).await;
             assert_eq!(signature[0], OP_EMULEPROT);
             assert_eq!(signature[5], super::OP_SIGNATURE);
+
+            let request_filename = read_packet(&mut stream).await;
+            assert_eq!(request_filename[0], OP_EDONKEYPROT);
+            assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
+            assert_eq!(&request_filename[6..22], &file_hash.0);
+
+            let set_req_file_id = read_packet(&mut stream).await;
+            assert_eq!(set_req_file_id[0], OP_EDONKEYPROT);
+            assert_eq!(set_req_file_id[5], super::OP_SETREQFILEID);
+            assert_eq!(&set_req_file_id[6..22], &file_hash.0);
 
             let hashset_request = read_packet(&mut stream).await;
             assert_eq!(hashset_request[0], OP_EDONKEYPROT);
@@ -4904,6 +4987,8 @@ mod tests {
             stream.write_all(&peer_public_key_packet).await.unwrap();
 
             let _signature = read_packet(&mut stream).await;
+            let request_filename = read_packet(&mut stream).await;
+            assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
             let _start_upload = read_packet(&mut stream).await;
             stream.write_all(&encode_accept_upload_req()).await.unwrap();
 
