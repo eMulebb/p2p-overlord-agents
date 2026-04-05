@@ -1237,6 +1237,7 @@ async fn drive_download_session(
     const MAX_INFLIGHT_PARTS_PER_PEER: usize = 2;
     const HASHSET_STALL_UPLOAD_FALLBACK: Duration = Duration::from_millis(500);
     const QUEUE_RANK_GRACE: Duration = Duration::from_secs(20);
+    const PART_RESPONSE_GRACE: Duration = Duration::from_secs(20);
     let mut pending_parts: Vec<(u32, u64, u64)> = Vec::new();
     let mut manifest = transfer_runtime.manifest(file_hash_hex).await?;
     let mut peer_secure_ident = Ed2kPeerSecureIdentState::default();
@@ -1249,6 +1250,7 @@ async fn drive_download_session(
     let mut hashset_requested_at = None;
     let mut upload_requested = false;
     let mut upload_accepted = false;
+    let mut part_response_deadline = None;
     let mut queued_until = None;
 
     let session_result = async {
@@ -1431,6 +1433,8 @@ async fn drive_download_session(
                         .with_context(|| {
                             format!("failed to send OP_REQUESTPARTS to {peer_addr}")
                         })?;
+                    part_response_deadline =
+                        Some(tokio::time::Instant::now() + PART_RESPONSE_GRACE);
                 }
             }
 
@@ -1480,6 +1484,14 @@ async fn drive_download_session(
                         continue;
                     }
                     if queued_until.is_some_and(|deadline| tokio::time::Instant::now() < deadline) {
+                        continue;
+                    }
+                    if pending_parts.is_empty() {
+                        part_response_deadline = None;
+                    }
+                    if part_response_deadline
+                        .is_some_and(|deadline| tokio::time::Instant::now() < deadline)
+                    {
                         continue;
                     }
                     if hello_complete {
@@ -1710,6 +1722,9 @@ async fn drive_download_session(
                         continue;
                     };
                     let (expected_part, _, _) = pending_parts.remove(pending_index);
+                    if pending_parts.is_empty() {
+                        part_response_deadline = None;
+                    }
                     transfer_runtime
                         .store_piece_data(file_hash_hex, expected_part, &bytes)
                         .await?;
