@@ -864,6 +864,7 @@ pub struct OverlordAgentEmule {
     control_selection_state: Arc<RwLock<ResolvedInterfaceBindingReport>>,
     p2p_selection_state: Arc<RwLock<ResolvedInterfaceBindingReport>>,
     active_searches: Arc<Mutex<HashMap<Uuid, ActiveSearchHandle>>>,
+    active_ed2k_downloads: Arc<Mutex<HashSet<String>>>,
     restart_requested: Arc<AtomicBool>,
     restart_notify: Arc<Notify>,
     started: AtomicBool,
@@ -976,8 +977,9 @@ impl AgentActivityTracker {
 
 fn activity_precedence(state: AgentActivityState) -> u8 {
     match state {
-        AgentActivityState::Degraded => 8,
-        AgentActivityState::Reconfiguring => 7,
+        AgentActivityState::Degraded => 9,
+        AgentActivityState::Reconfiguring => 8,
+        AgentActivityState::Downloading => 7,
         AgentActivityState::ActiveSearch => 6,
         AgentActivityState::PassiveHarvestReplay => 5,
         AgentActivityState::Publishing => 4,
@@ -1008,6 +1010,10 @@ fn new_activity_snapshot(
 
 fn active_search_key(job_id: Uuid) -> String {
     format!("active_search:{job_id}")
+}
+
+fn active_ed2k_download_key(file_hash: &str) -> String {
+    format!("ed2k_download:{file_hash}")
 }
 
 fn passive_replay_key(replay_id: Uuid) -> String {
@@ -1143,6 +1149,7 @@ impl OverlordAgentEmule {
             control_selection_state: Arc::new(RwLock::new(control_selection_state)),
             p2p_selection_state: Arc::new(RwLock::new(p2p_selection_state)),
             active_searches: Arc::new(Mutex::new(HashMap::new())),
+            active_ed2k_downloads: Arc::new(Mutex::new(HashSet::new())),
             restart_requested: Arc::new(AtomicBool::new(false)),
             restart_notify: Arc::new(Notify::new()),
             started: AtomicBool::new(false),
@@ -5438,7 +5445,7 @@ impl IndexerService for OverlordAgentEmule {
     async fn enrich(&self, payload: Value) -> Result<()> {
         let request: EnrichEd2kDownloadRequest = serde_json::from_value(payload)
             .context("invalid enrich payload for overlord-agent-emule")?;
-        self.start_native_ed2k_download(request).await
+        self.spawn_native_ed2k_download(request).await
     }
 
     async fn seed_popular(&self, hashes: Vec<PopularHash>) -> Result<()> {
@@ -5712,18 +5719,18 @@ impl OverlordAgentEmule {
     }
 
     async fn native_ed2k_download_sources(
-        &self,
         runtime: &AgentNetworkRuntime,
         config: &EmuleAgentConfig,
         file_hash: Ed2kHash,
         file_size: u64,
+        ed2k_user_hash: [u8; 16],
     ) -> Result<Vec<Ed2kFoundSource>> {
         let cancel = CancellationToken::new();
         let mut sources = Vec::new();
         let shared_catalog = runtime.ed2k_shared_catalog.read().await.clone();
         let source_search_timeout = ed2k_source_search_timeout(&config.p2p.ed2k);
         let hello_identity = Ed2kHelloIdentity {
-            user_hash: self.ed2k_user_hash,
+            user_hash: ed2k_user_hash,
             client_id: 0,
             tcp_port: config.p2p.ed2k.listen_port,
             udp_port: config.p2p.kad.listen_port,
@@ -5804,18 +5811,23 @@ impl OverlordAgentEmule {
         Ok(sources)
     }
 
-    async fn start_native_ed2k_download(&self, request: EnrichEd2kDownloadRequest) -> Result<()> {
+    async fn start_native_ed2k_download(
+        runtime_handle: Arc<Mutex<Option<AgentNetworkRuntime>>>,
+        config_handle: Arc<RwLock<EmuleAgentConfig>>,
+        ed2k_user_hash: [u8; 16],
+        request: EnrichEd2kDownloadRequest,
+    ) -> Result<()> {
         if request.kind != "ed2k_download" {
             anyhow::bail!("unsupported enrich kind {}", request.kind);
         }
 
         let file_hash = Ed2kHash::from_str(&request.file_hash)
             .with_context(|| format!("invalid ED2K file hash {}", request.file_hash))?;
-        let runtime = self.runtime.lock().await.clone();
+        let runtime = runtime_handle.lock().await.clone();
         let Some(runtime) = runtime else {
             anyhow::bail!("agent networking is waiting for interface selection");
         };
-        let config = self.config.read().await.clone();
+        let config = config_handle.read().await.clone();
         let shared_catalog = runtime.ed2k_shared_catalog.read().await.clone();
         runtime
             .ed2k_transfer
@@ -5826,7 +5838,7 @@ impl OverlordAgentEmule {
             ))
             .await?;
         let hello_identity = Ed2kHelloIdentity {
-            user_hash: self.ed2k_user_hash,
+            user_hash: ed2k_user_hash,
             client_id: 0,
             tcp_port: config.p2p.ed2k.listen_port,
             udp_port: config.p2p.kad.listen_port,
@@ -5836,8 +5848,14 @@ impl OverlordAgentEmule {
             direct_udp_callback: false,
         };
         let mut sources = if request.sources.is_empty() {
-            self.native_ed2k_download_sources(&runtime, &config, file_hash, request.file_size)
-                .await?
+            Self::native_ed2k_download_sources(
+                &runtime,
+                &config,
+                file_hash,
+                request.file_size,
+                ed2k_user_hash,
+            )
+            .await?
         } else {
             request
                 .sources
@@ -6096,6 +6114,60 @@ impl OverlordAgentEmule {
             "native ED2K download found only callback-only or otherwise non-dialable sources for {}",
             request.file_hash
         );
+    }
+
+    async fn spawn_native_ed2k_download(&self, request: EnrichEd2kDownloadRequest) -> Result<()> {
+        if request.kind != "ed2k_download" {
+            anyhow::bail!("unsupported enrich kind {}", request.kind);
+        }
+
+        let normalized_file_hash = request.file_hash.to_lowercase();
+        {
+            let mut active = self.active_ed2k_downloads.lock().await;
+            if !active.insert(normalized_file_hash.clone()) {
+                anyhow::bail!("ED2K download {normalized_file_hash} is already active");
+            }
+        }
+
+        let runtime_handle = Arc::clone(&self.runtime);
+        let config_handle = Arc::clone(&self.config);
+        let agent_activity = Arc::clone(&self.agent_activity);
+        let active_downloads = Arc::clone(&self.active_ed2k_downloads);
+        let ed2k_user_hash = self.ed2k_user_hash;
+        tokio::spawn(async move {
+            let activity_key = active_ed2k_download_key(&normalized_file_hash);
+            let started_at = Utc::now();
+            let mut activity_snapshot =
+                new_activity_snapshot(AgentActivityState::Downloading, started_at);
+            activity_snapshot.protocol = Some(Protocol::Ed2k);
+            activity_snapshot.query_or_target =
+                Some(format!("{} ({})", request.file_name, normalized_file_hash));
+            begin_agent_activity(&agent_activity, activity_key.clone(), activity_snapshot).await;
+
+            let outcome = Self::start_native_ed2k_download(
+                runtime_handle,
+                config_handle,
+                ed2k_user_hash,
+                request,
+            )
+            .await;
+            finish_agent_activity(&agent_activity, &activity_key, Utc::now()).await;
+            match outcome {
+                Ok(()) => {
+                    clear_agent_degraded_activity(&agent_activity).await;
+                }
+                Err(error) => {
+                    let mut degraded_snapshot =
+                        new_activity_snapshot(AgentActivityState::Degraded, Utc::now());
+                    degraded_snapshot.query_or_target =
+                        Some(format!("ED2K download {normalized_file_hash}"));
+                    degraded_snapshot.last_error = Some(error.to_string());
+                    record_agent_degraded_activity(&agent_activity, degraded_snapshot).await;
+                }
+            }
+            active_downloads.lock().await.remove(&normalized_file_hash);
+        });
+        Ok(())
     }
 
     async fn await_callback_transfer_completion(

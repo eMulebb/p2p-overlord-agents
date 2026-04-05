@@ -137,6 +137,7 @@ pub enum AgentActivityState {
     Starting,
     Bootstrapping,
     Idle,
+    Downloading,
     ActiveSearch,
     PassiveHarvestReplay,
     Publishing,
