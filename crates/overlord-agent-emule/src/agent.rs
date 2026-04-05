@@ -6025,10 +6025,23 @@ impl OverlordAgentEmule {
                     runtime.ed2k_transfer.as_ref(),
                     &request.file_hash,
                     &runtime.ed2k_transfer.manifest(&request.file_hash).await?,
-                    Duration::from_secs(callback_timeout.as_secs().max(30)),
+                    Duration::from_secs(callback_timeout.as_secs().max(90)),
                 )
                 .await?;
                 if manifest.completed {
+                    return Ok(());
+                }
+                if manifest_has_ed2k_transfer_progress(&manifest) {
+                    info!(
+                        "native ED2K callback transfer remains in progress after grace window file_hash={} bytes_written={} md4_hashset_acquired={}",
+                        request.file_hash,
+                        manifest
+                            .pieces
+                            .iter()
+                            .map(|piece| piece.bytes_written)
+                            .sum::<u64>(),
+                        manifest.md4_hashset_acquired
+                    );
                     return Ok(());
                 }
             }
@@ -6048,10 +6061,23 @@ impl OverlordAgentEmule {
                 runtime.ed2k_transfer.as_ref(),
                 &request.file_hash,
                 &runtime.ed2k_transfer.manifest(&request.file_hash).await?,
-                Duration::from_secs(callback_timeout.as_secs().max(30)),
+                Duration::from_secs(callback_timeout.as_secs().max(90)),
             )
             .await?;
             if manifest.completed {
+                return Ok(());
+            }
+            if manifest_has_ed2k_transfer_progress(&manifest) {
+                info!(
+                    "native ED2K callback transfer remains in progress after grace window file_hash={} bytes_written={} md4_hashset_acquired={}",
+                    request.file_hash,
+                    manifest
+                        .pieces
+                        .iter()
+                        .map(|piece| piece.bytes_written)
+                        .sum::<u64>(),
+                    manifest.md4_hashset_acquired
+                );
                 return Ok(());
             }
         }
@@ -6081,10 +6107,6 @@ impl OverlordAgentEmule {
         if initial_manifest.completed {
             return Ok(initial_manifest.clone());
         }
-        if !manifest_has_ed2k_transfer_progress(initial_manifest) {
-            return Ok(initial_manifest.clone());
-        }
-
         let started = Instant::now();
         let poll_interval = Duration::from_secs(2);
         let mut last_manifest = initial_manifest.clone();
