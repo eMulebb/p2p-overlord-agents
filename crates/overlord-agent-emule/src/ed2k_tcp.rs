@@ -3219,36 +3219,36 @@ fn decode_compressed_part_payload(
     }
     let mut hash = [0u8; 16];
     hash.copy_from_slice(&payload[..16]);
-    let (start, compressed_len) = if use_i64 {
+    let (start, expected_uncompressed_len) = if use_i64 {
         let start = u64::from_le_bytes(payload[16..24].try_into().expect("u64 width"));
-        let compressed_len = usize::try_from(u32::from_le_bytes(
+        let expected_uncompressed_len = usize::try_from(u32::from_le_bytes(
             payload[24..28].try_into().expect("u32 width"),
         ))
         .unwrap_or(usize::MAX);
-        (start, compressed_len)
+        (start, expected_uncompressed_len)
     } else {
         let start = u64::from(u32::from_le_bytes(
             payload[16..20].try_into().expect("u32 width"),
         ));
-        let compressed_len = usize::try_from(u32::from_le_bytes(
+        let expected_uncompressed_len = usize::try_from(u32::from_le_bytes(
             payload[20..24].try_into().expect("u32 width"),
         ))
         .unwrap_or(usize::MAX);
-        (start, compressed_len)
+        (start, expected_uncompressed_len)
     };
     let compressed = &payload[header_len..];
-    if compressed.len() != compressed_len {
-        anyhow::bail!(
-            "OP_COMPRESSEDPART compressed length {} does not match payload body {}",
-            compressed_len,
-            compressed.len()
-        );
-    }
     let mut decoder = ZlibDecoder::new(compressed);
     let mut bytes = Vec::new();
     decoder
         .read_to_end(&mut bytes)
         .context("failed to inflate OP_COMPRESSEDPART payload")?;
+    if bytes.len() != expected_uncompressed_len {
+        anyhow::bail!(
+            "OP_COMPRESSEDPART inflated length {} does not match advertised {}",
+            bytes.len(),
+            expected_uncompressed_len
+        );
+    }
     let end = start + u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     Ok((Ed2kHash::from_bytes(hash), start, end, bytes))
 }
@@ -3574,7 +3574,7 @@ mod tests {
         let mut payload = Vec::with_capacity(16 + 4 + 4 + compressed.len());
         payload.extend_from_slice(&file_hash.0);
         payload.extend_from_slice(&(u32::try_from(start).unwrap()).to_le_bytes());
-        payload.extend_from_slice(&(u32::try_from(compressed.len()).unwrap()).to_le_bytes());
+        payload.extend_from_slice(&(u32::try_from(bytes.len()).unwrap()).to_le_bytes());
         payload.extend_from_slice(&compressed);
 
         let (decoded_hash, decoded_start, decoded_end, decoded_bytes) =
