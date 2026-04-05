@@ -286,6 +286,7 @@ struct Ed2kPeerSecureIdentState {
     peer_challenge_from: Option<u32>,
     challenge_for: Option<u32>,
     pending_signature: bool,
+    peer_signature_received: bool,
     requested_peer_key: bool,
 }
 
@@ -1244,7 +1245,9 @@ async fn drive_download_session(
                 && (peer_secure_ident.peer_challenge_from.is_none()
                     || peer_secure_ident.pending_signature
                     || (peer_secure_ident.requested_peer_key
-                        && peer_secure_ident.peer_public_key.is_none()));
+                        && peer_secure_ident.peer_public_key.is_none())
+                    || (peer_secure_ident.challenge_for.is_some()
+                        && !peer_secure_ident.peer_signature_received));
 
             if send_initial_requests && hello_complete && !secure_ident_started {
                 let secure_ident_probe = begin_secure_ident_probe(&mut peer_secure_ident);
@@ -1576,7 +1579,9 @@ async fn drive_download_session(
                     )
                     .await?;
                 }
-                (OP_EMULEPROT, OP_SIGNATURE) => {}
+                (OP_EMULEPROT, OP_SIGNATURE) => {
+                    peer_secure_ident.peer_signature_received = true;
+                }
                 (OP_EDONKEYPROT, OP_HASHSETANSWER) => {
                     let (returned_hash, hashset) = decode_hashset_answer(&packet.payload)?;
                     if returned_hash != file_hash {
@@ -3890,7 +3895,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn small_file_download_waits_for_peer_public_key_before_start_upload() {
+    async fn small_file_download_waits_for_peer_signature_before_start_upload() {
         async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
             let mut header = [0u8; 6];
             stream.read_exact(&mut header).await.unwrap();
@@ -3965,6 +3970,19 @@ mod tests {
             let signature = read_packet(&mut stream).await;
             assert_eq!(signature[0], OP_EMULEPROT);
             assert_eq!(signature[5], super::OP_SIGNATURE);
+
+            // Oracle-shaped sessions keep file startup traffic behind the full
+            // secure-ident roundtrip, so no filename/upload request should
+            // arrive before the peer signature closes the exchange.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), read_packet(&mut stream))
+                    .await
+                    .is_err(),
+                "startup requests must wait for peer OP_SIGNATURE"
+            );
+
+            let peer_signature = encode_packet(OP_EMULEPROT, super::OP_SIGNATURE, &[0xAA; 49]);
+            stream.write_all(&peer_signature).await.unwrap();
 
             let request_filename = read_packet(&mut stream).await;
             assert_eq!(request_filename[0], OP_EDONKEYPROT);
@@ -4108,6 +4126,14 @@ mod tests {
             stream.write_all(&peer_public_key_packet).await.unwrap();
 
             let _signature = read_packet(&mut stream).await;
+            stream
+                .write_all(&encode_packet(
+                    OP_EMULEPROT,
+                    super::OP_SIGNATURE,
+                    &[0xAA; 49],
+                ))
+                .await
+                .unwrap();
             let request_filename = read_packet(&mut stream).await;
             assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
             let _start_upload = read_packet(&mut stream).await;
@@ -4250,6 +4276,9 @@ mod tests {
             let signature = read_packet(&mut stream).await;
             assert_eq!(signature[0], OP_EMULEPROT);
             assert_eq!(signature[5], super::OP_SIGNATURE);
+
+            let peer_signature = encode_packet(OP_EMULEPROT, super::OP_SIGNATURE, &[0xAA; 49]);
+            stream.write_all(&peer_signature).await.unwrap();
 
             let request_filename = read_packet(&mut stream).await;
             assert_eq!(request_filename[0], OP_EDONKEYPROT);
@@ -4535,6 +4564,14 @@ mod tests {
 
             let signature = read_packet(&mut stream).await;
             assert_eq!(signature[5], super::OP_SIGNATURE);
+            stream
+                .write_all(&encode_packet(
+                    OP_EMULEPROT,
+                    super::OP_SIGNATURE,
+                    &[0xAA; 49],
+                ))
+                .await
+                .unwrap();
 
             let request_filename = read_packet(&mut stream).await;
             assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
@@ -4825,6 +4862,9 @@ mod tests {
             assert_eq!(signature[0], OP_EMULEPROT);
             assert_eq!(signature[5], super::OP_SIGNATURE);
 
+            let peer_signature = encode_packet(OP_EMULEPROT, super::OP_SIGNATURE, &[0xAA; 49]);
+            stream.write_all(&peer_signature).await.unwrap();
+
             let request_filename = read_packet(&mut stream).await;
             assert_eq!(request_filename[0], OP_EDONKEYPROT);
             assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
@@ -4987,6 +5027,14 @@ mod tests {
             stream.write_all(&peer_public_key_packet).await.unwrap();
 
             let _signature = read_packet(&mut stream).await;
+            stream
+                .write_all(&encode_packet(
+                    OP_EMULEPROT,
+                    super::OP_SIGNATURE,
+                    &[0xAA; 49],
+                ))
+                .await
+                .unwrap();
             let request_filename = read_packet(&mut stream).await;
             assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
             let _start_upload = read_packet(&mut stream).await;
