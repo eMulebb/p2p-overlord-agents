@@ -1980,7 +1980,9 @@ fn emule_misc_options1() -> u32 {
     let comments_version = 1u32;
     let peer_cache = 1u32;
     let no_view_shared_files = 1u32;
-    let multipacket = 1u32;
+    // Do not advertise multipacket support until the downloader and listener
+    // actually speak the oracle-style packed startup/request variants.
+    let multipacket = 0u32;
     let preview_supported = 0u32;
     (supports_aich << 29)
         | (supports_unicode << 28)
@@ -1997,14 +1999,16 @@ fn emule_misc_options1() -> u32 {
 }
 
 fn emule_misc_options2(connect_options: u8, direct_udp_callback: bool) -> u32 {
-    let supports_file_identifiers = 1u32;
+    // File identifiers are coupled to multipacket-ext2 and hashsetrequest2 in
+    // the oracle. Keep the advert conservative until those paths exist here.
+    let supports_file_identifiers = 0u32;
     let direct_udp_callback = u32::from(direct_udp_callback);
     let supports_captcha = 1u32;
     let supports_source_exchange2 = 1u32;
     let requires_crypt_layer = 0u32;
     let requests_crypt_layer = u32::from((connect_options & EMULE_CRYPT_REQUESTS) != 0);
     let supports_crypt_layer = u32::from((connect_options & EMULE_CRYPT_SUPPORTS) != 0);
-    let ext_multipacket = 1u32;
+    let ext_multipacket = 0u32;
     let supports_large_files = 1u32;
     let kad_version = EMULE_ADVERTISED_KAD_VERSION;
     (supports_file_identifiers << 13)
