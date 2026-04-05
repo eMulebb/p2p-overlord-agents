@@ -28,6 +28,8 @@ use overlord_agent_common::{HashType, PopularHash};
 use overlord_kad_proto::Ed2kHash;
 
 pub(crate) const ED2K_PART_SIZE: u64 = 9_728_000;
+/// Canonical eMule upload block size used inside one ED2K part request.
+pub(crate) const ED2K_EMBLOCK_SIZE: u64 = 184_320;
 const MANIFEST_FILE_NAME: &str = "resume-manifest.json";
 const PAYLOAD_FILE_NAME: &str = "pieces.bin";
 
@@ -423,6 +425,7 @@ impl Ed2kTransferRuntime {
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
+            .read(true)
             .write(true)
             .open(&payload_path)
             .await
@@ -451,6 +454,104 @@ impl Ed2kTransferRuntime {
         manifest.completed = manifest.is_fully_verified();
         self.upsert_verified_catalog_entry(&manifest).await;
         self.store_manifest_unlocked(&manifest).await
+    }
+
+    /// Append one contiguous download block into a requested piece.
+    ///
+    /// This is used for single-part ED2K downloads where peers expect
+    /// eMule-sized `OP_REQUESTPARTS` block ranges instead of one whole-file
+    /// range. The method only accepts strictly contiguous writes for the
+    /// claimed piece and verifies the full piece once the final block arrives.
+    pub async fn append_piece_block(
+        &self,
+        file_hash: &str,
+        piece_index: u32,
+        start: u64,
+        end: u64,
+        data: &[u8],
+    ) -> Result<bool> {
+        let _guard = self.manifest_io.lock().await;
+        let mut manifest = self.load_manifest_unlocked(file_hash).await?;
+        let piece_size = manifest.piece_size;
+        let piece_start = u64::from(piece_index) * piece_size;
+        let expected_piece_len =
+            expected_piece_length(manifest.file_size, piece_size, u64::from(piece_index));
+        let piece_end = piece_start + expected_piece_len;
+        let data_len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        let current_piece_bytes_written = manifest
+            .pieces
+            .iter()
+            .find(|piece| piece.piece_index == piece_index)
+            .map(|piece| piece.bytes_written)
+            .with_context(|| format!("missing piece index {piece_index} in {file_hash}"))?;
+        let expected_start = piece_start + current_piece_bytes_written;
+        let expected_end = expected_start + data_len;
+        if start != expected_start || end != expected_end || end > piece_end {
+            anyhow::bail!(
+                "piece {piece_index} for {file_hash} received unexpected block {start}..{end} expected {expected_start}..{expected_end} within {piece_start}..{piece_end}"
+            );
+        }
+
+        let payload_path = self.transfer_dir(file_hash).join(PAYLOAD_FILE_NAME);
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&payload_path)
+            .await
+            .with_context(|| format!("failed to open piece store {}", payload_path.display()))?;
+        use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+        file.write_all(data).await?;
+        file.flush().await?;
+
+        let next_piece_bytes_written = current_piece_bytes_written + data_len;
+        let mut piece_completed = false;
+        if next_piece_bytes_written == expected_piece_len {
+            let mut piece_bytes = vec![0u8; usize::try_from(expected_piece_len).unwrap_or(0)];
+            drop(file);
+            let mut read_file = tokio::fs::OpenOptions::new()
+                .read(true)
+                .open(&payload_path)
+                .await
+                .with_context(|| {
+                    format!("failed to reopen piece store {}", payload_path.display())
+                })?;
+            read_file
+                .seek(std::io::SeekFrom::Start(piece_start))
+                .await?;
+            read_file.read_exact(&mut piece_bytes).await?;
+            let verified = verify_piece_against_manifest(&manifest, piece_index, &piece_bytes)?;
+            let piece = manifest
+                .pieces
+                .iter_mut()
+                .find(|piece| piece.piece_index == piece_index)
+                .with_context(|| format!("missing piece index {piece_index} in {file_hash}"))?;
+            if verified {
+                piece.bytes_written = expected_piece_len;
+                piece.state = Ed2kTransferState::Verified;
+                piece_completed = true;
+            } else {
+                piece.state = Ed2kTransferState::Missing;
+                piece.bytes_written = 0;
+            }
+            rebuild_verified_ranges(&mut manifest);
+            manifest.completed = manifest.is_fully_verified();
+            if piece_completed {
+                self.upsert_verified_catalog_entry(&manifest).await;
+            }
+        } else {
+            let piece = manifest
+                .pieces
+                .iter_mut()
+                .find(|piece| piece.piece_index == piece_index)
+                .with_context(|| format!("missing piece index {piece_index} in {file_hash}"))?;
+            piece.bytes_written = next_piece_bytes_written;
+            piece.state = Ed2kTransferState::Requested;
+        }
+
+        self.store_manifest_unlocked(&manifest).await?;
+        Ok(piece_completed)
     }
 
     /// Read a fully verified range for upload serving.
