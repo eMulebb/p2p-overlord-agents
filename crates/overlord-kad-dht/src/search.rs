@@ -19,6 +19,17 @@ const SEARCH_TIMEOUT: Duration = Duration::from_secs(SEARCH_TIMEOUT_SECS);
 /// turning inbound harvest volume into backpressure on the traversal loop.
 const SEARCH_RESULT_STREAM_BUFFER: usize = 2048;
 
+fn map_source_search_result(
+    requested_file_hash: Ed2kHash,
+    tags: Vec<overlord_kad_proto::Tag>,
+) -> Option<SourceResult> {
+    // Kad SEARCH_RES entries for source searches use the entry-id slot for the
+    // publishing/source identity, not the requested file hash. Preserve the
+    // source endpoint from the result tags, but always pin the logical file
+    // hash to the original request target.
+    SourceResult::from_tags(requested_file_hash, tags)
+}
+
 /// Run a keyword search. Returns a Stream of results.
 pub fn search_keywords(
     rpc: RpcManager,
@@ -135,6 +146,7 @@ pub fn search_sources_by_request(
 ) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
     let (tx, rx) = mpsc::channel::<SourceResult>(SEARCH_RESULT_STREAM_BUFFER);
     let target = request.target;
+    let requested_file_hash = Ed2kHash::from_bytes(target.0);
 
     tokio::spawn(async move {
         let (raw_tx, mut raw_rx) =
@@ -159,14 +171,14 @@ pub fn search_sources_by_request(
                 _ = cancel.cancelled() => break,
                 next = raw_rx.recv() => next,
             };
-            let Some((hash, tags)) = next else {
+            let Some((_source_id, tags)) = next else {
                 break;
             };
             if seen_sources.len() >= result_cap {
                 break;
             }
 
-            let Some(source) = SourceResult::from_tags(hash, tags) else {
+            let Some(source) = map_source_search_result(requested_file_hash, tags) else {
                 continue;
             };
             let source_key = (source.ip, source.tcp_port, source.udp_port);
@@ -304,5 +316,24 @@ mod tests {
         .expect("note");
         assert_eq!(note.comment.as_deref(), Some("good"));
         assert_eq!(note.rating, Some(4));
+    }
+
+    #[test]
+    fn source_search_results_keep_requested_file_hash_instead_of_entry_id() {
+        let requested_file_hash = Ed2kHash::from_bytes([0x44; 16]);
+        let source_identity = Ed2kHash::from_bytes([0x80; 16]);
+        let tags = vec![
+            Tag::new_short(tag_name::SOURCEIP, TagValue::U32(0x7F000001)),
+            Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(42062)),
+            Tag::new_short(tag_name::SOURCEUPORT, TagValue::U16(42072)),
+        ];
+
+        let source =
+            map_source_search_result(requested_file_hash, tags).expect("source search result");
+        assert_eq!(source.file_hash, requested_file_hash);
+        assert_ne!(source.file_hash, source_identity);
+        assert_eq!(source.ip, std::net::Ipv4Addr::new(127, 0, 0, 1));
+        assert_eq!(source.tcp_port, 42062);
+        assert_eq!(source.udp_port, 42072);
     }
 }
