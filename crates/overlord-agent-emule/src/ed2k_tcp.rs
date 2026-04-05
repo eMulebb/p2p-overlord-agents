@@ -63,6 +63,7 @@ const OP_SENDINGPART: u8 = 0x46;
 const OP_REQUESTPARTS: u8 = 0x47;
 const OP_FILEREQANSNOFIL: u8 = 0x48;
 const OP_SETREQFILEID: u8 = 0x4F;
+const OP_FILESTATUS: u8 = 0x50;
 const OP_HASHSETREQUEST: u8 = 0x51;
 const OP_HASHSETANSWER: u8 = 0x52;
 const OP_STARTUPLOADREQ: u8 = 0x54;
@@ -422,6 +423,7 @@ fn ed2k_opcode_name(protocol: u8, opcode: u8) -> &'static str {
         (OP_EDONKEYPROT, OP_REQUESTPARTS) => "OP_REQUESTPARTS",
         (OP_EDONKEYPROT, OP_FILEREQANSNOFIL) => "OP_FILEREQANSNOFIL",
         (OP_EDONKEYPROT, OP_SETREQFILEID) => "OP_SETREQFILEID",
+        (OP_EDONKEYPROT, OP_FILESTATUS) => "OP_FILESTATUS",
         (OP_EDONKEYPROT, OP_HASHSETREQUEST) => "OP_HASHSETREQUEST",
         (OP_EDONKEYPROT, OP_HASHSETANSWER) => "OP_HASHSETANSWER",
         (OP_EDONKEYPROT, OP_STARTUPLOADREQ) => "OP_STARTUPLOADREQ",
@@ -1238,6 +1240,7 @@ async fn drive_download_session(
     let mut hello_complete = initial_hello_complete;
     let mut secure_ident_started = initial_secure_ident_started;
     let mut startup_file_requests_sent = false;
+    let mut startup_file_response_received = false;
     let mut source_request_sent = false;
     let mut hashset_requested = false;
     let mut hashset_requested_at = None;
@@ -1337,6 +1340,7 @@ async fn drive_download_session(
                 && !manifest.md4_hashset_acquired
                 && !hashset_requested
                 && !waiting_for_peer_secure_ident
+                && startup_file_response_received
             {
                 if file_size <= ED2K_PART_SIZE {
                     manifest = transfer_runtime
@@ -1368,6 +1372,7 @@ async fn drive_download_session(
                 && (manifest.md4_hashset_acquired || hashset_request_stalled)
                 && !upload_requested
                 && !waiting_for_peer_secure_ident
+                && startup_file_response_received
             {
                 if hashset_request_stalled && !manifest.md4_hashset_acquired {
                     dump_ed2k_tcp_download_meta(
@@ -1625,10 +1630,23 @@ async fn drive_download_session(
                         .store_md4_hashset(file_hash_hex, hashset)
                         .await?;
                 }
-                (OP_EDONKEYPROT, OP_REQFILENAMEANSWER) | (OP_EDONKEYPROT, OP_SETREQFILEID) => {
-                    // The downloader no longer relies on these startup messages for
-                    // public peers, but keep the session tolerant when a callback or
-                    // non-oracle peer still sends them.
+                (OP_EDONKEYPROT, OP_REQFILENAMEANSWER) => {
+                    startup_file_response_received = true;
+                }
+                (OP_EDONKEYPROT, OP_FILESTATUS) => {
+                    let (returned_hash, _part_count) = decode_file_status_payload(&packet.payload)?;
+                    if returned_hash != file_hash {
+                        anyhow::bail!(
+                            "peer {peer_addr} returned file status for unexpected file {}",
+                            returned_hash
+                        );
+                    }
+                    startup_file_response_received = true;
+                }
+                (OP_EDONKEYPROT, OP_SETREQFILEID) => {
+                    // Non-oracle peers sometimes echo the file id again instead of
+                    // the expected file-status payload. Stay tolerant, but do not
+                    // treat it as the startup gate that oracle-like peers rely on.
                 }
                 (OP_EMULEPROT, OP_ANSWERSOURCES) | (OP_EMULEPROT, OP_ANSWERSOURCES2) => {
                     // Source-exchange replies are opportunistic parity traffic. The
@@ -2265,6 +2283,30 @@ fn decode_public_key_payload(payload: &[u8]) -> Result<Vec<u8>> {
     Ok(key_bytes.to_vec())
 }
 
+fn decode_file_status_payload(payload: &[u8]) -> Result<(overlord_kad_proto::Ed2kHash, u16)> {
+    if payload.len() < 18 {
+        anyhow::bail!("short OP_FILESTATUS payload size {}", payload.len());
+    }
+    let returned_hash = overlord_kad_proto::Ed2kHash::from_bytes(payload[..16].try_into()?);
+    let part_count = u16::from_le_bytes([payload[16], payload[17]]);
+    let expected_bitfield_len = usize::from(part_count).div_ceil(8);
+    if payload.len() != 18 + expected_bitfield_len {
+        anyhow::bail!(
+            "invalid OP_FILESTATUS payload size {} for part_count {}",
+            payload.len(),
+            part_count
+        );
+    }
+    Ok((returned_hash, part_count))
+}
+
+fn encode_file_status_complete(file_hash: &overlord_kad_proto::Ed2kHash) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(18);
+    payload.extend_from_slice(&file_hash.0);
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    encode_packet(OP_EDONKEYPROT, OP_FILESTATUS, &payload)
+}
+
 pub(crate) fn apply_server_state(
     mut identity: Ed2kHelloIdentity,
     state: &Ed2kServerState,
@@ -2482,7 +2524,7 @@ async fn handle_connection(
                 let requested = decode_file_hash_payload(&packet.payload)?;
                 requested_file_hash = Some(requested);
                 let reply = if transfer_runtime.local_entry(&requested).await?.is_some() {
-                    encode_accept_upload_req()
+                    encode_file_status_complete(&requested)
                 } else {
                     encode_file_req_ans_nofil(&requested)
                 };
@@ -4037,6 +4079,17 @@ mod tests {
             assert_eq!(request_sources[0], OP_EMULEPROT);
             assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
 
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), read_packet(&mut stream))
+                    .await
+                    .is_err(),
+                "small-file startup must wait for OP_REQFILENAMEANSWER before upload"
+            );
+
+            let filename_answer =
+                super::encode_request_filename_answer(&file_hash, "captured.epub").unwrap();
+            stream.write_all(&filename_answer).await.unwrap();
+
             let start_upload = read_packet(&mut stream).await;
             assert_eq!(start_upload[0], OP_EDONKEYPROT);
             assert_eq!(start_upload[5], super::OP_STARTUPLOADREQ);
@@ -4343,6 +4396,16 @@ mod tests {
             let request_sources = read_packet(&mut stream).await;
             assert_eq!(request_sources[0], OP_EMULEPROT);
             assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), read_packet(&mut stream))
+                    .await
+                    .is_err(),
+                "large-file startup must wait for OP_FILESTATUS before hashset/upload"
+            );
+
+            let file_status = super::encode_file_status_complete(&file_hash);
+            stream.write_all(&file_status).await.unwrap();
 
             let hashset_request = read_packet(&mut stream).await;
             assert_eq!(hashset_request[0], OP_EDONKEYPROT);
@@ -4785,6 +4848,10 @@ mod tests {
                     .unwrap();
             assert_eq!(request_sources[0], OP_EMULEPROT);
             assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
+
+            let filename_answer =
+                super::encode_request_filename_answer(&file_hash, "callback.epub").unwrap();
+            stream.write_all(&filename_answer).await.unwrap();
 
             let start_upload =
                 tokio::time::timeout(Duration::from_secs(3), read_packet(&mut stream))
