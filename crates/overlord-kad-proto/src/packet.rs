@@ -174,6 +174,10 @@ pub struct SearchKeyReq {
 #[brw(little)]
 pub struct SearchSourceReq {
     pub target: NodeId,
+    /// Legacy source-page offset that still remains on the classic eMule wire.
+    ///
+    /// The oracle expects `KADEMLIA2_SEARCH_SOURCE_REQ` to carry this `u16`
+    /// field immediately before the 64-bit file size.
     pub start_position: u16,
     pub size: u64,
 }
@@ -518,7 +522,7 @@ impl KadPacket {
                 KadPacket::SearchKeyReq(p)
             }
             opcode::SEARCH_SOURCE_REQ => {
-                let p = cursor.read_le::<SearchSourceReq>()?;
+                let p = read_search_source_req(&mut cursor)?;
                 KadPacket::SearchSourceReq(p)
             }
             opcode::SEARCH_NOTES_REQ => {
@@ -608,7 +612,7 @@ impl KadPacket {
             KadPacket::Req(p) => buf.write_le(p)?,
             KadPacket::Res(p) => buf.write_le(p)?,
             KadPacket::SearchKeyReq(p) => write_search_key_req(&mut buf, p)?,
-            KadPacket::SearchSourceReq(p) => buf.write_le(p)?,
+            KadPacket::SearchSourceReq(p) => write_search_source_req(&mut buf, p)?,
             KadPacket::SearchNotesReq(p) => buf.write_le(p)?,
             KadPacket::SearchRes(p) => buf.write_le(p)?,
             KadPacket::PublishKeyReq(p) => buf.write_le(p)?,
@@ -756,6 +760,38 @@ fn write_search_key_req(
     buf.write_le(&packet.start_position)?;
     buf.write_all(&packet.restrictive_payload)
         .map_err(ProtoError::Io)?;
+    Ok(())
+}
+
+fn read_search_source_req(cursor: &mut Cursor<&[u8]>) -> Result<SearchSourceReq, ProtoError> {
+    let target = cursor.read_le::<NodeId>()?;
+    let remaining = cursor
+        .get_ref()
+        .len()
+        .saturating_sub(cursor.position() as usize);
+    let size = match remaining {
+        4 => u64::from(cursor.read_le::<u32>()?),
+        8 => cursor.read_le::<u64>()?,
+        10 => {
+            let _legacy_start_position = cursor.read_le::<u16>()?;
+            cursor.read_le::<u64>()?
+        }
+        _ => return Err(ProtoError::BufferTooShort),
+    };
+    Ok(SearchSourceReq {
+        target,
+        start_position: 0,
+        size,
+    })
+}
+
+fn write_search_source_req(
+    buf: &mut Cursor<Vec<u8>>,
+    packet: &SearchSourceReq,
+) -> Result<(), ProtoError> {
+    buf.write_le(&packet.target)?;
+    buf.write_le(&packet.start_position)?;
+    buf.write_le(&packet.size)?;
     Ok(())
 }
 
@@ -1246,6 +1282,26 @@ mod tests {
         } else {
             panic!("wrong type");
         }
+    }
+
+    #[test]
+    fn test_search_source_req_matches_non_obfuscated_capture_sample() {
+        let pkt = KadPacket::SearchSourceReq(SearchSourceReq {
+            target: NodeId::from_bytes([
+                0x60, 0xF2, 0x0A, 0x2D, 0x03, 0xA8, 0xD0, 0x1F, 0x23, 0xCF, 0xD7, 0xC9, 0x5A, 0xC8,
+                0xAD, 0xA9,
+            ]),
+            start_position: 0,
+            size: 2_409_452,
+        });
+
+        assert_eq!(
+            pkt.encode().unwrap()[2..],
+            vec![
+                0x60, 0xF2, 0x0A, 0x2D, 0x03, 0xA8, 0xD0, 0x1F, 0x23, 0xCF, 0xD7, 0xC9, 0x5A, 0xC8,
+                0xAD, 0xA9, 0x00, 0x00, 0xEC, 0xC3, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ]
+        );
     }
 
     #[test]
