@@ -6122,6 +6122,23 @@ impl OverlordAgentEmule {
         }
 
         let normalized_file_hash = request.file_hash.to_lowercase();
+        if let Some(runtime) = self.runtime.lock().await.clone()
+            && let Ok(manifest) = runtime.ed2k_transfer.manifest(&normalized_file_hash).await
+            && (manifest.completed || manifest_has_ed2k_transfer_progress(&manifest))
+        {
+            info!(
+                "native ED2K download already has persisted progress file_hash={} completed={} bytes_written={} md4_hashset_acquired={}",
+                normalized_file_hash,
+                manifest.completed,
+                manifest
+                    .pieces
+                    .iter()
+                    .map(|piece| piece.bytes_written)
+                    .sum::<u64>(),
+                manifest.md4_hashset_acquired
+            );
+            return Ok(());
+        }
         {
             let mut active = self.active_ed2k_downloads.lock().await;
             if !active.insert(normalized_file_hash.clone()) {
