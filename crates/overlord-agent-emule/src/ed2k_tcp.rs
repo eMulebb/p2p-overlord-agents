@@ -73,12 +73,14 @@ const OP_STARTUPLOADREQ: u8 = 0x54;
 const OP_ACCEPTUPLOADREQ: u8 = 0x55;
 const OP_REQUESTFILENAME: u8 = 0x58;
 const OP_REQFILENAMEANSWER: u8 = 0x59;
+const OP_QUEUERANKING: u8 = 0x60;
+const OP_FILEDESC: u8 = 0x61;
 const OP_REQUESTSOURCES: u8 = 0x81;
 const OP_ANSWERSOURCES: u8 = 0x82;
 const OP_REQUESTSOURCES2: u8 = 0x83;
 const OP_ANSWERSOURCES2: u8 = 0x84;
-const OP_QUEUERANKING: u8 = 0x60;
-const OP_FILEDESC: u8 = 0x61;
+const OP_AICHFILEHASHANS: u8 = 0x9D;
+const OP_AICHFILEHASHREQ: u8 = 0x9E;
 const OP_SENDINGPART_I64: u8 = 0xA2;
 const OP_REQUESTPARTS_I64: u8 = 0xA3;
 const OP_EMULEINFO: u8 = 0x01;
@@ -437,6 +439,8 @@ fn ed2k_opcode_name(protocol: u8, opcode: u8) -> &'static str {
         (OP_EMULEPROT, OP_ANSWERSOURCES) => "OP_ANSWERSOURCES",
         (OP_EMULEPROT, OP_REQUESTSOURCES2) => "OP_REQUESTSOURCES2",
         (OP_EMULEPROT, OP_ANSWERSOURCES2) => "OP_ANSWERSOURCES2",
+        (OP_EMULEPROT, OP_AICHFILEHASHANS) => "OP_AICHFILEHASHANS",
+        (OP_EMULEPROT, OP_AICHFILEHASHREQ) => "OP_AICHFILEHASHREQ",
         (OP_EMULEPROT, OP_EMULEINFO) => "OP_EMULEINFO",
         (OP_EMULEPROT, OP_EMULEINFOANSWER) => "OP_EMULEINFOANSWER",
         (OP_EMULEPROT, OP_QUEUERANKING) => "OP_QUEUERANKING",
@@ -1246,6 +1250,7 @@ async fn drive_download_session(
     let mut startup_file_requests_sent = false;
     let mut startup_file_response_received = false;
     let mut source_request_sent = false;
+    let mut aich_file_hash_requested = false;
     let mut hashset_requested = false;
     let mut hashset_requested_at = None;
     let mut upload_requested = false;
@@ -1338,6 +1343,27 @@ async fn drive_download_session(
                         format!("failed to send OP_REQUESTSOURCES2 to {peer_addr}")
                     })?;
                 source_request_sent = true;
+            }
+
+            if send_initial_requests
+                && hello_complete
+                && !aich_file_hash_requested
+                && !waiting_for_peer_secure_ident
+            {
+                let aich_file_hash_request = encode_aich_file_hash_request(&file_hash);
+                dump_ed2k_tcp_download_send(
+                    peer_addr,
+                    transport.mode,
+                    "aich_file_hash_request",
+                    &aich_file_hash_request,
+                );
+                transport
+                    .write_all(&aich_file_hash_request)
+                    .await
+                    .with_context(|| {
+                        format!("failed to send OP_AICHFILEHASHREQ to {peer_addr}")
+                    })?;
+                aich_file_hash_requested = true;
             }
 
             if send_initial_requests
@@ -1657,6 +1683,15 @@ async fn drive_download_session(
                         );
                     }
                     startup_file_response_received = true;
+                }
+                (OP_EMULEPROT, OP_AICHFILEHASHANS) => {
+                    let returned_hash = decode_aich_file_hash_answer(&packet.payload)?;
+                    if returned_hash != file_hash {
+                        anyhow::bail!(
+                            "peer {peer_addr} returned AICH file hash for unexpected file {}",
+                            returned_hash
+                        );
+                    }
                 }
                 (OP_EDONKEYPROT, OP_SETREQFILEID) => {
                     // Non-oracle peers sometimes echo the file id again instead of
@@ -2909,6 +2944,10 @@ fn encode_request_sources2(file_hash: &Ed2kHash) -> Vec<u8> {
     encode_packet(OP_EMULEPROT, OP_REQUESTSOURCES2, &payload)
 }
 
+fn encode_aich_file_hash_request(file_hash: &Ed2kHash) -> Vec<u8> {
+    encode_packet(OP_EMULEPROT, OP_AICHFILEHASHREQ, &file_hash.0)
+}
+
 fn encode_set_req_file_id(file_hash: &Ed2kHash) -> Vec<u8> {
     encode_packet(OP_EDONKEYPROT, OP_SETREQFILEID, &file_hash.0)
 }
@@ -2997,6 +3036,13 @@ fn decode_request_parts_payload(
         }
     }
     Ok((Ed2kHash::from_bytes(hash), ranges))
+}
+
+fn decode_aich_file_hash_answer(payload: &[u8]) -> Result<Ed2kHash> {
+    if payload.len() < 16 {
+        anyhow::bail!("short OP_AICHFILEHASHANS payload {}", payload.len());
+    }
+    Ok(Ed2kHash::from_bytes(payload[..16].try_into()?))
 }
 
 /// Encode one ED2K `OP_REQUESTPARTS` packet with up to three ranges.
@@ -4120,6 +4166,11 @@ mod tests {
             assert_eq!(request_sources[0], OP_EMULEPROT);
             assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
 
+            let aich_file_hash_request = read_packet(&mut stream).await;
+            assert_eq!(aich_file_hash_request[0], OP_EMULEPROT);
+            assert_eq!(aich_file_hash_request[5], super::OP_AICHFILEHASHREQ);
+            assert_eq!(&aich_file_hash_request[6..22], &file_hash.0);
+
             assert!(
                 tokio::time::timeout(Duration::from_millis(150), read_packet(&mut stream))
                     .await
@@ -4280,6 +4331,8 @@ mod tests {
             assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
             let request_sources = read_packet(&mut stream).await;
             assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
+            let aich_file_hash_request = read_packet(&mut stream).await;
+            assert_eq!(aich_file_hash_request[5], super::OP_AICHFILEHASHREQ);
             let _start_upload = read_packet(&mut stream).await;
             stream.write_all(&encode_accept_upload_req()).await.unwrap();
 
@@ -4437,6 +4490,11 @@ mod tests {
             let request_sources = read_packet(&mut stream).await;
             assert_eq!(request_sources[0], OP_EMULEPROT);
             assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
+
+            let aich_file_hash_request = read_packet(&mut stream).await;
+            assert_eq!(aich_file_hash_request[0], OP_EMULEPROT);
+            assert_eq!(aich_file_hash_request[5], super::OP_AICHFILEHASHREQ);
+            assert_eq!(&aich_file_hash_request[6..22], &file_hash.0);
 
             assert!(
                 tokio::time::timeout(Duration::from_millis(150), read_packet(&mut stream))
@@ -4737,6 +4795,9 @@ mod tests {
             let request_sources = read_packet(&mut stream).await;
             assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
 
+            let aich_file_hash_request = read_packet(&mut stream).await;
+            assert_eq!(aich_file_hash_request[5], super::OP_AICHFILEHASHREQ);
+
             let start_upload = read_packet(&mut stream).await;
             assert_eq!(start_upload[5], super::OP_STARTUPLOADREQ);
 
@@ -4889,6 +4950,14 @@ mod tests {
                     .unwrap();
             assert_eq!(request_sources[0], OP_EMULEPROT);
             assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
+
+            let aich_file_hash_request =
+                tokio::time::timeout(Duration::from_secs(3), read_packet(&mut stream))
+                    .await
+                    .unwrap();
+            assert_eq!(aich_file_hash_request[0], OP_EMULEPROT);
+            assert_eq!(aich_file_hash_request[5], super::OP_AICHFILEHASHREQ);
+            assert_eq!(&aich_file_hash_request[6..22], &file_hash.0);
 
             let filename_answer =
                 super::encode_request_filename_answer(&file_hash, "callback.epub").unwrap();
@@ -5211,6 +5280,8 @@ mod tests {
             assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
             let request_sources = read_packet(&mut stream).await;
             assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
+            let aich_file_hash_request = read_packet(&mut stream).await;
+            assert_eq!(aich_file_hash_request[5], super::OP_AICHFILEHASHREQ);
             let _start_upload = read_packet(&mut stream).await;
             stream.write_all(&encode_accept_upload_req()).await.unwrap();
 
