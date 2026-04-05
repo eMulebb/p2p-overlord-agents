@@ -49,7 +49,10 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::ed2k_server::{Ed2kFoundSource, Ed2kServerState};
-use crate::ed2k_transfer::{ED2K_PART_SIZE, Ed2kSourceHint, Ed2kTransferRuntime, new_transfer_job};
+use crate::ed2k_transfer::{
+    ED2K_PART_SIZE, Ed2kResumeManifest, Ed2kSourceHint, Ed2kTransferRuntime, Ed2kTransferState,
+    new_transfer_job,
+};
 use crate::kad_firewall::KadFirewallState;
 use overlord_kad_dht::DhtNode;
 use overlord_kad_proto::{Ed2kHash, FirewallUdp, KadPacket};
@@ -1282,7 +1285,7 @@ async fn drive_download_session(
                 && !startup_file_requests_sent
                 && !waiting_for_peer_secure_ident
             {
-                let request_filename = encode_request_filename(&file_hash);
+                let request_filename = encode_request_filename(&file_hash, &manifest);
                 dump_ed2k_tcp_download_send(
                     peer_addr,
                     transport.mode,
@@ -2860,8 +2863,27 @@ fn encode_start_upload_req(file_hash: &Ed2kHash) -> Vec<u8> {
     encode_packet(OP_EDONKEYPROT, OP_STARTUPLOADREQ, &file_hash.0)
 }
 
-fn encode_request_filename(file_hash: &Ed2kHash) -> Vec<u8> {
-    encode_packet(OP_EDONKEYPROT, OP_REQUESTFILENAME, &file_hash.0)
+fn encode_request_filename(file_hash: &Ed2kHash, manifest: &Ed2kResumeManifest) -> Vec<u8> {
+    let piece_count = u16::try_from(manifest.pieces.len()).unwrap_or(u16::MAX);
+    let bitfield_len = usize::from(piece_count).div_ceil(8);
+    let mut payload = Vec::with_capacity(16 + 2 + bitfield_len + 2);
+    payload.extend_from_slice(&file_hash.0);
+    payload.extend_from_slice(&piece_count.to_le_bytes());
+    let mut current_byte = 0u8;
+    for (index, piece) in manifest.pieces.iter().enumerate() {
+        if piece.state == Ed2kTransferState::Verified {
+            current_byte |= 1 << (index % 8);
+        }
+        if index % 8 == 7 {
+            payload.push(current_byte);
+            current_byte = 0;
+        }
+    }
+    if piece_count % 8 != 0 {
+        payload.push(current_byte);
+    }
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    encode_packet(OP_EDONKEYPROT, OP_REQUESTFILENAME, &payload)
 }
 
 fn encode_request_sources2(file_hash: &Ed2kHash) -> Vec<u8> {
