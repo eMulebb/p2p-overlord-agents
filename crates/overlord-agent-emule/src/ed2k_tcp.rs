@@ -1532,7 +1532,14 @@ async fn drive_download_session(
             } else {
                 None
             };
-            let read_timeout = fallback_poll_delay.map_or(timeout, |delay| timeout.min(delay));
+            let now = tokio::time::Instant::now();
+            let read_timeout = next_download_read_timeout(
+                now,
+                timeout,
+                fallback_poll_delay,
+                queued_until,
+                part_response_deadline,
+            );
             let packet = match tokio::time::timeout(read_timeout, transport.read_packet()).await {
                 Ok(Ok(Some(packet))) => packet,
                 Ok(Ok(None)) => {
@@ -1978,6 +1985,28 @@ async fn drive_download_session(
     }
 
     session_result
+}
+
+/// Pick the next ED2K download read wait so queue and part-response grace
+/// windows are enforced even when the caller configured a much larger session
+/// timeout.
+#[must_use]
+fn next_download_read_timeout(
+    now: tokio::time::Instant,
+    base_timeout: Duration,
+    fallback_poll_delay: Option<Duration>,
+    queued_until: Option<tokio::time::Instant>,
+    part_response_deadline: Option<tokio::time::Instant>,
+) -> Duration {
+    let mut read_timeout =
+        fallback_poll_delay.map_or(base_timeout, |delay| base_timeout.min(delay));
+    if let Some(deadline) = queued_until {
+        read_timeout = read_timeout.min(deadline.saturating_duration_since(now));
+    }
+    if let Some(deadline) = part_response_deadline {
+        read_timeout = read_timeout.min(deadline.saturating_duration_since(now));
+    }
+    read_timeout
 }
 
 impl Ed2kTransport {
@@ -3698,7 +3727,7 @@ mod tests {
         encode_accept_upload_req, encode_emule_info_answer, encode_emule_info_request,
         encode_hello_answer, encode_hello_request, encode_incoming_obfuscation_response,
         encode_packet, encode_secident_state, encode_sending_part, enrich_hello_identity,
-        is_mule_hello, request_udp_firewall_check,
+        is_mule_hello, next_download_read_timeout, request_udp_firewall_check,
     };
     use crate::{
         ed2k_server::{Ed2kFoundSource, Ed2kServerState},
@@ -5173,6 +5202,9 @@ mod tests {
 
             let request_filename = read_packet(&mut stream).await;
             assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
+            let filename_answer =
+                super::encode_request_filename_answer(&file_hash, "queued.epub").unwrap();
+            stream.write_all(&filename_answer).await.unwrap();
 
             let request_sources = read_packet(&mut stream).await;
             assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
@@ -5193,7 +5225,7 @@ mod tests {
             let queue_ranking = encode_packet(OP_EMULEPROT, super::OP_QUEUERANKING, &[0x01, 0x00]);
             stream.write_all(&queue_ranking).await.unwrap();
 
-            tokio::time::sleep(Duration::from_secs(4)).await;
+            tokio::time::sleep(Duration::from_millis(1500)).await;
 
             stream.write_all(&encode_accept_upload_req()).await.unwrap();
 
@@ -5244,7 +5276,7 @@ mod tests {
             &transfer_runtime,
             "queued.epub".to_string(),
             payload.len() as u64,
-            Duration::from_secs(3),
+            Duration::from_secs(1),
         )
         .await
         .unwrap();
@@ -5253,6 +5285,45 @@ mod tests {
         let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
         assert!(manifest.completed);
         server.await.unwrap();
+    }
+
+    #[test]
+    fn download_read_timeout_uses_earliest_queue_deadline() {
+        let now = tokio::time::Instant::now();
+        let read_timeout = next_download_read_timeout(
+            now,
+            Duration::from_secs(300),
+            None,
+            Some(now + Duration::from_secs(20)),
+            None,
+        );
+        assert_eq!(read_timeout, Duration::from_secs(20));
+    }
+
+    #[test]
+    fn download_read_timeout_uses_earliest_part_deadline() {
+        let now = tokio::time::Instant::now();
+        let read_timeout = next_download_read_timeout(
+            now,
+            Duration::from_secs(300),
+            Some(Duration::from_secs(120)),
+            Some(now + Duration::from_secs(25)),
+            Some(now + Duration::from_secs(7)),
+        );
+        assert_eq!(read_timeout, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn download_read_timeout_immediately_wakes_for_elapsed_deadline() {
+        let now = tokio::time::Instant::now();
+        let read_timeout = next_download_read_timeout(
+            now,
+            Duration::from_secs(300),
+            None,
+            Some(now - Duration::from_secs(1)),
+            None,
+        );
+        assert_eq!(read_timeout, Duration::ZERO);
     }
 
     #[tokio::test]
@@ -5660,6 +5731,9 @@ mod tests {
                 .unwrap();
             let request_filename = read_packet(&mut stream).await;
             assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
+            let filename_answer =
+                super::encode_request_filename_answer(&file_hash, "captured.epub").unwrap();
+            stream.write_all(&filename_answer).await.unwrap();
             let request_sources = read_packet(&mut stream).await;
             assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
             let aich_file_hash_request = read_packet(&mut stream).await;
@@ -5713,7 +5787,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap(),
+            Ed2kPeerDownloadOutcome::AcceptedButIncomplete
+        );
         let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
         assert!(!manifest.completed);
         assert_eq!(
