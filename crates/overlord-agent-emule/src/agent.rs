@@ -63,7 +63,7 @@ use overlord_kad_proto::{
 };
 use overlord_kad_routing::{Contact, ContactType};
 
-use crate::config::EmuleAgentConfig;
+use crate::config::{Ed2kConfig, EmuleAgentConfig};
 use crate::ed2k_server::{
     Ed2kFoundSource, Ed2kSearchFile, Ed2kServerSearchHandle, Ed2kServerState,
     new_ed2k_server_search_channel, request_callback_via_background_session, run_ed2k_server_loop,
@@ -2589,6 +2589,13 @@ fn map_ed2k_source_result(result: &Ed2kFoundSource, file_size: u64) -> FileRecor
     }
 }
 
+/// Live `OP_GETSOURCES` replies often arrive later than the initial ED2K
+/// login/status handshake, so source discovery needs a wider timeout budget
+/// than the generic connect timeout.
+fn ed2k_source_search_timeout(config: &Ed2kConfig) -> Duration {
+    Duration::from_secs(config.connect_timeout_secs.max(15))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn do_active_ed2k_keyword_search(
     bind_ip: Ipv4Addr,
@@ -2730,12 +2737,13 @@ async fn do_active_ed2k_source_search(
     };
     let file_hash = search_file_hash(job)?;
     let file_size = search_file_size(job)?;
+    let source_search_timeout = ed2k_source_search_timeout(&config.p2p.ed2k);
     let files = if let Some(background_search) = background_search {
         match search_source_via_background_session(
             &background_search,
             file_hash,
             file_size,
-            Duration::from_secs(config.p2p.ed2k.connect_timeout_secs.max(5)),
+            source_search_timeout,
             &cancel,
         )
         .await
@@ -5647,6 +5655,7 @@ impl OverlordAgentEmule {
         let cancel = CancellationToken::new();
         let mut sources = Vec::new();
         let shared_catalog = runtime.ed2k_shared_catalog.read().await.clone();
+        let source_search_timeout = ed2k_source_search_timeout(&config.p2p.ed2k);
         let hello_identity = Ed2kHelloIdentity {
             user_hash: self.ed2k_user_hash,
             client_id: 0,
@@ -5674,7 +5683,7 @@ impl OverlordAgentEmule {
                 &background_search,
                 file_hash,
                 file_size,
-                Duration::from_secs(config.p2p.ed2k.connect_timeout_secs.max(5)),
+                source_search_timeout,
                 &cancel,
             )
             .await
