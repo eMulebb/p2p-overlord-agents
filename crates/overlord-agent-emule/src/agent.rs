@@ -77,8 +77,8 @@ use crate::ed2k_tcp::{
     enrich_hello_identity, request_udp_firewall_check, run_ed2k_listener,
 };
 use crate::ed2k_transfer::{
-    Ed2kCallbackIntent, Ed2kSharedCatalog, Ed2kSharedEntry, Ed2kSourceHint, Ed2kTransferRuntime,
-    new_transfer_job,
+    Ed2kCallbackIntent, Ed2kResumeManifest, Ed2kSharedCatalog, Ed2kSharedEntry, Ed2kSourceHint,
+    Ed2kTransferRuntime, new_transfer_job,
 };
 use crate::kad_firewall::{
     ExternalPortDiscoveryOutcome, FirewallUdpPacketOutcome, FirewalledResponseOutcome,
@@ -2613,6 +2613,17 @@ fn kad_source_result_to_ed2k_found_source(result: SourceResult) -> Ed2kFoundSour
         user_hash: None,
         source_server: None,
     }
+}
+
+/// Callback-driven ED2K downloads can continue after the initial server-side
+/// callback request completes. Treat persisted piece/hashset progress as proof
+/// that a real transfer is in flight instead of reporting a terminal failure
+/// immediately after the first callback grace window.
+fn manifest_has_ed2k_transfer_progress(manifest: &Ed2kResumeManifest) -> bool {
+    manifest.completed
+        || manifest.md4_hashset_acquired
+        || !manifest.verified_ranges.is_empty()
+        || manifest.pieces.iter().any(|piece| piece.bytes_written != 0)
 }
 
 /// Collects Kad-advertised ED2K sources for a bounded window so downloads can
@@ -6010,7 +6021,13 @@ impl OverlordAgentEmule {
             }
             if !callback_only_sources.is_empty() {
                 tokio::time::sleep(callback_timeout).await;
-                let manifest = runtime.ed2k_transfer.manifest(&request.file_hash).await?;
+                let manifest = Self::await_callback_transfer_completion(
+                    runtime.ed2k_transfer.as_ref(),
+                    &request.file_hash,
+                    &runtime.ed2k_transfer.manifest(&request.file_hash).await?,
+                    Duration::from_secs(callback_timeout.as_secs().max(30)),
+                )
+                .await?;
                 if manifest.completed {
                     return Ok(());
                 }
@@ -6027,7 +6044,13 @@ impl OverlordAgentEmule {
 
         if !callback_only_sources.is_empty() {
             tokio::time::sleep(callback_timeout).await;
-            let manifest = runtime.ed2k_transfer.manifest(&request.file_hash).await?;
+            let manifest = Self::await_callback_transfer_completion(
+                runtime.ed2k_transfer.as_ref(),
+                &request.file_hash,
+                &runtime.ed2k_transfer.manifest(&request.file_hash).await?,
+                Duration::from_secs(callback_timeout.as_secs().max(30)),
+            )
+            .await?;
             if manifest.completed {
                 return Ok(());
             }
@@ -6047,6 +6070,33 @@ impl OverlordAgentEmule {
             "native ED2K download found only callback-only or otherwise non-dialable sources for {}",
             request.file_hash
         );
+    }
+
+    async fn await_callback_transfer_completion(
+        transfer_runtime: &Ed2kTransferRuntime,
+        file_hash: &str,
+        initial_manifest: &Ed2kResumeManifest,
+        wait_budget: Duration,
+    ) -> Result<Ed2kResumeManifest> {
+        if initial_manifest.completed {
+            return Ok(initial_manifest.clone());
+        }
+        if !manifest_has_ed2k_transfer_progress(initial_manifest) {
+            return Ok(initial_manifest.clone());
+        }
+
+        let started = Instant::now();
+        let poll_interval = Duration::from_secs(2);
+        let mut last_manifest = initial_manifest.clone();
+        while started.elapsed() < wait_budget {
+            tokio::time::sleep(poll_interval).await;
+            let manifest = transfer_runtime.manifest(file_hash).await?;
+            if manifest.completed || !manifest.verified_ranges.is_empty() {
+                return Ok(manifest);
+            }
+            last_manifest = manifest;
+        }
+        Ok(last_manifest)
     }
 
     async fn spawn_background_tasks(
