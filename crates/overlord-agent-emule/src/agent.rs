@@ -5856,7 +5856,9 @@ impl OverlordAgentEmule {
                 request.file_hash, skipped_low_id_sources
             );
         }
-        let callback_timeout = Duration::from_secs(config.p2p.ed2k.connect_timeout_secs.max(10));
+        // Low-ID peers often arrive noticeably later than direct ED2K connects
+        // because the server-mediated callback has to propagate first.
+        let callback_timeout = Duration::from_secs(config.p2p.ed2k.connect_timeout_secs.max(30));
         if !callback_only_sources.is_empty() {
             let cancel = CancellationToken::new();
             for source in &callback_only_sources {
