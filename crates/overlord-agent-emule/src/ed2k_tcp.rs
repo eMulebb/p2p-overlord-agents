@@ -1263,6 +1263,9 @@ async fn drive_download_session(
     const HASHSET_STALL_UPLOAD_FALLBACK: Duration = Duration::from_millis(500);
     const QUEUE_RANK_GRACE: Duration = Duration::from_secs(20);
     const PART_RESPONSE_GRACE: Duration = Duration::from_secs(20);
+    // eMule can split one requested range into multiple consecutive
+    // `OP_SENDINGPART` frames. Track the next expected start offset rather than
+    // assuming one packet completes one requested range.
     let mut pending_parts: Vec<(u32, u64, u64)> = Vec::new();
     let mut pending_compressed_parts: Vec<PendingCompressedPart> = Vec::new();
     let mut manifest = transfer_runtime.manifest(file_hash_hex).await?;
@@ -1931,7 +1934,7 @@ async fn drive_download_session(
                             pending_parts
                                 .iter()
                                 .position(|(_, expected_start, expected_end)| {
-                                    *expected_start == start && *expected_end == end
+                                    *expected_start == start && *expected_end >= end
                                 })
                         else {
                             dump_ed2k_tcp_download_meta(
@@ -1945,9 +1948,19 @@ async fn drive_download_session(
                             );
                             continue;
                         };
-                        let (expected_part, _, _) = pending_parts.remove(pending_index);
-                        if pending_parts.is_empty() {
-                            part_response_deadline = None;
+                        let (expected_part, expected_start, expected_end) =
+                            pending_parts[pending_index];
+                        if start != expected_start {
+                            dump_ed2k_tcp_download_meta(
+                                peer_addr,
+                                Some(transport.mode),
+                                "unexpected_part_fragment_start",
+                                format!(
+                                    "file_hash={file_hash_hex} expected_start={expected_start} start={start} end={end} pending={:?}",
+                                    pending_parts
+                                ),
+                            );
+                            continue;
                         }
                         let piece_completed = transfer_runtime
                             .append_piece_block(file_hash_hex, expected_part, start, end, &bytes)
@@ -1956,12 +1969,20 @@ async fn drive_download_session(
                         if piece_completed {
                             single_part_active_piece = None;
                         }
+                        if end == expected_end {
+                            pending_parts.remove(pending_index);
+                            if pending_parts.is_empty() {
+                                part_response_deadline = None;
+                            }
+                        } else {
+                            pending_parts[pending_index] = (expected_part, end, expected_end);
+                        }
                         dump_ed2k_tcp_download_meta(
                             peer_addr,
                             Some(transport.mode),
-                            "piece_stored",
+                            "piece_fragment_stored",
                             format!(
-                                "file_hash={file_hash_hex} piece_index={expected_part} start={start} end={end} completed={}",
+                                "file_hash={file_hash_hex} piece_index={expected_part} start={start} end={end} request_end={expected_end} completed={}",
                                 manifest.completed
                             ),
                         );
@@ -4618,6 +4639,164 @@ mod tests {
                 assert_eq!(next_requested_hash, file_hash);
                 current_ranges = next_ranges;
             }
+        });
+
+        let result = download_file_from_peer(
+            Ipv4Addr::LOCALHOST,
+            &Ed2kFoundSource {
+                file_hash,
+                ip: Ipv4Addr::LOCALHOST,
+                tcp_port: peer_addr.port(),
+                client_id: u32::from_le_bytes(Ipv4Addr::LOCALHOST.octets()),
+                low_id: false,
+                obfuscated: false,
+                obfuscation_options: None,
+                user_hash: None,
+            },
+            Ed2kHelloIdentity {
+                user_hash: [0x11; 16],
+                client_id: 0,
+                tcp_port: 41001,
+                udp_port: 41000,
+                server_ip: 0,
+                server_port: 0,
+                connect_options: emule_connect_options(false),
+                direct_udp_callback: false,
+            },
+            &Arc::new(
+                Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+                    .unwrap(),
+            ),
+            &transfer_runtime,
+            "captured.epub".to_string(),
+            payload.len() as u64,
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, Ed2kPeerDownloadOutcome::Completed);
+
+        let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
+        assert!(manifest.completed);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn small_file_download_accepts_split_sending_part_frames() {
+        async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
+            let mut header = [0u8; 6];
+            stream.read_exact(&mut header).await.unwrap();
+            let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+            let mut packet = header.to_vec();
+            let mut payload = vec![0u8; packet_len - 1];
+            stream.read_exact(&mut payload).await.unwrap();
+            packet.extend_from_slice(&payload);
+            packet
+        }
+
+        let root = unique_test_dir("ed2k-small-file-split-sendingpart");
+        let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+        let payload = vec![0x5A; 180 * 1024];
+        let file_hash = overlord_kad_proto::Ed2kHash::from_bytes(Md4::digest(&payload).into());
+        let file_hash_hex = file_hash.to_string();
+        transfer_runtime
+            .ensure_job(&new_transfer_job(
+                file_hash,
+                "captured.epub".to_string(),
+                payload.len() as u64,
+            ))
+            .await
+            .unwrap();
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let peer_public_key = Arc::new(
+            Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+                .unwrap(),
+        );
+        let payload_for_server = payload.clone();
+        let peer_public_key_for_server = Arc::clone(&peer_public_key);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            let hello = read_packet(&mut stream).await;
+            assert_eq!(hello[5], OP_HELLO);
+
+            let hello_answer = encode_hello_answer(Ed2kHelloIdentity {
+                user_hash: [0x42; 16],
+                client_id: 0x5912_0559,
+                tcp_port: peer_addr.port(),
+                udp_port: 0,
+                server_ip: 0,
+                server_port: 0,
+                connect_options: emule_connect_options(false),
+                direct_udp_callback: false,
+            });
+            stream.write_all(&hello_answer).await.unwrap();
+
+            let secure_ident_probe = read_packet(&mut stream).await;
+            assert_eq!(secure_ident_probe[5], OP_SECIDENTSTATE);
+            let peer_challenge =
+                encode_secident_state(ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, 0x4436_EEAC);
+            stream.write_all(&peer_challenge).await.unwrap();
+
+            let public_key = read_packet(&mut stream).await;
+            assert_eq!(public_key[5], super::OP_PUBLICKEY);
+            let peer_public_key_packet = encode_packet(
+                OP_EMULEPROT,
+                super::OP_PUBLICKEY,
+                &peer_public_key_for_server.public_key_payload().unwrap(),
+            );
+            stream.write_all(&peer_public_key_packet).await.unwrap();
+
+            let signature = read_packet(&mut stream).await;
+            assert_eq!(signature[5], super::OP_SIGNATURE);
+            let peer_signature = encode_packet(OP_EMULEPROT, super::OP_SIGNATURE, &[0xAA; 49]);
+            stream.write_all(&peer_signature).await.unwrap();
+
+            let request_filename = read_packet(&mut stream).await;
+            assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
+            let _request_sources = read_packet(&mut stream).await;
+            let _aich_request = read_packet(&mut stream).await;
+
+            let filename_answer =
+                super::encode_request_filename_answer(&file_hash, "captured.epub").unwrap();
+            stream.write_all(&filename_answer).await.unwrap();
+
+            let start_upload = read_packet(&mut stream).await;
+            assert_eq!(start_upload[5], super::OP_STARTUPLOADREQ);
+            let accept = encode_accept_upload_req();
+            stream.write_all(&accept).await.unwrap();
+
+            let request_parts = read_packet(&mut stream).await;
+            assert_eq!(request_parts[5], super::OP_REQUESTPARTS);
+            let (requested_hash, ranges) =
+                decode_request_parts_payload(&request_parts[6..], false).unwrap();
+            assert_eq!(requested_hash, file_hash);
+            let (start, end) = ranges[0];
+            let midpoint = start + ((end - start) / 2);
+
+            let first_fragment = encode_sending_part(
+                &file_hash,
+                start,
+                midpoint,
+                &payload_for_server
+                    [usize::try_from(start).unwrap()..usize::try_from(midpoint).unwrap()],
+                false,
+            )
+            .unwrap();
+            stream.write_all(&first_fragment).await.unwrap();
+
+            let second_fragment = encode_sending_part(
+                &file_hash,
+                midpoint,
+                end,
+                &payload_for_server
+                    [usize::try_from(midpoint).unwrap()..usize::try_from(end).unwrap()],
+                false,
+            )
+            .unwrap();
+            stream.write_all(&second_fragment).await.unwrap();
         });
 
         let result = download_file_from_peer(
