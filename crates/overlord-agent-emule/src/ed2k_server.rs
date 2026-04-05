@@ -533,8 +533,13 @@ enum SearchToken {
 #[derive(Debug, Serialize)]
 struct Ed2kServerDumpRecord<'a> {
     schema: &'static str,
+    source: &'static str,
     ts_utc: String,
+    event_seq: u64,
     trace_id: u64,
+    trace_key: String,
+    state_id: String,
+    state_label: &'a str,
     role: &'a str,
     phase: &'a str,
     direction: &'a str,
@@ -545,6 +550,22 @@ struct Ed2kServerDumpRecord<'a> {
     payload_len: Option<usize>,
     payload_hex: Option<String>,
     note: Option<String>,
+}
+
+fn next_ed2k_server_dump_event_seq() -> u64 {
+    static NEXT_EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
+    NEXT_EVENT_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+fn ed2k_server_trace_key(session: &ServerSession) -> String {
+    format!(
+        "server:{}:{}:{}",
+        session.trace_role, session.trace_id, session.endpoint
+    )
+}
+
+fn ed2k_server_state_id(session: &ServerSession) -> String {
+    format!("server.{}.{}", session.trace_role, session.phase.as_str())
 }
 
 /// Creates a bounded request channel for background-session ED2K server searches.
@@ -714,8 +735,13 @@ fn dump_ed2k_server_record(record: &Ed2kServerDumpRecord<'_>) {
 fn dump_ed2k_server_meta(session: &ServerSession, note: impl Into<String>) {
     let record = Ed2kServerDumpRecord {
         schema: "ed2k_server_session_v1",
+        source: "agent",
         ts_utc: chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        event_seq: next_ed2k_server_dump_event_seq(),
         trace_id: session.trace_id,
+        trace_key: ed2k_server_trace_key(session),
+        state_id: ed2k_server_state_id(session),
+        state_label: session.phase.as_str(),
         role: session.trace_role,
         phase: session.phase.as_str(),
         direction: "meta",
@@ -742,8 +768,13 @@ fn dump_ed2k_server_packet(
 ) {
     let record = Ed2kServerDumpRecord {
         schema: "ed2k_server_session_v1",
+        source: "agent",
         ts_utc: chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        event_seq: next_ed2k_server_dump_event_seq(),
         trace_id: session.trace_id,
+        trace_key: ed2k_server_trace_key(session),
+        state_id: ed2k_server_state_id(session),
+        state_label: session.phase.as_str(),
         role: session.trace_role,
         phase: session.phase.as_str(),
         direction,

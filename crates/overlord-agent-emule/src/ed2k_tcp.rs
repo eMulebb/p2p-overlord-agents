@@ -23,7 +23,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc, Mutex as StdMutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -391,7 +391,12 @@ impl Ed2kTransportMode {
 #[derive(Debug, Serialize)]
 struct Ed2kTcpDumpRecord<'a> {
     schema: &'static str,
+    source: &'static str,
     ts_utc: String,
+    event_seq: u64,
+    trace_key: String,
+    state_id: String,
+    state_label: &'a str,
     flow: &'static str,
     phase: &'a str,
     direction: &'a str,
@@ -406,6 +411,19 @@ struct Ed2kTcpDumpRecord<'a> {
     payload_len: Option<usize>,
     payload_hex: Option<String>,
     note: Option<String>,
+}
+
+fn ed2k_tcp_dump_event_seq() -> u64 {
+    static NEXT_EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
+    NEXT_EVENT_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+fn ed2k_tcp_trace_key(flow: &'static str, remote_addr: SocketAddr) -> String {
+    format!("{flow}:{remote_addr}")
+}
+
+fn ed2k_tcp_state_id(flow: &'static str, phase: &str) -> String {
+    format!("{flow}.{phase}")
 }
 
 fn ed2k_tcp_dump_file() -> &'static StdMutex<Option<fs::File>> {
@@ -498,7 +516,12 @@ fn dump_ed2k_tcp_meta(
 ) {
     let record = Ed2kTcpDumpRecord {
         schema: "ed2k_tcp_helper_v1",
+        source: "agent",
         ts_utc: chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        event_seq: ed2k_tcp_dump_event_seq(),
+        trace_key: ed2k_tcp_trace_key(flow, remote_addr),
+        state_id: ed2k_tcp_state_id(flow, phase),
+        state_label: phase,
         flow,
         phase,
         direction: "meta",
@@ -533,7 +556,12 @@ fn dump_ed2k_tcp_send(
     };
     let record = Ed2kTcpDumpRecord {
         schema: "ed2k_tcp_helper_v1",
+        source: "agent",
         ts_utc: chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        event_seq: ed2k_tcp_dump_event_seq(),
+        trace_key: ed2k_tcp_trace_key(flow, remote_addr),
+        state_id: ed2k_tcp_state_id(flow, phase),
+        state_label: phase,
         flow,
         phase,
         direction: "send",
@@ -561,7 +589,12 @@ fn dump_ed2k_tcp_recv(
 ) {
     let record = Ed2kTcpDumpRecord {
         schema: "ed2k_tcp_helper_v1",
+        source: "agent",
         ts_utc: chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        event_seq: ed2k_tcp_dump_event_seq(),
+        trace_key: ed2k_tcp_trace_key(flow, remote_addr),
+        state_id: ed2k_tcp_state_id(flow, phase),
+        state_label: phase,
         flow,
         phase,
         direction: "recv",

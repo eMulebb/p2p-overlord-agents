@@ -7,7 +7,10 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{
+    Mutex, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 use tracing::warn;
 
 const OVERLORD_TMP_DIR_ENV: &str = "OVERLORD_TMP_DIR";
@@ -119,6 +122,10 @@ struct UdpDumpRecord {
     schema: &'static str,
     source: &'static str,
     ts: String,
+    event_seq: u64,
+    trace_key: String,
+    state_id: String,
+    state_label: String,
     direction: &'static str,
     family: &'static str,
     peer: String,
@@ -159,6 +166,30 @@ struct UdpDumpRecord {
     tracker_max_packets: Option<u32>,
 }
 
+fn next_udp_dump_event_seq() -> u64 {
+    static NEXT_EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
+    NEXT_EVENT_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+fn udp_trace_key(peer: SocketAddr) -> String {
+    format!("kad:{}", peer)
+}
+
+fn udp_state_label(summary: &KadUdpDumpSummary) -> String {
+    summary
+        .opcode_name
+        .map(str::to_string)
+        .unwrap_or_else(|| "packet".to_string())
+}
+
+fn udp_state_id(direction: &str, summary: &KadUdpDumpSummary) -> String {
+    format!(
+        "kad.{}.{}",
+        direction,
+        summary.opcode_name.unwrap_or("packet").to_ascii_lowercase()
+    )
+}
+
 /// Append one oracle-shaped Kad UDP packet record to the current agent dump file.
 pub fn dump_kad_udp_packet(
     direction: &'static str,
@@ -175,6 +206,10 @@ pub fn dump_kad_udp_packet(
         schema: "udp_packet_v1",
         source: "agent",
         ts: Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
+        event_seq: next_udp_dump_event_seq(),
+        trace_key: udp_trace_key(peer),
+        state_id: udp_state_id(direction, &summary),
+        state_label: udp_state_label(&summary),
         direction,
         family: "kad",
         peer: peer.to_string(),
