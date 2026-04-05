@@ -16,8 +16,8 @@
 
 use std::{
     collections::VecDeque,
-    fs, io,
-    io::Write,
+    fs,
+    io::{self, Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     str::FromStr,
@@ -30,6 +30,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::SecondsFormat;
+use flate2::read::ZlibDecoder;
 use md5::compute as md5_compute;
 use rand::Rng;
 use rsa::{
@@ -62,6 +63,7 @@ const OP_EDONKEYPROT: u8 = 0xE3;
 const OP_PACKEDPROT: u8 = 0xD4;
 const OP_HELLO: u8 = 0x01;
 const OP_HELLOANSWER: u8 = 0x4C;
+const OP_COMPRESSEDPART: u8 = 0x40;
 const OP_SENDINGPART: u8 = 0x46;
 const OP_REQUESTPARTS: u8 = 0x47;
 const OP_FILEREQANSNOFIL: u8 = 0x48;
@@ -81,6 +83,7 @@ const OP_REQUESTSOURCES2: u8 = 0x83;
 const OP_ANSWERSOURCES2: u8 = 0x84;
 const OP_AICHFILEHASHANS: u8 = 0x9D;
 const OP_AICHFILEHASHREQ: u8 = 0x9E;
+const OP_COMPRESSEDPART_I64: u8 = 0xA1;
 const OP_SENDINGPART_I64: u8 = 0xA2;
 const OP_REQUESTPARTS_I64: u8 = 0xA3;
 const OP_EMULEINFO: u8 = 0x01;
@@ -424,6 +427,7 @@ fn ed2k_opcode_name(protocol: u8, opcode: u8) -> &'static str {
     match (protocol, opcode) {
         (OP_EDONKEYPROT, OP_HELLO) => "OP_HELLO",
         (OP_EDONKEYPROT, OP_HELLOANSWER) => "OP_HELLOANSWER",
+        (OP_EMULEPROT, OP_COMPRESSEDPART) => "OP_COMPRESSEDPART",
         (OP_EDONKEYPROT, OP_SENDINGPART) => "OP_SENDINGPART",
         (OP_EDONKEYPROT, OP_REQUESTPARTS) => "OP_REQUESTPARTS",
         (OP_EDONKEYPROT, OP_FILEREQANSNOFIL) => "OP_FILEREQANSNOFIL",
@@ -445,6 +449,7 @@ fn ed2k_opcode_name(protocol: u8, opcode: u8) -> &'static str {
         (OP_EMULEPROT, OP_EMULEINFOANSWER) => "OP_EMULEINFOANSWER",
         (OP_EMULEPROT, OP_QUEUERANKING) => "OP_QUEUERANKING",
         (OP_EMULEPROT, OP_FILEDESC) => "OP_FILEDESC",
+        (OP_EMULEPROT, OP_COMPRESSEDPART_I64) => "OP_COMPRESSEDPART_I64",
         (OP_EMULEPROT, OP_SENDINGPART_I64) => "OP_SENDINGPART_I64",
         (OP_EMULEPROT, OP_REQUESTPARTS_I64) => "OP_REQUESTPARTS_I64",
         (OP_EMULEPROT, OP_PUBLICKEY) => "OP_PUBLICKEY",
@@ -1756,10 +1761,19 @@ async fn drive_download_session(
                 (OP_EDONKEYPROT, OP_FILEREQANSNOFIL) => {
                     anyhow::bail!("peer {peer_addr} does not serve requested file {file_hash_hex}");
                 }
-                (OP_EDONKEYPROT, OP_SENDINGPART) | (OP_EMULEPROT, OP_SENDINGPART_I64) => {
-                    let use_i64 = packet.opcode == OP_SENDINGPART_I64;
-                    let (returned_hash, start, end, bytes) =
-                        decode_sending_part_payload(&packet.payload, use_i64)?;
+                (OP_EDONKEYPROT, OP_SENDINGPART)
+                | (OP_EMULEPROT, OP_SENDINGPART_I64)
+                | (OP_EMULEPROT, OP_COMPRESSEDPART)
+                | (OP_EMULEPROT, OP_COMPRESSEDPART_I64) => {
+                    let use_i64 =
+                        packet.opcode == OP_SENDINGPART_I64 || packet.opcode == OP_COMPRESSEDPART_I64;
+                    let (returned_hash, start, end, bytes) = if packet.opcode == OP_COMPRESSEDPART
+                        || packet.opcode == OP_COMPRESSEDPART_I64
+                    {
+                        decode_compressed_part_payload(&packet.payload, use_i64)?
+                    } else {
+                        decode_sending_part_payload(&packet.payload, use_i64)?
+                    };
                     if returned_hash != file_hash {
                         dump_ed2k_tcp_download_meta(
                             peer_addr,
@@ -3195,6 +3209,50 @@ fn decode_sending_part_payload(
     Ok((Ed2kHash::from_bytes(hash), start, end, bytes))
 }
 
+fn decode_compressed_part_payload(
+    payload: &[u8],
+    use_i64: bool,
+) -> Result<(Ed2kHash, u64, u64, Vec<u8>)> {
+    let header_len = 16 + if use_i64 { 12 } else { 8 };
+    if payload.len() < header_len {
+        anyhow::bail!("short OP_COMPRESSEDPART payload {}", payload.len());
+    }
+    let mut hash = [0u8; 16];
+    hash.copy_from_slice(&payload[..16]);
+    let (start, compressed_len) = if use_i64 {
+        let start = u64::from_le_bytes(payload[16..24].try_into().expect("u64 width"));
+        let compressed_len = usize::try_from(u32::from_le_bytes(
+            payload[24..28].try_into().expect("u32 width"),
+        ))
+        .unwrap_or(usize::MAX);
+        (start, compressed_len)
+    } else {
+        let start = u64::from(u32::from_le_bytes(
+            payload[16..20].try_into().expect("u32 width"),
+        ));
+        let compressed_len = usize::try_from(u32::from_le_bytes(
+            payload[20..24].try_into().expect("u32 width"),
+        ))
+        .unwrap_or(usize::MAX);
+        (start, compressed_len)
+    };
+    let compressed = &payload[header_len..];
+    if compressed.len() != compressed_len {
+        anyhow::bail!(
+            "OP_COMPRESSEDPART compressed length {} does not match payload body {}",
+            compressed_len,
+            compressed.len()
+        );
+    }
+    let mut decoder = ZlibDecoder::new(compressed);
+    let mut bytes = Vec::new();
+    decoder
+        .read_to_end(&mut bytes)
+        .context("failed to inflate OP_COMPRESSEDPART payload")?;
+    let end = start + u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    Ok((Ed2kHash::from_bytes(hash), start, end, bytes))
+}
+
 fn encode_sending_part(
     file_hash: &Ed2kHash,
     start: u64,
@@ -3451,6 +3509,7 @@ mod tests {
     };
     use hex::decode;
     use md4::{Digest, Md4};
+    use overlord_kad_proto::Ed2kHash;
     use rsa::{
         RsaPrivateKey, RsaPublicKey,
         pkcs1v15::{Signature, VerifyingKey},
@@ -3460,6 +3519,7 @@ mod tests {
     };
     use sha1::Sha1;
     use std::collections::VecDeque;
+    use std::io::Write as _;
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
         sync::Arc,
@@ -3500,6 +3560,29 @@ mod tests {
     #[test]
     fn public_key_payload_rejects_mismatched_length_prefix() {
         assert!(decode_public_key_payload(&[5, 1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn compressed_part_payload_roundtrip_inflates_zlib_body() {
+        let file_hash = Ed2kHash([0xAB; 16]);
+        let start = 0u64;
+        let bytes = vec![0x5A; 32_768];
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&bytes).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut payload = Vec::with_capacity(16 + 4 + 4 + compressed.len());
+        payload.extend_from_slice(&file_hash.0);
+        payload.extend_from_slice(&(u32::try_from(start).unwrap()).to_le_bytes());
+        payload.extend_from_slice(&(u32::try_from(compressed.len()).unwrap()).to_le_bytes());
+        payload.extend_from_slice(&compressed);
+
+        let (decoded_hash, decoded_start, decoded_end, decoded_bytes) =
+            super::decode_compressed_part_payload(&payload, false).unwrap();
+        assert_eq!(decoded_hash, file_hash);
+        assert_eq!(decoded_start, start);
+        assert_eq!(decoded_end, start + bytes.len() as u64);
+        assert_eq!(decoded_bytes, bytes);
     }
 
     #[test]
