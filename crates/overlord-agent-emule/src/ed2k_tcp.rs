@@ -69,6 +69,10 @@ const OP_STARTUPLOADREQ: u8 = 0x54;
 const OP_ACCEPTUPLOADREQ: u8 = 0x55;
 const OP_REQUESTFILENAME: u8 = 0x58;
 const OP_REQFILENAMEANSWER: u8 = 0x59;
+const OP_REQUESTSOURCES: u8 = 0x81;
+const OP_ANSWERSOURCES: u8 = 0x82;
+const OP_REQUESTSOURCES2: u8 = 0x83;
+const OP_ANSWERSOURCES2: u8 = 0x84;
 const OP_QUEUERANKING: u8 = 0x60;
 const OP_FILEDESC: u8 = 0x61;
 const OP_SENDINGPART_I64: u8 = 0xA2;
@@ -92,6 +96,7 @@ const EMULE_VERSION_SHORT: u8 = EMULE_VERSION_MINOR as u8;
 const EMULE_SECURE_IDENT_VERSION: u32 = 3;
 const EMULE_INFO_FEATURES: u32 = 3;
 const EMULE_ADVERTISED_KAD_VERSION: u32 = 10;
+const ED2K_SOURCE_EXCHANGE2_VERSION: u8 = 4;
 
 const TAGTYPE_STRING: u8 = 0x02;
 const TAGTYPE_UINT32: u8 = 0x03;
@@ -423,6 +428,10 @@ fn ed2k_opcode_name(protocol: u8, opcode: u8) -> &'static str {
         (OP_EDONKEYPROT, OP_ACCEPTUPLOADREQ) => "OP_ACCEPTUPLOADREQ",
         (OP_EDONKEYPROT, OP_REQUESTFILENAME) => "OP_REQUESTFILENAME",
         (OP_EDONKEYPROT, OP_REQFILENAMEANSWER) => "OP_REQFILENAMEANSWER",
+        (OP_EMULEPROT, OP_REQUESTSOURCES) => "OP_REQUESTSOURCES",
+        (OP_EMULEPROT, OP_ANSWERSOURCES) => "OP_ANSWERSOURCES",
+        (OP_EMULEPROT, OP_REQUESTSOURCES2) => "OP_REQUESTSOURCES2",
+        (OP_EMULEPROT, OP_ANSWERSOURCES2) => "OP_ANSWERSOURCES2",
         (OP_EMULEPROT, OP_EMULEINFO) => "OP_EMULEINFO",
         (OP_EMULEPROT, OP_EMULEINFOANSWER) => "OP_EMULEINFOANSWER",
         (OP_EMULEPROT, OP_QUEUERANKING) => "OP_QUEUERANKING",
@@ -1229,6 +1238,7 @@ async fn drive_download_session(
     let mut hello_complete = initial_hello_complete;
     let mut secure_ident_started = initial_secure_ident_started;
     let mut startup_file_requests_sent = false;
+    let mut source_request_sent = false;
     let mut hashset_requested = false;
     let mut hashset_requested_at = None;
     let mut upload_requested = false;
@@ -1299,6 +1309,27 @@ async fn drive_download_session(
                         })?;
                 }
                 startup_file_requests_sent = true;
+            }
+
+            if send_initial_requests
+                && hello_complete
+                && !source_request_sent
+                && !waiting_for_peer_secure_ident
+            {
+                let source_request = encode_request_sources2(&file_hash);
+                dump_ed2k_tcp_download_send(
+                    peer_addr,
+                    transport.mode,
+                    "request_sources2",
+                    &source_request,
+                );
+                transport
+                    .write_all(&source_request)
+                    .await
+                    .with_context(|| {
+                        format!("failed to send OP_REQUESTSOURCES2 to {peer_addr}")
+                    })?;
+                source_request_sent = true;
             }
 
             if send_initial_requests
@@ -1598,6 +1629,11 @@ async fn drive_download_session(
                     // The downloader no longer relies on these startup messages for
                     // public peers, but keep the session tolerant when a callback or
                     // non-oracle peer still sends them.
+                }
+                (OP_EMULEPROT, OP_ANSWERSOURCES) | (OP_EMULEPROT, OP_ANSWERSOURCES2) => {
+                    // Source-exchange replies are opportunistic parity traffic. The
+                    // direct downloader does not consume them yet, but the oracle does
+                    // emit the request during startup, so stay tolerant here.
                 }
                 (OP_EMULEPROT, OP_QUEUERANKING) => {
                     queued_until = Some(tokio::time::Instant::now() + QUEUE_RANK_GRACE);
@@ -2780,6 +2816,14 @@ fn encode_start_upload_req(file_hash: &Ed2kHash) -> Vec<u8> {
 
 fn encode_request_filename(file_hash: &Ed2kHash) -> Vec<u8> {
     encode_packet(OP_EDONKEYPROT, OP_REQUESTFILENAME, &file_hash.0)
+}
+
+fn encode_request_sources2(file_hash: &Ed2kHash) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(19);
+    payload.push(ED2K_SOURCE_EXCHANGE2_VERSION);
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&file_hash.0);
+    encode_packet(OP_EMULEPROT, OP_REQUESTSOURCES2, &payload)
 }
 
 fn encode_set_req_file_id(file_hash: &Ed2kHash) -> Vec<u8> {
@@ -3989,6 +4033,10 @@ mod tests {
             assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
             assert_eq!(&request_filename[6..22], &file_hash.0);
 
+            let request_sources = read_packet(&mut stream).await;
+            assert_eq!(request_sources[0], OP_EMULEPROT);
+            assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
+
             let start_upload = read_packet(&mut stream).await;
             assert_eq!(start_upload[0], OP_EDONKEYPROT);
             assert_eq!(start_upload[5], super::OP_STARTUPLOADREQ);
@@ -4136,6 +4184,8 @@ mod tests {
                 .unwrap();
             let request_filename = read_packet(&mut stream).await;
             assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
+            let request_sources = read_packet(&mut stream).await;
+            assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
             let _start_upload = read_packet(&mut stream).await;
             stream.write_all(&encode_accept_upload_req()).await.unwrap();
 
@@ -4289,6 +4339,10 @@ mod tests {
             assert_eq!(set_req_file_id[0], OP_EDONKEYPROT);
             assert_eq!(set_req_file_id[5], super::OP_SETREQFILEID);
             assert_eq!(&set_req_file_id[6..22], &file_hash.0);
+
+            let request_sources = read_packet(&mut stream).await;
+            assert_eq!(request_sources[0], OP_EMULEPROT);
+            assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
 
             let hashset_request = read_packet(&mut stream).await;
             assert_eq!(hashset_request[0], OP_EDONKEYPROT);
@@ -4576,6 +4630,9 @@ mod tests {
             let request_filename = read_packet(&mut stream).await;
             assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
 
+            let request_sources = read_packet(&mut stream).await;
+            assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
+
             let start_upload = read_packet(&mut stream).await;
             assert_eq!(start_upload[5], super::OP_STARTUPLOADREQ);
 
@@ -4721,6 +4778,13 @@ mod tests {
             assert_eq!(request_filename[0], OP_EDONKEYPROT);
             assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
             assert_eq!(&request_filename[6..22], &file_hash.0);
+
+            let request_sources =
+                tokio::time::timeout(Duration::from_secs(3), read_packet(&mut stream))
+                    .await
+                    .unwrap();
+            assert_eq!(request_sources[0], OP_EMULEPROT);
+            assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
 
             let start_upload =
                 tokio::time::timeout(Duration::from_secs(3), read_packet(&mut stream))
@@ -5037,6 +5101,8 @@ mod tests {
                 .unwrap();
             let request_filename = read_packet(&mut stream).await;
             assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
+            let request_sources = read_packet(&mut stream).await;
+            assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
             let _start_upload = read_packet(&mut stream).await;
             stream.write_all(&encode_accept_upload_req()).await.unwrap();
 
