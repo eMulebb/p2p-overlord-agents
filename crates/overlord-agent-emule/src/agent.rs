@@ -5754,7 +5754,7 @@ impl OverlordAgentEmule {
             }
         }
 
-        let server_results = search_source_servers(
+        match search_source_servers(
             runtime.bind_ip,
             &config.p2p.ed2k,
             hello_identity,
@@ -5765,8 +5765,15 @@ impl OverlordAgentEmule {
             file_size,
             &cancel,
         )
-        .await?;
-        merge_download_sources(&mut sources, server_results);
+        .await
+        {
+            Ok(server_results) => merge_download_sources(&mut sources, server_results),
+            Err(error) => {
+                warn!(
+                    "native ED2K download active server source search failed for file_hash={file_hash}: {error}"
+                );
+            }
+        }
         if sources.is_empty() {
             let kad_sources =
                 collect_kad_ed2k_sources(&runtime.dht, file_hash, file_size, source_search_timeout)
