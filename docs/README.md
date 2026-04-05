@@ -28,6 +28,21 @@ direction is explicit.
 - [Protocol Reference](./kad/PROTOCOL_REFERENCE.md)
 - [Observations](./kad/OBSERVATIONS.md)
 - [Wire Sequences](./kad/WIRE_SEQUENCES.md)
+- [ED2K Firewalled Parity Matrix](./kad/ED2K_FIREWALLED_PARITY_MATRIX.md)
+- [ED2K Firewalled Plaintext Parity](./kad/ED2K_FIREWALLED_PARITY.md)
+- [ED2K Firewalled Obfuscated Parity](./kad/ED2K_FIREWALLED_OBFUSCATED_PARITY.md)
+
+### Native Download Acceptance
+
+- For plaintext/native ED2K acceptance runs, keep the capture file external to
+  the repo and feed the target hash, file name, and file size through the
+  enrich/download path directly.
+- Set `OVERLORD_LOG_DIR` for the run so `agent-ed2k-tcp-dump-*.jsonl` captures
+  source candidates, per-peer attempts, packet flow, and final completion
+  evidence for comparison against the external packet capture.
+- Accept the run only when the transfer manifest ends `completed=true`, the
+  verified size matches the requested file size, and the final ED2K hash matches
+  the requested file hash.
 
 ## Repo Guards
 
