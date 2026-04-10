@@ -8,7 +8,9 @@
 use crate::error::DhtError;
 use crate::traversal::{TraversalConfig, TraversalContact, TraversalKind, run_traversal};
 use overlord_kad_net::RpcManager;
-use overlord_kad_proto::constants::{KAD_VERSION_AICH_KEYWORD_PUBLISH, STORE_TIMEOUT_SECS};
+use overlord_kad_proto::constants::{
+    KAD_VERSION_AICH_KEYWORD_PUBLISH, SEARCHTOLERANCE, STORE_TIMEOUT_SECS,
+};
 use overlord_kad_proto::{
     Ed2kHash, KadPacket, NodeId, Tag,
     constants::K,
@@ -100,15 +102,38 @@ async fn execute_publish_fanout(
 ///
 /// A zero configuration value falls back to one contact so a misconfigured
 /// runtime still emits publishes instead of silently disabling them.
+///
+/// Publish receivers apply a much stricter target-distance gate than Kad
+/// search phase 2. We therefore filter the traversal output here so the agent
+/// only spends publish budget on contacts that the eMule harness would accept.
 fn select_publish_contacts(
+    target: NodeId,
     contacts: &[TraversalContact],
     publish_contact_fanout: usize,
 ) -> Vec<TraversalContact> {
     contacts
         .iter()
+        .filter(|contact| publish_target_is_within_tolerance(target, contact))
         .take(publish_contact_fanout.max(1))
         .cloned()
         .collect()
+}
+
+/// Return whether this contact would accept a Kad publish for `target`.
+///
+/// The eMule publish handlers reject requests whose XOR distance first 32-bit
+/// chunk exceeds `SEARCHTOLERANCE`. Unlike our traversal search jump-start, we
+/// intentionally do not keep a LAN exemption here because local loopback test
+/// clusters still enforce the distance gate on receive.
+fn publish_target_is_within_tolerance(target: NodeId, contact: &TraversalContact) -> bool {
+    match contact.addr.ip() {
+        IpAddr::V4(_) => publish_distance_high32(target.distance(&contact.id)) <= SEARCHTOLERANCE,
+        IpAddr::V6(_) => false,
+    }
+}
+
+fn publish_distance_high32(distance: NodeId) -> u32 {
+    u32::from_le_bytes([distance.0[0], distance.0[1], distance.0[2], distance.0[3]])
 }
 
 /// Publish a keyword→file mapping.
@@ -144,7 +169,8 @@ pub async fn publish_keyword(
         return Err(DhtError::PublishFailed);
     }
 
-    let publish_contacts = select_publish_contacts(&traversal.closest, publish_contact_fanout);
+    let publish_contacts =
+        select_publish_contacts(target, &traversal.closest, publish_contact_fanout);
     let mut stats = PublishAttemptStats {
         closest_contacts_considered: traversal.closest.len() as u32,
         attempted_contacts: publish_contacts.len() as u32,
@@ -313,7 +339,8 @@ pub async fn publish_source(
         tags,
     });
 
-    let publish_contacts = select_publish_contacts(&traversal.closest, publish_contact_fanout);
+    let publish_contacts =
+        select_publish_contacts(target, &traversal.closest, publish_contact_fanout);
     let mut stats = PublishAttemptStats {
         closest_contacts_considered: traversal.closest.len() as u32,
         attempted_contacts: publish_contacts.len() as u32,
@@ -426,7 +453,8 @@ pub async fn publish_notes(
         tags,
     });
 
-    let publish_contacts = select_publish_contacts(&traversal.closest, publish_contact_fanout);
+    let publish_contacts =
+        select_publish_contacts(target, &traversal.closest, publish_contact_fanout);
     for contact in &publish_contacts {
         register_publish_contact(rpc, contact);
     }
@@ -520,27 +548,35 @@ fn register_publish_contact(rpc: &RpcManager, contact: &TraversalContact) {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_keyword_publish_packet, select_publish_contacts};
+    use super::{
+        build_keyword_publish_packet, publish_target_is_within_tolerance, select_publish_contacts,
+    };
     use crate::traversal::TraversalContact;
     use overlord_kad_proto::{Ed2kHash, KadPacket, NodeId, Tag, TagName, TagValue, tag_name};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    fn traversal_contact(index: u8) -> TraversalContact {
+    fn close_publish_contact(distance_low_byte: u8, host: u8) -> TraversalContact {
+        let mut id = [0u8; 16];
+        id[0] = distance_low_byte;
         TraversalContact {
-            id: NodeId::from_bytes([index; 16]),
-            addr: SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(10, 0, 0, index)),
-                4_000 + index as u16,
-            ),
-            version: index,
+            id: NodeId::from_bytes(id),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, host)), 4_600),
+            version: 9,
         }
     }
 
     #[test]
     fn select_publish_contacts_respects_requested_fanout() {
-        let contacts = (1..=5).map(traversal_contact).collect::<Vec<_>>();
+        let target = NodeId::ZERO;
+        let contacts = vec![
+            close_publish_contact(1, 2),
+            close_publish_contact(2, 3),
+            close_publish_contact(3, 4),
+            close_publish_contact(4, 5),
+            close_publish_contact(5, 6),
+        ];
 
-        let selected = select_publish_contacts(&contacts, 3);
+        let selected = select_publish_contacts(target, &contacts, 3);
 
         assert_eq!(selected.len(), 3);
         assert_eq!(selected[0].id, contacts[0].id);
@@ -549,12 +585,41 @@ mod tests {
 
     #[test]
     fn select_publish_contacts_clamps_zero_to_one() {
-        let contacts = (1..=5).map(traversal_contact).collect::<Vec<_>>();
+        let target = NodeId::ZERO;
+        let contacts = vec![close_publish_contact(1, 2), close_publish_contact(2, 3)];
 
-        let selected = select_publish_contacts(&contacts, 0);
+        let selected = select_publish_contacts(target, &contacts, 0);
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, contacts[0].id);
+    }
+
+    #[test]
+    fn select_publish_contacts_filters_far_contacts_before_fanout() {
+        let target = NodeId::ZERO;
+        let close = close_publish_contact(1, 2);
+        let far = TraversalContact {
+            id: NodeId::from_bytes([0xFF; 16]),
+            addr: "127.0.0.3:4672".parse().unwrap(),
+            version: 9,
+        };
+
+        let selected = select_publish_contacts(target, &[close.clone(), far], 4);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, close.id);
+    }
+
+    #[test]
+    fn publish_tolerance_uses_strict_distance_even_for_loopback_contacts() {
+        let target = NodeId::ZERO;
+        let far_loopback = TraversalContact {
+            id: NodeId::from_bytes([0xFF; 16]),
+            addr: "127.0.0.10:4672".parse().unwrap(),
+            version: 9,
+        };
+
+        assert!(!publish_target_is_within_tolerance(target, &far_loopback));
     }
 
     #[test]
