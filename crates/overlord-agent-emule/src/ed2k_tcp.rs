@@ -2640,7 +2640,9 @@ fn decode_hello_tag(mut bytes: &[u8]) -> Result<(Option<u8>, &[u8])> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DecodedHelloIdentity {
+    user_hash: [u8; 16],
     client_id: u32,
+    tcp_port: u16,
 }
 
 fn decode_hello_identity(payload: &[u8]) -> Result<DecodedHelloIdentity> {
@@ -2652,12 +2654,16 @@ fn decode_hello_identity(payload: &[u8]) -> Result<DecodedHelloIdentity> {
         anyhow::bail!("short eD2k hello identity payload");
     }
     Ok(DecodedHelloIdentity {
+        user_hash: type_payload[..16]
+            .try_into()
+            .context("short eD2k hello user hash")?,
         client_id: u32::from_le_bytes([
             type_payload[16],
             type_payload[17],
             type_payload[18],
             type_payload[19],
         ]),
+        tcp_port: u16::from_le_bytes([type_payload[20], type_payload[21]]),
     })
 }
 
@@ -2962,8 +2968,7 @@ async fn handle_connection(
             (OP_EDONKEYPROT, OP_HELLO) => {
                 let is_mule_hello = is_mule_hello(&packet.payload)?;
                 let remote_hello = decode_hello_identity(&packet.payload)?;
-                peer_upload_identity =
-                    upload_peer_identity_with_client_id(peer_addr, remote_hello.client_id);
+                peer_upload_identity = upload_peer_identity_from_hello(peer_addr, &remote_hello);
                 debug!(
                     "received eD2k OP_HELLO from {peer_addr} transport={} mule_hello={is_mule_hello}",
                     transport.mode.as_str(),
@@ -3454,15 +3459,19 @@ fn upload_peer_identity_from_socket(peer_addr: SocketAddr) -> Ed2kUploadPeerIden
     }
 }
 
-fn upload_peer_identity_with_client_id(
+fn upload_peer_identity_from_hello(
     peer_addr: SocketAddr,
-    client_id: u32,
+    remote_hello: &DecodedHelloIdentity,
 ) -> Ed2kUploadPeerIdentity {
     Ed2kUploadPeerIdentity {
         ip: peer_addr.ip(),
-        tcp_port: peer_addr.port(),
-        user_hash: None,
-        client_id: Some(client_id),
+        tcp_port: if remote_hello.tcp_port == 0 {
+            peer_addr.port()
+        } else {
+            remote_hello.tcp_port
+        },
+        user_hash: Some(remote_hello.user_hash),
+        client_id: Some(remote_hello.client_id),
     }
 }
 
