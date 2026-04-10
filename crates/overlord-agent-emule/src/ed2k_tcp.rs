@@ -58,7 +58,8 @@ use tracing::{debug, info, warn};
 use crate::ed2k_server::{Ed2kFoundSource, Ed2kServerState};
 use crate::ed2k_transfer::{
     ED2K_EMBLOCK_SIZE, ED2K_PART_SIZE, Ed2kResumeManifest, Ed2kSourceHint, Ed2kTransferRuntime,
-    Ed2kTransferState, new_transfer_job,
+    Ed2kTransferState, Ed2kUploadPeerIdentity, Ed2kUploadSessionHandle, Ed2kUploadSessionStatus,
+    new_transfer_job,
 };
 use crate::kad_firewall::KadFirewallState;
 use overlord_kad_dht::DhtNode;
@@ -79,6 +80,7 @@ const OP_HASHSETREQUEST: u8 = 0x51;
 const OP_HASHSETANSWER: u8 = 0x52;
 const OP_STARTUPLOADREQ: u8 = 0x54;
 const OP_ACCEPTUPLOADREQ: u8 = 0x55;
+const OP_CANCELTRANSFER: u8 = 0x56;
 const OP_REQUESTFILENAME: u8 = 0x58;
 const OP_REQFILENAMEANSWER: u8 = 0x59;
 const OP_QUEUERANKING: u8 = 0x60;
@@ -101,6 +103,7 @@ const OP_FWCHECKUDPREQ: u8 = 0xA7;
 const TCP_PACKET_HEADER_LEN: usize = 6;
 const MAX_PEER_DECOMPRESSED_PACKET_LEN: usize = 50_000;
 const ED2K_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const ED2K_UPLOAD_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const FIREWALL_HELPER_POST_REQUEST_KEEPALIVE_SECS: u64 = 10;
 const ED2K_UPLOAD_PACKET_SPLIT_THRESHOLD: usize = 13_000;
 const ED2K_UPLOAD_PACKET_FRAGMENT_LEN: usize = 10_240;
@@ -2800,20 +2803,27 @@ pub async fn run_ed2k_listener(
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
-                if let Err(error) = handle_connection(
-                    stream,
-                    peer_addr,
-                    &dht,
-                    &server_state,
-                    &kad_firewall,
-                    &secure_ident,
-                    &transfer_runtime,
-                    hello_identity,
-                )
-                .await
-                {
-                    debug!("eD2k connection handling failed from {peer_addr}: {error}");
-                }
+                let dht = dht.clone();
+                let server_state = Arc::clone(&server_state);
+                let kad_firewall = Arc::clone(&kad_firewall);
+                let secure_ident = Arc::clone(&secure_ident);
+                let transfer_runtime = Arc::clone(&transfer_runtime);
+                tokio::spawn(async move {
+                    if let Err(error) = handle_connection(
+                        stream,
+                        peer_addr,
+                        &dht,
+                        &server_state,
+                        &kad_firewall,
+                        &secure_ident,
+                        &transfer_runtime,
+                        hello_identity,
+                    )
+                    .await
+                    {
+                        debug!("eD2k connection handling failed from {peer_addr}: {error}");
+                    }
+                });
             }
             Err(error) if is_transient_accept_error(&error) => {
                 debug!("ignoring transient eD2k accept failure: {error}");
@@ -2869,17 +2879,69 @@ async fn handle_connection(
     );
     let mut peer_secure_ident = Ed2kPeerSecureIdentState::default();
     let mut requested_file_hash: Option<Ed2kHash> = None;
+    let mut peer_upload_identity = upload_peer_identity_from_socket(peer_addr);
+    let mut upload_session: Option<Ed2kUploadSessionHandle> = None;
+    let mut upload_session_file_hash: Option<Ed2kHash> = None;
+    let mut upload_granted_sent = false;
+    let mut last_queue_rank = None;
 
-    loop {
-        let packet =
-            match tokio::time::timeout(ED2K_CONNECTION_IDLE_TIMEOUT, transport.read_packet()).await
-            {
-                Ok(packet) => packet
-                    .with_context(|| format!("failed to read eD2k packet from {peer_addr}"))?,
-                Err(_) => return Ok(()),
-            };
+    let result = loop {
+        let read_timeout = if upload_session.is_some() {
+            ED2K_UPLOAD_QUEUE_POLL_INTERVAL
+        } else {
+            ED2K_CONNECTION_IDLE_TIMEOUT
+        };
+        let packet = match tokio::time::timeout(read_timeout, transport.read_packet()).await {
+            Ok(packet) => {
+                packet.with_context(|| format!("failed to read eD2k packet from {peer_addr}"))?
+            }
+            Err(_) => {
+                let Some(upload_session_handle) = upload_session.as_ref() else {
+                    break Ok(());
+                };
+                match transfer_runtime
+                    .poll_upload_session(upload_session_handle, true)
+                    .await
+                {
+                    Ed2kUploadSessionStatus::Granted => {
+                        if !upload_granted_sent {
+                            let reply = encode_accept_upload_req();
+                            dump_ed2k_tcp_listener_send(
+                                peer_addr,
+                                transport.mode,
+                                "accept_upload",
+                                &reply,
+                            );
+                            transport.write_all(&reply).await.with_context(|| {
+                                format!("failed to send OP_ACCEPTUPLOADREQ to {peer_addr}")
+                            })?;
+                            upload_granted_sent = true;
+                            last_queue_rank = None;
+                        }
+                        continue;
+                    }
+                    Ed2kUploadSessionStatus::Waiting { rank } => {
+                        if last_queue_rank != Some(rank) {
+                            let reply = encode_queue_ranking(rank);
+                            dump_ed2k_tcp_listener_send(
+                                peer_addr,
+                                transport.mode,
+                                "queue_ranking",
+                                &reply,
+                            );
+                            transport.write_all(&reply).await.with_context(|| {
+                                format!("failed to send OP_QUEUERANKING to {peer_addr}")
+                            })?;
+                            last_queue_rank = Some(rank);
+                        }
+                        continue;
+                    }
+                    Ed2kUploadSessionStatus::Stale => break Ok(()),
+                }
+            }
+        };
         let Some(packet) = packet else {
-            return Ok(());
+            break Ok(());
         };
         dump_ed2k_tcp_listener_recv(peer_addr, transport.mode, "session", &packet);
 
@@ -2887,6 +2949,8 @@ async fn handle_connection(
             (OP_EDONKEYPROT, OP_HELLO) => {
                 let is_mule_hello = is_mule_hello(&packet.payload)?;
                 let remote_hello = decode_hello_identity(&packet.payload)?;
+                peer_upload_identity =
+                    upload_peer_identity_with_client_id(peer_addr, remote_hello.client_id);
                 debug!(
                     "received eD2k OP_HELLO from {peer_addr} transport={} mule_hello={is_mule_hello}",
                     transport.mode.as_str(),
@@ -2941,8 +3005,8 @@ async fn handle_connection(
                     )
                     .await?
                     {
-                        Ed2kPeerDownloadOutcome::Completed => return Ok(()),
-                        Ed2kPeerDownloadOutcome::AcceptedButIncomplete => return Ok(()),
+                        Ed2kPeerDownloadOutcome::Completed => break Ok(()),
+                        Ed2kPeerDownloadOutcome::AcceptedButIncomplete => break Ok(()),
                     }
                 }
             }
@@ -2982,7 +3046,45 @@ async fn handle_connection(
                 let requested = decode_file_hash_payload(&packet.payload)?;
                 requested_file_hash = Some(requested);
                 let reply = if transfer_runtime.local_entry(&requested).await?.is_some() {
-                    encode_accept_upload_req()
+                    let status = if upload_session_file_hash == Some(requested) {
+                        match upload_session.as_ref() {
+                            Some(upload_session_handle) => {
+                                transfer_runtime
+                                    .poll_upload_session(upload_session_handle, true)
+                                    .await
+                            }
+                            None => Ed2kUploadSessionStatus::Stale,
+                        }
+                    } else {
+                        if let Some(previous_session) = upload_session.take() {
+                            transfer_runtime
+                                .release_upload_session(&previous_session)
+                                .await;
+                        }
+                        let (session_handle, status) = transfer_runtime
+                            .begin_upload_session(peer_upload_identity.clone(), &requested)
+                            .await;
+                        upload_session = Some(session_handle);
+                        upload_session_file_hash = Some(requested);
+                        status
+                    };
+                    match status {
+                        Ed2kUploadSessionStatus::Granted => {
+                            upload_granted_sent = true;
+                            last_queue_rank = None;
+                            encode_accept_upload_req()
+                        }
+                        Ed2kUploadSessionStatus::Waiting { rank } => {
+                            upload_granted_sent = false;
+                            last_queue_rank = Some(rank);
+                            encode_queue_ranking(rank)
+                        }
+                        Ed2kUploadSessionStatus::Stale => {
+                            upload_granted_sent = false;
+                            last_queue_rank = Some(1);
+                            encode_queue_ranking(1)
+                        }
+                    }
                 } else {
                     encode_file_req_ans_nofil(&requested)
                 };
@@ -2990,6 +3092,15 @@ async fn handle_connection(
                 transport.write_all(&reply).await.with_context(|| {
                     format!("failed to send OP_STARTUPLOADREQ response to {peer_addr}")
                 })?;
+            }
+            (OP_EDONKEYPROT, OP_CANCELTRANSFER) => {
+                if let Some(upload_session_handle) = upload_session.as_ref() {
+                    transfer_runtime
+                        .release_upload_session(upload_session_handle)
+                        .await;
+                }
+                upload_session = None;
+                break Ok(());
             }
             (OP_EDONKEYPROT, OP_HASHSETREQUEST) => {
                 let requested = decode_file_hash_payload(&packet.payload)?;
@@ -3025,6 +3136,91 @@ async fn handle_connection(
                     })?;
                     continue;
                 };
+
+                if upload_session_file_hash != Some(requested) {
+                    if let Some(previous_session) = upload_session.take() {
+                        transfer_runtime
+                            .release_upload_session(&previous_session)
+                            .await;
+                    }
+                    let (session_handle, status) = transfer_runtime
+                        .begin_upload_session(peer_upload_identity.clone(), &requested)
+                        .await;
+                    upload_session = Some(session_handle);
+                    upload_session_file_hash = Some(requested);
+                    upload_granted_sent = false;
+                    match status {
+                        Ed2kUploadSessionStatus::Granted => {
+                            let reply = encode_accept_upload_req();
+                            dump_ed2k_tcp_listener_send(
+                                peer_addr,
+                                transport.mode,
+                                "accept_upload",
+                                &reply,
+                            );
+                            transport.write_all(&reply).await.with_context(|| {
+                                format!("failed to send OP_ACCEPTUPLOADREQ to {peer_addr}")
+                            })?;
+                            upload_granted_sent = true;
+                            last_queue_rank = None;
+                        }
+                        Ed2kUploadSessionStatus::Waiting { rank } => {
+                            let reply = encode_queue_ranking(rank);
+                            dump_ed2k_tcp_listener_send(
+                                peer_addr,
+                                transport.mode,
+                                "queue_ranking",
+                                &reply,
+                            );
+                            transport.write_all(&reply).await.with_context(|| {
+                                format!("failed to send OP_QUEUERANKING to {peer_addr}")
+                            })?;
+                            last_queue_rank = Some(rank);
+                            continue;
+                        }
+                        Ed2kUploadSessionStatus::Stale => continue,
+                    }
+                }
+
+                let Some(upload_session_handle) = upload_session.as_ref() else {
+                    continue;
+                };
+                match transfer_runtime
+                    .note_upload_request_parts(upload_session_handle)
+                    .await
+                {
+                    Ed2kUploadSessionStatus::Granted => {
+                        if !upload_granted_sent {
+                            let reply = encode_accept_upload_req();
+                            dump_ed2k_tcp_listener_send(
+                                peer_addr,
+                                transport.mode,
+                                "accept_upload",
+                                &reply,
+                            );
+                            transport.write_all(&reply).await.with_context(|| {
+                                format!("failed to send OP_ACCEPTUPLOADREQ to {peer_addr}")
+                            })?;
+                            upload_granted_sent = true;
+                        }
+                        last_queue_rank = None;
+                    }
+                    Ed2kUploadSessionStatus::Waiting { rank } => {
+                        let reply = encode_queue_ranking(rank);
+                        dump_ed2k_tcp_listener_send(
+                            peer_addr,
+                            transport.mode,
+                            "queue_ranking",
+                            &reply,
+                        );
+                        transport.write_all(&reply).await.with_context(|| {
+                            format!("failed to send OP_QUEUERANKING to {peer_addr}")
+                        })?;
+                        last_queue_rank = Some(rank);
+                        continue;
+                    }
+                    Ed2kUploadSessionStatus::Stale => break Ok(()),
+                }
                 for (start, end) in ranges {
                     let Some(bytes) = transfer_runtime
                         .read_verified_range(&requested, start, end)
@@ -3178,15 +3374,43 @@ async fn handle_connection(
                         "closing eD2k connection from {peer_addr}: unsupported protocol=0x{:02X} opcode=0x{:02X} requested_file_hash={requested_file_hash}",
                         packet.protocol, packet.opcode
                     );
-                    return Ok(());
+                    break Ok(());
                 }
                 debug!(
                     "closing eD2k connection from {peer_addr}: unsupported protocol=0x{:02X} opcode=0x{:02X}",
                     packet.protocol, packet.opcode
                 );
-                return Ok(());
+                break Ok(());
             }
         }
+    };
+
+    if let Some(upload_session_handle) = upload_session.as_ref() {
+        transfer_runtime
+            .release_upload_session(upload_session_handle)
+            .await;
+    }
+    result
+}
+
+fn upload_peer_identity_from_socket(peer_addr: SocketAddr) -> Ed2kUploadPeerIdentity {
+    Ed2kUploadPeerIdentity {
+        ip: peer_addr.ip(),
+        tcp_port: peer_addr.port(),
+        user_hash: None,
+        client_id: None,
+    }
+}
+
+fn upload_peer_identity_with_client_id(
+    peer_addr: SocketAddr,
+    client_id: u32,
+) -> Ed2kUploadPeerIdentity {
+    Ed2kUploadPeerIdentity {
+        ip: peer_addr.ip(),
+        tcp_port: peer_addr.port(),
+        user_hash: None,
+        client_id: Some(client_id),
     }
 }
 
@@ -3319,6 +3543,10 @@ fn encode_file_req_ans_nofil(file_hash: &Ed2kHash) -> Vec<u8> {
 
 fn encode_accept_upload_req() -> Vec<u8> {
     encode_packet(OP_EDONKEYPROT, OP_ACCEPTUPLOADREQ, &[])
+}
+
+fn encode_queue_ranking(rank: u16) -> Vec<u8> {
+    encode_packet(OP_EMULEPROT, OP_QUEUERANKING, &rank.to_le_bytes())
 }
 
 fn encode_start_upload_req(file_hash: &Ed2kHash) -> Vec<u8> {
@@ -4071,7 +4299,9 @@ mod tests {
     };
     use crate::{
         ed2k_server::{Ed2kFoundSource, Ed2kServerState},
-        ed2k_transfer::{ED2K_PART_SIZE, Ed2kTransferRuntime, new_transfer_job},
+        ed2k_transfer::{
+            ED2K_PART_SIZE, Ed2kTransferRuntime, Ed2kUploadQueueConfig, new_transfer_job,
+        },
         kad_firewall::KadFirewallState,
         paths::unique_test_dir,
     };
@@ -6805,6 +7035,400 @@ mod tests {
         assert!(saw_compressed);
         assert_eq!(reconstructed, payload);
         drop(stream);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn listener_upload_queue_promotes_waiter_after_disconnect() {
+        async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
+            let mut header = [0u8; 6];
+            stream.read_exact(&mut header).await.unwrap();
+            let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+            let mut packet = header.to_vec();
+            let mut payload = vec![0u8; packet_len - 1];
+            stream.read_exact(&mut payload).await.unwrap();
+            packet.extend_from_slice(&payload);
+            packet
+        }
+
+        async fn read_until_opcode(stream: &mut TcpStream, protocol: u8, opcode: u8) -> Vec<u8> {
+            loop {
+                let packet = read_packet(stream).await;
+                if packet[0] == protocol && packet[5] == opcode {
+                    return packet;
+                }
+            }
+        }
+
+        let payload = vec![0x51; 4096];
+        let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
+        let file_hash_hex = file_hash.to_string();
+        let root = unique_test_dir("ed2k-upload-listener-queue-disconnect");
+        let transfer_runtime = Arc::new(Ed2kTransferRuntime::load_or_create(&root).unwrap());
+        transfer_runtime
+            .configure_upload_queue(Ed2kUploadQueueConfig {
+                active_slots: 1,
+                waiting_capacity: 8,
+                waiting_timeout: Duration::from_secs(30),
+                granted_timeout: Duration::from_secs(30),
+                upload_timeout: Duration::from_secs(30),
+            })
+            .await;
+        let job = new_transfer_job(file_hash, "queued.txt".to_string(), payload.len() as u64);
+        transfer_runtime.ensure_job(&job).await.unwrap();
+        transfer_runtime
+            .store_md4_hashset(&file_hash_hex, Vec::new())
+            .await
+            .unwrap();
+        transfer_runtime
+            .store_piece_data(&file_hash_hex, 0, &payload)
+            .await
+            .unwrap();
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let dht = DhtNode::new(DhtConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            node_id: NodeId::from_bytes([0x3D; 16]),
+            udp_key: 0x1122_3344,
+            ..DhtConfig::default()
+        })
+        .await
+        .unwrap();
+        let server_state = Arc::new(RwLock::new(Ed2kServerState::default()));
+        let kad_firewall = Arc::new(Mutex::new(KadFirewallState::default()));
+        let secure_ident = Arc::new(
+            Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+                .unwrap(),
+        );
+        let hello_identity = Ed2kHelloIdentity {
+            user_hash: [0x22; 16],
+            client_id: 0x1234_5678,
+            tcp_port: 41001,
+            udp_port: 41000,
+            server_ip: 0,
+            server_port: 0,
+            connect_options: emule_connect_options(false),
+            direct_udp_callback: false,
+        };
+
+        let server = tokio::spawn({
+            let dht = dht.clone();
+            let transfer_runtime = Arc::clone(&transfer_runtime);
+            let server_state = Arc::clone(&server_state);
+            let kad_firewall = Arc::clone(&kad_firewall);
+            let secure_ident = Arc::clone(&secure_ident);
+            async move {
+                let (first_stream, first_addr) = listener.accept().await.unwrap();
+                let first = tokio::spawn({
+                    let dht = dht.clone();
+                    let transfer_runtime = Arc::clone(&transfer_runtime);
+                    let server_state = Arc::clone(&server_state);
+                    let kad_firewall = Arc::clone(&kad_firewall);
+                    let secure_ident = Arc::clone(&secure_ident);
+                    async move {
+                        super::handle_connection(
+                            first_stream,
+                            first_addr,
+                            &dht,
+                            &server_state,
+                            &kad_firewall,
+                            &secure_ident,
+                            &transfer_runtime,
+                            hello_identity,
+                        )
+                        .await
+                    }
+                });
+
+                let (second_stream, second_addr) = listener.accept().await.unwrap();
+                let second = tokio::spawn({
+                    let transfer_runtime = Arc::clone(&transfer_runtime);
+                    let server_state = Arc::clone(&server_state);
+                    let kad_firewall = Arc::clone(&kad_firewall);
+                    let secure_ident = Arc::clone(&secure_ident);
+                    async move {
+                        super::handle_connection(
+                            second_stream,
+                            second_addr,
+                            &dht,
+                            &server_state,
+                            &kad_firewall,
+                            &secure_ident,
+                            &transfer_runtime,
+                            hello_identity,
+                        )
+                        .await
+                    }
+                });
+
+                first.await.unwrap().unwrap();
+                second.await.unwrap().unwrap();
+            }
+        });
+
+        let first_identity = Ed2kHelloIdentity {
+            user_hash: [0x31; 16],
+            client_id: 0x0102_0304,
+            tcp_port: 4661,
+            udp_port: 4665,
+            server_ip: 0,
+            server_port: 0,
+            connect_options: emule_connect_options(false),
+            direct_udp_callback: false,
+        };
+        let mut first_stream = TcpStream::connect(peer_addr).await.unwrap();
+        first_stream
+            .write_all(&encode_hello_request(first_identity))
+            .await
+            .unwrap();
+        let _ = read_until_opcode(&mut first_stream, OP_EDONKEYPROT, OP_HELLOANSWER).await;
+        first_stream
+            .write_all(&super::encode_start_upload_req(&file_hash))
+            .await
+            .unwrap();
+        let _ =
+            read_until_opcode(&mut first_stream, OP_EDONKEYPROT, super::OP_ACCEPTUPLOADREQ).await;
+
+        let second_identity = Ed2kHelloIdentity {
+            user_hash: [0x32; 16],
+            client_id: 0x0506_0708,
+            tcp_port: 4662,
+            udp_port: 4666,
+            server_ip: 0,
+            server_port: 0,
+            connect_options: emule_connect_options(false),
+            direct_udp_callback: false,
+        };
+        let mut second_stream = TcpStream::connect(peer_addr).await.unwrap();
+        second_stream
+            .write_all(&encode_hello_request(second_identity))
+            .await
+            .unwrap();
+        let _ = read_until_opcode(&mut second_stream, OP_EDONKEYPROT, OP_HELLOANSWER).await;
+        second_stream
+            .write_all(&super::encode_start_upload_req(&file_hash))
+            .await
+            .unwrap();
+        let queue_ranking =
+            read_until_opcode(&mut second_stream, OP_EMULEPROT, super::OP_QUEUERANKING).await;
+        assert_eq!(u16::from_le_bytes([queue_ranking[6], queue_ranking[7]]), 1);
+
+        drop(first_stream);
+
+        let promoted = tokio::time::timeout(
+            Duration::from_secs(3),
+            read_until_opcode(
+                &mut second_stream,
+                OP_EDONKEYPROT,
+                super::OP_ACCEPTUPLOADREQ,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(promoted.len(), 6);
+        drop(second_stream);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn listener_upload_queue_promotes_waiter_after_cancel_transfer() {
+        async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
+            let mut header = [0u8; 6];
+            stream.read_exact(&mut header).await.unwrap();
+            let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+            let mut packet = header.to_vec();
+            let mut payload = vec![0u8; packet_len - 1];
+            stream.read_exact(&mut payload).await.unwrap();
+            packet.extend_from_slice(&payload);
+            packet
+        }
+
+        async fn read_until_opcode(stream: &mut TcpStream, protocol: u8, opcode: u8) -> Vec<u8> {
+            loop {
+                let packet = read_packet(stream).await;
+                if packet[0] == protocol && packet[5] == opcode {
+                    return packet;
+                }
+            }
+        }
+
+        let payload = vec![0x61; 4096];
+        let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
+        let file_hash_hex = file_hash.to_string();
+        let root = unique_test_dir("ed2k-upload-listener-queue-cancel");
+        let transfer_runtime = Arc::new(Ed2kTransferRuntime::load_or_create(&root).unwrap());
+        transfer_runtime
+            .configure_upload_queue(Ed2kUploadQueueConfig {
+                active_slots: 1,
+                waiting_capacity: 8,
+                waiting_timeout: Duration::from_secs(30),
+                granted_timeout: Duration::from_secs(30),
+                upload_timeout: Duration::from_secs(30),
+            })
+            .await;
+        let job = new_transfer_job(file_hash, "queued.txt".to_string(), payload.len() as u64);
+        transfer_runtime.ensure_job(&job).await.unwrap();
+        transfer_runtime
+            .store_md4_hashset(&file_hash_hex, Vec::new())
+            .await
+            .unwrap();
+        transfer_runtime
+            .store_piece_data(&file_hash_hex, 0, &payload)
+            .await
+            .unwrap();
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let dht = DhtNode::new(DhtConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            node_id: NodeId::from_bytes([0x3E; 16]),
+            udp_key: 0x5566_7788,
+            ..DhtConfig::default()
+        })
+        .await
+        .unwrap();
+        let server_state = Arc::new(RwLock::new(Ed2kServerState::default()));
+        let kad_firewall = Arc::new(Mutex::new(KadFirewallState::default()));
+        let secure_ident = Arc::new(
+            Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+                .unwrap(),
+        );
+        let hello_identity = Ed2kHelloIdentity {
+            user_hash: [0x23; 16],
+            client_id: 0x2233_4455,
+            tcp_port: 41002,
+            udp_port: 41003,
+            server_ip: 0,
+            server_port: 0,
+            connect_options: emule_connect_options(false),
+            direct_udp_callback: false,
+        };
+
+        let server = tokio::spawn({
+            let dht = dht.clone();
+            let transfer_runtime = Arc::clone(&transfer_runtime);
+            let server_state = Arc::clone(&server_state);
+            let kad_firewall = Arc::clone(&kad_firewall);
+            let secure_ident = Arc::clone(&secure_ident);
+            async move {
+                let (first_stream, first_addr) = listener.accept().await.unwrap();
+                let first = tokio::spawn({
+                    let dht = dht.clone();
+                    let transfer_runtime = Arc::clone(&transfer_runtime);
+                    let server_state = Arc::clone(&server_state);
+                    let kad_firewall = Arc::clone(&kad_firewall);
+                    let secure_ident = Arc::clone(&secure_ident);
+                    async move {
+                        super::handle_connection(
+                            first_stream,
+                            first_addr,
+                            &dht,
+                            &server_state,
+                            &kad_firewall,
+                            &secure_ident,
+                            &transfer_runtime,
+                            hello_identity,
+                        )
+                        .await
+                    }
+                });
+
+                let (second_stream, second_addr) = listener.accept().await.unwrap();
+                let second = tokio::spawn({
+                    let transfer_runtime = Arc::clone(&transfer_runtime);
+                    let server_state = Arc::clone(&server_state);
+                    let kad_firewall = Arc::clone(&kad_firewall);
+                    let secure_ident = Arc::clone(&secure_ident);
+                    async move {
+                        super::handle_connection(
+                            second_stream,
+                            second_addr,
+                            &dht,
+                            &server_state,
+                            &kad_firewall,
+                            &secure_ident,
+                            &transfer_runtime,
+                            hello_identity,
+                        )
+                        .await
+                    }
+                });
+
+                first.await.unwrap().unwrap();
+                second.await.unwrap().unwrap();
+            }
+        });
+
+        let first_identity = Ed2kHelloIdentity {
+            user_hash: [0x41; 16],
+            client_id: 0x1111_1111,
+            tcp_port: 4661,
+            udp_port: 4665,
+            server_ip: 0,
+            server_port: 0,
+            connect_options: emule_connect_options(false),
+            direct_udp_callback: false,
+        };
+        let mut first_stream = TcpStream::connect(peer_addr).await.unwrap();
+        first_stream
+            .write_all(&encode_hello_request(first_identity))
+            .await
+            .unwrap();
+        let _ = read_until_opcode(&mut first_stream, OP_EDONKEYPROT, OP_HELLOANSWER).await;
+        first_stream
+            .write_all(&super::encode_start_upload_req(&file_hash))
+            .await
+            .unwrap();
+        let _ =
+            read_until_opcode(&mut first_stream, OP_EDONKEYPROT, super::OP_ACCEPTUPLOADREQ).await;
+
+        let second_identity = Ed2kHelloIdentity {
+            user_hash: [0x42; 16],
+            client_id: 0x2222_2222,
+            tcp_port: 4662,
+            udp_port: 4666,
+            server_ip: 0,
+            server_port: 0,
+            connect_options: emule_connect_options(false),
+            direct_udp_callback: false,
+        };
+        let mut second_stream = TcpStream::connect(peer_addr).await.unwrap();
+        second_stream
+            .write_all(&encode_hello_request(second_identity))
+            .await
+            .unwrap();
+        let _ = read_until_opcode(&mut second_stream, OP_EDONKEYPROT, OP_HELLOANSWER).await;
+        second_stream
+            .write_all(&super::encode_start_upload_req(&file_hash))
+            .await
+            .unwrap();
+        let queue_ranking =
+            read_until_opcode(&mut second_stream, OP_EMULEPROT, super::OP_QUEUERANKING).await;
+        assert_eq!(u16::from_le_bytes([queue_ranking[6], queue_ranking[7]]), 1);
+
+        first_stream
+            .write_all(&encode_packet(
+                OP_EDONKEYPROT,
+                super::OP_CANCELTRANSFER,
+                &[],
+            ))
+            .await
+            .unwrap();
+        drop(first_stream);
+
+        let promoted = tokio::time::timeout(
+            Duration::from_secs(3),
+            read_until_opcode(
+                &mut second_stream,
+                OP_EDONKEYPROT,
+                super::OP_ACCEPTUPLOADREQ,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(promoted.len(), 6);
+        drop(second_stream);
         server.await.unwrap();
     }
 

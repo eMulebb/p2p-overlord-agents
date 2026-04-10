@@ -11,12 +11,16 @@
 //! - compatibility catalog hints for server-side `OP_OFFERFILES`
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet, VecDeque},
     fs,
+    net::IpAddr,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -32,6 +36,272 @@ pub(crate) const ED2K_PART_SIZE: u64 = 9_728_000;
 pub(crate) const ED2K_EMBLOCK_SIZE: u64 = 184_320;
 const MANIFEST_FILE_NAME: &str = "resume-manifest.json";
 const PAYLOAD_FILE_NAME: &str = "pieces.bin";
+
+/// Upload-slot and waiting-queue policy used by the inbound ED2K listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Ed2kUploadQueueConfig {
+    /// Maximum number of concurrently granted upload sessions.
+    pub active_slots: usize,
+    /// Maximum number of queued waiters retained at once.
+    pub waiting_capacity: usize,
+    /// Maximum idle time for a queued waiter before it is discarded.
+    pub waiting_timeout: Duration,
+    /// Maximum stall time after grant before the peer requests data.
+    pub granted_timeout: Duration,
+    /// Maximum idle time while a peer already has an active upload slot.
+    pub upload_timeout: Duration,
+}
+
+impl Default for Ed2kUploadQueueConfig {
+    fn default() -> Self {
+        Self {
+            active_slots: 3,
+            waiting_capacity: 512,
+            waiting_timeout: Duration::from_secs(180),
+            granted_timeout: Duration::from_secs(30),
+            upload_timeout: Duration::from_secs(90),
+        }
+    }
+}
+
+/// Stable peer identity used to keep uploader queue decisions deterministic.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct Ed2kUploadPeerIdentity {
+    /// Remote peer IP address.
+    pub ip: IpAddr,
+    /// Remote peer TCP port advertised in hello or observed on the socket.
+    pub tcp_port: u16,
+    /// Remote peer user hash when known.
+    pub user_hash: Option<[u8; 16]>,
+    /// Remote peer client-id when known.
+    pub client_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Ed2kUploadSessionKey {
+    peer: Ed2kUploadPeerIdentity,
+    file_hash: String,
+}
+
+/// Opaque handle bound to one live uploader transport session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Ed2kUploadSessionHandle {
+    key: Ed2kUploadSessionKey,
+    connection_id: u64,
+}
+
+/// Queue-visible state of one inbound upload session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ed2kUploadSessionStatus {
+    /// The peer is queued and should see a rank.
+    Waiting { rank: u16 },
+    /// The peer currently owns an upload slot.
+    Granted,
+    /// The session expired, was cancelled, or was replaced by a reconnect.
+    Stale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ed2kUploadSessionPhase {
+    Waiting,
+    Granted,
+    Uploading,
+}
+
+#[derive(Debug, Clone)]
+struct Ed2kUploadSessionEntry {
+    phase: Ed2kUploadSessionPhase,
+    connection_id: u64,
+    last_activity: Instant,
+}
+
+#[derive(Debug)]
+struct Ed2kUploadQueueState {
+    config: Ed2kUploadQueueConfig,
+    sessions: HashMap<Ed2kUploadSessionKey, Ed2kUploadSessionEntry>,
+    waiting_order: VecDeque<Ed2kUploadSessionKey>,
+}
+
+impl Ed2kUploadQueueState {
+    fn new(config: Ed2kUploadQueueConfig) -> Self {
+        Self {
+            config,
+            sessions: HashMap::new(),
+            waiting_order: VecDeque::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn configure(&mut self, config: Ed2kUploadQueueConfig) {
+        self.config = config;
+        let now = Instant::now();
+        self.reap_expired_sessions(now);
+        self.trim_waiting_queue();
+        self.promote_waiters(now);
+    }
+
+    fn begin_session(
+        &mut self,
+        key: Ed2kUploadSessionKey,
+        connection_id: u64,
+        now: Instant,
+    ) -> Ed2kUploadSessionStatus {
+        self.reap_expired_sessions(now);
+        if let Some(session) = self.sessions.get_mut(&key) {
+            session.connection_id = connection_id;
+            session.last_activity = now;
+            return self.status_for_key(&key);
+        }
+
+        let phase = if self.active_session_count() < self.config.active_slots {
+            Ed2kUploadSessionPhase::Granted
+        } else {
+            self.trim_waiting_queue();
+            self.waiting_order.push_back(key.clone());
+            Ed2kUploadSessionPhase::Waiting
+        };
+        self.sessions.insert(
+            key.clone(),
+            Ed2kUploadSessionEntry {
+                phase,
+                connection_id,
+                last_activity: now,
+            },
+        );
+        self.status_for_key(&key)
+    }
+
+    fn poll_session(
+        &mut self,
+        handle: &Ed2kUploadSessionHandle,
+        now: Instant,
+        refresh_activity: bool,
+    ) -> Ed2kUploadSessionStatus {
+        self.reap_expired_sessions(now);
+        let Some(session) = self.sessions.get_mut(&handle.key) else {
+            return Ed2kUploadSessionStatus::Stale;
+        };
+        if session.connection_id != handle.connection_id {
+            return Ed2kUploadSessionStatus::Stale;
+        }
+        if refresh_activity {
+            session.last_activity = now;
+        }
+        self.status_for_key(&handle.key)
+    }
+
+    fn note_request_parts(
+        &mut self,
+        handle: &Ed2kUploadSessionHandle,
+        now: Instant,
+    ) -> Ed2kUploadSessionStatus {
+        self.reap_expired_sessions(now);
+        let Some(session) = self.sessions.get_mut(&handle.key) else {
+            return Ed2kUploadSessionStatus::Stale;
+        };
+        if session.connection_id != handle.connection_id {
+            return Ed2kUploadSessionStatus::Stale;
+        }
+        session.last_activity = now;
+        if matches!(
+            session.phase,
+            Ed2kUploadSessionPhase::Granted | Ed2kUploadSessionPhase::Uploading
+        ) {
+            session.phase = Ed2kUploadSessionPhase::Uploading;
+            return Ed2kUploadSessionStatus::Granted;
+        }
+        self.status_for_key(&handle.key)
+    }
+
+    fn release_session(&mut self, handle: &Ed2kUploadSessionHandle, now: Instant) {
+        let Some(session) = self.sessions.get(&handle.key) else {
+            return;
+        };
+        if session.connection_id != handle.connection_id {
+            return;
+        }
+        let phase = session.phase;
+        self.sessions.remove(&handle.key);
+        if phase == Ed2kUploadSessionPhase::Waiting {
+            self.waiting_order.retain(|key| key != &handle.key);
+        }
+        self.reap_expired_sessions(now);
+        self.promote_waiters(now);
+    }
+
+    fn status_for_key(&self, key: &Ed2kUploadSessionKey) -> Ed2kUploadSessionStatus {
+        match self.sessions.get(key).map(|session| session.phase) {
+            Some(Ed2kUploadSessionPhase::Waiting) => Ed2kUploadSessionStatus::Waiting {
+                rank: self.rank_for_key(key),
+            },
+            Some(Ed2kUploadSessionPhase::Granted | Ed2kUploadSessionPhase::Uploading) => {
+                Ed2kUploadSessionStatus::Granted
+            }
+            None => Ed2kUploadSessionStatus::Stale,
+        }
+    }
+
+    fn rank_for_key(&self, key: &Ed2kUploadSessionKey) -> u16 {
+        let Some(position) = self.waiting_order.iter().position(|queued| queued == key) else {
+            return 0;
+        };
+        u16::try_from(position.saturating_add(1)).unwrap_or(u16::MAX)
+    }
+
+    fn active_session_count(&self) -> usize {
+        self.sessions
+            .values()
+            .filter(|session| {
+                matches!(
+                    session.phase,
+                    Ed2kUploadSessionPhase::Granted | Ed2kUploadSessionPhase::Uploading
+                )
+            })
+            .count()
+    }
+
+    fn trim_waiting_queue(&mut self) {
+        while self.waiting_order.len() >= self.config.waiting_capacity {
+            let Some(evicted) = self.waiting_order.pop_front() else {
+                break;
+            };
+            self.sessions.remove(&evicted);
+        }
+    }
+
+    fn reap_expired_sessions(&mut self, now: Instant) {
+        let expired = self
+            .sessions
+            .iter()
+            .filter_map(|(key, session)| {
+                let timeout = match session.phase {
+                    Ed2kUploadSessionPhase::Waiting => self.config.waiting_timeout,
+                    Ed2kUploadSessionPhase::Granted => self.config.granted_timeout,
+                    Ed2kUploadSessionPhase::Uploading => self.config.upload_timeout,
+                };
+                (now.duration_since(session.last_activity) > timeout).then(|| key.clone())
+            })
+            .collect::<Vec<_>>();
+        for key in expired {
+            self.sessions.remove(&key);
+            self.waiting_order.retain(|queued| queued != &key);
+        }
+        self.promote_waiters(now);
+    }
+
+    fn promote_waiters(&mut self, now: Instant) {
+        while self.active_session_count() < self.config.active_slots {
+            let Some(next_key) = self.waiting_order.pop_front() else {
+                break;
+            };
+            let Some(next_session) = self.sessions.get_mut(&next_key) else {
+                continue;
+            };
+            next_session.phase = Ed2kUploadSessionPhase::Granted;
+            next_session.last_activity = now;
+        }
+    }
+}
 
 /// Shared ED2K advertised file catalog used by the long-lived server session.
 pub type Ed2kSharedCatalog = Arc<RwLock<Vec<Ed2kSharedEntry>>>;
@@ -233,6 +503,8 @@ pub struct Ed2kTransferRuntime {
     shared_catalog: Ed2kSharedCatalog,
     callback_intents: Arc<RwLock<Vec<Ed2kCallbackIntent>>>,
     manifest_io: Arc<Mutex<()>>,
+    upload_queue: Arc<Mutex<Ed2kUploadQueueState>>,
+    next_upload_connection_id: AtomicU64,
 }
 
 impl Ed2kTransferRuntime {
@@ -248,7 +520,17 @@ impl Ed2kTransferRuntime {
             shared_catalog,
             callback_intents: Arc::new(RwLock::new(Vec::new())),
             manifest_io: Arc::new(Mutex::new(())),
+            upload_queue: Arc::new(Mutex::new(Ed2kUploadQueueState::new(
+                Ed2kUploadQueueConfig::default(),
+            ))),
+            next_upload_connection_id: AtomicU64::new(1),
         })
+    }
+
+    /// Override inbound uploader queue policy for controlled scenarios and tests.
+    #[cfg(test)]
+    pub async fn configure_upload_queue(&self, config: Ed2kUploadQueueConfig) {
+        self.upload_queue.lock().await.configure(config);
     }
 
     /// Borrow the shared catalog used by server-session advertisement and
@@ -633,6 +915,61 @@ impl Ed2kTransferRuntime {
         self.load_manifest_unlocked(file_hash).await
     }
 
+    /// Admit or refresh one inbound uploader session and return the queue-visible state.
+    pub async fn begin_upload_session(
+        &self,
+        peer: Ed2kUploadPeerIdentity,
+        file_hash: &Ed2kHash,
+    ) -> (Ed2kUploadSessionHandle, Ed2kUploadSessionStatus) {
+        let connection_id = self
+            .next_upload_connection_id
+            .fetch_add(1, Ordering::Relaxed);
+        let handle = Ed2kUploadSessionHandle {
+            key: Ed2kUploadSessionKey {
+                peer,
+                file_hash: file_hash.to_string(),
+            },
+            connection_id,
+        };
+        let status = self.upload_queue.lock().await.begin_session(
+            handle.key.clone(),
+            connection_id,
+            Instant::now(),
+        );
+        (handle, status)
+    }
+
+    /// Poll the current queue-visible state for one upload session.
+    pub async fn poll_upload_session(
+        &self,
+        handle: &Ed2kUploadSessionHandle,
+        refresh_activity: bool,
+    ) -> Ed2kUploadSessionStatus {
+        self.upload_queue
+            .lock()
+            .await
+            .poll_session(handle, Instant::now(), refresh_activity)
+    }
+
+    /// Mark a part request as activity and return whether the peer may receive data.
+    pub async fn note_upload_request_parts(
+        &self,
+        handle: &Ed2kUploadSessionHandle,
+    ) -> Ed2kUploadSessionStatus {
+        self.upload_queue
+            .lock()
+            .await
+            .note_request_parts(handle, Instant::now())
+    }
+
+    /// Release one upload slot or waiting entry after disconnect or explicit cancel.
+    pub async fn release_upload_session(&self, handle: &Ed2kUploadSessionHandle) {
+        self.upload_queue
+            .lock()
+            .await
+            .release_session(handle, Instant::now());
+    }
+
     async fn load_manifest_or_rebuild_unlocked(
         &self,
         job: &Ed2kTransferJob,
@@ -871,13 +1208,18 @@ fn rebuild_verified_ranges(manifest: &mut Ed2kResumeManifest) {
 mod tests {
     use super::{
         ED2K_PART_SIZE, Ed2kResumeManifest, Ed2kSharedEntry, Ed2kSourceHint, Ed2kTransferRuntime,
-        Ed2kTransferState, new_transfer_job,
+        Ed2kTransferState, Ed2kUploadPeerIdentity, Ed2kUploadQueueConfig, Ed2kUploadSessionStatus,
+        new_transfer_job,
     };
     use crate::paths::unique_test_dir;
     use md4::{Digest, Md4};
     use overlord_agent_common::{HashType, PopularHash};
     use overlord_kad_proto::Ed2kHash;
-    use std::str::FromStr;
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        str::FromStr,
+        time::Duration,
+    };
 
     #[tokio::test]
     async fn ensure_job_tracks_verified_parts_via_md4_hashset() {
@@ -1001,5 +1343,86 @@ mod tests {
                 .all(|piece| piece.state == Ed2kTransferState::Missing)
         );
         assert_eq!(manifest.sources, Vec::<Ed2kSourceHint>::new());
+    }
+
+    #[tokio::test]
+    async fn upload_queue_grants_immediately_then_promotes_waiter() {
+        let root = unique_test_dir("ed2k-upload-queue-promote");
+        let runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+        runtime
+            .configure_upload_queue(Ed2kUploadQueueConfig {
+                active_slots: 1,
+                waiting_capacity: 8,
+                waiting_timeout: Duration::from_secs(30),
+                granted_timeout: Duration::from_secs(30),
+                upload_timeout: Duration::from_secs(30),
+            })
+            .await;
+        let file_hash = Ed2kHash::from_bytes([0x5A; 16]);
+
+        let first_peer = Ed2kUploadPeerIdentity {
+            ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            tcp_port: 4662,
+            user_hash: Some([0x11; 16]),
+            client_id: Some(1),
+        };
+        let second_peer = Ed2kUploadPeerIdentity {
+            ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            tcp_port: 4662,
+            user_hash: Some([0x22; 16]),
+            client_id: Some(2),
+        };
+
+        let (first_handle, first_status) =
+            runtime.begin_upload_session(first_peer, &file_hash).await;
+        assert_eq!(first_status, Ed2kUploadSessionStatus::Granted);
+
+        let (second_handle, second_status) =
+            runtime.begin_upload_session(second_peer, &file_hash).await;
+        assert_eq!(second_status, Ed2kUploadSessionStatus::Waiting { rank: 1 });
+
+        runtime.release_upload_session(&first_handle).await;
+        assert_eq!(
+            runtime.poll_upload_session(&second_handle, true).await,
+            Ed2kUploadSessionStatus::Granted
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_queue_reconnect_replaces_stale_connection() {
+        let root = unique_test_dir("ed2k-upload-queue-reconnect");
+        let runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+        runtime
+            .configure_upload_queue(Ed2kUploadQueueConfig {
+                active_slots: 1,
+                waiting_capacity: 8,
+                waiting_timeout: Duration::from_secs(30),
+                granted_timeout: Duration::from_secs(30),
+                upload_timeout: Duration::from_secs(30),
+            })
+            .await;
+        let file_hash = Ed2kHash::from_bytes([0xA5; 16]);
+        let peer = Ed2kUploadPeerIdentity {
+            ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)),
+            tcp_port: 4662,
+            user_hash: Some([0x44; 16]),
+            client_id: Some(9),
+        };
+
+        let (first_handle, first_status) =
+            runtime.begin_upload_session(peer.clone(), &file_hash).await;
+        assert_eq!(first_status, Ed2kUploadSessionStatus::Granted);
+
+        let (second_handle, second_status) = runtime.begin_upload_session(peer, &file_hash).await;
+        assert_eq!(second_status, Ed2kUploadSessionStatus::Granted);
+        assert_eq!(
+            runtime.poll_upload_session(&first_handle, true).await,
+            Ed2kUploadSessionStatus::Stale
+        );
+        runtime.release_upload_session(&first_handle).await;
+        assert_eq!(
+            runtime.poll_upload_session(&second_handle, true).await,
+            Ed2kUploadSessionStatus::Granted
+        );
     }
 }
