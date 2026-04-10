@@ -746,7 +746,7 @@ pub async fn request_callback_on_server(
                     hello_identity.tcp_port,
                 )
                 .await?;
-                wait_for_offer_files_settle(&mut session).await;
+                wait_for_offer_files_settle(&session).await;
                 session.set_phase(
                     ServerSessionPhase::SearchActive,
                     format!("dispatching callback request client_id={client_id}"),
@@ -1357,7 +1357,7 @@ async fn run_one_server_session(
                 } else {
                     std::future::pending::<()>().await;
                 }
-            } => {
+            }, if queued_background_search.is_none() && pending_background_search.is_none() => {
                 fail_background_search_request(
                     &mut queued_background_search,
                     "ED2K background session rotated before search dispatch",
@@ -1634,7 +1634,10 @@ pub async fn search_keyword_servers(
         return Ok(Vec::new());
     }
 
-    let idle_timeout = Duration::from_secs(config.connect_timeout_secs.max(5));
+    // Live servers regularly take around 10 seconds to emit the LowID warning
+    // plus OP_IDCHANGE before any source search can even start, so the generic
+    // connect timeout floor is too short for real-world GETSOURCES sessions.
+    let idle_timeout = Duration::from_secs(config.connect_timeout_secs.max(15));
     let mut last_error = None;
 
     for (attempt_index, configured_server) in configured_servers
@@ -1728,7 +1731,10 @@ pub async fn search_source_servers(
         configured_servers.insert(0, preferred);
     }
 
-    let idle_timeout = Duration::from_secs(config.connect_timeout_secs.max(5));
+    // Low-ID servers often take around 10 seconds just to emit the warning and
+    // OP_IDCHANGE on a new TCP session, so source-search sessions need a
+    // longer floor than the generic connect timeout to reach GETSOURCES.
+    let idle_timeout = Duration::from_secs(config.connect_timeout_secs.max(15));
     let mut last_error = None;
     let mut aggregated_results: Vec<Ed2kFoundSource> = Vec::new();
 

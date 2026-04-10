@@ -15,9 +15,10 @@
 //! like a dead-end TCP port to real peers.
 
 use std::{
+    borrow::Cow,
     collections::VecDeque,
     fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     str::FromStr,
@@ -30,7 +31,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::SecondsFormat;
-use flate2::{Decompress, FlushDecompress, Status};
+use flate2::{Decompress, FlushDecompress, Status, read::ZlibDecoder};
 use md5::compute as md5_compute;
 use rand::Rng;
 use rsa::{
@@ -93,6 +94,7 @@ const OP_SIGNATURE: u8 = 0x86;
 const OP_SECIDENTSTATE: u8 = 0x87;
 const OP_FWCHECKUDPREQ: u8 = 0xA7;
 const TCP_PACKET_HEADER_LEN: usize = 6;
+const MAX_PEER_DECOMPRESSED_PACKET_LEN: usize = 50_000;
 const ED2K_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const FIREWALL_HELPER_POST_REQUEST_KEEPALIVE_SECS: u64 = 10;
 
@@ -494,6 +496,70 @@ fn ed2k_opcode_name(protocol: u8, opcode: u8) -> &'static str {
     }
 }
 
+fn oracle_ed2k_send_phase(flow: &'static str, protocol: u8, opcode: u8) -> Option<&'static str> {
+    let phase = match (protocol, opcode) {
+        (OP_EDONKEYPROT, OP_HELLO) => "hello_request",
+        (OP_EDONKEYPROT, OP_HELLOANSWER) => "hello_answer",
+        (OP_EDONKEYPROT, OP_REQFILENAMEANSWER) => "filename_answer",
+        (OP_EDONKEYPROT, OP_FILESTATUS) => "file_status",
+        (OP_EMULEPROT, OP_EMULEINFO) => "mule_info",
+        (OP_EMULEPROT, OP_EMULEINFOANSWER) => "mule_info_answer",
+        (OP_EMULEPROT, OP_PUBLICKEY) => "public_key",
+        (OP_EMULEPROT, OP_SIGNATURE) => "signature",
+        (OP_EMULEPROT, OP_SECIDENTSTATE) => "secure_ident_probe",
+        (OP_EMULEPROT, OP_FWCHECKUDPREQ) => "fwcheck_request",
+        _ => match flow {
+            // The oracle emits generic per-session labels for ordinary listener and
+            // downloader traffic, and only uses dedicated phase names for a small
+            // parity-critical subset.
+            "listener" | "native_download" => "session",
+            "udp_firewall_check" => "hello_exchange",
+            _ => return None,
+        },
+    };
+    Some(phase)
+}
+
+fn oracle_ed2k_recv_phase(flow: &'static str, protocol: u8, opcode: u8) -> Option<&'static str> {
+    let phase = match (protocol, opcode) {
+        (OP_EMULEPROT, OP_FWCHECKUDPREQ) => "fwcheck_request",
+        _ => match flow {
+            "listener" | "native_download" => "session",
+            "udp_firewall_check" => "hello_exchange",
+            _ => return None,
+        },
+    };
+    Some(phase)
+}
+
+fn canonical_ed2k_send_phase<'a>(
+    flow: &'static str,
+    fallback: &'a str,
+    protocol: Option<u8>,
+    opcode: Option<u8>,
+) -> Cow<'a, str> {
+    if let Some((protocol, opcode)) = protocol.zip(opcode)
+        && let Some(phase) = oracle_ed2k_send_phase(flow, protocol, opcode)
+    {
+        return Cow::Borrowed(phase);
+    }
+
+    Cow::Borrowed(fallback)
+}
+
+fn canonical_ed2k_recv_phase<'a>(
+    flow: &'static str,
+    fallback: &'a str,
+    protocol: u8,
+    opcode: u8,
+) -> Cow<'a, str> {
+    if let Some(phase) = oracle_ed2k_recv_phase(flow, protocol, opcode) {
+        return Cow::Borrowed(phase);
+    }
+
+    Cow::Borrowed(fallback)
+}
+
 fn dump_ed2k_tcp_record(record: &Ed2kTcpDumpRecord<'_>) {
     let Ok(line) = serde_json::to_string(record) else {
         return;
@@ -554,16 +620,17 @@ fn dump_ed2k_tcp_send(
     } else {
         None
     };
+    let canonical_phase = canonical_ed2k_send_phase(flow, phase, protocol, opcode);
     let record = Ed2kTcpDumpRecord {
         schema: "ed2k_tcp_helper_v1",
         source: "agent",
         ts_utc: chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         event_seq: ed2k_tcp_dump_event_seq(),
         trace_key: ed2k_tcp_trace_key(flow, remote_addr),
-        state_id: ed2k_tcp_state_id(flow, phase),
-        state_label: phase,
+        state_id: ed2k_tcp_state_id(flow, canonical_phase.as_ref()),
+        state_label: canonical_phase.as_ref(),
         flow,
-        phase,
+        phase: canonical_phase.as_ref(),
         direction: "send",
         remote_addr: remote_addr.to_string(),
         transport_mode: transport_mode.as_str(),
@@ -587,16 +654,17 @@ fn dump_ed2k_tcp_recv(
     phase: &str,
     packet: &EmuleTcpPacket,
 ) {
+    let canonical_phase = canonical_ed2k_recv_phase(flow, phase, packet.protocol, packet.opcode);
     let record = Ed2kTcpDumpRecord {
         schema: "ed2k_tcp_helper_v1",
         source: "agent",
         ts_utc: chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         event_seq: ed2k_tcp_dump_event_seq(),
         trace_key: ed2k_tcp_trace_key(flow, remote_addr),
-        state_id: ed2k_tcp_state_id(flow, phase),
-        state_label: phase,
+        state_id: ed2k_tcp_state_id(flow, canonical_phase.as_ref()),
+        state_label: canonical_phase.as_ref(),
         flow,
-        phase,
+        phase: canonical_phase.as_ref(),
         direction: "recv",
         remote_addr: remote_addr.to_string(),
         transport_mode: transport_mode.as_str(),
@@ -2183,6 +2251,7 @@ impl Ed2kTransport {
         let payload_len = usize::try_from(packet_length - 1).context("packet length overflow")?;
         let mut payload = vec![0u8; payload_len];
         self.read_exact(&mut payload).await?;
+        let (protocol, payload) = decode_peer_payload(protocol, payload)?;
         Ok(Some(EmuleTcpPacket {
             protocol,
             opcode,
@@ -2236,6 +2305,39 @@ impl Ed2kTransport {
         }
         Ok(())
     }
+}
+
+/// Decode one peer TCP payload exactly like the oracle socket path: packed
+/// frames inflate first and then continue through the eMule extension opcode
+/// dispatcher as `OP_EMULEPROT`.
+fn decode_peer_payload(protocol: u8, payload: Vec<u8>) -> Result<(u8, Vec<u8>)> {
+    if protocol != OP_PACKEDPROT {
+        return Ok((protocol, payload));
+    }
+
+    let mut decoder = ZlibDecoder::new(payload.as_slice());
+    let mut decoded = Vec::with_capacity(
+        payload
+            .len()
+            .saturating_mul(10)
+            .saturating_add(300)
+            .min(MAX_PEER_DECOMPRESSED_PACKET_LEN),
+    );
+    let mut chunk = [0u8; 4096];
+    loop {
+        let read = decoder.read(&mut chunk).context("zlib inflate failed")?;
+        if read == 0 {
+            break;
+        }
+        if decoded.len().saturating_add(read) > MAX_PEER_DECOMPRESSED_PACKET_LEN {
+            anyhow::bail!(
+                "decompressed ED2K peer packet exceeded {} bytes",
+                MAX_PEER_DECOMPRESSED_PACKET_LEN
+            );
+        }
+        decoded.extend_from_slice(&chunk[..read]);
+    }
+    Ok((OP_EMULEPROT, decoded))
 }
 
 /// Return the eMule TCP/Kad connect-option bits mirrored from the oracle
@@ -3166,6 +3268,18 @@ fn encode_packet(protocol: u8, opcode: u8, payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
+#[cfg(test)]
+fn encode_packed_packet(opcode: u8, payload: &[u8]) -> Result<Vec<u8>> {
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(payload)
+        .context("failed to deflate ED2K peer payload")?;
+    let packed_payload = encoder
+        .finish()
+        .context("failed to finalize ED2K peer payload compression")?;
+    Ok(encode_packet(OP_PACKEDPROT, opcode, &packed_payload))
+}
+
 fn decode_file_hash_payload(payload: &[u8]) -> Result<Ed2kHash> {
     if payload.len() < 16 {
         anyhow::bail!("expected 16-byte file hash payload, got {}", payload.len());
@@ -3558,6 +3672,33 @@ fn encode_sending_part(
     Ok(encode_packet(OP_EDONKEYPROT, OP_SENDINGPART, &payload))
 }
 
+#[cfg(test)]
+fn encode_compressed_part_fragment(
+    file_hash: &Ed2kHash,
+    start: u64,
+    advertised_compressed_len: usize,
+    compressed_fragment: &[u8],
+    use_i64: bool,
+) -> Result<Vec<u8>> {
+    let advertised_compressed_len = u32::try_from(advertised_compressed_len)
+        .context("compressed payload exceeds OP_COMPRESSEDPART length field")?;
+    let mut payload =
+        Vec::with_capacity(16 + if use_i64 { 12 } else { 8 } + compressed_fragment.len());
+    payload.extend_from_slice(&file_hash.0);
+    if use_i64 {
+        payload.extend_from_slice(&start.to_le_bytes());
+        payload.extend_from_slice(&advertised_compressed_len.to_le_bytes());
+        payload.extend_from_slice(compressed_fragment);
+        return Ok(encode_packet(OP_EMULEPROT, OP_COMPRESSEDPART_I64, &payload));
+    }
+
+    let start = u32::try_from(start).context("start offset exceeds OP_COMPRESSEDPART limit")?;
+    payload.extend_from_slice(&start.to_le_bytes());
+    payload.extend_from_slice(&advertised_compressed_len.to_le_bytes());
+    payload.extend_from_slice(compressed_fragment);
+    Ok(encode_packet(OP_EMULEPROT, OP_COMPRESSEDPART, &payload))
+}
+
 fn is_plain_ed2k_protocol_marker(marker: u8) -> bool {
     matches!(marker, OP_EDONKEYPROT | OP_PACKEDPROT | OP_EMULEPROT)
 }
@@ -3772,14 +3913,15 @@ mod tests {
         EMULE_TCP_CRYPT_MAGIC_SYNC, EMULE_VERSION_SHORT, Ed2kHelloIdentity, Ed2kPeerConnectMode,
         Ed2kPeerDownloadOutcome, Ed2kPeerSecureIdentState, Ed2kSecureIdent, Ed2kTransport,
         Ed2kTransportMode, FirewallCheckUdpRequest, HELLO_NICKNAME, OP_EDONKEYPROT, OP_EMULEINFO,
-        OP_EMULEINFOANSWER, OP_EMULEPROT, OP_FWCHECKUDPREQ, OP_HELLO, OP_HELLOANSWER,
-        OP_SECIDENTSTATE, TAGTYPE_STRING, TAGTYPE_UINT32, begin_secure_ident_probe,
-        build_hello_responses, connect_callback_peer, decode_incoming_obfuscation_header,
-        decode_public_key_payload, decode_request_parts_payload, decode_secident_state,
-        derive_obfuscation_key, download_file_from_peer, drive_download_session,
-        emule_connect_options, emule_misc_options1, emule_misc_options2, emule_version_tag,
-        encode_accept_upload_req, encode_emule_info_answer, encode_emule_info_request,
-        encode_hello_answer, encode_hello_request, encode_incoming_obfuscation_response,
+        OP_EMULEINFOANSWER, OP_EMULEPROT, OP_FILESTATUS, OP_FWCHECKUDPREQ, OP_HELLO,
+        OP_HELLOANSWER, OP_REQFILENAMEANSWER, OP_REQUESTPARTS, OP_SECIDENTSTATE, TAGTYPE_STRING,
+        TAGTYPE_UINT32, begin_secure_ident_probe, build_hello_responses, connect_callback_peer,
+        decode_incoming_obfuscation_header, decode_peer_payload, decode_public_key_payload,
+        decode_request_parts_payload, decode_secident_state, derive_obfuscation_key,
+        download_file_from_peer, drive_download_session, emule_connect_options,
+        emule_misc_options1, emule_misc_options2, emule_version_tag, encode_accept_upload_req,
+        encode_emule_info_answer, encode_emule_info_request, encode_hello_answer,
+        encode_hello_request, encode_incoming_obfuscation_response, encode_packed_packet,
         encode_packet, encode_secident_state, encode_sending_part, enrich_hello_identity,
         is_mule_hello, next_download_read_timeout, request_udp_firewall_check,
     };
@@ -3894,6 +4036,100 @@ mod tests {
         assert_eq!(pending.compressed_received, compressed.len());
         assert_eq!(pending.uncompressed_written, bytes.len() as u64);
         assert_eq!([first_bytes, second_bytes].concat(), bytes);
+    }
+
+    #[test]
+    fn packed_peer_payload_decodes_to_emule_protocol() {
+        let payload = vec![0xCA, 0xFE, 0xBA, 0xBE];
+        let packed = encode_packed_packet(super::OP_PUBLICKEY, &payload).unwrap();
+        let (protocol, decoded) =
+            decode_peer_payload(super::OP_PACKEDPROT, packed[6..].to_vec()).unwrap();
+
+        assert_eq!(protocol, OP_EMULEPROT);
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn dump_send_phases_follow_oracle_labels() {
+        assert_eq!(
+            super::canonical_ed2k_send_phase(
+                "listener",
+                "hello_reply",
+                Some(OP_EDONKEYPROT),
+                Some(OP_HELLOANSWER),
+            )
+            .as_ref(),
+            "hello_answer"
+        );
+        assert_eq!(
+            super::canonical_ed2k_send_phase(
+                "listener",
+                "request_filename",
+                Some(OP_EDONKEYPROT),
+                Some(OP_REQFILENAMEANSWER),
+            )
+            .as_ref(),
+            "filename_answer"
+        );
+        assert_eq!(
+            super::canonical_ed2k_send_phase(
+                "listener",
+                "set_req_file_id",
+                Some(OP_EDONKEYPROT),
+                Some(OP_FILESTATUS),
+            )
+            .as_ref(),
+            "file_status"
+        );
+        assert_eq!(
+            super::canonical_ed2k_send_phase(
+                "native_download",
+                "hello",
+                Some(OP_EDONKEYPROT),
+                Some(OP_HELLO),
+            )
+            .as_ref(),
+            "hello_request"
+        );
+        assert_eq!(
+            super::canonical_ed2k_send_phase(
+                "native_download",
+                "request_parts",
+                Some(OP_EDONKEYPROT),
+                Some(OP_REQUESTPARTS),
+            )
+            .as_ref(),
+            "session"
+        );
+    }
+
+    #[test]
+    fn dump_recv_phases_follow_oracle_labels() {
+        assert_eq!(
+            super::canonical_ed2k_recv_phase("listener", "custom", OP_EDONKEYPROT, OP_HELLOANSWER,)
+                .as_ref(),
+            "session"
+        );
+        assert_eq!(
+            super::canonical_ed2k_recv_phase(
+                "udp_firewall_check",
+                "session",
+                OP_EDONKEYPROT,
+                OP_HELLO,
+            )
+            .as_ref(),
+            "hello_exchange"
+        );
+        assert_eq!(
+            super::canonical_ed2k_recv_phase(
+                "udp_firewall_check",
+                "session",
+                OP_EMULEPROT,
+                OP_FWCHECKUDPREQ,
+            )
+            .as_ref(),
+            "fwcheck_request"
+        );
     }
 
     #[test]
@@ -4854,6 +5090,341 @@ mod tests {
                 server_ip: 0,
                 server_port: 0,
                 connect_options: emule_connect_options(false),
+                direct_udp_callback: false,
+            },
+            &Arc::new(
+                Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+                    .unwrap(),
+            ),
+            &transfer_runtime,
+            "captured.epub".to_string(),
+            payload.len() as u64,
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, Ed2kPeerDownloadOutcome::Completed);
+
+        let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
+        assert!(manifest.completed);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn small_file_download_accepts_split_compressed_part_frames() {
+        async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
+            let mut header = [0u8; 6];
+            stream.read_exact(&mut header).await.unwrap();
+            let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+            let mut packet = header.to_vec();
+            let mut payload = vec![0u8; packet_len - 1];
+            stream.read_exact(&mut payload).await.unwrap();
+            packet.extend_from_slice(&payload);
+            packet
+        }
+
+        let root = unique_test_dir("ed2k-small-file-split-compressedpart");
+        let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+        let payload = vec![0x5A; 8 * 1024];
+        let file_hash = overlord_kad_proto::Ed2kHash::from_bytes(Md4::digest(&payload).into());
+        let file_hash_hex = file_hash.to_string();
+        transfer_runtime
+            .ensure_job(&new_transfer_job(
+                file_hash,
+                "captured.epub".to_string(),
+                payload.len() as u64,
+            ))
+            .await
+            .unwrap();
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let peer_public_key = Arc::new(
+            Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+                .unwrap(),
+        );
+        let peer_public_key_for_server = Arc::clone(&peer_public_key);
+        let payload_for_server = payload.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            let hello = read_packet(&mut stream).await;
+            assert_eq!(hello[5], OP_HELLO);
+
+            let hello_answer = encode_hello_answer(Ed2kHelloIdentity {
+                user_hash: [0x42; 16],
+                client_id: 0x5912_0559,
+                tcp_port: peer_addr.port(),
+                udp_port: 0,
+                server_ip: 0,
+                server_port: 0,
+                connect_options: emule_connect_options(false),
+                direct_udp_callback: false,
+            });
+            stream.write_all(&hello_answer).await.unwrap();
+
+            let secure_ident_probe = read_packet(&mut stream).await;
+            assert_eq!(secure_ident_probe[5], OP_SECIDENTSTATE);
+            let peer_challenge =
+                encode_secident_state(ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, 0x4436_EEAC);
+            stream.write_all(&peer_challenge).await.unwrap();
+
+            let public_key = read_packet(&mut stream).await;
+            assert_eq!(public_key[5], super::OP_PUBLICKEY);
+            let peer_public_key_packet = encode_packet(
+                OP_EMULEPROT,
+                super::OP_PUBLICKEY,
+                &peer_public_key_for_server.public_key_payload().unwrap(),
+            );
+            stream.write_all(&peer_public_key_packet).await.unwrap();
+
+            let signature = read_packet(&mut stream).await;
+            assert_eq!(signature[5], super::OP_SIGNATURE);
+            let peer_signature = encode_packet(OP_EMULEPROT, super::OP_SIGNATURE, &[0xAA; 49]);
+            stream.write_all(&peer_signature).await.unwrap();
+
+            let request_filename = read_packet(&mut stream).await;
+            assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
+            let _request_sources = read_packet(&mut stream).await;
+            let _aich_request = read_packet(&mut stream).await;
+
+            let filename_answer =
+                super::encode_request_filename_answer(&file_hash, "captured.epub").unwrap();
+            stream.write_all(&filename_answer).await.unwrap();
+
+            let start_upload = read_packet(&mut stream).await;
+            assert_eq!(start_upload[5], super::OP_STARTUPLOADREQ);
+            stream.write_all(&encode_accept_upload_req()).await.unwrap();
+
+            let request_parts = read_packet(&mut stream).await;
+            assert_eq!(request_parts[5], super::OP_REQUESTPARTS);
+            let (requested_hash, ranges) =
+                decode_request_parts_payload(&request_parts[6..], false).unwrap();
+            assert_eq!(requested_hash, file_hash);
+            assert_eq!(ranges, vec![(0, payload_for_server.len() as u64)]);
+
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(&payload_for_server).unwrap();
+            let compressed = encoder.finish().unwrap();
+            let split_at = (compressed.len() / 2).max(1);
+
+            let first_fragment = super::encode_compressed_part_fragment(
+                &file_hash,
+                0,
+                compressed.len(),
+                &compressed[..split_at],
+                false,
+            )
+            .unwrap();
+            stream.write_all(&first_fragment).await.unwrap();
+
+            let second_fragment = super::encode_compressed_part_fragment(
+                &file_hash,
+                0,
+                compressed.len(),
+                &compressed[split_at..],
+                false,
+            )
+            .unwrap();
+            stream.write_all(&second_fragment).await.unwrap();
+        });
+
+        let result = download_file_from_peer(
+            Ipv4Addr::LOCALHOST,
+            &Ed2kFoundSource {
+                file_hash,
+                ip: Ipv4Addr::LOCALHOST,
+                tcp_port: peer_addr.port(),
+                client_id: u32::from_le_bytes(Ipv4Addr::LOCALHOST.octets()),
+                low_id: false,
+                obfuscated: false,
+                obfuscation_options: None,
+                user_hash: None,
+                source_server: None,
+            },
+            Ed2kHelloIdentity {
+                user_hash: [0x11; 16],
+                client_id: 0,
+                tcp_port: 41001,
+                udp_port: 41000,
+                server_ip: 0,
+                server_port: 0,
+                connect_options: emule_connect_options(false),
+                direct_udp_callback: false,
+            },
+            &Arc::new(
+                Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+                    .unwrap(),
+            ),
+            &transfer_runtime,
+            "captured.epub".to_string(),
+            payload.len() as u64,
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, Ed2kPeerDownloadOutcome::Completed);
+
+        let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
+        assert!(manifest.completed);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn small_file_download_accepts_obfuscated_packed_startup_and_compressed_part_frames() {
+        let root = unique_test_dir("ed2k-small-file-obfuscated-packed-compressedpart");
+        let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+        let payload = vec![0x5A; 8 * 1024];
+        let file_hash = overlord_kad_proto::Ed2kHash::from_bytes(Md4::digest(&payload).into());
+        let file_hash_hex = file_hash.to_string();
+        transfer_runtime
+            .ensure_job(&new_transfer_job(
+                file_hash,
+                "captured.epub".to_string(),
+                payload.len() as u64,
+            ))
+            .await
+            .unwrap();
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let peer_user_hash = [0x42; 16];
+        let peer_public_key = Arc::new(
+            Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+                .unwrap(),
+        );
+        let peer_public_key_for_server = Arc::clone(&peer_public_key);
+        let payload_for_server = payload.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut transport = Ed2kTransport::accept(stream, peer_user_hash).await.unwrap();
+            assert_eq!(transport.mode, Ed2kTransportMode::Obfuscated);
+
+            let hello = transport.read_packet().await.unwrap().unwrap();
+            assert_eq!(hello.protocol, OP_EDONKEYPROT);
+            assert_eq!(hello.opcode, OP_HELLO);
+
+            let hello_answer = encode_hello_answer(Ed2kHelloIdentity {
+                user_hash: peer_user_hash,
+                client_id: 0x5912_0559,
+                tcp_port: peer_addr.port(),
+                udp_port: 0,
+                server_ip: 0,
+                server_port: 0,
+                connect_options: emule_connect_options(true),
+                direct_udp_callback: false,
+            });
+            transport.write_all(&hello_answer).await.unwrap();
+
+            let secure_ident_probe = transport.read_packet().await.unwrap().unwrap();
+            assert_eq!(secure_ident_probe.protocol, OP_EMULEPROT);
+            assert_eq!(secure_ident_probe.opcode, OP_SECIDENTSTATE);
+
+            let peer_challenge =
+                encode_secident_state(ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, 0x4436_EEAC);
+            transport.write_all(&peer_challenge).await.unwrap();
+
+            let public_key = transport.read_packet().await.unwrap().unwrap();
+            assert_eq!(public_key.protocol, OP_EMULEPROT);
+            assert_eq!(public_key.opcode, super::OP_PUBLICKEY);
+
+            let peer_public_key_packet = encode_packed_packet(
+                super::OP_PUBLICKEY,
+                &peer_public_key_for_server.public_key_payload().unwrap(),
+            )
+            .unwrap();
+            transport.write_all(&peer_public_key_packet).await.unwrap();
+
+            let signature = transport.read_packet().await.unwrap().unwrap();
+            assert_eq!(signature.protocol, OP_EMULEPROT);
+            assert_eq!(signature.opcode, super::OP_SIGNATURE);
+
+            let peer_signature = encode_packed_packet(super::OP_SIGNATURE, &[0xAA; 49]).unwrap();
+            transport.write_all(&peer_signature).await.unwrap();
+
+            let request_filename = transport.read_packet().await.unwrap().unwrap();
+            assert_eq!(request_filename.protocol, OP_EDONKEYPROT);
+            assert_eq!(request_filename.opcode, super::OP_REQUESTFILENAME);
+
+            let request_sources = transport.read_packet().await.unwrap().unwrap();
+            assert_eq!(request_sources.protocol, OP_EMULEPROT);
+            assert_eq!(request_sources.opcode, super::OP_REQUESTSOURCES2);
+
+            let aich_request = transport.read_packet().await.unwrap().unwrap();
+            assert_eq!(aich_request.protocol, OP_EMULEPROT);
+            assert_eq!(aich_request.opcode, super::OP_AICHFILEHASHREQ);
+
+            let filename_answer =
+                super::encode_request_filename_answer(&file_hash, "captured.epub").unwrap();
+            transport.write_all(&filename_answer).await.unwrap();
+
+            let start_upload = transport.read_packet().await.unwrap().unwrap();
+            assert_eq!(start_upload.protocol, OP_EDONKEYPROT);
+            assert_eq!(start_upload.opcode, super::OP_STARTUPLOADREQ);
+            transport
+                .write_all(&encode_accept_upload_req())
+                .await
+                .unwrap();
+
+            let request_parts = transport.read_packet().await.unwrap().unwrap();
+            assert_eq!(request_parts.protocol, OP_EDONKEYPROT);
+            assert_eq!(request_parts.opcode, super::OP_REQUESTPARTS);
+            let (requested_hash, ranges) =
+                decode_request_parts_payload(&request_parts.payload, false).unwrap();
+            assert_eq!(requested_hash, file_hash);
+            assert_eq!(ranges, vec![(0, payload_for_server.len() as u64)]);
+
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(&payload_for_server).unwrap();
+            let compressed = encoder.finish().unwrap();
+            let split_at = (compressed.len() / 2).max(1);
+
+            let first_fragment = super::encode_compressed_part_fragment(
+                &file_hash,
+                0,
+                compressed.len(),
+                &compressed[..split_at],
+                false,
+            )
+            .unwrap();
+            transport.write_all(&first_fragment).await.unwrap();
+
+            let second_fragment = super::encode_compressed_part_fragment(
+                &file_hash,
+                0,
+                compressed.len(),
+                &compressed[split_at..],
+                false,
+            )
+            .unwrap();
+            transport.write_all(&second_fragment).await.unwrap();
+        });
+
+        let result = download_file_from_peer(
+            Ipv4Addr::LOCALHOST,
+            &Ed2kFoundSource {
+                file_hash,
+                ip: Ipv4Addr::LOCALHOST,
+                tcp_port: peer_addr.port(),
+                client_id: u32::from_le_bytes(Ipv4Addr::LOCALHOST.octets()),
+                low_id: false,
+                obfuscated: true,
+                obfuscation_options: Some(
+                    super::EMULE_CRYPT_SUPPORTS | super::EMULE_CRYPT_REQUESTS,
+                ),
+                user_hash: Some(peer_user_hash),
+                source_server: None,
+            },
+            Ed2kHelloIdentity {
+                user_hash: [0x11; 16],
+                client_id: 0,
+                tcp_port: 41001,
+                udp_port: 41000,
+                server_ip: 0,
+                server_port: 0,
+                connect_options: emule_connect_options(true),
                 direct_udp_callback: false,
             },
             &Arc::new(
