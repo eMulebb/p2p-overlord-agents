@@ -707,6 +707,28 @@ impl Ed2kTransferRuntime {
         Ok(())
     }
 
+    /// Requeue any persisted requested pieces after a downloader restart.
+    ///
+    /// Requested pieces are session-local claims. If the process exits before
+    /// the downloader releases them, the next process instance must move them
+    /// back to `Missing` so resume can continue from the already persisted byte
+    /// prefix instead of deadlocking on a stale in-flight marker.
+    pub async fn reclaim_stale_piece_requests(&self, file_hash: &str) -> Result<bool> {
+        let _guard = self.manifest_io.lock().await;
+        let mut manifest = self.load_manifest_unlocked(file_hash).await?;
+        let mut changed = false;
+        for piece in &mut manifest.pieces {
+            if piece.state == Ed2kTransferState::Requested {
+                piece.state = Ed2kTransferState::Missing;
+                changed = true;
+            }
+        }
+        if changed {
+            self.store_manifest_unlocked(&manifest).await?;
+        }
+        Ok(changed)
+    }
+
     /// Persist one downloaded piece into the local piece store.
     #[allow(dead_code)]
     pub async fn store_piece_data(
@@ -1346,6 +1368,38 @@ mod tests {
             .unwrap();
         assert_eq!(reclaimed.piece_index, 0);
         assert_eq!(reclaimed.bytes_written, split as u64);
+    }
+
+    #[tokio::test]
+    async fn reclaim_stale_piece_requests_restores_missing_state_with_progress() {
+        let root = unique_test_dir("ed2k-transfer-reclaim-stale-request");
+        let runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+        let payload = vec![0x6Bu8; 32_768];
+        let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
+        let job = new_transfer_job(file_hash, "resume.bin".to_string(), payload.len() as u64);
+        runtime.ensure_job(&job).await.unwrap();
+
+        runtime
+            .claim_next_missing_part(&job.file_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        let split = 8_192usize;
+        runtime
+            .append_piece_block(&job.file_hash, 0, 0, split as u64, &payload[..split])
+            .await
+            .unwrap();
+
+        assert!(
+            runtime
+                .reclaim_stale_piece_requests(&job.file_hash)
+                .await
+                .unwrap()
+        );
+
+        let manifest = runtime.manifest(&job.file_hash).await.unwrap();
+        assert_eq!(manifest.pieces[0].state, Ed2kTransferState::Missing);
+        assert_eq!(manifest.pieces[0].bytes_written, split as u64);
     }
 
     #[tokio::test]

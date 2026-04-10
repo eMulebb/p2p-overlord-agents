@@ -5849,6 +5849,10 @@ impl OverlordAgentEmule {
                 request.file_size,
             ))
             .await?;
+        runtime
+            .ed2k_transfer
+            .reclaim_stale_piece_requests(&request.file_hash)
+            .await?;
         let hello_identity = Ed2kHelloIdentity {
             user_hash: ed2k_user_hash,
             client_id: 0,
@@ -7621,7 +7625,7 @@ mod tests {
         ed2k_tcp::{
             Ed2kHelloIdentity, Ed2kPeerDownloadOutcome, Ed2kSecureIdent, emule_connect_options,
         },
-        ed2k_transfer::{Ed2kTransferRuntime, new_transfer_job},
+        ed2k_transfer::{Ed2kTransferRuntime, Ed2kTransferState, new_transfer_job},
         kad_firewall::KadFirewallState,
         paths::unique_test_dir,
         snoop_queue::{SnoopQueue, SnoopQueueFamilyCounts},
@@ -8006,7 +8010,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_native_ed2k_download_attempts_direct_source_with_persisted_progress() {
+    async fn spawn_native_ed2k_download_reclaims_stale_piece_requests_after_restart() {
         let temp_root = unique_test_dir("overlord-agent-emule-direct-download-resume-spawn");
         let mut config = build_test_config(&temp_root, "http://127.0.0.1:9".to_string());
         config.p2p.ed2k.listen_port = 41001;
@@ -8046,17 +8050,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!completed);
-        runtime
-            .ed2k_transfer
-            .release_piece_request(&file_hash_hex, claimed.piece_index)
-            .await
-            .unwrap();
         let manifest = runtime
             .ed2k_transfer
             .manifest(&file_hash_hex)
             .await
             .unwrap();
         assert!(manifest_has_ed2k_transfer_progress(&manifest));
+        assert_eq!(manifest.pieces[0].state, Ed2kTransferState::Requested);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let peer_port = listener.local_addr().unwrap().port();
@@ -8090,6 +8090,19 @@ mod tests {
             .await
             .unwrap();
         peer_task.await.unwrap();
+        let reclaimed_manifest = runtime
+            .ed2k_transfer
+            .manifest(&file_hash_hex)
+            .await
+            .unwrap();
+        assert_ne!(
+            reclaimed_manifest.pieces[0].state,
+            Ed2kTransferState::Verified
+        );
+        assert_eq!(
+            reclaimed_manifest.pieces[0].bytes_written,
+            persisted_len as u64
+        );
 
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
