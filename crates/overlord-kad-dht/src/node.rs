@@ -581,7 +581,7 @@ impl DhtNode {
     ) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
         self.search_source_request_with_phase2_fanout_and_cancel(
             SearchSourceReq {
-                target: NodeId::from_bytes(file_hash.0),
+                target: NodeId::from_be_bytes(file_hash.0),
                 start_position: 0,
                 size: file_size,
             },
@@ -640,7 +640,7 @@ impl DhtNode {
     ) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
         self.search_source_request_with_phase2_fanout_and_cancel(
             SearchSourceReq {
-                target: NodeId::from_bytes(file_hash.0),
+                target: NodeId::from_be_bytes(file_hash.0),
                 start_position: 0,
                 size: file_size,
             },
@@ -680,7 +680,7 @@ impl DhtNode {
         phase2_fanout: usize,
         cancel: CancellationToken,
     ) -> impl tokio_stream::Stream<Item = NoteResult> + Send + 'static {
-        let target = NodeId::from_bytes(file_hash.0);
+        let target = NodeId::from_be_bytes(file_hash.0);
         let initial = self.closest_search_contacts(target);
         crate::search::search_notes(
             self.inner.rpc.clone(),

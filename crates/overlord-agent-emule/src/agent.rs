@@ -856,6 +856,7 @@ pub struct OverlordAgentEmule {
     snoop_queue: Arc<Mutex<SnoopQueue>>,
     observed_snoop_events: Arc<Mutex<Vec<SnoopObservation>>>,
     local_store: Arc<Mutex<KadLocalStore>>,
+    publish_batch_gate: Arc<Mutex<()>>,
     publish_observability: Arc<Mutex<KadPublishObservability>>,
     harvest_observability: Arc<Mutex<KadHarvestObservability>>,
     agent_activity: Arc<Mutex<AgentActivityTracker>>,
@@ -1151,6 +1152,7 @@ impl OverlordAgentEmule {
             snoop_queue: Arc::new(Mutex::new(SnoopQueue::new(snoop_queue_config))),
             observed_snoop_events: Arc::new(Mutex::new(Vec::new())),
             local_store: Arc::new(Mutex::new(local_store)),
+            publish_batch_gate: Arc::new(Mutex::new(())),
             publish_observability: Arc::new(Mutex::new(KadPublishObservability::default())),
             harvest_observability: Arc::new(Mutex::new(KadHarvestObservability::default())),
             agent_activity: Arc::new(Mutex::new(AgentActivityTracker::new(activity_started_at))),
@@ -2293,7 +2295,7 @@ async fn run_passive_notes_replay(
     let mut outcome = PassiveReplayRunOutcome::default();
     let mut seen_note_sources = HashSet::new();
     let mut files = Vec::new();
-    let file_hash = Ed2kHash::from_bytes(request.target.0);
+    let file_hash = Ed2kHash::from_bytes(request.target.to_be_bytes());
     let (batch_tx, batch_task) = spawn_passive_batch_poster(
         context.coordinator.clone(),
         context.indexer_id,
@@ -2981,10 +2983,23 @@ struct SourcePublishSettings {
 #[derive(Clone, Copy)]
 struct PublishExecutionContext<'a> {
     local_store: &'a Arc<Mutex<KadLocalStore>>,
+    publish_batch_gate: &'a Arc<Mutex<()>>,
     publish_observability: &'a Arc<Mutex<KadPublishObservability>>,
     agent_activity: &'a Arc<Mutex<AgentActivityTracker>>,
     activity_key: Option<&'a str>,
     notes_publish_enabled: bool,
+}
+
+async fn run_publish_batch_with_gate<T, Operation, OperationFuture>(
+    publish_batch_gate: &Arc<Mutex<()>>,
+    operation: Operation,
+) -> T
+where
+    Operation: FnOnce() -> OperationFuture,
+    OperationFuture: Future<Output = T>,
+{
+    let _publish_batch_guard = publish_batch_gate.lock().await;
+    operation().await
 }
 
 /// Chooses coordinator-provided hashes when available and otherwise falls back to the
@@ -3036,21 +3051,24 @@ async fn seed_popular_from_source(
     shared_catalog: &Ed2kSharedCatalog,
     context: PublishExecutionContext<'_>,
 ) -> Result<()> {
-    info!(
-        "kad seeding source={} entries={} notes_publish_enabled={}",
-        source.label(),
-        hashes.len(),
-        context.notes_publish_enabled
-    );
-    refresh_ed2k_shared_catalog(shared_catalog, &hashes).await;
-    seed_popular_impl(
-        dht,
-        source_publish_identity,
-        source_publish_settings,
-        source,
-        hashes,
-        context,
-    )
+    run_publish_batch_with_gate(context.publish_batch_gate, || async move {
+        info!(
+            "kad seeding source={} entries={} notes_publish_enabled={}",
+            source.label(),
+            hashes.len(),
+            context.notes_publish_enabled
+        );
+        refresh_ed2k_shared_catalog(shared_catalog, &hashes).await;
+        seed_popular_impl(
+            dht,
+            source_publish_identity,
+            source_publish_settings,
+            source,
+            hashes,
+            context,
+        )
+        .await
+    })
     .await
 }
 
@@ -3339,7 +3357,7 @@ async fn seed_popular_impl(
         if let IpAddr::V4(source_ip) = bind_addr.ip() {
             let mut store = context.local_store.lock().await;
             store.record_source_publish(
-                NodeId::from_bytes(file_hash.0),
+                NodeId::from_be_bytes(file_hash.0),
                 source_publish_identity,
                 source_ip,
                 &source_tags,
@@ -3373,7 +3391,7 @@ async fn seed_popular_impl(
             {
                 let mut store = context.local_store.lock().await;
                 store.record_notes_publish(
-                    NodeId::from_bytes(file_hash.0),
+                    NodeId::from_be_bytes(file_hash.0),
                     notes_publish_identity,
                     &notes_tags,
                     Utc::now(),
@@ -3611,15 +3629,7 @@ fn keyword_target(query: &str) -> NodeId {
     let mut hasher = Md4::new();
     hasher.update(first_word.as_bytes());
     let digest: [u8; 16] = hasher.finalize().into();
-    let mut wire = [0u8; 16];
-    for chunk in 0..4 {
-        let base = chunk * 4;
-        wire[base] = digest[base + 3];
-        wire[base + 1] = digest[base + 2];
-        wire[base + 2] = digest[base + 1];
-        wire[base + 3] = digest[base];
-    }
-    NodeId::from_bytes(wire)
+    NodeId::from_bytes(digest)
 }
 
 fn guess_content_type(name: Option<&String>) -> Option<ContentType> {
@@ -3660,7 +3670,9 @@ fn guess_content_type(name: Option<&String>) -> Option<ContentType> {
 
 fn mock_file_record(query: &str, bind_addr: String) -> FileRecord {
     FileRecord {
-        hashes: vec![HashType::Ed2k(hex::encode(keyword_target(query).0))],
+        hashes: vec![HashType::Ed2k(hex::encode(
+            keyword_target(query).to_be_bytes(),
+        ))],
         names: vec![format!(
             "{}.bin",
             query.trim().replace(' ', "_").to_lowercase()
@@ -5466,7 +5478,6 @@ impl IndexerService for OverlordAgentEmule {
             anyhow::bail!("agent networking is waiting for interface selection");
         };
         let source_publish_identity = source_publish_client_hash(self.indexer_id);
-        let ed2k_shared_catalog = Arc::clone(&runtime.ed2k_shared_catalog);
         let config = self.config.read().await;
         let source_publish_settings = SourcePublishSettings {
             tcp_port: config.p2p.ed2k.listen_port,
@@ -5486,15 +5497,16 @@ impl IndexerService for OverlordAgentEmule {
             activity_snapshot,
         )
         .await;
-        refresh_ed2k_shared_catalog(&ed2k_shared_catalog, &hashes).await;
-        let seed_result = seed_popular_impl(
+        let seed_result = seed_popular_from_source(
             &runtime.dht,
             source_publish_identity,
             source_publish_settings,
             PublishSeedSource::ManualApi,
             hashes,
+            &runtime.ed2k_shared_catalog,
             PublishExecutionContext {
                 local_store: &self.local_store,
+                publish_batch_gate: &self.publish_batch_gate,
                 publish_observability: &self.publish_observability,
                 agent_activity: &self.agent_activity,
                 activity_key: Some(activity_key.as_str()),
@@ -6288,6 +6300,7 @@ impl OverlordAgentEmule {
         let state_paths = self.state_paths.clone();
         let coordinator = self.coordinator.clone();
         let local_store = Arc::clone(&self.local_store);
+        let publish_batch_gate = Arc::clone(&self.publish_batch_gate);
         let publish_observability = Arc::clone(&self.publish_observability);
         let agent_activity = Arc::clone(&self.agent_activity);
         let ed2k_shared_catalog = Arc::clone(&runtime.ed2k_shared_catalog);
@@ -6322,6 +6335,7 @@ impl OverlordAgentEmule {
                             &ed2k_shared_catalog,
                             PublishExecutionContext {
                                 local_store: &local_store,
+                                publish_batch_gate: &publish_batch_gate,
                                 publish_observability: &publish_observability,
                                 agent_activity: &agent_activity,
                                 activity_key: None,
@@ -7542,6 +7556,7 @@ impl OverlordAgentEmule {
         let shutdown = Arc::clone(&runtime.shutdown);
         let republish_secs = config.p2p.kad.republish_interval_secs;
         let local_store = Arc::clone(&self.local_store);
+        let publish_batch_gate = Arc::clone(&self.publish_batch_gate);
         let publish_observability = Arc::clone(&self.publish_observability);
         let agent_activity = Arc::clone(&self.agent_activity);
         let ed2k_shared_catalog = Arc::clone(&runtime.ed2k_shared_catalog);
@@ -7565,6 +7580,7 @@ impl OverlordAgentEmule {
                     &ed2k_shared_catalog,
                     PublishExecutionContext {
                         local_store: &local_store,
+                        publish_batch_gate: &publish_batch_gate,
                         publish_observability: &publish_observability,
                         agent_activity: &agent_activity,
                         activity_key: None,
@@ -8136,7 +8152,7 @@ mod tests {
     fn keyword_target_is_stable() {
         assert_eq!(
             hex::encode(keyword_target("Torino Train").0),
-            "b2bc3aa39f375069e7c27eb83ce6baf3"
+            "a33abcb26950379fb87ec2e7f3bae63c"
         );
     }
 

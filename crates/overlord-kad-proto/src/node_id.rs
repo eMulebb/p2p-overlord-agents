@@ -18,6 +18,52 @@ impl NodeId {
         NodeId(b)
     }
 
+    /// Construct a Kad ID from canonical big-endian chunk bytes such as raw
+    /// MD4/file-hash bytes or eMule `ToHexString()` output.
+    #[must_use]
+    pub fn from_be_bytes(bytes: [u8; 16]) -> Self {
+        let mut wire = [0u8; 16];
+        for chunk_idx in 0..4 {
+            let start = chunk_idx * 4;
+            wire[start..start + 4].copy_from_slice(&[
+                bytes[start + 3],
+                bytes[start + 2],
+                bytes[start + 1],
+                bytes[start],
+            ]);
+        }
+        NodeId(wire)
+    }
+
+    /// Decode one eMule `CUInt128` chunk from the raw Kad wire/storage layout.
+    #[must_use]
+    pub fn chunk_u32(self, index: usize) -> u32 {
+        let start = index * 4;
+        u32::from_le_bytes([
+            self.0[start],
+            self.0[start + 1],
+            self.0[start + 2],
+            self.0[start + 3],
+        ])
+    }
+
+    /// Convert the raw Kad wire/storage layout back into canonical big-endian
+    /// chunk bytes such as MD4/file-hash order.
+    #[must_use]
+    pub fn to_be_bytes(self) -> [u8; 16] {
+        let mut bytes = [0u8; 16];
+        for chunk_idx in 0..4 {
+            let start = chunk_idx * 4;
+            bytes[start..start + 4].copy_from_slice(&[
+                self.0[start + 3],
+                self.0[start + 2],
+                self.0[start + 1],
+                self.0[start],
+            ]);
+        }
+        bytes
+    }
+
     /// XOR distance between two node IDs.
     #[must_use]
     pub fn distance(&self, other: &Self) -> NodeId {
@@ -33,10 +79,10 @@ impl NodeId {
     #[must_use]
     pub fn distance_exp(&self, other: &Self) -> Option<u32> {
         let xor = self.distance(other);
-        for (byte_idx, b) in (0_u32..).zip(xor.0) {
-            if b != 0 {
-                // highest set bit in this byte
-                return Some(byte_idx * 8 + (7 - b.ilog2()));
+        for chunk_idx in 0..4 {
+            let chunk = xor.chunk_u32(chunk_idx);
+            if chunk != 0 {
+                return Some(chunk_idx as u32 * 32 + chunk.leading_zeros());
             }
         }
         None
@@ -45,19 +91,19 @@ impl NodeId {
     /// Returns the bit at position `pos` (0 = MSB of byte 0).
     #[must_use]
     pub fn bit(&self, pos: u32) -> bool {
-        let byte_idx = (pos / 8) as usize;
-        let bit_idx = 7 - (pos % 8); // MSB = bit 7
-        if byte_idx >= 16 {
+        let chunk_idx = (pos / 32) as usize;
+        if chunk_idx >= 4 {
             return false;
         }
-        (self.0[byte_idx] >> bit_idx) & 1 == 1
+        let bit_idx = 31 - (pos % 32);
+        (self.chunk_u32(chunk_idx) >> bit_idx) & 1 == 1
     }
 }
 
 impl fmt::Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for b in &self.0 {
-            write!(f, "{b:02x}")?;
+        for chunk_idx in 0..4 {
+            write!(f, "{:08x}", self.chunk_u32(chunk_idx))?;
         }
         Ok(())
     }
@@ -71,11 +117,13 @@ impl FromStr for NodeId {
             return Err(ProtoError::InvalidNodeId);
         }
         let mut bytes = [0u8; 16];
-        for i in 0..16 {
-            bytes[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+        for chunk_idx in 0..4 {
+            let start = chunk_idx * 8;
+            let chunk = u32::from_str_radix(&s[start..start + 8], 16)
                 .map_err(|_| ProtoError::InvalidNodeId)?;
+            bytes[chunk_idx * 4..chunk_idx * 4 + 4].copy_from_slice(&chunk.to_be_bytes());
         }
-        Ok(NodeId(bytes))
+        Ok(NodeId::from_be_bytes(bytes))
     }
 }
 
@@ -87,7 +135,13 @@ impl PartialOrd for NodeId {
 
 impl Ord for NodeId {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.cmp(&other.0)
+        for chunk_idx in 0..4 {
+            let ordering = self.chunk_u32(chunk_idx).cmp(&other.chunk_u32(chunk_idx));
+            if ordering != std::cmp::Ordering::Equal {
+                return ordering;
+            }
+        }
+        std::cmp::Ordering::Equal
     }
 }
 
@@ -127,32 +181,32 @@ mod tests {
 
     #[test]
     fn test_distance_exp_msb() {
-        // XOR = 0x80 00 ... => highest bit at position 0
-        let a = NodeId::from_bytes([0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // XOR chunk0 = 0x80000000 => highest bit at position 0
+        let a = make_id("80000000000000000000000000000000");
         let b = NodeId::ZERO;
         assert_eq!(a.distance_exp(&b), Some(0));
     }
 
     #[test]
     fn test_distance_exp_second_byte() {
-        // XOR = 0x00 0x80 ... => highest bit at position 8
-        let a = NodeId::from_bytes([0x00, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // XOR chunk0 = 0x00800000 => highest bit at position 8
+        let a = make_id("00800000000000000000000000000000");
         let b = NodeId::ZERO;
         assert_eq!(a.distance_exp(&b), Some(8));
     }
 
     #[test]
     fn test_distance_exp_lsb() {
-        // XOR = 0x00...01 => bit at position 127
-        let a = NodeId::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]);
+        // XOR chunk3 = 0x00000001 => bit at position 127
+        let a = make_id("00000000000000000000000000000001");
         let b = NodeId::ZERO;
         assert_eq!(a.distance_exp(&b), Some(127));
     }
 
     #[test]
     fn test_bit() {
-        // byte 0 = 0x80 => bit 0 = 1, bit 1 = 0
-        let a = NodeId::from_bytes([0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // chunk0 = 0x80000000 => bit 0 = 1, bit 1 = 0
+        let a = make_id("80000000000000000000000000000000");
         assert!(a.bit(0));
         assert!(!a.bit(1));
         assert!(!a.bit(8));
@@ -160,8 +214,8 @@ mod tests {
 
     #[test]
     fn test_bit_second_byte() {
-        // byte 1 = 0x01 => bit 15 = 1
-        let a = NodeId::from_bytes([0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // chunk0 = 0x00010000 => bit 15 = 1
+        let a = make_id("00010000000000000000000000000000");
         assert!(!a.bit(8));
         assert!(a.bit(15));
     }
@@ -169,8 +223,8 @@ mod tests {
     #[test]
     fn test_display() {
         let a = NodeId::from_bytes([
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
-            0x0f, 0x10,
+            0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05, 0x0c, 0x0b, 0x0a, 0x09, 0x10, 0x0f,
+            0x0e, 0x0d,
         ]);
         assert_eq!(format!("{a}"), "0102030405060708090a0b0c0d0e0f10");
     }
@@ -180,6 +234,38 @@ mod tests {
         let hex = "0102030405060708090a0b0c0d0e0f10";
         let id: NodeId = hex.parse().unwrap();
         assert_eq!(format!("{id}"), hex);
+        assert_eq!(
+            id.0,
+            [
+                0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05, 0x0c, 0x0b, 0x0a, 0x09, 0x10, 0x0f,
+                0x0e, 0x0d,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_from_be_bytes_matches_emule_wire_layout() {
+        let id = NodeId::from_be_bytes([
+            0x2a, 0x85, 0xd7, 0xa5, 0x6b, 0x40, 0x4d, 0x26, 0x4a, 0x2a, 0x68, 0x2d, 0xd1, 0xb6,
+            0x8f, 0xa8,
+        ]);
+        assert_eq!(
+            id.0,
+            [
+                0xa5, 0xd7, 0x85, 0x2a, 0x26, 0x4d, 0x40, 0x6b, 0x2d, 0x68, 0x2a, 0x4a, 0xa8, 0x8f,
+                0xb6, 0xd1,
+            ]
+        );
+        assert_eq!(id.to_string(), "2a85d7a56b404d264a2a682dd1b68fa8");
+    }
+
+    #[test]
+    fn test_to_be_bytes_roundtrip() {
+        let canonical = [
+            0x2a, 0x85, 0xd7, 0xa5, 0x6b, 0x40, 0x4d, 0x26, 0x4a, 0x2a, 0x68, 0x2d, 0xd1, 0xb6,
+            0x8f, 0xa8,
+        ];
+        assert_eq!(NodeId::from_be_bytes(canonical).to_be_bytes(), canonical);
     }
 
     #[test]
@@ -195,9 +281,16 @@ mod tests {
     #[test]
     fn test_ord() {
         let a = NodeId::from_bytes([0x00; 16]);
-        let b = NodeId::from_bytes([0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let b = make_id("00000001000000000000000000000000");
         assert!(a < b);
         assert!(b > a);
+    }
+
+    #[test]
+    fn test_ord_uses_emule_chunk_order_not_raw_byte_order() {
+        let smaller = make_id("00000001000000000000000000000000");
+        let larger = make_id("00000100000000000000000000000000");
+        assert!(smaller < larger);
     }
 
     #[test]

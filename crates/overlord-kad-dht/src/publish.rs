@@ -311,7 +311,7 @@ pub async fn publish_source(
     tags: Vec<Tag>,
     publish_contact_fanout: usize,
 ) -> Result<PublishAttemptStats, DhtError> {
-    let target = NodeId::from_bytes(file_hash.0);
+    let target = NodeId::from_be_bytes(file_hash.0);
     let initial = get_initial(routing_table, &target).await;
 
     let traversal = run_traversal(
@@ -425,7 +425,7 @@ pub async fn publish_notes(
     tags: Vec<Tag>,
     publish_contact_fanout: usize,
 ) -> Result<PublishAttemptStats, DhtError> {
-    let target = NodeId::from_bytes(file_hash.0);
+    let target = NodeId::from_be_bytes(file_hash.0);
     let initial = get_initial(routing_table, &target).await;
 
     let traversal = run_traversal(
@@ -620,6 +620,24 @@ mod tests {
         };
 
         assert!(!publish_target_is_within_tolerance(target, &far_loopback));
+    }
+
+    #[test]
+    fn publish_tolerance_accepts_exact_harness_keyword_target() {
+        let target = NodeId::from_be_bytes([
+            0x2a, 0x85, 0xd7, 0xa5, 0x6b, 0x40, 0x4d, 0x26, 0x4a, 0x2a, 0x68, 0x2d, 0xd1, 0xb6,
+            0x8f, 0xa8,
+        ]);
+        let exact_contact = TraversalContact {
+            id: NodeId::from_bytes([
+                0xa5, 0xd7, 0x85, 0x2a, 0x26, 0x4d, 0x40, 0x6b, 0x2d, 0x68, 0x2a, 0x4a, 0xa8, 0x8f,
+                0xb6, 0xd1,
+            ]),
+            addr: "127.0.0.2:4672".parse().unwrap(),
+            version: 9,
+        };
+
+        assert!(publish_target_is_within_tolerance(target, &exact_contact));
     }
 
     #[test]

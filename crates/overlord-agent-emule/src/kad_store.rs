@@ -218,7 +218,7 @@ impl KadLocalStore {
 
         purge_expired(&mut self.source_entries, self.config.source_ttl, now);
         let offset = usize::from(request.start_position & 0x7FFF);
-        let file_hash = Ed2kHash::from_bytes(request.target.0);
+        let file_hash = Ed2kHash::from_bytes(request.target.to_be_bytes());
         let results = self
             .source_entries
             .iter()
@@ -261,7 +261,7 @@ impl KadLocalStore {
             })
             .take(limit)
             .map(|entry| SearchResultEntry {
-                entry_id: Ed2kHash::from_bytes(entry.publisher_id.0),
+                entry_id: Ed2kHash::from_bytes(entry.publisher_id.to_be_bytes()),
                 tags: entry.tags.clone(),
             })
             .collect::<Vec<_>>();
@@ -606,7 +606,10 @@ mod tests {
             )
             .expect("source response");
         assert_eq!(response.results.len(), 2);
-        assert_eq!(response.results[0].entry_id, Ed2kHash::from_bytes(target.0));
+        assert_eq!(
+            response.results[0].entry_id,
+            Ed2kHash::from_bytes(target.to_be_bytes())
+        );
         assert!(response.results.iter().all(|entry| {
             entry
                 .tags
@@ -639,7 +642,7 @@ mod tests {
         assert_eq!(response.results.len(), 1);
         assert_eq!(
             response.results[0].entry_id,
-            Ed2kHash::from_bytes(publisher_id.0)
+            Ed2kHash::from_bytes(publisher_id.to_be_bytes())
         );
 
         let missing = store.notes_search_response(

@@ -125,7 +125,7 @@ pub fn search_sources(
         rpc,
         initial,
         SearchSourceReq {
-            target: NodeId::from_bytes(file_hash.0),
+            target: NodeId::from_be_bytes(file_hash.0),
             start_position: 0,
             size: file_size,
         },
@@ -146,7 +146,7 @@ pub fn search_sources_by_request(
 ) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
     let (tx, rx) = mpsc::channel::<SourceResult>(SEARCH_RESULT_STREAM_BUFFER);
     let target = request.target;
-    let requested_file_hash = Ed2kHash::from_bytes(target.0);
+    let requested_file_hash = Ed2kHash::from_bytes(target.to_be_bytes());
 
     tokio::spawn(async move {
         let (raw_tx, mut raw_rx) =
@@ -207,7 +207,7 @@ pub fn search_notes(
     cancel: CancellationToken,
 ) -> impl tokio_stream::Stream<Item = NoteResult> + Send + 'static {
     let (tx, rx) = mpsc::channel::<NoteResult>(SEARCH_RESULT_STREAM_BUFFER);
-    let target = NodeId::from_bytes(file_hash.0);
+    let target = NodeId::from_be_bytes(file_hash.0);
 
     tokio::spawn(async move {
         let (raw_tx, mut raw_rx) =
