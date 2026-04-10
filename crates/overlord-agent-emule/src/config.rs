@@ -103,6 +103,11 @@ pub struct KadConfig {
     pub nodes_dat_path: String,
     /// Optional plaintext bootstrap contact list.
     pub bootstrap_nodes: Vec<String>,
+    /// Minimum number of routing contacts required before Kad-dependent workflows may run.
+    ///
+    /// The default remains `10` for real-network behavior. Smaller local harness
+    /// clusters may lower this explicitly in their private config.
+    pub bootstrap_min_routing_contacts: usize,
     pub search_timeout_secs: u64,
     pub store_timeout_secs: u64,
     pub republish_interval_secs: u64,
@@ -325,6 +330,7 @@ impl Default for KadConfig {
             listen_port: 41_000,
             nodes_dat_path: "./runtime/overlord-kad.nodes.dat".to_string(),
             bootstrap_nodes: Vec::new(),
+            bootstrap_min_routing_contacts: 10,
             search_timeout_secs: 45,
             store_timeout_secs: 140,
             republish_interval_secs: 18_000,

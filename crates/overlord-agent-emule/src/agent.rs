@@ -1742,6 +1742,7 @@ impl OverlordAgentEmule {
             bind_addr,
             node_id,
             max_routing_table_size: 12_000,
+            bootstrap_min_routing_contacts: config.p2p.kad.bootstrap_min_routing_contacts,
             max_concurrent_searches: 5,
             search_timeout: Duration::from_secs(config.p2p.kad.search_timeout_secs),
             store_timeout: Duration::from_secs(config.p2p.kad.store_timeout_secs),

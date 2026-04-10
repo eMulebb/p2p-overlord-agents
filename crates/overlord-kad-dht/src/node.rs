@@ -37,6 +37,8 @@ pub struct DhtConfig {
     pub node_id: NodeId,
     /// Max contacts in routing table.
     pub max_routing_table_size: usize,
+    /// Minimum number of routing contacts required before the node is treated as bootstrapped.
+    pub bootstrap_min_routing_contacts: usize,
     /// Max concurrent searches (semaphore).
     pub max_concurrent_searches: usize,
     /// Search timeout.
@@ -73,6 +75,7 @@ impl Default for DhtConfig {
             bind_addr: "0.0.0.0:4672".parse().unwrap(),
             node_id: NodeId::ZERO,
             max_routing_table_size: 12000,
+            bootstrap_min_routing_contacts: 10,
             max_concurrent_searches: 5,
             search_timeout: Duration::from_secs(45),
             store_timeout: Duration::from_secs(140),
@@ -438,7 +441,7 @@ impl DhtNode {
         let size = self.inner.routing_table.lock().await.len();
         info!("bootstrap complete - routing table has {} contacts", size);
 
-        if size >= 10 {
+        if bootstrap_ready_with_contacts(self.inner.config.bootstrap_min_routing_contacts, size) {
             self.inner
                 .bootstrapped
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -818,13 +821,31 @@ async fn expire_contact_for_massive_flood(
     }
 }
 
+fn bootstrap_ready_with_contacts(min_ready_contacts: usize, routing_contacts: usize) -> bool {
+    routing_contacts >= min_ready_contacts.max(1)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::bootstrap_ready_with_contacts;
+
     #[test]
     fn bootstrap_log_messages_are_ascii_only() {
         assert!(
             "bootstrap response from {addr} - routing table now {contacts} contacts".is_ascii()
         );
         assert!("bootstrap complete - routing table has {contacts} contacts".is_ascii());
+    }
+
+    #[test]
+    fn bootstrap_ready_threshold_is_never_zero() {
+        assert!(bootstrap_ready_with_contacts(0, 1));
+        assert!(!bootstrap_ready_with_contacts(0, 0));
+    }
+
+    #[test]
+    fn bootstrap_ready_threshold_honors_configured_contact_floor() {
+        assert!(!bootstrap_ready_with_contacts(3, 2));
+        assert!(bootstrap_ready_with_contacts(3, 3));
     }
 }

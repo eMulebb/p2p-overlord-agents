@@ -10,9 +10,12 @@
 //! - inbound `OP_EMULEINFO` / `OP_EMULEINFOANSWER` framing
 //! - inbound `OP_FWCHECKUDPREQ`
 //!
-//! The listener intentionally does not claim full eD2k file-transfer support;
-//! it only keeps enough of the oracle's hello-capability shape to avoid looking
-//! like a dead-end TCP port to real peers.
+//! The listener intentionally does not claim full eD2k file-transfer support,
+//! but it now serves the verified upload subset that peers expect once they
+//! choose us as a source:
+//! - filename, file-status, and hashset answers for known files
+//! - upload-intent acknowledgement
+//! - range serving with eMule-style part fragmentation and optional compression
 
 use std::{
     borrow::Cow,
@@ -31,7 +34,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::SecondsFormat;
-use flate2::{Decompress, FlushDecompress, Status, read::ZlibDecoder};
+use flate2::{
+    Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status, read::ZlibDecoder,
+};
 use md5::compute as md5_compute;
 use rand::Rng;
 use rsa::{
@@ -97,6 +102,8 @@ const TCP_PACKET_HEADER_LEN: usize = 6;
 const MAX_PEER_DECOMPRESSED_PACKET_LEN: usize = 50_000;
 const ED2K_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const FIREWALL_HELPER_POST_REQUEST_KEEPALIVE_SECS: u64 = 10;
+const ED2K_UPLOAD_PACKET_SPLIT_THRESHOLD: usize = 13_000;
+const ED2K_UPLOAD_PACKET_FRAGMENT_LEN: usize = 10_240;
 
 const EMULE_PROTOCOL_VERSION: u8 = 0x01;
 const EDONKEY_VERSION: u32 = 0x3C;
@@ -320,6 +327,11 @@ struct PendingCompressedPart {
     compressed_received: usize,
     uncompressed_written: u64,
     inflater: Decompress,
+}
+
+struct EncodedUploadPartPacket {
+    phase: &'static str,
+    packet: Vec<u8>,
 }
 
 /// Immutable session metadata shared by one outgoing TCP helper exchange.
@@ -3000,7 +3012,7 @@ async fn handle_connection(
                 let is_i64 = packet.opcode == OP_REQUESTPARTS_I64;
                 let (requested, ranges) = decode_request_parts_payload(&packet.payload, is_i64)?;
                 requested_file_hash = Some(requested);
-                if transfer_runtime.local_entry(&requested).await?.is_none() {
+                let Some(shared) = transfer_runtime.local_entry(&requested).await? else {
                     let reply = encode_file_req_ans_nofil(&requested);
                     dump_ed2k_tcp_listener_send(
                         peer_addr,
@@ -3012,7 +3024,7 @@ async fn handle_connection(
                         format!("failed to send OP_FILEREQANSNOFIL to {peer_addr}")
                     })?;
                     continue;
-                }
+                };
                 for (start, end) in ranges {
                     let Some(bytes) = transfer_runtime
                         .read_verified_range(&requested, start, end)
@@ -3020,12 +3032,24 @@ async fn handle_connection(
                     else {
                         continue;
                     };
-                    let reply = encode_sending_part(&requested, start, end, &bytes, is_i64)?;
-                    dump_ed2k_tcp_listener_send(peer_addr, transport.mode, "sending_part", &reply);
-                    transport
-                        .write_all(&reply)
-                        .await
-                        .with_context(|| format!("failed to send OP_SENDINGPART to {peer_addr}"))?;
+                    for reply in build_upload_part_packets(
+                        &requested,
+                        &shared.canonical_name,
+                        start,
+                        end,
+                        &bytes,
+                        is_i64,
+                    )? {
+                        dump_ed2k_tcp_listener_send(
+                            peer_addr,
+                            transport.mode,
+                            reply.phase,
+                            &reply.packet,
+                        );
+                        transport.write_all(&reply.packet).await.with_context(|| {
+                            format!("failed to send ED2K upload payload to {peer_addr}")
+                        })?;
+                    }
                 }
             }
             (OP_EMULEPROT, OP_EMULEINFO) => {
@@ -3649,6 +3673,127 @@ fn inflate_compressed_part_fragment(
     Ok((bytes, finished))
 }
 
+fn upload_packet_fragment_len(remaining: usize) -> usize {
+    if remaining < ED2K_UPLOAD_PACKET_SPLIT_THRESHOLD {
+        remaining
+    } else {
+        ED2K_UPLOAD_PACKET_FRAGMENT_LEN
+    }
+}
+
+fn should_attempt_upload_compression(canonical_name: &str) -> bool {
+    let Some(extension) = Path::new(canonical_name)
+        .extension()
+        .and_then(|value| value.to_str())
+    else {
+        return true;
+    };
+    let extension = extension.to_ascii_lowercase();
+    !matches!(
+        extension.as_str(),
+        "zip" | "rar" | "7z" | "cbz" | "cbr" | "ogm" | "ace"
+    )
+}
+
+fn compress_upload_payload(canonical_name: &str, bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+    if !should_attempt_upload_compression(canonical_name) {
+        return Ok(None);
+    }
+
+    let mut compressor = Compress::new(Compression::new(1), true);
+    let mut compressed = Vec::with_capacity(bytes.len().saturating_add(300));
+    let mut remaining = bytes;
+    let mut output = [0u8; 16 * 1024];
+    loop {
+        let total_in_before = compressor.total_in();
+        let total_out_before = compressor.total_out();
+        let status = compressor
+            .compress(remaining, &mut output, FlushCompress::Finish)
+            .context("failed to deflate ED2K upload payload")?;
+        let consumed = usize::try_from(compressor.total_in() - total_in_before).unwrap_or(0);
+        let produced = usize::try_from(compressor.total_out() - total_out_before).unwrap_or(0);
+        if produced != 0 {
+            compressed.extend_from_slice(&output[..produced]);
+        }
+        remaining = &remaining[consumed..];
+        match status {
+            Status::StreamEnd => break,
+            Status::Ok | Status::BufError => {
+                if consumed == 0 && produced == 0 {
+                    anyhow::bail!("ED2K upload compression made no progress");
+                }
+            }
+        }
+    }
+
+    if compressed.len() >= bytes.len() {
+        return Ok(None);
+    }
+
+    Ok(Some(compressed))
+}
+
+fn build_upload_part_packets(
+    file_hash: &Ed2kHash,
+    canonical_name: &str,
+    start: u64,
+    end: u64,
+    bytes: &[u8],
+    use_i64: bool,
+) -> Result<Vec<EncodedUploadPartPacket>> {
+    let range_len = usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX);
+    if range_len != bytes.len() {
+        anyhow::bail!(
+            "upload payload length {} does not match requested range {}..{}",
+            bytes.len(),
+            start,
+            end
+        );
+    }
+
+    if let Some(compressed) = compress_upload_payload(canonical_name, bytes)? {
+        let mut packets = Vec::new();
+        let mut offset = 0usize;
+        while offset < compressed.len() {
+            let fragment_len = upload_packet_fragment_len(compressed.len() - offset);
+            let packet = encode_compressed_part_fragment(
+                file_hash,
+                start,
+                compressed.len(),
+                &compressed[offset..offset + fragment_len],
+                use_i64,
+            )?;
+            packets.push(EncodedUploadPartPacket {
+                phase: "compressed_part",
+                packet,
+            });
+            offset += fragment_len;
+        }
+        return Ok(packets);
+    }
+
+    let mut packets = Vec::new();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let fragment_len = upload_packet_fragment_len(bytes.len() - offset);
+        let fragment_start = start + u64::try_from(offset).unwrap_or(u64::MAX);
+        let fragment_end = fragment_start + u64::try_from(fragment_len).unwrap_or(u64::MAX);
+        let packet = encode_sending_part(
+            file_hash,
+            fragment_start,
+            fragment_end,
+            &bytes[offset..offset + fragment_len],
+            use_i64,
+        )?;
+        packets.push(EncodedUploadPartPacket {
+            phase: "sending_part",
+            packet,
+        });
+        offset += fragment_len;
+    }
+    Ok(packets)
+}
+
 fn encode_sending_part(
     file_hash: &Ed2kHash,
     start: u64,
@@ -3672,7 +3817,6 @@ fn encode_sending_part(
     Ok(encode_packet(OP_EDONKEYPROT, OP_SENDINGPART, &payload))
 }
 
-#[cfg(test)]
 fn encode_compressed_part_fragment(
     file_hash: &Ed2kHash,
     start: u64,
@@ -3931,9 +4075,11 @@ mod tests {
         kad_firewall::KadFirewallState,
         paths::unique_test_dir,
     };
+    use flate2::Decompress;
     use hex::decode;
     use md4::{Digest, Md4};
-    use overlord_kad_proto::Ed2kHash;
+    use overlord_kad_dht::{DhtConfig, DhtNode};
+    use overlord_kad_proto::{Ed2kHash, NodeId};
     use rsa::{
         RsaPrivateKey, RsaPublicKey,
         pkcs1v15::{Signature, VerifyingKey},
@@ -6440,6 +6586,225 @@ mod tests {
 
         let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
         assert!(manifest.completed);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn upload_part_packets_split_large_uncompressed_ranges() {
+        let file_hash = Ed2kHash::from_bytes([0x5A; 16]);
+        let mut lcg = 0x1234_5678u32;
+        let payload = (0..32_768)
+            .map(|_| {
+                lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (lcg >> 24) as u8
+            })
+            .collect::<Vec<_>>();
+
+        let packets = super::build_upload_part_packets(
+            &file_hash,
+            "upload.bin",
+            0,
+            payload.len() as u64,
+            &payload,
+            false,
+        )
+        .unwrap();
+
+        assert!(packets.len() > 1);
+        let mut reconstructed = Vec::new();
+        let mut expected_start = 0u64;
+        for packet in packets {
+            assert_eq!(packet.phase, "sending_part");
+            let (decoded_hash, start, end, bytes) =
+                super::decode_sending_part_payload(&packet.packet[6..], false).unwrap();
+            assert_eq!(decoded_hash, file_hash);
+            assert_eq!(start, expected_start);
+            expected_start = end;
+            reconstructed.extend_from_slice(&bytes);
+        }
+
+        assert_eq!(reconstructed, payload);
+    }
+
+    #[tokio::test]
+    async fn listener_upload_session_serves_verified_file_via_compressed_parts() {
+        async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
+            let mut header = [0u8; 6];
+            stream.read_exact(&mut header).await.unwrap();
+            let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+            let mut packet = header.to_vec();
+            let mut payload = vec![0u8; packet_len - 1];
+            stream.read_exact(&mut payload).await.unwrap();
+            packet.extend_from_slice(&payload);
+            packet
+        }
+
+        async fn read_until_opcode(stream: &mut TcpStream, protocol: u8, opcode: u8) -> Vec<u8> {
+            loop {
+                let packet = read_packet(stream).await;
+                if packet[0] == protocol && packet[5] == opcode {
+                    return packet;
+                }
+            }
+        }
+
+        let mut payload = Vec::new();
+        for index in 0..12_000u32 {
+            writeln!(
+                &mut payload,
+                "ubuntu linux upload parity line {:05} repeated request surface",
+                index % 1024
+            )
+            .unwrap();
+        }
+        let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
+        let file_hash_hex = file_hash.to_string();
+
+        let root = unique_test_dir("ed2k-upload-listener-compressed");
+        let transfer_runtime = Arc::new(Ed2kTransferRuntime::load_or_create(&root).unwrap());
+        let job = new_transfer_job(file_hash, "upload.txt".to_string(), payload.len() as u64);
+        transfer_runtime.ensure_job(&job).await.unwrap();
+        transfer_runtime
+            .store_md4_hashset(&file_hash_hex, Vec::new())
+            .await
+            .unwrap();
+        transfer_runtime
+            .store_piece_data(&file_hash_hex, 0, &payload)
+            .await
+            .unwrap();
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let dht = DhtNode::new(DhtConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            node_id: NodeId::from_bytes([0x3C; 16]),
+            udp_key: 0x1122_3344,
+            ..DhtConfig::default()
+        })
+        .await
+        .unwrap();
+        let server_state = Arc::new(RwLock::new(Ed2kServerState::default()));
+        let kad_firewall = Arc::new(Mutex::new(KadFirewallState::default()));
+        let secure_ident = Arc::new(
+            Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+                .unwrap(),
+        );
+        let hello_identity = Ed2kHelloIdentity {
+            user_hash: [0x22; 16],
+            client_id: 0x1234_5678,
+            tcp_port: 41001,
+            udp_port: 41000,
+            server_ip: 0,
+            server_port: 0,
+            connect_options: emule_connect_options(false),
+            direct_udp_callback: false,
+        };
+
+        let server = tokio::spawn({
+            let transfer_runtime = Arc::clone(&transfer_runtime);
+            let server_state = Arc::clone(&server_state);
+            let kad_firewall = Arc::clone(&kad_firewall);
+            let secure_ident = Arc::clone(&secure_ident);
+            async move {
+                let (stream, remote_addr) = listener.accept().await.unwrap();
+                super::handle_connection(
+                    stream,
+                    remote_addr,
+                    &dht,
+                    &server_state,
+                    &kad_firewall,
+                    &secure_ident,
+                    &transfer_runtime,
+                    hello_identity,
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let mut stream = TcpStream::connect(peer_addr).await.unwrap();
+        let peer_identity = Ed2kHelloIdentity {
+            user_hash: [0x77; 16],
+            client_id: 0x8765_4321,
+            tcp_port: 46671,
+            udp_port: 46672,
+            server_ip: 0,
+            server_port: 0,
+            connect_options: emule_connect_options(false),
+            direct_udp_callback: false,
+        };
+        stream
+            .write_all(&encode_hello_request(peer_identity))
+            .await
+            .unwrap();
+        let _hello_answer = read_until_opcode(&mut stream, OP_EDONKEYPROT, OP_HELLOANSWER).await;
+
+        let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
+        stream
+            .write_all(&super::encode_request_filename(&file_hash, &manifest))
+            .await
+            .unwrap();
+        let request_filename_answer =
+            read_until_opcode(&mut stream, OP_EDONKEYPROT, OP_REQFILENAMEANSWER).await;
+        assert_eq!(&request_filename_answer[6..22], &file_hash.0);
+
+        stream
+            .write_all(&super::encode_start_upload_req(&file_hash))
+            .await
+            .unwrap();
+        let accept_upload =
+            read_until_opcode(&mut stream, OP_EDONKEYPROT, super::OP_ACCEPTUPLOADREQ).await;
+        assert_eq!(accept_upload.len(), 6);
+
+        stream
+            .write_all(
+                &super::encode_request_parts_batch(&file_hash, &[(0, payload.len() as u64)])
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let mut reconstructed = Vec::new();
+        let mut saw_compressed = false;
+        let mut pending = None;
+        while reconstructed.len() < payload.len() {
+            let packet = read_packet(&mut stream).await;
+            match (packet[0], packet[5]) {
+                (OP_EMULEPROT, super::OP_COMPRESSEDPART) => {
+                    saw_compressed = true;
+                    let (decoded_hash, start, advertised_len, fragment) =
+                        super::decode_compressed_part_fragment(&packet[6..], false).unwrap();
+                    assert_eq!(decoded_hash, file_hash);
+                    assert_eq!(start, 0);
+                    let pending_stream =
+                        pending.get_or_insert_with(|| super::PendingCompressedPart {
+                            piece_index: 0,
+                            start: 0,
+                            end: payload.len() as u64,
+                            advertised_compressed_len: advertised_len,
+                            compressed_received: 0,
+                            uncompressed_written: 0,
+                            inflater: Decompress::new(true),
+                        });
+                    let (bytes, finished) =
+                        super::inflate_compressed_part_fragment(pending_stream, fragment).unwrap();
+                    reconstructed.extend_from_slice(&bytes);
+                    if finished {
+                        pending = None;
+                    }
+                }
+                (OP_EDONKEYPROT, super::OP_SENDINGPART) => {
+                    let (_, _, _, bytes) =
+                        super::decode_sending_part_payload(&packet[6..], false).unwrap();
+                    reconstructed.extend_from_slice(&bytes);
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_compressed);
+        assert_eq!(reconstructed, payload);
+        drop(stream);
         server.await.unwrap();
     }
 
