@@ -104,6 +104,10 @@ const TCP_PACKET_HEADER_LEN: usize = 6;
 const MAX_PEER_DECOMPRESSED_PACKET_LEN: usize = 50_000;
 const ED2K_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const ED2K_UPLOAD_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+#[cfg(not(test))]
+const ED2K_UPLOAD_QUEUE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const ED2K_UPLOAD_QUEUE_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
 const FIREWALL_HELPER_POST_REQUEST_KEEPALIVE_SECS: u64 = 10;
 const ED2K_UPLOAD_PACKET_SPLIT_THRESHOLD: usize = 13_000;
 const ED2K_UPLOAD_PACKET_FRAGMENT_LEN: usize = 10_240;
@@ -2885,6 +2889,7 @@ async fn handle_connection(
     let mut upload_session_file_hash: Option<Ed2kHash> = None;
     let mut upload_granted_sent = false;
     let mut last_queue_rank = None;
+    let mut last_queue_rank_sent_at = None;
 
     let result = loop {
         let read_timeout = if upload_session.is_some() {
@@ -2918,11 +2923,17 @@ async fn handle_connection(
                             })?;
                             upload_granted_sent = true;
                             last_queue_rank = None;
+                            last_queue_rank_sent_at = None;
                         }
                         continue;
                     }
                     Ed2kUploadSessionStatus::Waiting { rank } => {
-                        if last_queue_rank != Some(rank) {
+                        let now = tokio::time::Instant::now();
+                        let should_refresh = last_queue_rank != Some(rank)
+                            || last_queue_rank_sent_at.is_none_or(|sent_at| {
+                                now.duration_since(sent_at) >= ED2K_UPLOAD_QUEUE_REFRESH_INTERVAL
+                            });
+                        if should_refresh {
                             let reply = encode_queue_ranking(rank);
                             dump_ed2k_tcp_listener_send(
                                 peer_addr,
@@ -2934,6 +2945,7 @@ async fn handle_connection(
                                 format!("failed to send OP_QUEUERANKING to {peer_addr}")
                             })?;
                             last_queue_rank = Some(rank);
+                            last_queue_rank_sent_at = Some(now);
                         }
                         continue;
                     }
@@ -3073,16 +3085,19 @@ async fn handle_connection(
                         Ed2kUploadSessionStatus::Granted => {
                             upload_granted_sent = true;
                             last_queue_rank = None;
+                            last_queue_rank_sent_at = None;
                             encode_accept_upload_req()
                         }
                         Ed2kUploadSessionStatus::Waiting { rank } => {
                             upload_granted_sent = false;
                             last_queue_rank = Some(rank);
+                            last_queue_rank_sent_at = Some(tokio::time::Instant::now());
                             encode_queue_ranking(rank)
                         }
                         Ed2kUploadSessionStatus::Stale => {
                             upload_granted_sent = false;
                             last_queue_rank = Some(1);
+                            last_queue_rank_sent_at = Some(tokio::time::Instant::now());
                             encode_queue_ranking(1)
                         }
                     }
@@ -3196,6 +3211,7 @@ async fn handle_connection(
                             })?;
                             upload_granted_sent = true;
                             last_queue_rank = None;
+                            last_queue_rank_sent_at = None;
                         }
                         Ed2kUploadSessionStatus::Waiting { rank } => {
                             let reply = encode_queue_ranking(rank);
@@ -3209,6 +3225,7 @@ async fn handle_connection(
                                 format!("failed to send OP_QUEUERANKING to {peer_addr}")
                             })?;
                             last_queue_rank = Some(rank);
+                            last_queue_rank_sent_at = Some(tokio::time::Instant::now());
                             continue;
                         }
                         Ed2kUploadSessionStatus::Stale => continue,
@@ -3237,6 +3254,7 @@ async fn handle_connection(
                             upload_granted_sent = true;
                         }
                         last_queue_rank = None;
+                        last_queue_rank_sent_at = None;
                     }
                     Ed2kUploadSessionStatus::Waiting { rank } => {
                         let reply = encode_queue_ranking(rank);
@@ -3250,6 +3268,7 @@ async fn handle_connection(
                             format!("failed to send OP_QUEUERANKING to {peer_addr}")
                         })?;
                         last_queue_rank = Some(rank);
+                        last_queue_rank_sent_at = Some(tokio::time::Instant::now());
                         continue;
                     }
                     Ed2kUploadSessionStatus::Stale => break Ok(()),
@@ -7609,6 +7628,215 @@ mod tests {
         let queue_ranking =
             read_until_opcode(&mut second_stream, OP_EMULEPROT, super::OP_QUEUERANKING).await;
         assert_eq!(u16::from_le_bytes([queue_ranking[6], queue_ranking[7]]), 1);
+
+        first_stream
+            .write_all(&encode_packet(
+                OP_EDONKEYPROT,
+                super::OP_CANCELTRANSFER,
+                &[],
+            ))
+            .await
+            .unwrap();
+        drop(first_stream);
+
+        let promoted = tokio::time::timeout(
+            Duration::from_secs(3),
+            read_until_opcode(
+                &mut second_stream,
+                OP_EDONKEYPROT,
+                super::OP_ACCEPTUPLOADREQ,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(promoted.len(), 6);
+        drop(second_stream);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn listener_upload_queue_refreshes_waiting_rank_before_promotion() {
+        async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
+            let mut header = [0u8; 6];
+            stream.read_exact(&mut header).await.unwrap();
+            let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+            let mut packet = header.to_vec();
+            let mut payload = vec![0u8; packet_len - 1];
+            stream.read_exact(&mut payload).await.unwrap();
+            packet.extend_from_slice(&payload);
+            packet
+        }
+
+        async fn read_until_opcode(stream: &mut TcpStream, protocol: u8, opcode: u8) -> Vec<u8> {
+            loop {
+                let packet = read_packet(stream).await;
+                if packet[0] == protocol && packet[5] == opcode {
+                    return packet;
+                }
+            }
+        }
+
+        let payload = vec![0x71; 4096];
+        let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
+        let file_hash_hex = file_hash.to_string();
+        let root = unique_test_dir("ed2k-upload-listener-queue-refresh");
+        let transfer_runtime = Arc::new(Ed2kTransferRuntime::load_or_create(&root).unwrap());
+        transfer_runtime
+            .configure_upload_queue(Ed2kUploadQueueConfig {
+                active_slots: 1,
+                waiting_capacity: 8,
+                waiting_timeout: Duration::from_secs(30),
+                granted_timeout: Duration::from_secs(30),
+                upload_timeout: Duration::from_secs(30),
+            })
+            .await;
+        let job = new_transfer_job(file_hash, "queued.txt".to_string(), payload.len() as u64);
+        transfer_runtime.ensure_job(&job).await.unwrap();
+        transfer_runtime
+            .store_md4_hashset(&file_hash_hex, Vec::new())
+            .await
+            .unwrap();
+        transfer_runtime
+            .store_piece_data(&file_hash_hex, 0, &payload)
+            .await
+            .unwrap();
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let dht = DhtNode::new(DhtConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            node_id: NodeId::from_bytes([0x4E; 16]),
+            udp_key: 0x2233_4455,
+            ..DhtConfig::default()
+        })
+        .await
+        .unwrap();
+        let server_state = Arc::new(RwLock::new(Ed2kServerState::default()));
+        let kad_firewall = Arc::new(Mutex::new(KadFirewallState::default()));
+        let secure_ident = Arc::new(
+            Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+                .unwrap(),
+        );
+        let hello_identity = Ed2kHelloIdentity {
+            user_hash: [0x51; 16],
+            client_id: 0x3141_5926,
+            tcp_port: 41002,
+            udp_port: 41003,
+            server_ip: 0,
+            server_port: 0,
+            connect_options: emule_connect_options(false),
+            direct_udp_callback: false,
+        };
+
+        let server = tokio::spawn({
+            let dht = dht.clone();
+            let transfer_runtime = Arc::clone(&transfer_runtime);
+            let server_state = Arc::clone(&server_state);
+            let kad_firewall = Arc::clone(&kad_firewall);
+            let secure_ident = Arc::clone(&secure_ident);
+            async move {
+                let (first_stream, first_addr) = listener.accept().await.unwrap();
+                let first = tokio::spawn({
+                    let dht = dht.clone();
+                    let transfer_runtime = Arc::clone(&transfer_runtime);
+                    let server_state = Arc::clone(&server_state);
+                    let kad_firewall = Arc::clone(&kad_firewall);
+                    let secure_ident = Arc::clone(&secure_ident);
+                    async move {
+                        super::handle_connection(
+                            first_stream,
+                            first_addr,
+                            &dht,
+                            &server_state,
+                            &kad_firewall,
+                            &secure_ident,
+                            &transfer_runtime,
+                            hello_identity,
+                        )
+                        .await
+                    }
+                });
+
+                let (second_stream, second_addr) = listener.accept().await.unwrap();
+                let second = tokio::spawn({
+                    let transfer_runtime = Arc::clone(&transfer_runtime);
+                    let server_state = Arc::clone(&server_state);
+                    let kad_firewall = Arc::clone(&kad_firewall);
+                    let secure_ident = Arc::clone(&secure_ident);
+                    async move {
+                        super::handle_connection(
+                            second_stream,
+                            second_addr,
+                            &dht,
+                            &server_state,
+                            &kad_firewall,
+                            &secure_ident,
+                            &transfer_runtime,
+                            hello_identity,
+                        )
+                        .await
+                    }
+                });
+
+                first.await.unwrap().unwrap();
+                second.await.unwrap().unwrap();
+            }
+        });
+
+        let first_identity = Ed2kHelloIdentity {
+            user_hash: [0x61; 16],
+            client_id: 0x1111_2222,
+            tcp_port: 4661,
+            udp_port: 4665,
+            server_ip: 0,
+            server_port: 0,
+            connect_options: emule_connect_options(false),
+            direct_udp_callback: false,
+        };
+        let mut first_stream = TcpStream::connect(peer_addr).await.unwrap();
+        first_stream
+            .write_all(&encode_hello_request(first_identity))
+            .await
+            .unwrap();
+        let _ = read_until_opcode(&mut first_stream, OP_EDONKEYPROT, OP_HELLOANSWER).await;
+        first_stream
+            .write_all(&super::encode_start_upload_req(&file_hash))
+            .await
+            .unwrap();
+        let _ =
+            read_until_opcode(&mut first_stream, OP_EDONKEYPROT, super::OP_ACCEPTUPLOADREQ).await;
+
+        let second_identity = Ed2kHelloIdentity {
+            user_hash: [0x62; 16],
+            client_id: 0x2222_3333,
+            tcp_port: 4662,
+            udp_port: 4666,
+            server_ip: 0,
+            server_port: 0,
+            connect_options: emule_connect_options(false),
+            direct_udp_callback: false,
+        };
+        let mut second_stream = TcpStream::connect(peer_addr).await.unwrap();
+        second_stream
+            .write_all(&encode_hello_request(second_identity))
+            .await
+            .unwrap();
+        let _ = read_until_opcode(&mut second_stream, OP_EDONKEYPROT, OP_HELLOANSWER).await;
+        second_stream
+            .write_all(&super::encode_start_upload_req(&file_hash))
+            .await
+            .unwrap();
+        let first_rank =
+            read_until_opcode(&mut second_stream, OP_EMULEPROT, super::OP_QUEUERANKING).await;
+        assert_eq!(u16::from_le_bytes([first_rank[6], first_rank[7]]), 1);
+
+        let refreshed = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_until_opcode(&mut second_stream, OP_EMULEPROT, super::OP_QUEUERANKING),
+        )
+        .await
+        .unwrap();
+        assert_eq!(u16::from_le_bytes([refreshed[6], refreshed[7]]), 1);
 
         first_stream
             .write_all(&encode_packet(
