@@ -3584,7 +3584,9 @@ fn encode_accept_upload_req() -> Vec<u8> {
 }
 
 fn encode_queue_ranking(rank: u16) -> Vec<u8> {
-    encode_packet(OP_EMULEPROT, OP_QUEUERANKING, &rank.to_le_bytes())
+    let mut payload = [0u8; 12];
+    payload[..2].copy_from_slice(&rank.to_le_bytes());
+    encode_packet(OP_EMULEPROT, OP_QUEUERANKING, &payload)
 }
 
 fn encode_start_upload_req(file_hash: &Ed2kHash) -> Vec<u8> {
@@ -4421,6 +4423,17 @@ mod tests {
             decode_secident_state(&packet[6..]).unwrap(),
             (ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, 0x4436EEAC)
         );
+    }
+
+    #[test]
+    fn queue_ranking_matches_emule_twelve_byte_payload_shape() {
+        let packet = super::encode_queue_ranking(7);
+
+        assert_eq!(packet[0], OP_EMULEPROT);
+        assert_eq!(packet[5], super::OP_QUEUERANKING);
+        assert_eq!(&packet[6..8], &7u16.to_le_bytes());
+        assert_eq!(packet.len(), 18);
+        assert!(packet[8..].iter().all(|byte| *byte == 0));
     }
 
     #[test]
@@ -6472,7 +6485,7 @@ mod tests {
             );
             stream.write_all(&file_desc).await.unwrap();
 
-            let queue_ranking = encode_packet(OP_EMULEPROT, super::OP_QUEUERANKING, &[0x01, 0x00]);
+            let queue_ranking = super::encode_queue_ranking(1);
             stream.write_all(&queue_ranking).await.unwrap();
 
             tokio::time::sleep(Duration::from_millis(1500)).await;
