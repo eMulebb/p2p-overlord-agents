@@ -395,6 +395,15 @@ pub enum Ed2kTransferState {
     Verified,
 }
 
+/// One claimed download piece plus the already persisted byte prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Ed2kClaimedPart {
+    /// Piece index inside the resume manifest.
+    pub piece_index: u32,
+    /// Number of contiguous bytes already persisted for this piece.
+    pub bytes_written: u64,
+}
+
 /// Per-piece status tracked by the resume manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ed2kPieceState {
@@ -656,8 +665,11 @@ impl Ed2kTransferRuntime {
         Ok(false)
     }
 
-    /// Claim the next missing part atomically for one peer session.
-    pub async fn claim_next_missing_part(&self, file_hash: &str) -> Result<Option<u32>> {
+    /// Claim the next incomplete part atomically for one peer session.
+    pub async fn claim_next_missing_part(
+        &self,
+        file_hash: &str,
+    ) -> Result<Option<Ed2kClaimedPart>> {
         let _guard = self.manifest_io.lock().await;
         let mut manifest = self.load_manifest_unlocked(file_hash).await?;
         let Some(piece) = manifest
@@ -667,13 +679,19 @@ impl Ed2kTransferRuntime {
         else {
             return Ok(None);
         };
+        let claimed = Ed2kClaimedPart {
+            piece_index: piece.piece_index,
+            bytes_written: piece.bytes_written,
+        };
         piece.state = Ed2kTransferState::Requested;
-        let piece_index = piece.piece_index;
         self.store_manifest_unlocked(&manifest).await?;
-        Ok(Some(piece_index))
+        Ok(Some(claimed))
     }
 
     /// Release a previously requested part back to the missing pool.
+    ///
+    /// Any already persisted byte prefix is kept so a later peer session can
+    /// resume from the exact missing range instead of discarding good data.
     pub async fn release_piece_request(&self, file_hash: &str, piece_index: u32) -> Result<()> {
         let _guard = self.manifest_io.lock().await;
         let mut manifest = self.load_manifest_unlocked(file_hash).await?;
@@ -684,7 +702,6 @@ impl Ed2kTransferRuntime {
             .with_context(|| format!("missing piece index {piece_index} in {file_hash}"))?;
         if piece.state == Ed2kTransferState::Requested {
             piece.state = Ed2kTransferState::Missing;
-            piece.bytes_written = 0;
             self.store_manifest_unlocked(&manifest).await?;
         }
         Ok(())
@@ -1287,6 +1304,48 @@ mod tests {
                 .iter()
                 .any(|entry| entry.file_hash == job.file_hash && entry.verified_complete)
         );
+    }
+
+    #[tokio::test]
+    async fn release_piece_request_preserves_partial_piece_progress() {
+        let root = unique_test_dir("ed2k-transfer-release-request-progress");
+        let runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+        let payload = vec![0x5Au8; 32_768];
+        let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
+        let job = new_transfer_job(file_hash, "resume.bin".to_string(), payload.len() as u64);
+        runtime.ensure_job(&job).await.unwrap();
+
+        let claimed = runtime
+            .claim_next_missing_part(&job.file_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.piece_index, 0);
+        assert_eq!(claimed.bytes_written, 0);
+
+        let split = 8_192usize;
+        let completed = runtime
+            .append_piece_block(&job.file_hash, 0, 0, split as u64, &payload[..split])
+            .await
+            .unwrap();
+        assert!(!completed);
+
+        runtime
+            .release_piece_request(&job.file_hash, 0)
+            .await
+            .unwrap();
+
+        let manifest = runtime.manifest(&job.file_hash).await.unwrap();
+        assert_eq!(manifest.pieces[0].state, Ed2kTransferState::Missing);
+        assert_eq!(manifest.pieces[0].bytes_written, split as u64);
+
+        let reclaimed = runtime
+            .claim_next_missing_part(&job.file_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reclaimed.piece_index, 0);
+        assert_eq!(reclaimed.bytes_written, split as u64);
     }
 
     #[tokio::test]
