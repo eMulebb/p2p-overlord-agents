@@ -510,7 +510,17 @@ pub struct Ed2kTransferRuntime {
 impl Ed2kTransferRuntime {
     /// Load any persisted transfer manifests and create the runtime root if it
     /// does not exist yet.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn load_or_create(root_dir: &Path) -> Result<Self> {
+        Self::load_or_create_with_upload_queue(root_dir, Ed2kUploadQueueConfig::default())
+    }
+
+    /// Load any persisted transfer manifests with an explicit inbound upload
+    /// queue policy and create the runtime root if it does not exist yet.
+    pub fn load_or_create_with_upload_queue(
+        root_dir: &Path,
+        upload_queue_config: Ed2kUploadQueueConfig,
+    ) -> Result<Self> {
         fs::create_dir_all(root_dir).with_context(|| {
             format!("failed to create ED2K transfer root {}", root_dir.display())
         })?;
@@ -520,9 +530,7 @@ impl Ed2kTransferRuntime {
             shared_catalog,
             callback_intents: Arc::new(RwLock::new(Vec::new())),
             manifest_io: Arc::new(Mutex::new(())),
-            upload_queue: Arc::new(Mutex::new(Ed2kUploadQueueState::new(
-                Ed2kUploadQueueConfig::default(),
-            ))),
+            upload_queue: Arc::new(Mutex::new(Ed2kUploadQueueState::new(upload_queue_config))),
             next_upload_connection_id: AtomicU64::new(1),
         })
     }

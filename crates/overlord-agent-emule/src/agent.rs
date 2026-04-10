@@ -63,7 +63,7 @@ use overlord_kad_proto::{
 };
 use overlord_kad_routing::{Contact, ContactType};
 
-use crate::config::{Ed2kConfig, EmuleAgentConfig};
+use crate::config::{Ed2kConfig, Ed2kUploadQueuePolicyConfig, EmuleAgentConfig};
 use crate::ed2k_server::{
     Ed2kFoundSource, Ed2kSearchFile, Ed2kServerSearchHandle, Ed2kServerState,
     new_ed2k_server_search_channel, request_callback_on_server,
@@ -78,7 +78,7 @@ use crate::ed2k_tcp::{
 };
 use crate::ed2k_transfer::{
     Ed2kCallbackIntent, Ed2kResumeManifest, Ed2kSharedCatalog, Ed2kSharedEntry, Ed2kSourceHint,
-    Ed2kTransferRuntime, new_transfer_job,
+    Ed2kTransferRuntime, Ed2kUploadQueueConfig, new_transfer_job,
 };
 use crate::kad_firewall::{
     ExternalPortDiscoveryOutcome, FirewallUdpPacketOutcome, FirewalledResponseOutcome,
@@ -1105,6 +1105,16 @@ async fn clear_agent_degraded_activity(tracker: &Arc<Mutex<AgentActivityTracker>
 }
 
 impl OverlordAgentEmule {
+    fn ed2k_upload_queue_config(config: &Ed2kUploadQueuePolicyConfig) -> Ed2kUploadQueueConfig {
+        Ed2kUploadQueueConfig {
+            active_slots: config.active_slots,
+            waiting_capacity: config.waiting_capacity,
+            waiting_timeout: Duration::from_secs(config.waiting_timeout_secs),
+            granted_timeout: Duration::from_secs(config.granted_timeout_secs),
+            upload_timeout: Duration::from_secs(config.upload_timeout_secs),
+        }
+    }
+
     pub async fn new(config: EmuleAgentConfig) -> Result<Self> {
         let indexer_id = load_or_create_indexer_id(&config.agent.indexer_id_path)?;
         let coordinator = CoordinatorClient::new(&config.coordinator.url)?;
@@ -1789,8 +1799,9 @@ impl OverlordAgentEmule {
             })?);
         let (ed2k_server_search, ed2k_server_search_inbox) =
             new_ed2k_server_search_channel(ED2K_BACKGROUND_SEARCH_QUEUE_CAPACITY);
-        let ed2k_transfer = Arc::new(Ed2kTransferRuntime::load_or_create(
+        let ed2k_transfer = Arc::new(Ed2kTransferRuntime::load_or_create_with_upload_queue(
             &self.state_paths.ed2k_transfer_root,
+            Self::ed2k_upload_queue_config(&config.p2p.ed2k.upload_queue),
         )?);
         ed2k_transfer
             .replace_catalog_hints(&synthetic_popular_hashes())

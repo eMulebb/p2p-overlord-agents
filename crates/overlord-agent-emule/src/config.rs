@@ -182,6 +182,24 @@ pub struct Ed2kConfig {
     /// A value of `0` disables proactive rotation and keeps the current session
     /// alive until the remote side disconnects or the agent shuts down.
     pub session_rotation_secs: u64,
+    /// Deterministic inbound upload queue policy for peer download sessions.
+    pub upload_queue: Ed2kUploadQueuePolicyConfig,
+}
+
+/// Agent-configurable ED2K upload queue policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Ed2kUploadQueuePolicyConfig {
+    /// Maximum number of concurrently granted upload sessions.
+    pub active_slots: usize,
+    /// Maximum number of queued waiters retained at once.
+    pub waiting_capacity: usize,
+    /// Maximum idle time for a queued waiter before it expires.
+    pub waiting_timeout_secs: u64,
+    /// Maximum stall time after a grant before the peer requests part data.
+    pub granted_timeout_secs: u64,
+    /// Maximum idle time while a peer is actively uploading.
+    pub upload_timeout_secs: u64,
 }
 
 /// Metadata-rich ED2K server bootstrap entry mirrored from eMule's
@@ -372,6 +390,19 @@ impl Default for Ed2kConfig {
             reconnect_interval_secs: 30,
             keepalive_secs: 60,
             session_rotation_secs: 0,
+            upload_queue: Ed2kUploadQueuePolicyConfig::default(),
+        }
+    }
+}
+
+impl Default for Ed2kUploadQueuePolicyConfig {
+    fn default() -> Self {
+        Self {
+            active_slots: 3,
+            waiting_capacity: 512,
+            waiting_timeout_secs: 180,
+            granted_timeout_secs: 30,
+            upload_timeout_secs: 90,
         }
     }
 }
@@ -784,6 +815,13 @@ listen_port = 41000
 [p2p.ed2k]
 listen_port = 41001
 
+[p2p.ed2k.upload_queue]
+active_slots = 2
+waiting_capacity = 64
+waiting_timeout_secs = 45
+granted_timeout_secs = 12
+upload_timeout_secs = 33
+
 [nat.p2p]
 enabled = true
 backend_order = ["upnp_miniupnpc"]
@@ -807,6 +845,11 @@ renew_margin_secs = 300
         assert!(config.p2p.selection_confirmed);
         assert_eq!(config.p2p.kad.listen_port, 41_000);
         assert_eq!(config.p2p.ed2k.listen_port, 41_001);
+        assert_eq!(config.p2p.ed2k.upload_queue.active_slots, 2);
+        assert_eq!(config.p2p.ed2k.upload_queue.waiting_capacity, 64);
+        assert_eq!(config.p2p.ed2k.upload_queue.waiting_timeout_secs, 45);
+        assert_eq!(config.p2p.ed2k.upload_queue.granted_timeout_secs, 12);
+        assert_eq!(config.p2p.ed2k.upload_queue.upload_timeout_secs, 33);
         assert!(config.nat.p2p.enabled);
         assert_eq!(
             config.nat.p2p.backend_order,
