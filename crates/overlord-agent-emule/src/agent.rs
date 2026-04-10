@@ -6136,20 +6136,25 @@ impl OverlordAgentEmule {
         let normalized_file_hash = request.file_hash.to_lowercase();
         if let Some(runtime) = self.runtime.lock().await.clone()
             && let Ok(manifest) = runtime.ed2k_transfer.manifest(&normalized_file_hash).await
-            && (manifest.completed || manifest_has_ed2k_transfer_progress(&manifest))
         {
-            info!(
-                "native ED2K download already has persisted progress file_hash={} completed={} bytes_written={} md4_hashset_acquired={}",
-                normalized_file_hash,
-                manifest.completed,
-                manifest
-                    .pieces
-                    .iter()
-                    .map(|piece| piece.bytes_written)
-                    .sum::<u64>(),
-                manifest.md4_hashset_acquired
-            );
-            return Ok(());
+            let persisted_bytes = manifest
+                .pieces
+                .iter()
+                .map(|piece| piece.bytes_written)
+                .sum::<u64>();
+            if manifest.completed {
+                info!(
+                    "native ED2K download already completed file_hash={} bytes_written={} md4_hashset_acquired={}",
+                    normalized_file_hash, persisted_bytes, manifest.md4_hashset_acquired
+                );
+                return Ok(());
+            }
+            if manifest_has_ed2k_transfer_progress(&manifest) {
+                info!(
+                    "native ED2K download resuming persisted progress file_hash={} bytes_written={} md4_hashset_acquired={}",
+                    normalized_file_hash, persisted_bytes, manifest.md4_hashset_acquired
+                );
+            }
         }
         {
             let mut active = self.active_ed2k_downloads.lock().await;
@@ -7592,15 +7597,16 @@ fn merge_download_sources(
 mod tests {
     use super::{
         COORDINATOR_RECONNECT_SECS, EMULE_LARGE_FILE_SIZE_THRESHOLD, EmuleAgentConfig,
-        OverlordAgentEmule, PASSIVE_REPLAY_CONCURRENCY, PassiveReplaySelection,
-        SYNTHETIC_POPULAR_SEEDS, SourcePublishSettings, apply_harvest_record,
-        apply_networking_config, apply_publish_summary, apply_queue_family_counts,
-        build_hello_request, build_hello_response, build_kad_hello_request_tags,
-        build_kad_hello_response_tags, build_keyword_snoop_entry, build_notes_publish_tags,
-        build_notes_snoop_entry, build_publish_batch_summary, build_source_publish_tags,
-        build_source_snoop_entry, current_tcp_firewalled, ed2k_file_type_search_term,
-        effective_publish_counters, empty_networking_config, emule_high_id_source_type,
-        flush_snoop_queue, keyword_target, next_passive_replay_request,
+        EnrichEd2kDownloadRequest, EnrichEd2kDownloadSource, OverlordAgentEmule,
+        PASSIVE_REPLAY_CONCURRENCY, PassiveReplaySelection, SYNTHETIC_POPULAR_SEEDS,
+        SourcePublishSettings, apply_harvest_record, apply_networking_config,
+        apply_publish_summary, apply_queue_family_counts, build_hello_request,
+        build_hello_response, build_kad_hello_request_tags, build_kad_hello_response_tags,
+        build_keyword_snoop_entry, build_notes_publish_tags, build_notes_snoop_entry,
+        build_publish_batch_summary, build_source_publish_tags, build_source_snoop_entry,
+        current_tcp_firewalled, ed2k_file_type_search_term, effective_publish_counters,
+        empty_networking_config, emule_high_id_source_type, flush_snoop_queue, keyword_target,
+        manifest_has_ed2k_transfer_progress, next_passive_replay_request,
         next_passive_replay_request_for_family, normalize_ed2k_user_hash_markers,
         parse_kad_hello_metadata, record_passive_replay_complete,
         record_passive_replay_enqueue_wait, record_passive_replay_idle,
@@ -7997,6 +8003,112 @@ mod tests {
         assert_eq!(*attempts.lock().await, vec![41001, 41002]);
         let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
         assert!(manifest.completed);
+    }
+
+    #[tokio::test]
+    async fn spawn_native_ed2k_download_attempts_direct_source_with_persisted_progress() {
+        let temp_root = unique_test_dir("overlord-agent-emule-direct-download-resume-spawn");
+        let mut config = build_test_config(&temp_root, "http://127.0.0.1:9".to_string());
+        config.p2p.ed2k.listen_port = 41001;
+        config.p2p.kad.listen_port = 41000;
+        let agent = OverlordAgentEmule::new(config).await.unwrap();
+        agent.start().await.unwrap();
+
+        let runtime = agent.runtime.lock().await.clone().unwrap();
+        let payload = b"captured partial file payload".repeat(1024);
+        let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
+        let file_hash_hex = file_hash.to_string();
+        runtime
+            .ed2k_transfer
+            .ensure_job(&new_transfer_job(
+                file_hash,
+                "captured-resume.iso".to_string(),
+                payload.len() as u64,
+            ))
+            .await
+            .unwrap();
+        let claimed = runtime
+            .ed2k_transfer
+            .claim_next_missing_part(&file_hash_hex)
+            .await
+            .unwrap()
+            .unwrap();
+        let persisted_len = 16_384usize;
+        let completed = runtime
+            .ed2k_transfer
+            .append_piece_block(
+                &file_hash_hex,
+                claimed.piece_index,
+                0,
+                persisted_len as u64,
+                &payload[..persisted_len],
+            )
+            .await
+            .unwrap();
+        assert!(!completed);
+        runtime
+            .ed2k_transfer
+            .release_piece_request(&file_hash_hex, claimed.piece_index)
+            .await
+            .unwrap();
+        let manifest = runtime
+            .ed2k_transfer
+            .manifest(&file_hash_hex)
+            .await
+            .unwrap();
+        assert!(manifest_has_ed2k_transfer_progress(&manifest));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_port = listener.local_addr().unwrap().port();
+        let connected = Arc::new(tokio::sync::Notify::new());
+        let connected_signal = Arc::clone(&connected);
+        let peer_task = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            connected_signal.notify_one();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        });
+
+        agent
+            .spawn_native_ed2k_download(EnrichEd2kDownloadRequest {
+                kind: "ed2k_download".to_string(),
+                file_hash: file_hash_hex.clone(),
+                file_name: "captured-resume.iso".to_string(),
+                file_size: payload.len() as u64,
+                sources: vec![EnrichEd2kDownloadSource {
+                    ip: Ipv4Addr::LOCALHOST,
+                    tcp_port: peer_port,
+                    client_id: Some(1),
+                    low_id: Some(false),
+                    obfuscation_options: None,
+                    user_hash: None,
+                }],
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), connected.notified())
+            .await
+            .unwrap();
+        peer_task.await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !agent
+                    .active_ed2k_downloads
+                    .lock()
+                    .await
+                    .contains(&file_hash_hex)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        agent.stop().await.unwrap();
+        fs::remove_dir_all(&temp_root).unwrap();
     }
 
     #[test]
