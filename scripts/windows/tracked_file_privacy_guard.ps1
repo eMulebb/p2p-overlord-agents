@@ -1,3 +1,4 @@
+#Requires -Version 7.6
 # Runs the tracked-file privacy guard for the agents repo.
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
