@@ -488,6 +488,7 @@ fn ed2k_opcode_name(protocol: u8, opcode: u8) -> &'static str {
         (OP_EDONKEYPROT, OP_HASHSETANSWER) => "OP_HASHSETANSWER",
         (OP_EDONKEYPROT, OP_STARTUPLOADREQ) => "OP_STARTUPLOADREQ",
         (OP_EDONKEYPROT, OP_ACCEPTUPLOADREQ) => "OP_ACCEPTUPLOADREQ",
+        (OP_EDONKEYPROT, OP_CANCELTRANSFER) => "OP_CANCELTRANSFER",
         (OP_EDONKEYPROT, OP_REQUESTFILENAME) => "OP_REQUESTFILENAME",
         (OP_EDONKEYPROT, OP_REQFILENAMEANSWER) => "OP_REQFILENAMEANSWER",
         (OP_EMULEPROT, OP_REQUESTSOURCES) => "OP_REQUESTSOURCES",
@@ -3119,6 +3120,38 @@ async fn handle_connection(
                     .await
                     .with_context(|| format!("failed to send OP_HASHSETANSWER to {peer_addr}"))?;
             }
+            (OP_EMULEPROT, OP_REQUESTSOURCES) | (OP_EMULEPROT, OP_REQUESTSOURCES2) => {
+                let (requested, requested_version) =
+                    decode_request_sources_payload(packet.opcode, &packet.payload)?;
+                requested_file_hash = Some(requested);
+                if transfer_runtime.local_entry(&requested).await?.is_some() {
+                    let reply = if packet.opcode == OP_REQUESTSOURCES2 {
+                        encode_answer_sources2_empty(
+                            &requested,
+                            requested_version.max(ED2K_SOURCE_EXCHANGE2_VERSION),
+                        )
+                    } else {
+                        encode_answer_sources_empty(&requested)
+                    };
+                    dump_ed2k_tcp_listener_send(
+                        peer_addr,
+                        transport.mode,
+                        "answer_sources",
+                        &reply,
+                    );
+                    transport.write_all(&reply).await.with_context(|| {
+                        format!("failed to send source exchange reply to {peer_addr}")
+                    })?;
+                }
+            }
+            (OP_EMULEPROT, OP_AICHFILEHASHREQ) => {
+                let requested = decode_file_hash_payload(&packet.payload)?;
+                requested_file_hash = Some(requested);
+                if transfer_runtime.local_entry(&requested).await?.is_some() {
+                    // Keep the legacy AICH probe from tearing down the upload
+                    // session even when we do not currently expose an AICH tree.
+                }
+            }
             (OP_EDONKEYPROT, OP_REQUESTPARTS) | (OP_EMULEPROT, OP_REQUESTPARTS_I64) => {
                 let is_i64 = packet.opcode == OP_REQUESTPARTS_I64;
                 let (requested, ranges) = decode_request_parts_payload(&packet.payload, is_i64)?;
@@ -3584,6 +3617,21 @@ fn encode_request_sources2(file_hash: &Ed2kHash) -> Vec<u8> {
     encode_packet(OP_EMULEPROT, OP_REQUESTSOURCES2, &payload)
 }
 
+fn encode_answer_sources_empty(file_hash: &Ed2kHash) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(18);
+    payload.extend_from_slice(&file_hash.0);
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    encode_packet(OP_EMULEPROT, OP_ANSWERSOURCES, &payload)
+}
+
+fn encode_answer_sources2_empty(file_hash: &Ed2kHash, version: u8) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(19);
+    payload.push(version);
+    payload.extend_from_slice(&file_hash.0);
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    encode_packet(OP_EMULEPROT, OP_ANSWERSOURCES2, &payload)
+}
+
 fn encode_aich_file_hash_request(file_hash: &Ed2kHash) -> Vec<u8> {
     encode_packet(OP_EMULEPROT, OP_AICHFILEHASHREQ, &file_hash.0)
 }
@@ -3676,6 +3724,19 @@ fn decode_request_parts_payload(
         }
     }
     Ok((Ed2kHash::from_bytes(hash), ranges))
+}
+
+fn decode_request_sources_payload(opcode: u8, payload: &[u8]) -> Result<(Ed2kHash, u8)> {
+    match opcode {
+        OP_REQUESTSOURCES => Ok((decode_file_hash_payload(payload)?, 0)),
+        OP_REQUESTSOURCES2 => {
+            if payload.len() < 19 {
+                anyhow::bail!("short OP_REQUESTSOURCES2 payload {}", payload.len());
+            }
+            Ok((decode_file_hash_payload(&payload[3..])?, payload[0]))
+        }
+        _ => anyhow::bail!("unsupported source request opcode 0x{opcode:02X}"),
+    }
 }
 
 fn decode_aich_file_hash_answer(payload: &[u8]) -> Result<Ed2kHash> {
@@ -7034,6 +7095,148 @@ mod tests {
 
         assert!(saw_compressed);
         assert_eq!(reconstructed, payload);
+        drop(stream);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
+        async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
+            let mut header = [0u8; 6];
+            stream.read_exact(&mut header).await.unwrap();
+            let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+            let mut packet = header.to_vec();
+            let mut payload = vec![0u8; packet_len - 1];
+            stream.read_exact(&mut payload).await.unwrap();
+            packet.extend_from_slice(&payload);
+            packet
+        }
+
+        async fn read_until_opcode(stream: &mut TcpStream, protocol: u8, opcode: u8) -> Vec<u8> {
+            loop {
+                let packet = read_packet(stream).await;
+                if packet[0] == protocol && packet[5] == opcode {
+                    return packet;
+                }
+            }
+        }
+
+        let payload = b"ubuntu linux upload startup handshake".repeat(512);
+        let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
+        let file_hash_hex = file_hash.to_string();
+        let root = unique_test_dir("ed2k-upload-listener-startup");
+        let transfer_runtime = Arc::new(Ed2kTransferRuntime::load_or_create(&root).unwrap());
+        let job = new_transfer_job(file_hash, "startup.txt".to_string(), payload.len() as u64);
+        transfer_runtime.ensure_job(&job).await.unwrap();
+        transfer_runtime
+            .store_md4_hashset(&file_hash_hex, Vec::new())
+            .await
+            .unwrap();
+        transfer_runtime
+            .store_piece_data(&file_hash_hex, 0, &payload)
+            .await
+            .unwrap();
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let dht = DhtNode::new(DhtConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            node_id: NodeId::from_bytes([0x4D; 16]),
+            udp_key: 0x5566_7788,
+            ..DhtConfig::default()
+        })
+        .await
+        .unwrap();
+        let server_state = Arc::new(RwLock::new(Ed2kServerState::default()));
+        let kad_firewall = Arc::new(Mutex::new(KadFirewallState::default()));
+        let secure_ident = Arc::new(
+            Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+                .unwrap(),
+        );
+        let hello_identity = Ed2kHelloIdentity {
+            user_hash: [0x31; 16],
+            client_id: 0x1357_2468,
+            tcp_port: 41011,
+            udp_port: 41010,
+            server_ip: 0,
+            server_port: 0,
+            connect_options: emule_connect_options(false),
+            direct_udp_callback: false,
+        };
+
+        let server = tokio::spawn({
+            let transfer_runtime = Arc::clone(&transfer_runtime);
+            let server_state = Arc::clone(&server_state);
+            let kad_firewall = Arc::clone(&kad_firewall);
+            let secure_ident = Arc::clone(&secure_ident);
+            async move {
+                let (stream, remote_addr) = listener.accept().await.unwrap();
+                super::handle_connection(
+                    stream,
+                    remote_addr,
+                    &dht,
+                    &server_state,
+                    &kad_firewall,
+                    &secure_ident,
+                    &transfer_runtime,
+                    hello_identity,
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let mut stream = TcpStream::connect(peer_addr).await.unwrap();
+        let peer_identity = Ed2kHelloIdentity {
+            user_hash: [0x41; 16],
+            client_id: 0x2468_1357,
+            tcp_port: 4662,
+            udp_port: 4672,
+            server_ip: 0,
+            server_port: 0,
+            connect_options: emule_connect_options(false),
+            direct_udp_callback: false,
+        };
+        stream
+            .write_all(&encode_hello_request(peer_identity))
+            .await
+            .unwrap();
+        let _ = read_until_opcode(&mut stream, OP_EDONKEYPROT, OP_HELLOANSWER).await;
+
+        let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
+        stream
+            .write_all(&super::encode_request_filename(&file_hash, &manifest))
+            .await
+            .unwrap();
+        let filename_answer =
+            read_until_opcode(&mut stream, OP_EDONKEYPROT, OP_REQFILENAMEANSWER).await;
+        assert_eq!(&filename_answer[6..22], &file_hash.0);
+
+        stream
+            .write_all(&super::encode_request_sources2(&file_hash))
+            .await
+            .unwrap();
+        let source_answer =
+            read_until_opcode(&mut stream, OP_EMULEPROT, super::OP_ANSWERSOURCES2).await;
+        assert_eq!(source_answer[6], super::ED2K_SOURCE_EXCHANGE2_VERSION);
+        assert_eq!(&source_answer[7..23], &file_hash.0);
+        assert_eq!(
+            u16::from_le_bytes([source_answer[23], source_answer[24]]),
+            0
+        );
+
+        stream
+            .write_all(&super::encode_aich_file_hash_request(&file_hash))
+            .await
+            .unwrap();
+        stream
+            .write_all(&super::encode_start_upload_req(&file_hash))
+            .await
+            .unwrap();
+        let accept_upload =
+            read_until_opcode(&mut stream, OP_EDONKEYPROT, super::OP_ACCEPTUPLOADREQ).await;
+        assert_eq!(accept_upload.len(), 6);
+
         drop(stream);
         server.await.unwrap();
     }
