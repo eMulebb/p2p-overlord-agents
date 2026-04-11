@@ -2117,7 +2117,7 @@ async fn run_passive_keyword_replay(
 
     for responder_ceiling in passive_replay_tier_contact_limits(context.max_phase2_fanout) {
         let tier_result_start = outcome.result_count;
-        info!(
+        debug!(
             "kad passive replay tier start family=keyword target={} responder_ceiling={} restrictive_bytes={}",
             request.target,
             responder_ceiling,
@@ -2163,7 +2163,7 @@ async fn run_passive_keyword_replay(
         }
 
         let tier_results = outcome.result_count - tier_result_start;
-        info!(
+        debug!(
             "kad passive replay tier done family=keyword target={} responder_ceiling={} tier_results={} cumulative_results={}",
             request.target, responder_ceiling, tier_results, outcome.result_count
         );
@@ -2215,7 +2215,7 @@ async fn run_passive_source_replay(
 
     for responder_ceiling in passive_replay_tier_contact_limits(context.max_phase2_fanout) {
         let tier_result_start = outcome.result_count;
-        info!(
+        debug!(
             "kad passive replay tier start family=source target={} responder_ceiling={} size={}",
             request.target, responder_ceiling, request.size
         );
@@ -2254,7 +2254,7 @@ async fn run_passive_source_replay(
         }
 
         let tier_results = outcome.result_count - tier_result_start;
-        info!(
+        debug!(
             "kad passive replay tier done family=source target={} responder_ceiling={} tier_results={} cumulative_results={}",
             request.target, responder_ceiling, tier_results, outcome.result_count
         );
@@ -3852,7 +3852,7 @@ async fn record_snoop_entry(
         apply_harvest_record(&mut observability, from, &entry, outcome.is_new);
     }
     if outcome.is_new || outcome.hit_count <= 3 || outcome.hit_count % 10 == 0 {
-        info!(
+        debug!(
             "kad snoop family={} from={} target={} {} queue_depth={} family_queue_depth={} hit_count={} state={} seen_at={}",
             family,
             from,
@@ -6949,7 +6949,7 @@ impl OverlordAgentEmule {
                                 replay_started_at,
                             );
                         }
-                        info!(
+                        debug!(
                             "kad passive source replay start target={} start_position={} size={}",
                             request.target, request.start_position, request.size
                         );
@@ -7008,7 +7008,7 @@ impl OverlordAgentEmule {
                         {
                             debug!("failed to post source harvest replay summary: {error}");
                         }
-                        info!(
+                        debug!(
                             "kad passive source replay done results={} batches_posted={}",
                             outcome.result_count, outcome.batch_count
                         );
@@ -7324,7 +7324,7 @@ impl OverlordAgentEmule {
                                 replay_started_at,
                             );
                         }
-                        info!(
+                        debug!(
                             "kad passive source replay start target={} start_position={} size={}",
                             request.target, request.start_position, request.size
                         );
@@ -7383,7 +7383,7 @@ impl OverlordAgentEmule {
                         {
                             debug!("failed to post source harvest replay summary: {error}");
                         }
-                        info!(
+                        debug!(
                             "kad passive source replay done results={} batches_posted={}",
                             outcome.result_count, outcome.batch_count
                         );

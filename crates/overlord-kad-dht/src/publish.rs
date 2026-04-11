@@ -180,7 +180,7 @@ pub async fn publish_keyword(
         register_publish_contact(rpc, contact);
     }
     for (index, contact) in publish_contacts.iter().enumerate() {
-        tracing::info!(
+        tracing::debug!(
             "kad publish contact family=keyword step=send rank={}/{} contact_addr={} contact_id={} contact_version={} target={} file_hash={}",
             index + 1,
             stats.attempted_contacts,
@@ -229,7 +229,7 @@ pub async fn publish_keyword(
         match result {
             Ok(KadPacket::PublishRes(response)) => {
                 stats.acked_contacts += 1;
-                tracing::info!(
+                tracing::debug!(
                     "kad publish contact family=keyword step=ack rank={}/{} contact_addr={} contact_id={} response_target={} response_load={}",
                     attempt.rank,
                     attempt.total,
@@ -241,7 +241,7 @@ pub async fn publish_keyword(
             }
             Ok(other) => {
                 stats.acked_contacts += 1;
-                tracing::info!(
+                tracing::debug!(
                     "kad publish contact family=keyword step=ack rank={}/{} contact_addr={} contact_id={} response_opcode=0x{:02X}",
                     attempt.rank,
                     attempt.total,
@@ -254,7 +254,7 @@ pub async fn publish_keyword(
                 if matches!(e, overlord_kad_net::NetError::Timeout { .. }) {
                     stats.timed_out_contacts += 1;
                 }
-                tracing::info!(
+                tracing::debug!(
                     "kad publish contact family=keyword step=fail rank={}/{} contact_addr={} contact_id={} error={}",
                     attempt.rank,
                     attempt.total,
@@ -350,7 +350,7 @@ pub async fn publish_source(
         register_publish_contact(rpc, contact);
     }
     for (index, contact) in publish_contacts.iter().enumerate() {
-        tracing::info!(
+        tracing::debug!(
             "kad publish contact family=source step=send rank={}/{} contact_addr={} contact_id={} contact_version={} target={} file_hash={} publisher_id={}",
             index + 1,
             stats.attempted_contacts,
@@ -366,7 +366,7 @@ pub async fn publish_source(
         match result {
             Ok(KadPacket::PublishRes(response)) => {
                 stats.acked_contacts += 1;
-                tracing::info!(
+                tracing::debug!(
                     "kad publish contact family=source step=ack rank={}/{} contact_addr={} contact_id={} response_target={} response_load={}",
                     attempt.rank,
                     attempt.total,
@@ -378,7 +378,7 @@ pub async fn publish_source(
             }
             Ok(other) => {
                 stats.acked_contacts += 1;
-                tracing::info!(
+                tracing::debug!(
                     "kad publish contact family=source step=ack rank={}/{} contact_addr={} contact_id={} response_opcode=0x{:02X}",
                     attempt.rank,
                     attempt.total,
@@ -391,7 +391,7 @@ pub async fn publish_source(
                 if matches!(e, overlord_kad_net::NetError::Timeout { .. }) {
                     stats.timed_out_contacts += 1;
                 }
-                tracing::info!(
+                tracing::debug!(
                     "kad publish contact family=source step=fail rank={}/{} contact_addr={} contact_id={} error={}",
                     attempt.rank,
                     attempt.total,
@@ -468,7 +468,7 @@ pub async fn publish_notes(
         match result {
             Ok(KadPacket::PublishRes(response)) => {
                 stats.acked_contacts += 1;
-                tracing::info!(
+                tracing::debug!(
                     "kad publish contact family=notes step=ack rank={}/{} contact_addr={} contact_id={} response_target={} response_load={}",
                     attempt.rank,
                     attempt.total,

@@ -475,7 +475,7 @@ impl RpcManager {
                                 if is_publish_opcode(entry.request_opcode)
                                     || is_publish_opcode(response_opcode)
                                 {
-                                    info!(
+                                    debug!(
                                         "kad publish pending match pending_id={} request_opcode={} response_opcode={} from={} age_ms={}",
                                         id,
                                         opcode_name(entry.request_opcode),
@@ -522,7 +522,7 @@ impl RpcManager {
                         };
 
                         if is_publish_opcode(response_opcode) {
-                            info!(
+                            debug!(
                                 "kad publish recv opcode={} from={} matched_pending={} matched_pending_id={} matched_age_ms={} matched_request_opcode={} matched_by_ip_only={} tracked_by_ip={} tracked_request_opcode={} obfuscated={} sender_verify_key={}",
                                 opcode_name(response_opcode),
                                 from,
@@ -554,7 +554,7 @@ impl RpcManager {
                                     .record_response_dropped_unrequested(response_opcode);
                                 dump_summary.drop_reason = Some("unrequested_response");
                                 dump_kad_udp_packet("recv", from, &data, &plain, dump_summary);
-                                info!(
+                                debug!(
                                     "kad recv dropping-unrequested-response opcode={} from={} obfuscated={} sender_verify_key={}",
                                     opcode_name(response_opcode),
                                     from,
@@ -578,7 +578,7 @@ impl RpcManager {
                             }
                             dump_kad_udp_packet("recv", from, &data, &plain, dump_summary);
                             if should_log_unsolicited_opcode(response_opcode) {
-                                info!(
+                                debug!(
                                     "kad recv unsolicited opcode={} from={} obfuscated={} sender_verify_key={} tracked_request_opcode={}",
                                     opcode_name(response_opcode),
                                     from,
@@ -654,7 +654,7 @@ impl RpcManager {
         }
 
         if is_publish_opcode(packet.opcode()) || is_publish_opcode(expected_opcode) {
-            info!(
+            debug!(
                 "kad publish pending add pending_id={} request_opcode={} expected_opcode={} to={} timeout_ms={}",
                 id,
                 opcode_name(packet.opcode()),
@@ -693,7 +693,7 @@ impl RpcManager {
                     .map(|entry| entry.created_at.elapsed().as_millis())
                     .unwrap_or_default();
                 if is_publish_opcode(packet.opcode()) || is_publish_opcode(expected_opcode) {
-                    info!(
+                    debug!(
                         "kad publish pending timeout pending_id={} request_opcode={} expected_opcode={} to={} age_ms={}",
                         id,
                         opcode_name(packet.opcode()),
@@ -747,7 +747,7 @@ impl RpcManager {
                 .peer_node_id
                 .map(|node_id| node_id.to_string())
                 .unwrap_or_else(|| "-".to_string());
-            info!(
+            debug!(
                 "kad publish send opcode={} to={} payload_len={} wire_len={} mode={} receiver_verify_key={} sender_verify_key={} crypt_target={}",
                 opcode_name(packet.opcode()),
                 addr,

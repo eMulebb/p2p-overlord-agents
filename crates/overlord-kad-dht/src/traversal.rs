@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CandidateState {
@@ -488,7 +488,7 @@ async fn run_search_phase(
             TraversalKind::Store => unreachable!(),
         };
 
-        info!(
+        debug!(
             "traversal phase2: jump-start send to {} remaining_contacts={}",
             contact.addr,
             pending_contacts.len()
@@ -563,7 +563,7 @@ async fn collect_search_results_until(
                     continue;
                 }
 
-                info!(
+                debug!(
                     "search phase got SearchRes: {} results from sender {}",
                     sr.results.len(),
                     sr.sender_id
