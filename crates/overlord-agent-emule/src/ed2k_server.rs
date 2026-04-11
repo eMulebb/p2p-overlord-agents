@@ -1760,6 +1760,7 @@ pub async fn search_source_servers(
     hello_identity: Ed2kHelloIdentity,
     shared_catalog: &[Ed2kSharedEntry],
     preferred_endpoint: Option<SocketAddr>,
+    excluded_endpoint: Option<SocketAddr>,
     max_attempts: usize,
     file_hash: Ed2kHash,
     _file_size: u64,
@@ -1777,6 +1778,22 @@ pub async fn search_source_servers(
     {
         let preferred = configured_servers.remove(index);
         configured_servers.insert(0, preferred);
+    }
+    if let Some(excluded_endpoint) = excluded_endpoint {
+        let before_len = configured_servers.len();
+        configured_servers.retain(|entry| {
+            entry.host != excluded_endpoint.ip().to_string()
+                || entry.port != excluded_endpoint.port()
+        });
+        if configured_servers.len() != before_len {
+            info!(
+                "ED2K source search skipping currently connected background endpoint={} file_hash={}",
+                excluded_endpoint, file_hash
+            );
+        }
+    }
+    if configured_servers.is_empty() {
+        return Ok(Vec::new());
     }
 
     // Low-ID servers often take around 10 seconds just to emit the warning and
