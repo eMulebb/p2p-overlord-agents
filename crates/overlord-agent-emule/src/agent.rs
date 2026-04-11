@@ -5185,7 +5185,8 @@ impl IndexerService for OverlordAgentEmule {
         let ed2k_shared_catalog = runtime.ed2k_shared_catalog.read().await.clone();
         let indexer_id = self.indexer_id;
         let config = self.config.clone();
-        let callback_client = self.coordinator.clone();
+        let callback_client = CoordinatorClient::new(&job.callback_url)
+            .with_context(|| format!("invalid search callback url for job {}", job.job_id))?;
         let active_searches = Arc::clone(&self.active_searches);
         let agent_activity = Arc::clone(&self.agent_activity);
         let cancel = CancellationToken::new();
