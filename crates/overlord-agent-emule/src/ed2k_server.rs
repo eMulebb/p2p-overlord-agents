@@ -765,11 +765,50 @@ pub async fn request_callback_on_server(
                         "plaintext"
                     }
                 );
-                session.set_phase(
-                    ServerSessionPhase::Completed,
-                    format!("completed callback request client_id={client_id}"),
-                );
-                return Ok(());
+                let callback_response_deadline =
+                    TokioInstant::now() + timeout.min(Duration::from_secs(5));
+                loop {
+                    if cancel.is_cancelled() {
+                        return Ok(());
+                    }
+                    let remaining = callback_response_deadline
+                        .checked_duration_since(TokioInstant::now())
+                        .unwrap_or_default();
+                    if remaining.is_zero() {
+                        session.set_phase(
+                            ServerSessionPhase::Completed,
+                            format!(
+                                "completed callback request client_id={client_id} without explicit failure"
+                            ),
+                        );
+                        return Ok(());
+                    }
+                    let packet = tokio::time::timeout(remaining, session.read_packet())
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "timed out waiting for ED2K callback response from {transport_endpoint}"
+                            )
+                        })??;
+                    let Some(packet) = packet else {
+                        anyhow::bail!(
+                            "ED2K server {transport_endpoint} closed after callback dispatch"
+                        );
+                    };
+                    match packet.opcode {
+                        OP_CALLBACK_FAIL => {
+                            anyhow::bail!(
+                                "ED2K server {transport_endpoint} reported callback failure for client_id={client_id}"
+                            );
+                        }
+                        OP_REJECT => {
+                            anyhow::bail!(
+                                "ED2K server {transport_endpoint} rejected the callback request"
+                            );
+                        }
+                        _ => {}
+                    }
+                }
             }
             OP_REJECT => {
                 anyhow::bail!("ED2K server {transport_endpoint} rejected the callback request");
@@ -1571,13 +1610,22 @@ async fn run_one_server_session(
                     std::future::pending::<Result<Option<ServerUdpPacket>>>().await
                 }
             } => {
-                if let Some(packet) = udp_packet? {
-                    handle_background_udp_packet(
-                        server,
-                        &packet,
-                        &mut pending_background_search,
-                        &context.state,
-                    )?;
+                match udp_packet {
+                    Ok(Some(packet)) => {
+                        handle_background_udp_packet(
+                            server,
+                            &packet,
+                            &mut pending_background_search,
+                            &context.state,
+                        )?;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(
+                            "ignoring ED2K server UDP helper receive failure for {}: {error}",
+                            server.base_endpoint()
+                        );
+                    }
                 }
             }
             _ = tokio::time::sleep(context.keepalive_interval) => {
