@@ -1,39 +1,18 @@
 # Agents Repo Rules
 
-- Follow the shared workspace guidance from `../AGENTS.md` in addition to this file.
+- Follow the shared workspace policy in
+  `../p2p-overlord-tooling/docs/WORKSPACE_POLICY.md`.
 - Use `docs/README.md` as the canonical agents docs home.
 - Use `../p2p-overlord-be/BACKLOG.md` as the canonical active backlog.
-- Use `scripts/windows/rust_quality.ps1` as the canonical local quality gate for this repo.
+- Use `scripts/windows/rust_quality.ps1` as the canonical local Rust quality
+  gate.
 - Before finishing Rust changes, run:
   - `cargo fmt --all --check`
   - `cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::all`
 - Keep public-facing Rust items documented with `///` or `//!`.
-- Document protocol and stateful Rust code in detail.
-  - Every public Kad API must explain protocol role, important inputs, and observable outcomes.
-  - Every wire-facing or stateful module must carry `//!` docs that describe the protocol family or runtime state it owns.
-  - State transitions, transport-mode choices, and identity semantics must be documented where they are implemented, not only in markdown design notes.
-  - When a field name is semantically loaded by the oracle contract, document that meaning explicitly in code comments or doc comments.
-- Prefer JSONL dumps for packet-level runtime evidence.
-  - When Kad or eD2k parity work needs packet capture, prefer machine-readable JSONL dumps over ad-hoc text logs.
-  - Instrument both the Rust agent and the oracle as needed so the same scenario can be compared from structured dumps on both sides.
-  - Treat JSONL dump support as reusable observability infrastructure, not one-off debug code.
 - Treat `rustfmt` output as canonical.
-- Keep reusable operational tooling in `../p2p-overlord-tooling`, not inline in issue-specific commands.
-- Keep the tracked-file privacy guard passing locally and in CI.
-  - Do not commit local user-profile paths such as `C:\Users\...`, `C:/Users/...`, `/Users/...`, or `/home/...`.
-  - Do not commit tracked filenames that embed configured personal identifiers.
-  - Do not hardcode real personal identifiers in tracked policy files; use local untracked policy or environment configuration for repo-specific identifier checks.
-  - Run `scripts/windows/tracked_file_privacy_guard.ps1` after touching docs, scripts, config, or generated support files.
-- Respect the workspace line-ending policy:
-  - tracked text files use LF by default
-  - `.ps1`, `.cmd`, and `.bat` may use CRLF
-- Make granular commits while working on protocol/runtime slices.
-  - Prefer one small commit per coherent transfer, listener, server-session, or observability change.
-  - Make WIP commits as intermediate slices land instead of carrying large uncommitted protocol work.
-- When launching `overlord-agent-emule` interactively for local runs:
-  - ensure no dangling `overlord-agent-emule` processes remain from earlier launches before starting a new one
-  - launch the agent in a hidden window
-- Treat ED2K server/client IPv4 tokens as little-endian wire values unless the protocol path clearly proves otherwise.
-  - `client_id` values and server-reported IPv4 fields on the ED2K wire are not normal big-endian IPv4 integers.
-  - When converting those wire tokens to `Ipv4Addr`, use little-endian byte order.
-  - If a decoded “direct peer” lands in impossible/bogus ranges such as multicast-looking `236.x.x.x`, check endianness first.
+- Prefer JSONL dumps for packet-level runtime evidence.
+- When launching `overlord-agent-emule` interactively for local runs, ensure no
+  dangling agent processes remain and use a hidden window.
+- Treat ED2K server/client IPv4 tokens as little-endian wire values unless the
+  protocol path clearly proves otherwise.
