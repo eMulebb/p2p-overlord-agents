@@ -3629,7 +3629,7 @@ fn keyword_target(query: &str) -> NodeId {
     let mut hasher = Md4::new();
     hasher.update(first_word.as_bytes());
     let digest: [u8; 16] = hasher.finalize().into();
-    NodeId::from_bytes(digest)
+    NodeId::from_be_bytes(digest)
 }
 
 fn guess_content_type(name: Option<&String>) -> Option<ContentType> {
@@ -8152,7 +8152,7 @@ mod tests {
     fn keyword_target_is_stable() {
         assert_eq!(
             hex::encode(keyword_target("Torino Train").0),
-            "a33abcb26950379fb87ec2e7f3bae63c"
+            "b2bc3aa39f375069e7c27eb83ce6baf3"
         );
     }
 
