@@ -614,7 +614,7 @@ impl KadPacket {
             KadPacket::SearchKeyReq(p) => write_search_key_req(&mut buf, p)?,
             KadPacket::SearchSourceReq(p) => write_search_source_req(&mut buf, p)?,
             KadPacket::SearchNotesReq(p) => buf.write_le(p)?,
-            KadPacket::SearchRes(p) => buf.write_le(p)?,
+            KadPacket::SearchRes(p) => write_search_res(&mut buf, p)?,
             KadPacket::PublishKeyReq(p) => buf.write_le(p)?,
             KadPacket::PublishSourceReq(p) => buf.write_le(p)?,
             KadPacket::PublishNotesReq(p) => buf.write_le(p)?,
@@ -674,6 +674,19 @@ impl KadPacket {
     }
 }
 
+fn read_kad_search_entry_id(cursor: &mut Cursor<&[u8]>) -> Result<Ed2kHash, ProtoError> {
+    let entry_id = cursor.read_le::<NodeId>()?;
+    Ok(Ed2kHash::from_bytes(entry_id.to_be_bytes()))
+}
+
+fn write_kad_search_entry_id(
+    cursor: &mut Cursor<Vec<u8>>,
+    entry_id: &Ed2kHash,
+) -> Result<(), ProtoError> {
+    cursor.write_le(&NodeId::from_be_bytes(entry_id.0))?;
+    Ok(())
+}
+
 fn read_search_res(cursor: &mut Cursor<&[u8]>) -> Result<SearchRes, ProtoError> {
     // SEARCH_RES is the one Kad path where eMule/aMule allow non-UTF-8 strings to
     // fall back to the local ANSI code page for backward-compatible display.
@@ -687,7 +700,7 @@ fn read_search_res(cursor: &mut Cursor<&[u8]>) -> Result<SearchRes, ProtoError> 
     let mut results = Vec::with_capacity(count as usize);
 
     for _ in 0..count {
-        let entry_id = cursor.read_le::<Ed2kHash>()?;
+        let entry_id = read_kad_search_entry_id(cursor)?;
         let tag_count = cursor.read_le::<u8>()?;
         let mut tags = Vec::with_capacity(tag_count as usize);
         for _ in 0..tag_count {
@@ -705,6 +718,21 @@ fn read_search_res(cursor: &mut Cursor<&[u8]>) -> Result<SearchRes, ProtoError> 
         target,
         results,
     })
+}
+
+fn write_search_res(cursor: &mut Cursor<Vec<u8>>, packet: &SearchRes) -> Result<(), ProtoError> {
+    cursor.write_le(&packet.sender_id)?;
+    cursor.write_le(&packet.target)?;
+    cursor
+        .write_le(&u16::try_from(packet.results.len()).expect("search result count exceeds u16"))?;
+    for result in &packet.results {
+        write_kad_search_entry_id(cursor, &result.entry_id)?;
+        cursor.write_le(&u8::try_from(result.tags.len()).expect("tag count exceeds u8"))?;
+        for tag in &result.tags {
+            cursor.write_le(tag)?;
+        }
+    }
+    Ok(())
 }
 
 fn read_find_buddy_res(cursor: &mut Cursor<&[u8]>) -> Result<FindBuddyRes, ProtoError> {
@@ -978,9 +1006,42 @@ mod tests {
         if let KadPacket::SearchRes(res) = pkt2 {
             assert_eq!(res.results.len(), 1);
             assert_eq!(res.results[0].tags.len(), 2);
+            assert_eq!(res.results[0].entry_id, Ed2kHash::from_bytes([0xAB; 16]));
         } else {
             panic!("wrong type");
         }
+    }
+
+    #[test]
+    fn test_search_res_entry_id_uses_kad_chunk_byte_order() {
+        let entry = SearchResultEntry {
+            entry_id: "0102030405060708090a0b0c0d0e0f10".parse().unwrap(),
+            tags: vec![],
+        };
+        let pkt = KadPacket::SearchRes(SearchRes {
+            sender_id: NodeId::from_bytes([0x11; 16]),
+            target: NodeId::from_bytes([0x22; 16]),
+            results: vec![entry],
+        });
+
+        let bytes = pkt.encode().expect("encode search res");
+        let search_res_bytes = &bytes[2..];
+        assert_eq!(
+            &search_res_bytes[34..50],
+            &[
+                0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05, 0x0C, 0x0B, 0x0A, 0x09, 0x10, 0x0F,
+                0x0E, 0x0D
+            ]
+        );
+
+        let decoded = KadPacket::decode(&bytes).expect("decode search res");
+        let KadPacket::SearchRes(search_res) = decoded else {
+            panic!("wrong packet type");
+        };
+        assert_eq!(
+            search_res.results[0].entry_id,
+            "0102030405060708090a0b0c0d0e0f10".parse().unwrap()
+        );
     }
 
     #[test]
@@ -1001,6 +1062,10 @@ mod tests {
             panic!("wrong packet type");
         };
         assert_eq!(search_res.results.len(), 1);
+        assert_eq!(
+            search_res.results[0].entry_id,
+            "33333333333333333333333333333333".parse().unwrap()
+        );
         assert_eq!(search_res.results[0].tags.len(), 1);
         assert_eq!(search_res.results[0].tags[0], Tag::filename("Tést"));
     }
