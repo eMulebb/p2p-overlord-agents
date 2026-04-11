@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(SEARCH_TIMEOUT_SECS);
@@ -63,6 +64,7 @@ pub fn search_keywords_by_request(
     cancel: CancellationToken,
 ) -> impl tokio_stream::Stream<Item = SearchResult> + Send + 'static {
     let (tx, rx) = mpsc::channel::<SearchResult>(SEARCH_RESULT_STREAM_BUFFER);
+    let request_target = request.target;
     tokio::spawn(async move {
         let (raw_tx, mut raw_rx) =
             mpsc::channel::<(Ed2kHash, Vec<overlord_kad_proto::Tag>)>(SEARCH_RESULT_STREAM_BUFFER);
@@ -81,6 +83,12 @@ pub fn search_keywords_by_request(
         });
 
         let mut seen_hashes = HashSet::new();
+        let mut raw_entry_count = 0usize;
+        let mut accepted_count = 0usize;
+        let mut duplicate_count = 0usize;
+        let mut missing_name_count = 0usize;
+        let mut missing_size_count = 0usize;
+        let mut sample_rejection = None::<String>;
         loop {
             let next = tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -89,24 +97,62 @@ pub fn search_keywords_by_request(
             let Some((hash, tags)) = next else {
                 break;
             };
+            raw_entry_count += 1;
             if seen_hashes.len() >= result_cap {
                 break;
             }
 
             let result = SearchResult::from_tags(hash, tags);
+            if result.names.is_empty() {
+                missing_name_count += 1;
+                if sample_rejection.is_none() {
+                    sample_rejection = Some(format!(
+                        "missing_name hash={} size={:?} tag_count={}",
+                        result.hash,
+                        result.size,
+                        result.tags.len()
+                    ));
+                }
+                continue;
+            }
+            if result.size.is_none() {
+                missing_size_count += 1;
+                if sample_rejection.is_none() {
+                    sample_rejection = Some(format!(
+                        "missing_size hash={} first_name={:?} tag_count={}",
+                        result.hash,
+                        result.names.first(),
+                        result.tags.len()
+                    ));
+                }
+                continue;
+            }
             if !is_acceptable_keyword_result(&result) {
                 continue;
             }
             if !seen_hashes.insert(result.hash) {
+                duplicate_count += 1;
                 continue;
             }
             if tx.send(result).await.is_err() {
                 break;
             }
+            accepted_count += 1;
         }
 
         drop(raw_rx);
         let _ = traversal.await;
+        info!(
+            "kad keyword search stream summary target={} raw_entries={} accepted={} duplicates={} missing_name={} missing_size={} result_cap={} sample_rejection={}",
+            request_target,
+            raw_entry_count,
+            accepted_count,
+            duplicate_count,
+            missing_name_count,
+            missing_size_count,
+            result_cap,
+            sample_rejection.unwrap_or_else(|| "-".to_string())
+        );
     });
     ReceiverStream::new(rx)
 }
