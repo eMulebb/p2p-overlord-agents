@@ -6046,8 +6046,7 @@ impl OverlordAgentEmule {
         if !had_direct_sources {
             info!(
                 "native ED2K download source filtering left no direct-dialable sources file_hash={} callback_only_source_count={}",
-                request.file_hash,
-                skipped_low_id_sources
+                request.file_hash, skipped_low_id_sources
             );
         }
         for source in &sources {
