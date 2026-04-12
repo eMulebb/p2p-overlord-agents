@@ -5795,8 +5795,22 @@ impl OverlordAgentEmule {
             )
             .await
             {
-                Ok(results) if !results.is_empty() => merge_download_sources(&mut sources, results),
+                Ok(results) if !results.is_empty() => {
+                    let source_count = results.len();
+                    merge_download_sources(&mut sources, results);
+                    info!(
+                        "native ED2K download background source acquisition completed file_hash={} source_count={} aggregated_source_count={}",
+                        file_hash,
+                        source_count,
+                        sources.len()
+                    );
+                }
                 Ok(_) => {
+                    info!(
+                        "native ED2K download background source acquisition completed file_hash={} source_count=0 aggregated_source_count={}",
+                        file_hash,
+                        sources.len()
+                    );
                     warn!(
                         "native ED2K download background source search returned no sources for file_hash={file_hash}"
                     );
@@ -5825,7 +5839,16 @@ impl OverlordAgentEmule {
         )
         .await
         {
-            Ok(server_results) => merge_download_sources(&mut sources, server_results),
+            Ok(server_results) => {
+                let source_count = server_results.len();
+                merge_download_sources(&mut sources, server_results);
+                info!(
+                    "native ED2K download active source acquisition completed file_hash={} source_count={} aggregated_source_count={}",
+                    file_hash,
+                    source_count,
+                    sources.len()
+                );
+            }
             Err(error) => {
                 warn!(
                     "native ED2K download active server source search failed for file_hash={file_hash}: {error}"
@@ -5837,14 +5860,27 @@ impl OverlordAgentEmule {
                 collect_kad_ed2k_sources(&runtime.dht, file_hash, file_size, source_search_timeout)
                     .await;
             if !kad_sources.is_empty() {
-                info!(
-                    "native ED2K download Kad source fallback produced file_hash={} source_count={}",
-                    file_hash,
-                    kad_sources.len()
-                );
+                let source_count = kad_sources.len();
                 merge_download_sources(&mut sources, kad_sources);
+                info!(
+                    "native ED2K download Kad source fallback produced file_hash={} source_count={} aggregated_source_count={}",
+                    file_hash,
+                    source_count,
+                    sources.len()
+                );
+            } else {
+                info!(
+                    "native ED2K download Kad source fallback returned no sources for file_hash={}",
+                    file_hash
+                );
             }
         }
+        info!(
+            "native ED2K download source acquisition completed file_hash={} aggregated_source_count={} background_search_enabled={}",
+            file_hash,
+            sources.len(),
+            has_background_search
+        );
         Ok(sources)
     }
 
@@ -5918,12 +5954,24 @@ impl OverlordAgentEmule {
             )
         });
 
+        let pre_filter_source_count = sources.len();
+        let post_filter_source_count = sources
+            .iter()
+            .filter(|source| source.is_direct_dialable())
+            .count();
         let callback_only_sources: Vec<_> = sources
             .iter()
             .filter(|source| source.low_id)
             .cloned()
             .collect();
         let skipped_low_id_sources = callback_only_sources.len();
+        info!(
+            "native ED2K download source filtering file_hash={} pre_filter_source_count={} callback_only_source_count={} post_filter_source_count={}",
+            request.file_hash,
+            pre_filter_source_count,
+            skipped_low_id_sources,
+            post_filter_source_count
+        );
         if skipped_low_id_sources != 0 {
             info!(
                 "native ED2K download filtered callback-only sources file_hash={} skipped_low_id_sources={}",
@@ -5995,6 +6043,13 @@ impl OverlordAgentEmule {
         }
         sources.retain(Ed2kFoundSource::is_direct_dialable);
         let had_direct_sources = !sources.is_empty();
+        if !had_direct_sources {
+            info!(
+                "native ED2K download source filtering left no direct-dialable sources file_hash={} callback_only_source_count={}",
+                request.file_hash,
+                skipped_low_id_sources
+            );
+        }
         for source in &sources {
             dump_ed2k_tcp_download_meta(
                 SocketAddr::new(IpAddr::V4(source.ip), source.tcp_port),
