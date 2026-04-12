@@ -29,6 +29,7 @@ direction is explicit.
 - [Observations](./kad/OBSERVATIONS.md)
 - [Wire Sequences](./kad/WIRE_SEQUENCES.md)
 - [ED2K Firewalled Parity Matrix](./kad/ED2K_FIREWALLED_PARITY_MATRIX.md)
+- [ED2K Parity State Machine](./kad/ED2K_PARITY_STATE_MACHINE.md)
 - [ED2K Firewalled Plaintext Parity](./kad/ED2K_FIREWALLED_PARITY.md)
 - [ED2K Firewalled Obfuscated Parity](./kad/ED2K_FIREWALLED_OBFUSCATED_PARITY.md)
 
