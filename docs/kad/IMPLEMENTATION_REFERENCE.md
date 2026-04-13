@@ -1,7 +1,8 @@
 # Overlord Kad2 Implementation Reference
 
 Overlord Kad2 architecture and implementation reference.
-This file is maintained in the current Overlord workspace under `overlord-agents/docs/kad/`.
+This file is maintained in the current Overlord workspace under
+`p2p-overlord-agents/docs/kad/`.
 
 **Language**: Rust
 **Protocol**: eMule Kademlia v2 (Kad2), IPv4 only
@@ -90,7 +91,7 @@ libed2k's `traversal_algorithm` / `rpc_manager` / `observer` pattern informs our
 
 ```
 p2p-overlord/
-├── overlord-agents/
+├── p2p-overlord-agents/
 │   ├── Cargo.toml
 │   ├── overlord.toml.example
 │   └── crates/
@@ -100,7 +101,7 @@ p2p-overlord/
 │       ├── overlord-kad-dht/      ← DHT operations: bootstrap, lookup, search, publish
 │       ├── overlord-agent-common/ ← shared HTTP/control-plane contract for agents
 │       └── overlord-agent-emule/  ← Kad2 agent binary and coordinator integration
-└── overlord-be/
+└── p2p-overlord-be/
     └── overlord-be-coordinator/   ← coordinator, result ingestion, search dispatch, snoop APIs
 ```
 
@@ -607,8 +608,8 @@ POST /api/search
 
 Primary config file for the Rust agent workspace:
 
-- `overlord-agents/overlord.toml`
-- example: `overlord-agents/overlord.toml.example`
+- `p2p-overlord-agents/overlord.toml`
+- example: `p2p-overlord-agents/overlord.toml.example`
 
 Path can be overridden with `--config`.
 

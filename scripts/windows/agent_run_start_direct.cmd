@@ -11,7 +11,7 @@ TIMEOUT /T 2 >nul
 
 ECHO OVERLORD_PROJECT_DIR = [ %OVERLORD_PROJECT_DIR% ] [ %TIME% ]
 
-CD /D %OVERLORD_PROJECT_DIR%\overlord-agents
+CD /D %OVERLORD_PROJECT_DIR%\p2p-overlord-agents
 
 cargo build -p overlord-agent-emule --bin overlord-agent-emule
 IF ERRORLEVEL 1 EXIT /B %ERRORLEVEL%

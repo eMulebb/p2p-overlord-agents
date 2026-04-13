@@ -3,7 +3,9 @@
 Canonical ED2K parity map for the agent runtime, tests, and scenario tooling.
 
 Use this file as the protocol and scenario inventory for staged ED2K parity
-work. The acceptance target is full native parity across both roles:
+work. The acceptance target is native capability coverage across both roles
+where it materially improves live-network acceptance, reachability, or harvest
+yield:
 
 - downloader and search consumer
 - listener and upload server
@@ -281,7 +283,7 @@ Do not collapse these buckets:
 - runtime orchestration:
   `p2p-overlord-tooling/orchestration/Invoke-RealnetKadSearchDownloadParityScenario.ps1`
 - agent session helpers and deterministic runs:
-  `p2p-overlord-tooling/helper-agent-*.ps1`
+  `p2p-overlord-tooling/subsystems/agent/helper-agent-*.ps1`
   `p2p-overlord-tooling/orchestration/Invoke-ValidateEd2kServerTriplet.ps1`
 - ED2K downloader and listener protocol:
   `crates/overlord-agent-emule/src/ed2k_tcp.rs`

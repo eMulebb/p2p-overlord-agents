@@ -2,10 +2,12 @@
 
 Canonical documentation home for `overlord-agents`.
 
-The protocol end goal for this repo is full native parity with the oracle
-families we target: Kad for indexing and notes, plus ED2K for server search,
-peer search, sharing, upload, and download. Milestones remain staged, but the
-direction is explicit.
+The protocol end goal for this repo is native capability coverage across the
+oracle families we target where it materially improves acceptance,
+reachability, or harvest yield: Kad for indexing and notes, plus ED2K for
+server search, peer search, sharing, upload, and download. Milestones remain
+staged, but wire-compatible behavior stays mandatory where interoperability or
+traffic shape depends on it.
 
 ## Kad
 
