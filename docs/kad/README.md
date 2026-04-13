@@ -19,5 +19,6 @@ parity, including searching, sharing, upload, and download behavior.
 - [Parity Notes](./PARITY_NOTES.md)
 - [Observations](./OBSERVATIONS.md)
 - [Oracle Differences](./PROTOCOL_DIFFS.md)
+- [Stock eMule `community-0.60` Comparison](./EMULE_COMMUNITY_060_COMPARISON.md)
 - [ED2K Parity State Machine](./ED2K_PARITY_STATE_MACHINE.md)
 - [ED2K Firewalled Parity Matrix](./ED2K_FIREWALLED_PARITY_MATRIX.md)

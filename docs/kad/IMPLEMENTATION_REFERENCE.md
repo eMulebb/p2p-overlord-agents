@@ -207,13 +207,33 @@ Use the labels below when reading the current port status:
 | `overlord-kad-routing` | `Equivalent behavior` | `src/table.rs`, `src/zone.rs`, and `src/bin.rs` now match the oracle global duplicate limits, `RoutingZone.cpp CanSplit`, and the per-bin two-per-`/24` clustering cap enforced in `routing/RoutingBin.cpp AddContact`. |
 | `overlord-kad-net` | `Equivalent behavior` + `Pending parity gap` | `src/rpc.rs`, `src/tracker.rs`, and the transport flow now implement oracle-shaped per-IP, per-opcode request tracking and the current obfuscation-mode selection. The remaining gap is live-behavior density and HELLO-derived key registration, not generic tracker shape anymore. |
 | `overlord-kad-dht` | `Equivalent behavior` + `Repo policy` | `src/traversal.rs` emits the same Kad2 search request families as oracle `CSearch::StorePacket`, and the main search/source/notes traversal shape is recognizable. `src/search.rs is_acceptable_keyword_result` is currently repo policy rather than a direct oracle port, and source publish now fills the second `KADEMLIA2_PUBLISH_SOURCE_REQ` field with publisher identity like eMule/aMule. Bootstrap persistence now also preserves peer UDP keys from `nodes.dat` so restarts retain the same obfuscation context the oracle keeps. |
-| `overlord-agent-emule` | `Equivalent behavior` + `Pending parity gap` | `src/agent.rs` already observes unsolicited Kad `Search*Req` traffic, persists the snoop queue, and now exposes active Kad notes search and validation-only notes publish. `src/snoop_queue.rs` still keeps only target-centric queue entries, so passive replay cannot yet preserve oracle request details such as restrictive keyword expressions, source pagination, or notes size-only semantics. |
+| `overlord-agent-emule` | `Equivalent behavior` + `Verified difference` + `Pending parity gap` | `src/agent.rs` already observes unsolicited Kad `Search*Req` traffic, persists the full passive replay shape (`start_position`, restrictive keyword payloads, source `size`, notes `size`), and exposes active Kad notes search plus validation-only notes publish. Verified ED2K gaps remain outside the Kad core: `src/ed2k_server.rs` is still a focused `ServerConnect`/`ServerSocket` subset, `src/ed2k_transfer.rs` uses a FIFO fixed-slot upload queue rather than eMule `UploadQueue.cpp` scoring, `src/ed2k_tcp.rs` now keeps an adaptive pending-block window with safe teardown for malformed or out-of-order replies but still stops short of full eMule A4AF/global scheduler parity, and `src/agent.rs` still reports `ED2K notes search is not wired yet`. |
 
 ### Current Oracle Findings Backlog
 
 1. `overlord-kad-net`: finish the oracle obfuscation port and verify it on the live network. The recent `a1`-`a7` eMule packet captures under `ext-deps/eMule_full_build_deps/eMule/srchybrid/x64/Debug/` show that modern oracle sessions are overwhelmingly obfuscated, while plaintext Kad appears only as a small bootstrap, hello, or fallback slice. An isolated oracle run from `ext-deps/eMule-build` on 2026-03-22 reinforced that result: a 5-minute capture on `46663/udp` produced `1009` packets, only `55` plaintext `0xE4...` packets, and `954` non-plaintext packets, while the oracle trace log still recorded successful publish sends and accepts.
-2. `overlord-agent-emule`: preserve fuller snooped request shape so passive replay can match oracle keyword/source/notes request details more closely.
-3. `overlord-kad-net` and live runtime validation: keep re-running live-network acceptance to improve HELLO key registration completeness and obfuscation density against the oracle.
+2. `overlord-agent-emule`: replace the current FIFO fixed-slot ED2K upload queue with a stock-eMule-like score, credit, friend-slot, LowID, and session-rotation model so listener behavior stops diverging from `UploadQueue.cpp`.
+3. `overlord-agent-emule`: extend the new adaptive pending-block downloader window toward fuller eMule `DownloadClient.cpp CreateBlockRequests` / `SendBlockRequests` parity, especially the broader callback and A4AF-driven control flow those paths assume.
+4. `overlord-agent-emule`: finish the remaining ED2K control-plane gaps, especially active ED2K notes search and the still-partial `ServerSocket` feature surface.
+5. `overlord-kad-net` and live runtime validation: keep re-running live-network acceptance to improve HELLO key registration completeness and obfuscation density against the oracle.
+
+### 2026-04 Stock eMule Comparison
+
+The isolated comparison against the local stock eMule `community-0.60` tree is
+tracked in [Stock eMule `community-0.60` Comparison](./EMULE_COMMUNITY_060_COMPARISON.md).
+
+Current review summary:
+
+- Kad routing, publish/search wire shapes, and packet-tracking budgets are now
+  close to the stock oracle or intentionally repo-policy differences.
+- Passive Kad replay is no longer target-only; the persisted request shape now
+  keeps restrictive keyword payloads plus source and notes size metadata.
+- ED2K server sessions are credible enough for login, search, source search,
+  HighID or LowID handling, and callback-aware source modeling, but they still
+  cover only the subset that matters for current interoperability.
+- ED2K peer transfer remains the largest stock-eMule gap because upload queue
+  selection and downloader block scheduling are still materially simpler than
+  `community-0.60`.
 
 ---
 
@@ -385,6 +405,9 @@ the note's Kad/source identity and is persisted as `source_id`.
 
 - `Equivalent behavior`: `crates/overlord-kad-dht/src/traversal.rs` emits `SearchNotesReq { target, size }`, matching eMule `kademlia/Search.cpp CSearch::StorePacket` and `net/KademliaUDPListener.cpp Process_KADEMLIA2_SEARCH_NOTES_REQ`, cross-checked against the aMule equivalents.
 - `Equivalent behavior`: `crates/overlord-agent-emule/src/agent.rs` now exposes coordinator-triggered Kad notes searches end to end; the remaining notes follow-up is richer result modeling for distinct note authors.
+- `Pending parity gap`: active ED2K notes search is still separate work. The
+  current `crates/overlord-agent-emule/src/agent.rs` ED2K search dispatch still
+  rejects `SearchKind::Notes` with `ED2K notes search is not wired yet`.
 
 ### Publish
 
@@ -958,11 +981,29 @@ tokio-stream = "0.1"
 > Kad1 would add significant complexity with minimal benefit. If ever needed, it would require
 > a separate packet parser, separate routing table update rules, and a version negotiation layer.
 
-### ed2k Server Protocol
+### ED2K Server And Peer Protocol
 
-> **FUTURE(server)**: The eMule TCP server protocol (connecting to central `server.met` nodes)
-> is out of scope for the current Kad workspace slice. The server protocol can be implemented as
-> a separate crate in `overlord-agents` without affecting the Kad2 core.
+Partial ED2K support already ships in `overlord-agent-emule`.
+
+Current implemented scope:
+
+- long-lived server TCP sessions for `OP_LOGINREQUEST`, `OP_OFFERFILES`
+  keepalive, `OP_IDCHANGE`, keyword search, and source search
+- callback-aware source modeling, including LowID detection and obfuscated
+  source metadata
+- downloader startup with secure-ident, filename and hashset requests, queue
+  handling, and resumable verified-piece manifests
+- listener-side queue-rank updates, verified-range serving, and reconnect-aware
+  upload resume
+
+Remaining parity work:
+
+- broader `ServerSocket` feature coverage beyond the currently targeted subset
+- eMule-like upload queue scoring and rotation instead of FIFO fixed slots
+- adaptive multi-block downloader scheduling and the wider callback control flow
+  that eMule couples to that scheduler
+- AICH parity
+- active ED2K notes search
 
 ### Buddy System / Firewall NAT Traversal
 

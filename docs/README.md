@@ -19,6 +19,7 @@ traffic shape depends on it.
 - [Observations](./kad/OBSERVATIONS.md)
 - [Wire Sequences](./kad/WIRE_SEQUENCES.md)
 - [Oracle Differences](./kad/PROTOCOL_DIFFS.md)
+- [Stock eMule `community-0.60` Comparison](./kad/EMULE_COMMUNITY_060_COMPARISON.md)
 
 ## ED2K
 
@@ -30,6 +31,7 @@ traffic shape depends on it.
 - [Protocol Reference](./kad/PROTOCOL_REFERENCE.md)
 - [Observations](./kad/OBSERVATIONS.md)
 - [Wire Sequences](./kad/WIRE_SEQUENCES.md)
+- [Stock eMule `community-0.60` Comparison](./kad/EMULE_COMMUNITY_060_COMPARISON.md)
 - [ED2K Firewalled Parity Matrix](./kad/ED2K_FIREWALLED_PARITY_MATRIX.md)
 - [ED2K Parity State Machine](./kad/ED2K_PARITY_STATE_MACHINE.md)
 - [ED2K Firewalled Plaintext Parity](./kad/ED2K_FIREWALLED_PARITY.md)
