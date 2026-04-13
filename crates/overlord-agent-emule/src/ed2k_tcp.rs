@@ -59,7 +59,7 @@ use crate::ed2k_server::{Ed2kFoundSource, Ed2kServerState};
 use crate::ed2k_transfer::{
     ED2K_EMBLOCK_SIZE, ED2K_PART_SIZE, Ed2kResumeManifest, Ed2kSourceHint, Ed2kTransferRuntime,
     Ed2kTransferState, Ed2kUploadPeerIdentity, Ed2kUploadSessionHandle, Ed2kUploadSessionStatus,
-    new_transfer_job,
+    expected_piece_length, new_transfer_job,
 };
 use crate::kad_firewall::KadFirewallState;
 use overlord_kad_dht::DhtNode;
@@ -334,6 +334,41 @@ struct PendingCompressedPart {
     compressed_received: usize,
     uncompressed_written: u64,
     inflater: Decompress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveDownloadPiece {
+    piece_index: u32,
+    next_offset: u64,
+    piece_end: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingPartRequest {
+    piece_index: u32,
+    start: u64,
+    end: u64,
+    queued: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DownloadWindowLimits {
+    max_pending_blocks: usize,
+    min_pending_blocks: usize,
+}
+
+struct DownloadRequestWindowState<'a> {
+    transfer_runtime: &'a Ed2kTransferRuntime,
+    file_hash: &'a Ed2kHash,
+    file_hash_hex: &'a str,
+    file_size: u64,
+    manifest: &'a Ed2kResumeManifest,
+    active_piece_request: &'a mut Option<ActiveDownloadPiece>,
+    pending_part_requests: &'a mut Vec<PendingPartRequest>,
+    upload_accepted_at: tokio::time::Instant,
+    completed_block_count: usize,
+    session_payload_down: u64,
+    part_response_grace: Duration,
 }
 
 struct EncodedUploadPartPacket {
@@ -1383,10 +1418,10 @@ async fn drive_download_session(
     const HASHSET_STALL_UPLOAD_FALLBACK: Duration = Duration::from_millis(500);
     const QUEUE_RANK_GRACE: Duration = Duration::from_secs(20);
     const PART_RESPONSE_GRACE: Duration = Duration::from_secs(20);
-    // eMule can split one requested range into multiple consecutive
-    // `OP_SENDINGPART` frames. Track the next expected start offset rather than
-    // assuming one packet completes one requested range.
-    let mut pending_parts: Vec<(u32, u64, u64)> = Vec::new();
+    // eMule keeps a pending block scheduler that is broader than one live wire
+    // request. We mirror that with one claimed piece, a queued-vs-unqueued
+    // block list, and wire packets that carry up to three queued ranges.
+    let mut pending_part_requests: Vec<PendingPartRequest> = Vec::new();
     let mut pending_compressed_parts: Vec<PendingCompressedPart> = Vec::new();
     let mut manifest = transfer_runtime.manifest(file_hash_hex).await?;
     let mut peer_secure_ident = Ed2kPeerSecureIdentState::default();
@@ -1400,9 +1435,12 @@ async fn drive_download_session(
     let mut hashset_requested_at = None;
     let mut upload_requested = false;
     let mut upload_accepted = false;
+    let mut upload_accepted_at = None;
     let mut part_response_deadline = None;
     let mut queued_until = None;
-    let mut active_piece_request: Option<(u32, u64)> = None;
+    let mut active_piece_request: Option<ActiveDownloadPiece> = None;
+    let mut completed_block_count = 0usize;
+    let mut session_payload_down = 0u64;
 
     let session_result = async {
         loop {
@@ -1573,51 +1611,29 @@ async fn drive_download_session(
                 upload_requested = true;
             }
 
-            if manifest.md4_hashset_acquired && upload_accepted && pending_parts.is_empty() {
-                if active_piece_request.is_none() {
-                    let Some(next_part) = transfer_runtime
-                        .claim_next_missing_part(file_hash_hex)
-                        .await?
-                    else {
-                        continue;
-                    };
-                    let piece_start = u64::from(next_part.piece_index) * ED2K_PART_SIZE;
-                    active_piece_request = Some((
-                        next_part.piece_index,
-                        piece_start + next_part.bytes_written,
-                    ));
-                }
-
-                let mut requested_ranges = Vec::with_capacity(1);
-                if let Some((piece_index, next_offset)) = active_piece_request {
-                    let piece_end =
-                        (u64::from(piece_index) * ED2K_PART_SIZE + ED2K_PART_SIZE).min(file_size);
-                    if next_offset >= piece_end {
-                        active_piece_request = None;
-                    } else {
-                        let end = (next_offset + ED2K_EMBLOCK_SIZE).min(piece_end);
-                        pending_parts.push((piece_index, next_offset, end));
-                        requested_ranges.push((next_offset, end));
-                        active_piece_request = Some((piece_index, end));
-                    }
-                }
-                if !requested_ranges.is_empty() {
-                    let request_parts = encode_request_parts_batch(&file_hash, &requested_ranges)?;
-                    dump_ed2k_tcp_download_send(
-                        peer_addr,
-                        transport.mode,
-                        "request_parts",
-                        &request_parts,
-                    );
-                    transport
-                        .write_all(&request_parts)
-                        .await
-                        .with_context(|| {
-                            format!("failed to send OP_REQUESTPARTS to {peer_addr}")
-                        })?;
-                    part_response_deadline =
-                        Some(tokio::time::Instant::now() + PART_RESPONSE_GRACE);
-                }
+            if manifest.md4_hashset_acquired
+                && upload_accepted
+                && let Some(next_deadline) = pump_download_request_window(
+                    transport,
+                    peer_addr,
+                    DownloadRequestWindowState {
+                        transfer_runtime,
+                        file_hash: &file_hash,
+                        file_hash_hex,
+                        file_size,
+                        manifest: &manifest,
+                        active_piece_request: &mut active_piece_request,
+                        pending_part_requests: &mut pending_part_requests,
+                        upload_accepted_at: upload_accepted_at
+                            .unwrap_or_else(tokio::time::Instant::now),
+                        completed_block_count,
+                        session_payload_down,
+                        part_response_grace: PART_RESPONSE_GRACE,
+                    },
+                )
+                .await?
+            {
+                part_response_deadline = Some(next_deadline);
             }
 
             let fallback_poll_delay = if send_initial_requests
@@ -1675,7 +1691,7 @@ async fn drive_download_session(
                     if queued_until.is_some_and(|deadline| tokio::time::Instant::now() < deadline) {
                         continue;
                     }
-                    if pending_parts.is_empty() {
+                    if !pending_part_requests.iter().any(|request| request.queued) {
                         part_response_deadline = None;
                     }
                     if part_response_deadline
@@ -1749,6 +1765,7 @@ async fn drive_download_session(
                 }
                 (OP_EDONKEYPROT, OP_ACCEPTUPLOADREQ) => {
                     upload_accepted = true;
+                    upload_accepted_at.get_or_insert_with(tokio::time::Instant::now);
                     queued_until = None;
                 }
                 (OP_EMULEPROT, OP_EMULEINFO) => {
@@ -1890,8 +1907,8 @@ async fn drive_download_session(
                 | (OP_EMULEPROT, OP_SENDINGPART_I64)
                 | (OP_EMULEPROT, OP_COMPRESSEDPART)
                 | (OP_EMULEPROT, OP_COMPRESSEDPART_I64) => {
-                    let use_i64 =
-                        packet.opcode == OP_SENDINGPART_I64 || packet.opcode == OP_COMPRESSEDPART_I64;
+                    let use_i64 = packet.opcode == OP_SENDINGPART_I64
+                        || packet.opcode == OP_COMPRESSEDPART_I64;
                     if packet.opcode == OP_COMPRESSEDPART || packet.opcode == OP_COMPRESSEDPART_I64 {
                         let (returned_hash, start, advertised_compressed_len, compressed_fragment) =
                             decode_compressed_part_fragment(&packet.payload, use_i64)?;
@@ -1906,10 +1923,21 @@ async fn drive_download_session(
                             );
                             continue;
                         }
-                        let Some(pending_index) = pending_parts.iter().position(
-                            |(_, expected_start, expected_end)| {
-                                *expected_start == start && *expected_end > *expected_start
-                            },
+                        let Some(first_queued_index) =
+                            pending_part_requests.iter().position(|request| request.queued)
+                        else {
+                            dump_ed2k_tcp_download_meta(
+                                peer_addr,
+                                Some(transport.mode),
+                                "unexpected_compressed_part_without_queued_request",
+                                format!(
+                                    "file_hash={file_hash_hex} start={start} compressed_len={advertised_compressed_len}"
+                                ),
+                            );
+                            return Ok(Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
+                        };
+                        let Some(pending_index) = pending_part_requests.iter().position(
+                            |request| request.queued && request.start == start && request.end > request.start,
                         ) else {
                             dump_ed2k_tcp_download_meta(
                                 peer_addr,
@@ -1917,22 +1945,37 @@ async fn drive_download_session(
                                 "unexpected_compressed_part_range",
                                 format!(
                                     "file_hash={file_hash_hex} start={start} compressed_len={advertised_compressed_len} pending={:?}",
-                                    pending_parts
+                                    pending_part_requests
                                 ),
                             );
-                            continue;
+                            return Ok(Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
                         };
-                        let (expected_part, expected_start, expected_end) =
-                            pending_parts[pending_index];
+                        if pending_index != first_queued_index {
+                            dump_ed2k_tcp_download_meta(
+                                peer_addr,
+                                Some(transport.mode),
+                                "out_of_order_compressed_part_range",
+                                format!(
+                                    "file_hash={file_hash_hex} start={start} compressed_len={advertised_compressed_len} pending={:?}",
+                                    pending_part_requests
+                                ),
+                            );
+                            return Ok(Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
+                        }
+                        let expected_request = pending_part_requests[pending_index];
+                        let expected_part = expected_request.piece_index;
+                        let expected_start = expected_request.start;
+                        let expected_end = expected_request.end;
                         let compressed_index = if let Some(index) = pending_compressed_parts
                             .iter()
-                            .position(|pending| pending.piece_index == expected_part)
+                            .position(|pending| {
+                                pending.piece_index == expected_part
+                                    && pending.start == expected_start
+                                    && pending.end == expected_end
+                            })
                         {
                             let pending = &pending_compressed_parts[index];
-                            if pending.start != expected_start
-                                || pending.end != expected_end
-                                || pending.advertised_compressed_len != advertised_compressed_len
-                            {
+                            if pending.advertised_compressed_len != advertised_compressed_len {
                                 anyhow::bail!(
                                     "peer {peer_addr} changed compressed-part framing for piece {expected_part} start={}..{} advertised={} expected={}..{} advertised={}",
                                     pending.start,
@@ -2008,9 +2051,11 @@ async fn drive_download_session(
                             );
                         }
                         if pending.uncompressed_written == piece_len {
-                            pending_parts.remove(pending_index);
+                            pending_part_requests.remove(pending_index);
                             pending_compressed_parts.remove(compressed_index);
-                            if pending_parts.is_empty() {
+                            completed_block_count += 1;
+                            session_payload_down = session_payload_down.saturating_add(piece_len);
+                            if !pending_part_requests.iter().any(|request| request.queued) {
                                 part_response_deadline = None;
                             }
                         }
@@ -2028,26 +2073,47 @@ async fn drive_download_session(
                             );
                             continue;
                         }
-                        let Some(pending_index) =
-                            pending_parts
-                                .iter()
-                                .position(|(_, expected_start, expected_end)| {
-                                    *expected_start == start && *expected_end >= end
-                                })
+                        let Some(first_queued_index) =
+                            pending_part_requests.iter().position(|request| request.queued)
                         else {
+                            dump_ed2k_tcp_download_meta(
+                                peer_addr,
+                                Some(transport.mode),
+                                "unexpected_part_without_queued_request",
+                                format!("file_hash={file_hash_hex} start={start} end={end}"),
+                            );
+                            return Ok(Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
+                        };
+                        let Some(pending_index) = pending_part_requests.iter().position(
+                            |request| request.queued && request.start == start && request.end >= end,
+                        ) else {
                             dump_ed2k_tcp_download_meta(
                                 peer_addr,
                                 Some(transport.mode),
                                 "unexpected_part_range",
                                 format!(
                                     "file_hash={file_hash_hex} start={start} end={end} pending={:?}",
-                                    pending_parts
+                                    pending_part_requests
                                 ),
                             );
-                            continue;
+                            return Ok(Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
                         };
-                        let (expected_part, expected_start, expected_end) =
-                            pending_parts[pending_index];
+                        if pending_index != first_queued_index {
+                            dump_ed2k_tcp_download_meta(
+                                peer_addr,
+                                Some(transport.mode),
+                                "out_of_order_part_range",
+                                format!(
+                                    "file_hash={file_hash_hex} start={start} end={end} pending={:?}",
+                                    pending_part_requests
+                                ),
+                            );
+                            return Ok(Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
+                        }
+                        let expected_request = pending_part_requests[pending_index];
+                        let expected_part = expected_request.piece_index;
+                        let expected_start = expected_request.start;
+                        let expected_end = expected_request.end;
                         if start != expected_start {
                             dump_ed2k_tcp_download_meta(
                                 peer_addr,
@@ -2055,10 +2121,10 @@ async fn drive_download_session(
                                 "unexpected_part_fragment_start",
                                 format!(
                                     "file_hash={file_hash_hex} expected_start={expected_start} start={start} end={end} pending={:?}",
-                                    pending_parts
+                                    pending_part_requests
                                 ),
                             );
-                            continue;
+                            return Ok(Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
                         }
                         let piece_completed = transfer_runtime
                             .append_piece_block(file_hash_hex, expected_part, start, end, &bytes)
@@ -2068,12 +2134,15 @@ async fn drive_download_session(
                             active_piece_request = None;
                         }
                         if end == expected_end {
-                            pending_parts.remove(pending_index);
-                            if pending_parts.is_empty() {
+                            pending_part_requests.remove(pending_index);
+                            completed_block_count += 1;
+                            session_payload_down =
+                                session_payload_down.saturating_add(end.saturating_sub(start));
+                            if !pending_part_requests.iter().any(|request| request.queued) {
                                 part_response_deadline = None;
                             }
                         } else {
-                            pending_parts[pending_index] = (expected_part, end, expected_end);
+                            pending_part_requests[pending_index].start = end;
                         }
                         dump_ed2k_tcp_download_meta(
                             peer_addr,
@@ -2092,18 +2161,173 @@ async fn drive_download_session(
     }
     .await;
 
-    for (piece_index, _, _) in pending_parts {
+    if let Some(active_piece) = active_piece_request.or_else(|| {
+        pending_part_requests
+            .first()
+            .map(|request| ActiveDownloadPiece {
+                piece_index: request.piece_index,
+                next_offset: request.end,
+                piece_end: request.end,
+            })
+    }) {
         transfer_runtime
-            .release_piece_request(file_hash_hex, piece_index)
-            .await?;
-    }
-    if let Some((piece_index, _)) = active_piece_request {
-        transfer_runtime
-            .release_piece_request(file_hash_hex, piece_index)
+            .release_piece_request(file_hash_hex, active_piece.piece_index)
             .await?;
     }
 
     session_result
+}
+
+async fn pump_download_request_window(
+    transport: &mut Ed2kTransport,
+    peer_addr: SocketAddr,
+    state: DownloadRequestWindowState<'_>,
+) -> Result<Option<tokio::time::Instant>> {
+    let DownloadRequestWindowState {
+        transfer_runtime,
+        file_hash,
+        file_hash_hex,
+        file_size,
+        manifest,
+        active_piece_request,
+        pending_part_requests,
+        upload_accepted_at,
+        completed_block_count,
+        session_payload_down,
+        part_response_grace,
+    } = state;
+    let window = select_download_window_limits(
+        manifest,
+        completed_block_count,
+        session_payload_down,
+        upload_accepted_at,
+    );
+    if pending_part_requests.len() < window.min_pending_blocks {
+        while pending_part_requests.len() < window.max_pending_blocks {
+            if active_piece_request.is_none() {
+                let Some(next_part) = transfer_runtime
+                    .claim_next_missing_part(file_hash_hex)
+                    .await?
+                else {
+                    break;
+                };
+                let piece_start = u64::from(next_part.piece_index) * ED2K_PART_SIZE;
+                let piece_end = (piece_start + ED2K_PART_SIZE).min(file_size);
+                *active_piece_request = Some(ActiveDownloadPiece {
+                    piece_index: next_part.piece_index,
+                    next_offset: piece_start + next_part.bytes_written,
+                    piece_end,
+                });
+            }
+            let Some(active_piece) = active_piece_request.as_mut() else {
+                break;
+            };
+            if active_piece.next_offset >= active_piece.piece_end {
+                break;
+            }
+            let end = (active_piece.next_offset + ED2K_EMBLOCK_SIZE).min(active_piece.piece_end);
+            pending_part_requests.push(PendingPartRequest {
+                piece_index: active_piece.piece_index,
+                start: active_piece.next_offset,
+                end,
+                queued: false,
+            });
+            active_piece.next_offset = end;
+        }
+    }
+
+    let mut request_indices = Vec::with_capacity(3);
+    let mut requested_ranges = Vec::with_capacity(3);
+    for (index, request) in pending_part_requests.iter().enumerate() {
+        if request.queued {
+            continue;
+        }
+        request_indices.push(index);
+        requested_ranges.push((request.start, request.end));
+        if request_indices.len() >= 3 {
+            break;
+        }
+    }
+    if requested_ranges.is_empty() {
+        return Ok(None);
+    }
+
+    let request_parts = encode_request_parts_batch(file_hash, &requested_ranges)?;
+    dump_ed2k_tcp_download_send(peer_addr, transport.mode, "request_parts", &request_parts);
+    transport
+        .write_all(&request_parts)
+        .await
+        .with_context(|| format!("failed to send OP_REQUESTPARTS to {peer_addr}"))?;
+    for index in request_indices {
+        pending_part_requests[index].queued = true;
+    }
+    dump_ed2k_tcp_download_meta(
+        peer_addr,
+        Some(transport.mode),
+        "request_window",
+        format!(
+            "file_hash={file_hash_hex} queued={} total_pending={} max_pending={} min_pending={}",
+            requested_ranges.len(),
+            pending_part_requests.len(),
+            window.max_pending_blocks,
+            window.min_pending_blocks
+        ),
+    );
+    Ok(Some(tokio::time::Instant::now() + part_response_grace))
+}
+
+#[must_use]
+fn select_download_window_limits(
+    manifest: &Ed2kResumeManifest,
+    completed_block_count: usize,
+    session_payload_down: u64,
+    upload_accepted_at: tokio::time::Instant,
+) -> DownloadWindowLimits {
+    if completed_block_count == 0 || session_payload_down == 0 {
+        return DownloadWindowLimits {
+            max_pending_blocks: 1,
+            min_pending_blocks: 1,
+        };
+    }
+
+    let remaining_bytes = remaining_unverified_bytes(manifest);
+    let elapsed_secs = upload_accepted_at.elapsed().as_secs_f64().max(0.001);
+    let download_rate = session_payload_down as f64 / elapsed_secs;
+
+    let (max_pending_blocks, block_delta) = if remaining_bytes <= ED2K_PART_SIZE * 4 {
+        if completed_block_count < 2 || download_rate < 600.0 || session_payload_down < 40 * 1024 {
+            (1usize, 0usize)
+        } else if download_rate < 1200.0 {
+            (2usize, 0usize)
+        } else {
+            (3usize, 1usize)
+        }
+    } else if completed_block_count >= 3 && download_rate > 75.0 * 1024.0 {
+        (6usize, 2usize)
+    } else {
+        (3usize, 1usize)
+    };
+
+    DownloadWindowLimits {
+        max_pending_blocks,
+        min_pending_blocks: max_pending_blocks.saturating_sub(block_delta).max(1),
+    }
+}
+
+#[must_use]
+fn remaining_unverified_bytes(manifest: &Ed2kResumeManifest) -> u64 {
+    manifest
+        .pieces
+        .iter()
+        .map(|piece| {
+            let piece_len = expected_piece_length(
+                manifest.file_size,
+                manifest.piece_size,
+                u64::from(piece.piece_index),
+            );
+            piece_len.saturating_sub(piece.bytes_written)
+        })
+        .sum()
 }
 
 /// Pick the next ED2K download read wait so queue and part-response grace
@@ -4347,15 +4571,16 @@ fn is_connection_shutdown_error(error: &anyhow::Error) -> bool {
 mod tests {
     use super::{
         CT_EMULE_MISCOPTIONS1, CT_EMULE_MISCOPTIONS2, CT_EMULE_UDPPORTS, CT_EMULE_VERSION, CT_NAME,
-        CT_VERSION, ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, EDONKEY_VERSION,
-        EMULE_CRYPT_REQUESTS, EMULE_CRYPT_SUPPORTS, EMULE_ENCRYPTION_METHOD_OBFUSCATION,
-        EMULE_PROTOCOL_VERSION, EMULE_TCP_CRYPT_MAGIC_REQUESTER, EMULE_TCP_CRYPT_MAGIC_SERVER,
-        EMULE_TCP_CRYPT_MAGIC_SYNC, EMULE_VERSION_SHORT, Ed2kHelloIdentity, Ed2kPeerConnectMode,
-        Ed2kPeerDownloadOutcome, Ed2kPeerSecureIdentState, Ed2kSecureIdent, Ed2kTransport,
-        Ed2kTransportMode, FirewallCheckUdpRequest, HELLO_NICKNAME, OP_EDONKEYPROT, OP_EMULEINFO,
-        OP_EMULEINFOANSWER, OP_EMULEPROT, OP_FILESTATUS, OP_FWCHECKUDPREQ, OP_HELLO,
-        OP_HELLOANSWER, OP_REQFILENAMEANSWER, OP_REQUESTPARTS, OP_SECIDENTSTATE, TAGTYPE_STRING,
-        TAGTYPE_UINT32, begin_secure_ident_probe, build_hello_responses, connect_callback_peer,
+        CT_VERSION, DownloadWindowLimits, ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED,
+        EDONKEY_VERSION, EMULE_CRYPT_REQUESTS, EMULE_CRYPT_SUPPORTS,
+        EMULE_ENCRYPTION_METHOD_OBFUSCATION, EMULE_PROTOCOL_VERSION,
+        EMULE_TCP_CRYPT_MAGIC_REQUESTER, EMULE_TCP_CRYPT_MAGIC_SERVER, EMULE_TCP_CRYPT_MAGIC_SYNC,
+        EMULE_VERSION_SHORT, Ed2kHelloIdentity, Ed2kPeerConnectMode, Ed2kPeerDownloadOutcome,
+        Ed2kPeerSecureIdentState, Ed2kSecureIdent, Ed2kTransport, Ed2kTransportMode,
+        FirewallCheckUdpRequest, HELLO_NICKNAME, OP_EDONKEYPROT, OP_EMULEINFO, OP_EMULEINFOANSWER,
+        OP_EMULEPROT, OP_FILESTATUS, OP_FWCHECKUDPREQ, OP_HELLO, OP_HELLOANSWER,
+        OP_REQFILENAMEANSWER, OP_REQUESTPARTS, OP_SECIDENTSTATE, TAGTYPE_STRING, TAGTYPE_UINT32,
+        begin_secure_ident_probe, build_hello_responses, connect_callback_peer,
         decode_incoming_obfuscation_header, decode_peer_payload, decode_public_key_payload,
         decode_request_parts_payload, decode_secident_state, derive_obfuscation_key,
         download_file_from_peer, drive_download_session, emule_connect_options,
@@ -4364,11 +4589,13 @@ mod tests {
         encode_hello_request, encode_incoming_obfuscation_response, encode_packed_packet,
         encode_packet, encode_secident_state, encode_sending_part, enrich_hello_identity,
         is_mule_hello, next_download_read_timeout, request_udp_firewall_check,
+        select_download_window_limits,
     };
     use crate::{
         ed2k_server::{Ed2kFoundSource, Ed2kServerState},
         ed2k_transfer::{
-            ED2K_PART_SIZE, Ed2kTransferRuntime, Ed2kUploadQueueConfig, new_transfer_job,
+            ED2K_PART_SIZE, Ed2kResumeManifest, Ed2kTransferRuntime, Ed2kUploadQueueConfig,
+            new_transfer_job,
         },
         kad_firewall::KadFirewallState,
         paths::unique_test_dir,
@@ -4387,7 +4614,7 @@ mod tests {
     };
     use sha1::Sha1;
     use std::collections::VecDeque;
-    use std::io::Write as _;
+    use std::io::{self, Write as _};
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
         sync::Arc,
@@ -5338,8 +5565,7 @@ mod tests {
             );
 
             let mut expected_start = 0u64;
-            let mut current_ranges = first_ranges;
-            while let Some((start, end)) = current_ranges.first().copied() {
+            for (start, end) in first_ranges {
                 assert_eq!(start, expected_start);
                 let sending_part = encode_sending_part(
                     &file_hash,
@@ -5352,16 +5578,29 @@ mod tests {
                 .unwrap();
                 stream.write_all(&sending_part).await.unwrap();
                 expected_start = end;
-                if expected_start >= payload_for_server.len() as u64 {
-                    break;
-                }
+            }
+            while expected_start < payload_for_server.len() as u64 {
                 let next_request_parts = read_packet(&mut stream).await;
                 assert_eq!(next_request_parts[0], OP_EDONKEYPROT);
                 assert_eq!(next_request_parts[5], super::OP_REQUESTPARTS);
                 let (next_requested_hash, next_ranges) =
                     decode_request_parts_payload(&next_request_parts[6..], false).unwrap();
                 assert_eq!(next_requested_hash, file_hash);
-                current_ranges = next_ranges;
+                assert!(!next_ranges.is_empty());
+                for (start, end) in next_ranges {
+                    assert_eq!(start, expected_start);
+                    let sending_part = encode_sending_part(
+                        &file_hash,
+                        start,
+                        end,
+                        &payload_for_server
+                            [usize::try_from(start).unwrap()..usize::try_from(end).unwrap()],
+                        false,
+                    )
+                    .unwrap();
+                    stream.write_all(&sending_part).await.unwrap();
+                    expected_start = end;
+                }
             }
         });
 
@@ -5902,15 +6141,15 @@ mod tests {
 
     #[tokio::test]
     async fn small_file_download_rejects_wrong_payload_and_keeps_manifest_incomplete() {
-        async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
+        async fn read_packet(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
             let mut header = [0u8; 6];
-            stream.read_exact(&mut header).await.unwrap();
+            stream.read_exact(&mut header).await?;
             let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
             let mut packet = header.to_vec();
             let mut payload = vec![0u8; packet_len - 1];
-            stream.read_exact(&mut payload).await.unwrap();
+            stream.read_exact(&mut payload).await?;
             packet.extend_from_slice(&payload);
-            packet
+            Ok(packet)
         }
 
         let root = unique_test_dir("ed2k-small-file-bad-payload");
@@ -5933,7 +6172,9 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
 
-            let hello = read_packet(&mut stream).await;
+            let Ok(hello) = read_packet(&mut stream).await else {
+                return;
+            };
             assert_eq!(hello[5], OP_HELLO);
 
             let hello_answer = encode_hello_answer(Ed2kHelloIdentity {
@@ -5948,7 +6189,9 @@ mod tests {
             });
             stream.write_all(&hello_answer).await.unwrap();
 
-            let _secure_ident_probe = read_packet(&mut stream).await;
+            let Ok(_secure_ident_probe) = read_packet(&mut stream).await else {
+                return;
+            };
             stream
                 .write_all(&encode_secident_state(
                     ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED,
@@ -5957,7 +6200,9 @@ mod tests {
                 .await
                 .unwrap();
 
-            let _public_key = read_packet(&mut stream).await;
+            let Ok(_public_key) = read_packet(&mut stream).await else {
+                return;
+            };
             let peer_public_key = Arc::new(
                 Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
                     .unwrap(),
@@ -5969,7 +6214,9 @@ mod tests {
             );
             stream.write_all(&peer_public_key_packet).await.unwrap();
 
-            let _signature = read_packet(&mut stream).await;
+            let Ok(_signature) = read_packet(&mut stream).await else {
+                return;
+            };
             stream
                 .write_all(&encode_packet(
                     OP_EMULEPROT,
@@ -5978,16 +6225,26 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            let request_filename = read_packet(&mut stream).await;
+            let Ok(request_filename) = read_packet(&mut stream).await else {
+                return;
+            };
             assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
-            let request_sources = read_packet(&mut stream).await;
+            let Ok(request_sources) = read_packet(&mut stream).await else {
+                return;
+            };
             assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
-            let aich_file_hash_request = read_packet(&mut stream).await;
+            let Ok(aich_file_hash_request) = read_packet(&mut stream).await else {
+                return;
+            };
             assert_eq!(aich_file_hash_request[5], super::OP_AICHFILEHASHREQ);
-            let _start_upload = read_packet(&mut stream).await;
+            let Ok(_start_upload) = read_packet(&mut stream).await else {
+                return;
+            };
             stream.write_all(&encode_accept_upload_req()).await.unwrap();
 
-            let request_parts = read_packet(&mut stream).await;
+            let Ok(request_parts) = read_packet(&mut stream).await else {
+                return;
+            };
             assert_eq!(request_parts[5], super::OP_REQUESTPARTS);
             let sending_part = encode_sending_part(
                 &file_hash,
@@ -6034,7 +6291,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap(),
+            Ed2kPeerDownloadOutcome::AcceptedButIncomplete
+        );
         let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
         assert!(!manifest.completed);
         assert_eq!(
@@ -6190,8 +6450,7 @@ mod tests {
             );
 
             let mut expected_start = 0u64;
-            let mut current_ranges = ranges;
-            while let Some((start, end)) = current_ranges.first().copied() {
+            for (start, end) in ranges {
                 assert_eq!(start, expected_start);
                 let start_index = usize::try_from(start).unwrap();
                 let end_index = usize::try_from(end).unwrap();
@@ -6205,9 +6464,8 @@ mod tests {
                 .unwrap();
                 stream.write_all(&sending_part).await.unwrap();
                 expected_start = end;
-                if expected_start >= payload_for_server.len() as u64 {
-                    break;
-                }
+            }
+            while expected_start < payload_for_server.len() as u64 {
                 let next_request_parts = read_packet(&mut stream).await;
                 let next_request_uses_i64 = next_request_parts[5] == super::OP_REQUESTPARTS_I64;
                 if next_request_uses_i64 {
@@ -6220,7 +6478,22 @@ mod tests {
                     decode_request_parts_payload(&next_request_parts[6..], next_request_uses_i64)
                         .unwrap();
                 assert_eq!(next_requested_hash, file_hash);
-                current_ranges = next_ranges;
+                assert!(!next_ranges.is_empty());
+                for (start, end) in next_ranges {
+                    assert_eq!(start, expected_start);
+                    let start_index = usize::try_from(start).unwrap();
+                    let end_index = usize::try_from(end).unwrap();
+                    let sending_part = encode_sending_part(
+                        &file_hash,
+                        start,
+                        end,
+                        &payload_for_server[start_index..end_index],
+                        next_request_uses_i64,
+                    )
+                    .unwrap();
+                    stream.write_all(&sending_part).await.unwrap();
+                    expected_start = end;
+                }
             }
         });
 
@@ -6588,6 +6861,70 @@ mod tests {
             None,
         );
         assert_eq!(read_timeout, Duration::ZERO);
+    }
+
+    #[test]
+    fn download_window_starts_with_one_block_before_any_completed_payload() {
+        let job = new_transfer_job(
+            Ed2kHash::from_bytes([0x21; 16]),
+            "window.iso".to_string(),
+            ED2K_PART_SIZE * 5,
+        );
+        let manifest = Ed2kResumeManifest::new(&job);
+        let limits = select_download_window_limits(&manifest, 0, 0, tokio::time::Instant::now());
+        assert_eq!(
+            limits,
+            DownloadWindowLimits {
+                max_pending_blocks: 1,
+                min_pending_blocks: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn download_window_grows_for_fast_large_transfer() {
+        let job = new_transfer_job(
+            Ed2kHash::from_bytes([0x31; 16]),
+            "window.iso".to_string(),
+            ED2K_PART_SIZE * 5,
+        );
+        let manifest = Ed2kResumeManifest::new(&job);
+        let limits = select_download_window_limits(
+            &manifest,
+            3,
+            1_024 * 1024,
+            tokio::time::Instant::now() - Duration::from_secs(10),
+        );
+        assert_eq!(
+            limits,
+            DownloadWindowLimits {
+                max_pending_blocks: 6,
+                min_pending_blocks: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn download_window_stays_small_for_slow_endgame_transfer() {
+        let job = new_transfer_job(
+            Ed2kHash::from_bytes([0x41; 16]),
+            "window.iso".to_string(),
+            ED2K_PART_SIZE * 2,
+        );
+        let manifest = Ed2kResumeManifest::new(&job);
+        let limits = select_download_window_limits(
+            &manifest,
+            1,
+            32 * 1024,
+            tokio::time::Instant::now() - Duration::from_secs(20),
+        );
+        assert_eq!(
+            limits,
+            DownloadWindowLimits {
+                max_pending_blocks: 1,
+                min_pending_blocks: 1,
+            }
+        );
     }
 
     #[tokio::test]
@@ -8779,6 +9116,204 @@ mod tests {
             manifest.pieces[0].state,
             crate::ed2k_transfer::Ed2kTransferState::Missing
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn small_file_download_releases_piece_after_out_of_order_multi_range_response() {
+        async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
+            let mut header = [0u8; 6];
+            stream.read_exact(&mut header).await.unwrap();
+            let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+            let mut packet = header.to_vec();
+            let mut payload = vec![0u8; packet_len - 1];
+            stream.read_exact(&mut payload).await.unwrap();
+            packet.extend_from_slice(&payload);
+            packet
+        }
+
+        let root = unique_test_dir("ed2k-small-file-out-of-order-window");
+        let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+        let payload = vec![0x5A; (super::ED2K_EMBLOCK_SIZE as usize) * 4];
+        let first_end = super::ED2K_EMBLOCK_SIZE;
+        let second_end = super::ED2K_EMBLOCK_SIZE * 2;
+        let file_hash = overlord_kad_proto::Ed2kHash::from_bytes(Md4::digest(&payload).into());
+        let file_hash_hex = file_hash.to_string();
+        transfer_runtime
+            .ensure_job(&new_transfer_job(
+                file_hash,
+                "window.epub".to_string(),
+                payload.len() as u64,
+            ))
+            .await
+            .unwrap();
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let payload_for_server = payload.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            let _hello = read_packet(&mut stream).await;
+            let hello_answer = encode_hello_answer(Ed2kHelloIdentity {
+                user_hash: [0x42; 16],
+                client_id: 0x5912_0559,
+                tcp_port: peer_addr.port(),
+                udp_port: 0,
+                server_ip: 0,
+                server_port: 0,
+                connect_options: emule_connect_options(false),
+                direct_udp_callback: false,
+            });
+            stream.write_all(&hello_answer).await.unwrap();
+
+            let _secure_ident_probe = read_packet(&mut stream).await;
+            stream
+                .write_all(&encode_secident_state(
+                    ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED,
+                    0x4436_EEAC,
+                ))
+                .await
+                .unwrap();
+
+            let _public_key = read_packet(&mut stream).await;
+            let peer_public_key = Arc::new(
+                Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+                    .unwrap(),
+            );
+            let peer_public_key_packet = encode_packet(
+                OP_EMULEPROT,
+                super::OP_PUBLICKEY,
+                &peer_public_key.public_key_payload().unwrap(),
+            );
+            stream.write_all(&peer_public_key_packet).await.unwrap();
+
+            let _signature = read_packet(&mut stream).await;
+            stream
+                .write_all(&encode_packet(
+                    OP_EMULEPROT,
+                    super::OP_SIGNATURE,
+                    &[0xAA; 49],
+                ))
+                .await
+                .unwrap();
+
+            let request_filename = read_packet(&mut stream).await;
+            assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
+            let filename_answer =
+                super::encode_request_filename_answer(&file_hash, "window.epub").unwrap();
+            stream.write_all(&filename_answer).await.unwrap();
+
+            let request_sources = read_packet(&mut stream).await;
+            assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
+            let aich_file_hash_request = read_packet(&mut stream).await;
+            assert_eq!(aich_file_hash_request[5], super::OP_AICHFILEHASHREQ);
+
+            let _start_upload = read_packet(&mut stream).await;
+            stream.write_all(&encode_accept_upload_req()).await.unwrap();
+
+            let first_request_parts = read_packet(&mut stream).await;
+            let (requested_hash, first_ranges) =
+                decode_request_parts_payload(&first_request_parts[6..], false).unwrap();
+            assert_eq!(requested_hash, file_hash);
+            assert_eq!(first_ranges, vec![(0, first_end)]);
+            let first_fragment = encode_sending_part(
+                &file_hash,
+                0,
+                first_end,
+                &payload_for_server[..usize::try_from(first_end).unwrap()],
+                false,
+            )
+            .unwrap();
+            stream.write_all(&first_fragment).await.unwrap();
+
+            let second_request_parts = read_packet(&mut stream).await;
+            let (requested_hash, second_ranges) =
+                decode_request_parts_payload(&second_request_parts[6..], false).unwrap();
+            assert_eq!(requested_hash, file_hash);
+            assert_eq!(second_ranges, vec![(first_end, second_end)]);
+            let second_fragment = encode_sending_part(
+                &file_hash,
+                first_end,
+                second_end,
+                &payload_for_server
+                    [usize::try_from(first_end).unwrap()..usize::try_from(second_end).unwrap()],
+                false,
+            )
+            .unwrap();
+            stream.write_all(&second_fragment).await.unwrap();
+
+            let third_request_parts = read_packet(&mut stream).await;
+            let (requested_hash, third_ranges) =
+                decode_request_parts_payload(&third_request_parts[6..], false).unwrap();
+            assert_eq!(requested_hash, file_hash);
+            assert_eq!(
+                third_ranges,
+                vec![
+                    (second_end, second_end + super::ED2K_EMBLOCK_SIZE),
+                    (
+                        second_end + super::ED2K_EMBLOCK_SIZE,
+                        payload_for_server.len() as u64,
+                    ),
+                ]
+            );
+
+            let (late_start, late_end) = third_ranges[1];
+            let late_fragment = encode_sending_part(
+                &file_hash,
+                late_start,
+                late_end,
+                &payload_for_server
+                    [usize::try_from(late_start).unwrap()..usize::try_from(late_end).unwrap()],
+                false,
+            )
+            .unwrap();
+            stream.write_all(&late_fragment).await.unwrap();
+        });
+
+        let result = download_file_from_peer(
+            Ipv4Addr::LOCALHOST,
+            &Ed2kFoundSource {
+                file_hash,
+                ip: Ipv4Addr::LOCALHOST,
+                tcp_port: peer_addr.port(),
+                client_id: u32::from_le_bytes(Ipv4Addr::LOCALHOST.octets()),
+                low_id: false,
+                obfuscated: false,
+                obfuscation_options: None,
+                user_hash: None,
+                source_server: None,
+            },
+            Ed2kHelloIdentity {
+                user_hash: [0x11; 16],
+                client_id: 0,
+                tcp_port: 41001,
+                udp_port: 41000,
+                server_ip: 0,
+                server_port: 0,
+                connect_options: emule_connect_options(false),
+                direct_udp_callback: false,
+            },
+            &Arc::new(
+                Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+                    .unwrap(),
+            ),
+            &transfer_runtime,
+            "window.epub".to_string(),
+            payload.len() as u64,
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
+        let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
+        assert!(!manifest.completed);
+        assert_eq!(
+            manifest.pieces[0].state,
+            crate::ed2k_transfer::Ed2kTransferState::Missing
+        );
+        assert_eq!(manifest.pieces[0].bytes_written, second_end);
         server.await.unwrap();
     }
 
