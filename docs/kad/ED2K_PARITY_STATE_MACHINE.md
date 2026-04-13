@@ -152,8 +152,9 @@ Existing unit coverage:
 Current verified difference from stock eMule:
 
 - `crates/overlord-agent-emule/src/ed2k_transfer.rs` keeps a FIFO
-  `waiting_order`, promotes from the front, and expires sessions by fixed
-  timeout classes.
+  `waiting_order`, promotes from the front, expires sessions by fixed timeout
+  classes, and now preserves one queue entry per peer across reconnects and
+  requested-file switches.
 - stock eMule `UploadQueue.cpp` selects the next client with
   `FindBestClientInQueue`, handles LowID reconnect and duplicate suppression in
   `AddClientToQueue`, and rotates slots by payload, time, and score in

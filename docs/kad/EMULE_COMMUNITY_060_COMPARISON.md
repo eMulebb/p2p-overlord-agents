@@ -84,9 +84,10 @@ Areas that are currently credible against stock eMule:
 Verified differences against stock eMule:
 
 - `overlord-agent-emule/src/ed2k_transfer.rs` uses a FIFO waiting queue with
-  fixed active slots and timeout classes. Stock eMule `UploadQueue.cpp`
-  calculates queue worth with `FindBestClientInQueue`, applies duplicate and IP
-  suppression in `AddClientToQueue`, and rotates slots with
+  fixed active slots and timeout classes, though it now preserves one queue
+  entry per peer across reconnects and requested-file switches. Stock eMule
+  `UploadQueue.cpp` calculates queue worth with `FindBestClientInQueue`,
+  applies duplicate and IP suppression in `AddClientToQueue`, and rotates slots with
   `CheckForTimeOver`.
 - `overlord-agent-emule/src/ed2k_tcp.rs` now keeps an adaptive pending-block
   window with rolling refills and safe teardown for malformed or out-of-order
