@@ -4313,6 +4313,22 @@ fn build_kad_hello_request_tags(
     Vec::new()
 }
 
+fn peer_has_known_udp_key(known_peer_key: Option<KadUdpKey>, contact_udp_key: KadUdpKey) -> bool {
+    known_peer_key.unwrap_or(contact_udp_key) != KadUdpKey::ZERO
+}
+
+fn should_request_proactive_hello_res_ack(peer_version: u8, peer_has_udp_key: bool) -> bool {
+    peer_version >= 8 && peer_has_udp_key
+}
+
+fn should_request_hello_response_ack(
+    peer_version: u8,
+    receiver_verify_key_valid: bool,
+    sender_verify_key: Option<u32>,
+) -> bool {
+    peer_version >= 8 && !receiver_verify_key_valid && sender_verify_key.is_some()
+}
+
 async fn build_hello_response(
     dht: &DhtNode,
     ed2k_listener: &TcpListener,
@@ -4750,7 +4766,11 @@ async fn handle_unsolicited_packet(
                 &req.tags,
             )
             .await;
-            let request_ack = req.version >= 8 && !receiver_verify_key_valid;
+            let request_ack = should_request_hello_response_ack(
+                req.version,
+                receiver_verify_key_valid,
+                sender_verify_key,
+            );
             let hello_res = build_hello_response(
                 dht,
                 context.ed2k_listener,
@@ -4769,6 +4789,12 @@ async fn handle_unsolicited_packet(
                 peer_metadata.tcp_firewalled,
                 peer_metadata.requests_hello_res_ack
             );
+            if req.version >= 8 && !receiver_verify_key_valid && sender_verify_key.is_none() {
+                debug!(
+                    "skipping HELLO_RES ACK request to={} because sender verify key is unavailable",
+                    from
+                );
+            }
             let _ = dht.send_packet(from, &KadPacket::HelloRes(hello_res)).await;
             spawn_kad_firewalled_check(
                 KadFirewalledCheckContext {
@@ -6781,7 +6807,10 @@ impl OverlordAgentEmule {
                 contacts.shuffle(&mut rand::thread_rng());
 
                 for (contact, addr) in contacts.into_iter().take(KAD_HELLO_INTRO_FANOUT) {
-                    let request_ack = contact.kad_version >= 8;
+                    let request_ack = should_request_proactive_hello_res_ack(
+                        contact.kad_version,
+                        peer_has_known_udp_key(dht.known_peer_key(addr), contact.udp_key),
+                    );
                     let hello = match build_hello_request(
                         &dht,
                         &ed2k_listener,
@@ -7699,7 +7728,8 @@ mod tests {
         record_passive_replay_enqueue_wait, record_passive_replay_idle,
         record_passive_replay_post_failure, record_passive_replay_post_latency,
         record_passive_replay_start, restore_snoop_queue, select_popular_hashes_for_seeding,
-        select_popular_hashes_from_fetch_result, significant_keyword_words, synthetic_file_hash,
+        select_popular_hashes_from_fetch_result, should_request_hello_response_ack,
+        should_request_proactive_hello_res_ack, significant_keyword_words, synthetic_file_hash,
         synthetic_popular_hashes, synthetic_publish_aich_hash, try_acquire_passive_replay_gate,
     };
     use crate::{
@@ -9202,6 +9232,33 @@ mod tests {
         let tags = build_kad_hello_request_tags(41000, false, false, false, false);
 
         assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn proactive_hello_ack_requires_known_peer_udp_key() {
+        assert!(!should_request_proactive_hello_res_ack(8, false));
+        assert!(should_request_proactive_hello_res_ack(8, true));
+        assert!(!should_request_proactive_hello_res_ack(7, true));
+    }
+
+    #[test]
+    fn hello_response_ack_requires_sender_verify_key() {
+        assert!(!should_request_hello_response_ack(8, false, None));
+        assert!(should_request_hello_response_ack(
+            8,
+            false,
+            Some(0x1122_3344)
+        ));
+        assert!(!should_request_hello_response_ack(
+            8,
+            true,
+            Some(0x1122_3344)
+        ));
+        assert!(!should_request_hello_response_ack(
+            7,
+            false,
+            Some(0x1122_3344)
+        ));
     }
 
     #[test]
