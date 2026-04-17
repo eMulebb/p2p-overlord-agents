@@ -54,11 +54,32 @@ function Test-RelativePathAgainstRegexes {
     }
 }
 
+function Test-ContentMatchAllowed {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$MatchLine,
+        [object[]]$Rules
+    )
+
+    if (@($Rules).Count -eq 0) {
+        return $false
+    }
+
+    foreach ($rule in $Rules) {
+        if ($MatchLine -match $rule.regex) {
+            return $true
+        }
+    }
+
+    $false
+}
+
 function Get-ContentMatches {
     param(
         [Parameter(Mandatory = $true)]
         [string]$RepoRoot,
-        [object[]]$Rules
+        [object[]]$Rules,
+        [object[]]$AllowRules
     )
 
     $matches = @()
@@ -69,6 +90,9 @@ function Get-ContentMatches {
         $output = & git -C $RepoRoot grep -n -I -E $rule.regex -- . 2>$null
         if ($LASTEXITCODE -eq 0 -and $output) {
             foreach ($line in @($output)) {
+                if (Test-ContentMatchAllowed -MatchLine $line -Rules $AllowRules) {
+                    continue
+                }
                 $matches += [pscustomobject]@{
                     rule = $rule.id
                     reason = $rule.reason
@@ -89,8 +113,9 @@ function Merge-PolicyRules {
         [hashtable]$ExtraPolicy
     )
 
-    $BasePolicy.pathRules = @($BasePolicy.pathRules) + @($ExtraPolicy.pathRules)
-    $BasePolicy.contentRules = @($BasePolicy.contentRules) + @($ExtraPolicy.contentRules)
+    $BasePolicy.pathRules = @($BasePolicy.pathRules | Where-Object { $_ }) + @($ExtraPolicy.pathRules | Where-Object { $_ })
+    $BasePolicy.contentRules = @($BasePolicy.contentRules | Where-Object { $_ }) + @($ExtraPolicy.contentRules | Where-Object { $_ })
+    $BasePolicy.contentAllowRules = @($BasePolicy.contentAllowRules | Where-Object { $_ }) + @($ExtraPolicy.contentAllowRules | Where-Object { $_ })
 }
 
 function New-IdentifierRules {
@@ -124,8 +149,9 @@ if (-not (Test-Path $policyPath)) {
 }
 
 $policy = Get-Content -Raw $policyPath | ConvertFrom-Json -AsHashtable
-$policy.pathRules = @($policy.pathRules)
-$policy.contentRules = @($policy.contentRules)
+$policy.pathRules = @($policy.pathRules | Where-Object { $_ })
+$policy.contentRules = @($policy.contentRules | Where-Object { $_ })
+$policy.contentAllowRules = @($policy.contentAllowRules | Where-Object { $_ })
 
 if (Test-Path $localPolicyPath) {
     $localPolicy = Get-Content -Raw $localPolicyPath | ConvertFrom-Json -AsHashtable
@@ -151,7 +177,7 @@ foreach ($relativePath in $trackedFiles) {
     }
 }
 
-$contentMatches = @(Get-ContentMatches -RepoRoot $repoRoot -Rules $policy.contentRules)
+$contentMatches = @(Get-ContentMatches -RepoRoot $repoRoot -Rules $policy.contentRules -AllowRules $policy.contentAllowRules)
 
 $summary = [pscustomobject]@{
     schemaVersion = "privacy-guard-summary/v1"

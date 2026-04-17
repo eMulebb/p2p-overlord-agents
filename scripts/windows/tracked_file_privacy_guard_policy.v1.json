@@ -22,5 +22,17 @@
       "reason": "Tracked content must not contain committed Unix home-directory paths.",
       "regex": "/home/[A-Za-z0-9_][A-Za-z0-9._-]*"
     }
+  ],
+  "contentAllowRules": [
+    {
+      "id": "public-kademlia-paper-url",
+      "reason": "Allow the public Stanford Kademlia paper URL; it is a legitimate reference, not a personal home-directory leak.",
+      "regex": "https://www\\.scs\\.stanford\\.edu/~dm/home/papers/kpos\\.pdf"
+    },
+    {
+      "id": "public-kademlia-paper-url-policy-entry",
+      "reason": "Allow the policy entry that documents the public Stanford Kademlia paper URL exception.",
+      "regex": "tracked_file_privacy_guard_policy\\.v1\\.json:.*public Stanford Kademlia paper URL|tracked_file_privacy_guard_policy\\.v1\\.json:.*kpos"
+    }
   ]
 }
