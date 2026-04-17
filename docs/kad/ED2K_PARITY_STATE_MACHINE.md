@@ -91,8 +91,8 @@ Current real-network scenario:
 
 Current grounded gap:
 
-- pinned obfuscated replay for `0669fe87943bdf0024f623815c616313` reaches
-  source-search start, then ends at `agent_source_search_returned_zero`
+- the current pinned obfuscated replay reaches source-search start, then ends at
+  `agent_source_search_returned_zero`
 
 ### 2. Downloader startup handshake
 

@@ -99,6 +99,14 @@ Current example:
   captcha support is part of the parity backlog until the implementation lands
   or the advert is made truthful again.
 
+## Vector Hygiene
+
+Live ED2K hashes, full links, and other real-network test vectors must stay in
+gitignored local files and local run artifacts only.
+
+Tracked docs, tests, manifests, and examples should use generic placeholders or
+explicitly synthetic fixtures instead of committing live-network vectors.
+
 ## Current Next Step
 
 The active next milestone is:

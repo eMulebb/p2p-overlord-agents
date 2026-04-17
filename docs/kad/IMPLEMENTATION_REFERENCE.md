@@ -641,27 +641,48 @@ Path can be overridden with `--config`.
 url = "http://127.0.0.1:13300"
 
 [agent]
-bind_addr = "127.0.0.1:13301"
 indexer_id_path = "./runtime/overlord-agent-emule.indexer-id"
 state_dir = "./runtime"
 hostname = "localhost"
 version = "0.1.0"
 
-[dht]
-udp_bind_addr = "0.0.0.0:41000"
+[control]
+listen_port = 13301
+
+[p2p.kad]
+listen_port = 41000
 nodes_dat_path = "./runtime/overlord-kad.nodes.dat"
 bootstrap_nodes = []
 search_timeout_secs = 45
 store_timeout_secs = 140
 republish_interval_secs = 18000
-max_outbound_pps = 50
+publish_contact_fanout = 4
+routing_refresh_interval_secs = 900
+hello_intro_interval_secs = 300
+hello_intro_fanout = 2
+max_outbound_pps = 8
+interactive_max_outbound_pps = 4
+harvest_max_outbound_pps = 1
+maintenance_max_outbound_pps = 1
+publish_max_outbound_pps = 1
 search_phase2_fanout = 50
 keyword_result_cap = 5000
 source_result_cap = 1000
 notes_result_cap = 1000
+synthetic_publish_interval_secs = 120
+synthetic_publish_batch_items = 1
+synthetic_publish_contact_fanout = 1
 obfuscation_enabled = true
 enable_mock_results = false
 
+[p2p.ed2k]
+listen_port = 41001
+max_concurrent_downloads = 1
+max_parallel_download_peers = 2
+keyword_server_attempt_budget = 3
+exact_hash_keyword_server_attempt_budget = 4
+source_server_attempt_budget = 3
+kad_source_supplement_max_existing_sources = 2
 
 [log]
 level = "info"

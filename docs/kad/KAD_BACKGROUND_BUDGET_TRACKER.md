@@ -71,22 +71,32 @@ As of **April 17, 2026**, the following is implemented:
 
 The current default Kad operating profile is:
 
-- global Kad cap: `32 pps`
-- `interactive`: `24 pps`
-- `harvest`: `4 pps`
-- `maintenance`: `2 pps`
+- global Kad cap: `8 pps`
+- `interactive`: `4 pps`
+- `harvest`: `1 pps`
+- `maintenance`: `1 pps`
 - `publish`: `1 pps`
-- routing refresh interval: `300s`
-- hello-intro interval: `90s`
-- hello-intro fanout: `6`
-- UDP firewall recheck interval: `900s`
-- general publish fanout: `8`
-- synthetic publish drip interval: `30s`
+- routing refresh interval: `900s`
+- hello-intro interval: `300s`
+- hello-intro fanout: `2`
+- UDP firewall recheck interval: `1800s`
+- general publish fanout: `4`
+- synthetic publish drip interval: `120s`
 - synthetic publish drip batch size: `1`
-- synthetic publish drip contact fanout: `4`
+- synthetic publish drip contact fanout: `1`
 
 These defaults are intentionally conservative. They prioritize “stay useful and
 quiet” over “stay maximally hot”.
+
+ED2K-active runs now also use tighter front-end pressure:
+
+- only `1` ED2K download may run active metadata/source acquisition at once by default
+- one file keeps at most `2` direct peers in flight at once
+- normal ED2K keyword searches probe at most `3` one-shot servers
+- exact `ed2k::<hash>` metadata lookups probe at most `4` one-shot servers
+- download source acquisition probes at most `3` one-shot servers
+- Kad source supplementation is skipped once ED2K already found more than `2`
+  sources for the file
 
 ## Evidence
 
