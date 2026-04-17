@@ -65,7 +65,10 @@ The following remain in scope for "full parity":
 - [x] `FileIdentifier` model plus modern startup `OP_MULTIPACKET_EXT2` /
       `OP_MULTIPACKETANSWER_EXT2` parity on the current downloader and listener
       subset
-- [ ] Modern AICH tree generation, transport, and verification parity
+- [x] Modern `OP_HASHSETREQUEST2` / `OP_HASHSETANSWER2` transport for the
+      `FileIdentifier` path with MD4 hashset coverage
+- [ ] Modern AICH root + part-hash generation, transport, and verification on
+      the `FileIdentifier` / `OP_HASHSETANSWER2` path
 - [ ] Stock `UploadQueue.cpp`-style credit, score, LowID, and friend-slot
       behavior
 - [ ] Full buddy / callback matrix and buddy-tag parity for firewalled mode
@@ -92,16 +95,22 @@ Current example:
 
 The active next milestone is:
 
-1. move modern AICH handling onto the `FileIdentifier` path instead of keeping
-   legacy standalone AICH packets as the primary active behavior
-2. implement AICH tree generation, transport, and verification parity for the
-   modern downloader / listener path
-3. extend the same truthfulness rule to every still-advertised non-obsolete
+1. persist a truthful AICH root and part-hash set in the transfer/shared-file
+   runtime instead of keeping `FileIdentifier.aich_root` empty on the active
+   ED2K path
+2. answer `OP_HASHSETREQUEST2` with AICH data when the peer requests it and
+   validate inbound `OP_HASHSETANSWER2` AICH payloads against the requested
+   root
+3. confirm that modern AICH transport on the `FileIdentifier` path is visible
+   in private dumps and then add a dedicated large-file live scenario so that
+   `server.met` realnet evidence covers the same branch
+4. extend the same truthfulness rule to every still-advertised non-obsolete
    ED2K feature that remains unimplemented, starting with chat-captcha
 
-This is the highest-leverage next step because `FileIdentifier` / `EXT2`
-startup is now in place, so the largest remaining truth gap is the still-modern
-AICH path that stock `v0.72a` drives through that transport.
+This remains the highest-leverage next step because the downloader and listener
+now use the modern `FileIdentifier` + `EXT2` + `HASHSETREQUEST2` transport, so
+the largest remaining truth gap is the still-modern AICH payload that stock
+`v0.72a` drives through that exact path.
 
 ## Current Evidence
 
@@ -115,6 +124,35 @@ new modern startup flow:
   - inbound `OP_MULTIPACKET_EXT2` from the agent at
     [emule-harness-ed2k-tcp-dump-2026.04.17-17.16.54.366-p9544.jsonl](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.emule-harness.agent.private.v1/ed2k.server.emule-harness.agent.private.v1-20260417-171635/emule-harness-artifacts/emule-harness-ed2k-tcp-dump-2026.04.17-17.16.54.366-p9544.jsonl>)
   - outbound `OP_MULTIPACKETANSWER_EXT2` back to the agent in the same dump
+
+As of **April 17, 2026**, live `server.met` validation is also green for the
+current acceptance gate:
+
+- the real-network scenario
+  `ed2k.server.emule-harness.agent.roundtrip.realnet.v1` completed
+  successfully on run
+  `ed2k.server.emule-harness.agent.roundtrip.realnet.v1-20260417-172433`
+- the selected live server came from the canonical imported `server.met` bundle
+  and was pinned as `145.239.2.134:4661` in
+  [run-manifest.json](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.emule-harness.agent.roundtrip.realnet.v1/ed2k.server.emule-harness.agent.roundtrip.realnet.v1-20260417-172433/run-manifest.json>)
+- the run summary confirms server-session establishment, agent download,
+  republish, and harness download completion in
+  [run-summary.json](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.emule-harness.agent.roundtrip.realnet.v1/ed2k.server.emule-harness.agent.roundtrip.realnet.v1-20260417-172433/run-summary.json>)
+- the agent log shows successful live-server session establishment and native
+  download completion against that server in
+  [overlord-agent-emule.log](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.emule-harness.agent.roundtrip.realnet.v1/ed2k.server.emule-harness.agent.roundtrip.realnet.v1-20260417-172433/agent-stage1-artifacts/overlord-agent-emule.log>)
+- the harness downloader log confirms the re-offered file verified as
+  `MD4: OK - AICH: OK` in
+  [eMule_Verbose.log](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.emule-harness.agent.roundtrip.realnet.v1/ed2k.server.emule-harness.agent.roundtrip.realnet.v1-20260417-172433/harness-downloader-artifacts/eMule_Verbose.log>)
+
+Important limitation:
+
+- that live roundtrip used a `262144` byte file, so it did **not** exercise the
+  large-file `OP_HASHSETREQUEST2` / `OP_HASHSETANSWER2` or modern AICH payload
+  branch
+- the live run is therefore valid evidence for publish/download/re-offer
+  acceptance on a real server selected from `server.met`, but **not yet**
+  sufficient evidence for modern AICH transport parity
 
 ## Validation Standard
 
