@@ -67,6 +67,8 @@ The following remain in scope for "full parity":
       subset
 - [x] Modern `OP_HASHSETREQUEST2` / `OP_HASHSETANSWER2` transport for the
       `FileIdentifier` path with MD4 hashset coverage
+- [x] Hash-only native download bootstrap that learns canonical name and file
+      size from peer startup metadata on the active `FileIdentifier` path
 - [x] Large-file live `server.met` validation for the current
       `FileIdentifier` / `OP_MULTIPACKET_EXT2` / `OP_HASHSETREQUEST2` /
       compressed-part transfer path
@@ -123,6 +125,10 @@ new modern startup flow:
 
 - `cargo test --workspace` passed after the `FileIdentifier` / `EXT2` changes
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::all` passed
+- the downloader now accepts hash-only requests and upgrades the manifest from
+  peer `OP_MULTIPACKETANSWER_EXT2` / `OP_REQFILENAMEANSWER` metadata, covered
+  by the `hash_only_small_file_download_learns_metadata_from_startup_answer`
+  and `reconcile_job_metadata_adopts_unknown_size_and_name` regressions
 - the private scenario `ed2k.server.emule-harness.agent.private.v1` completed
   successfully with the harness logging:
   - inbound `OP_MULTIPACKET_EXT2` from the agent at
