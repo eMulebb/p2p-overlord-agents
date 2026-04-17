@@ -62,8 +62,9 @@ The following remain in scope for "full parity":
 - [x] Listener upload subset with queue-rank and file-description handling
 - [x] Verified upload serving and resumable download coverage for the current
       subset
-- [ ] `FileIdentifier` model and `OP_MULTIPACKET_EXT2` /
-      `OP_MULTIPACKETANSWER_EXT2` parity
+- [x] `FileIdentifier` model plus modern startup `OP_MULTIPACKET_EXT2` /
+      `OP_MULTIPACKETANSWER_EXT2` parity on the current downloader and listener
+      subset
 - [ ] Modern AICH tree generation, transport, and verification parity
 - [ ] Stock `UploadQueue.cpp`-style credit, score, LowID, and friend-slot
       behavior
@@ -91,15 +92,29 @@ Current example:
 
 The active next milestone is:
 
-1. add a first-class `FileIdentifier` model to the Rust ED2K runtime
-2. switch the modern startup path to bundled `OP_MULTIPACKET_EXT2`
-3. add `OP_MULTIPACKETANSWER_EXT2` parsing and reply generation
-4. move modern AICH handling onto the `FileIdentifier` path instead of keeping
+1. move modern AICH handling onto the `FileIdentifier` path instead of keeping
    legacy standalone AICH packets as the primary active behavior
+2. implement AICH tree generation, transport, and verification parity for the
+   modern downloader / listener path
+3. extend the same truthfulness rule to every still-advertised non-obsolete
+   ED2K feature that remains unimplemented, starting with chat-captcha
 
-This is the highest-leverage next step because it closes the largest remaining
-gap between the current `v0.72a` capability advert and the actual runtime wire
-behavior.
+This is the highest-leverage next step because `FileIdentifier` / `EXT2`
+startup is now in place, so the largest remaining truth gap is the still-modern
+AICH path that stock `v0.72a` drives through that transport.
+
+## Current Evidence
+
+As of **April 17, 2026**, the private deterministic harness path confirms the
+new modern startup flow:
+
+- `cargo test --workspace` passed after the `FileIdentifier` / `EXT2` changes
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::all` passed
+- the private scenario `ed2k.server.emule-harness.agent.private.v1` completed
+  successfully with the harness logging:
+  - inbound `OP_MULTIPACKET_EXT2` from the agent at
+    [emule-harness-ed2k-tcp-dump-2026.04.17-17.16.54.366-p9544.jsonl](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.emule-harness.agent.private.v1/ed2k.server.emule-harness.agent.private.v1-20260417-171635/emule-harness-artifacts/emule-harness-ed2k-tcp-dump-2026.04.17-17.16.54.366-p9544.jsonl>)
+  - outbound `OP_MULTIPACKETANSWER_EXT2` back to the agent in the same dump
 
 ## Validation Standard
 
