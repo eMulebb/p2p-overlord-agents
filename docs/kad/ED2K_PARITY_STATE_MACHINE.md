@@ -7,6 +7,12 @@ work. The acceptance target is native capability coverage across both roles
 where it materially improves live-network acceptance, reachability, or harvest
 yield:
 
+The canonical target statement now lives in
+[ED2K 0.72a Full Parity Tracker](./ED2K_072A_FULL_PARITY_TRACKER.md): **full
+stock eMule `v0.72a` parity, excluding obsolete protocol features only**.
+Treat older `community-0.60` comparisons in this doc set as historical context,
+not as the current end target.
+
 - downloader and search consumer
 - listener and upload server
 

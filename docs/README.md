@@ -25,12 +25,15 @@ traffic shape depends on it.
 
 - ED2K runtime and wire work currently lives alongside the Kad docs in the same
   reference set while parity is still being built out.
+- The current canonical ED2K target is **full stock eMule `v0.72a` parity,
+  excluding obsolete protocol features only**.
 - [Kad Docs Landing Page](./kad/README.md)
 - [Implementation Reference](./kad/IMPLEMENTATION_REFERENCE.md)
 - [KV6_001 Kad2 IPv6 Design](./kad/KV6_001_KAD2_IPV6_DESIGN.md)
 - [Protocol Reference](./kad/PROTOCOL_REFERENCE.md)
 - [Observations](./kad/OBSERVATIONS.md)
 - [Wire Sequences](./kad/WIRE_SEQUENCES.md)
+- [ED2K 0.72a Full Parity Tracker](./kad/ED2K_072A_FULL_PARITY_TRACKER.md)
 - [Stock eMule `community-0.60` Comparison](./kad/EMULE_COMMUNITY_060_COMPARISON.md)
 - [ED2K Firewalled Parity Matrix](./kad/ED2K_FIREWALLED_PARITY_MATRIX.md)
 - [ED2K Parity State Machine](./kad/ED2K_PARITY_STATE_MACHINE.md)

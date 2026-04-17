@@ -7,6 +7,9 @@ current documentation home for ED2K server-session, source-search, and future
 transfer-parity work. The long-term repo target is full native Kad and ED2K
 parity, including searching, sharing, upload, and download behavior.
 
+The current canonical ED2K target is **full stock eMule `v0.72a` parity,
+excluding obsolete protocol features only**.
+
 ## Core Reference
 
 - [Implementation Reference](./IMPLEMENTATION_REFERENCE.md)
@@ -19,6 +22,7 @@ parity, including searching, sharing, upload, and download behavior.
 - [Parity Notes](./PARITY_NOTES.md)
 - [Observations](./OBSERVATIONS.md)
 - [Oracle Differences](./PROTOCOL_DIFFS.md)
+- [ED2K 0.72a Full Parity Tracker](./ED2K_072A_FULL_PARITY_TRACKER.md)
 - [Stock eMule `community-0.60` Comparison](./EMULE_COMMUNITY_060_COMPARISON.md)
 - [ED2K Parity State Machine](./ED2K_PARITY_STATE_MACHINE.md)
 - [ED2K Firewalled Parity Matrix](./ED2K_FIREWALLED_PARITY_MATRIX.md)
