@@ -73,10 +73,10 @@ impl RpcClassBudgetConfig {
 impl Default for RpcClassBudgetConfig {
     fn default() -> Self {
         Self {
-            interactive_max_outbound_pps: 32,
-            harvest_max_outbound_pps: 8,
-            maintenance_max_outbound_pps: 4,
-            publish_max_outbound_pps: 2,
+            interactive_max_outbound_pps: 4,
+            harvest_max_outbound_pps: 1,
+            maintenance_max_outbound_pps: 1,
+            publish_max_outbound_pps: 1,
         }
     }
 }
@@ -105,7 +105,7 @@ pub struct RpcConfig {
 impl Default for RpcConfig {
     fn default() -> Self {
         Self {
-            max_outbound_pps: 50,
+            max_outbound_pps: 8,
             class_budgets: RpcClassBudgetConfig::default(),
             max_inbound_per_ip: 20,
             max_inbound_search_res_per_ip: 256,
@@ -1789,7 +1789,10 @@ mod tests {
             .unwrap();
 
         let snapshot = rpc.observability();
-        assert_eq!(snapshot.global_max_outbound_pps, RpcConfig::default().max_outbound_pps);
+        assert_eq!(
+            snapshot.global_max_outbound_pps,
+            RpcConfig::default().max_outbound_pps
+        );
         assert_eq!(snapshot.work_classes.len(), 4);
 
         let harvest = snapshot

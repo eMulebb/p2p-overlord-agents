@@ -201,6 +201,22 @@ pub struct Ed2kConfig {
     /// A value of `0` disables proactive rotation and keeps the current session
     /// alive until the remote side disconnects or the agent shuts down.
     pub session_rotation_secs: u64,
+    /// Maximum number of ED2K download jobs allowed to run active metadata/source
+    /// acquisition and peer sessions at once.
+    pub max_concurrent_downloads: usize,
+    /// Maximum number of direct ED2K peers one download may keep in flight at once.
+    pub max_parallel_download_peers: usize,
+    /// Maximum number of one-shot ED2K servers to probe for a normal keyword search.
+    pub keyword_server_attempt_budget: usize,
+    /// Maximum number of one-shot ED2K servers to probe for an exact `ed2k::<hash>`
+    /// metadata lookup before the job falls back to later retry paths.
+    pub exact_hash_keyword_server_attempt_budget: usize,
+    /// Maximum number of one-shot ED2K servers to probe while acquiring sources
+    /// for one active file download.
+    pub source_server_attempt_budget: usize,
+    /// Only run Kad source supplementation when the ED2K server path found at
+    /// most this many sources for the file.
+    pub kad_source_supplement_max_existing_sources: usize,
     /// Deterministic inbound upload queue policy for peer download sessions.
     pub upload_queue: Ed2kUploadQueuePolicyConfig,
 }
@@ -371,13 +387,13 @@ impl Default for KadConfig {
             search_timeout_secs: 45,
             store_timeout_secs: 140,
             republish_interval_secs: 18_000,
-            publish_contact_fanout: 8,
-            routing_refresh_interval_secs: 300,
-            hello_intro_interval_secs: 90,
-            hello_intro_fanout: 6,
+            publish_contact_fanout: 4,
+            routing_refresh_interval_secs: 900,
+            hello_intro_interval_secs: 300,
+            hello_intro_fanout: 2,
             nodes_dat_refresh_interval_secs: 300,
             udp_firewall_check_enabled: true,
-            udp_firewall_recheck_interval_secs: 900,
+            udp_firewall_recheck_interval_secs: 1_800,
             udp_firewall_check_timeout_secs: 20,
             udp_firewall_check_contact_count: 2,
             local_store_enabled: true,
@@ -387,18 +403,18 @@ impl Default for KadConfig {
             local_store_keyword_capacity: 20_000,
             local_store_source_capacity: 20_000,
             local_store_notes_capacity: 5_000,
-            max_outbound_pps: 32,
-            interactive_max_outbound_pps: 24,
-            harvest_max_outbound_pps: 4,
-            maintenance_max_outbound_pps: 2,
+            max_outbound_pps: 8,
+            interactive_max_outbound_pps: 4,
+            harvest_max_outbound_pps: 1,
+            maintenance_max_outbound_pps: 1,
             publish_max_outbound_pps: 1,
             search_phase2_fanout: 50,
             keyword_result_cap: 5_000,
             source_result_cap: 1_000,
             notes_result_cap: 1_000,
-            synthetic_publish_interval_secs: 30,
+            synthetic_publish_interval_secs: 120,
             synthetic_publish_batch_items: 1,
-            synthetic_publish_contact_fanout: 4,
+            synthetic_publish_contact_fanout: 1,
             seed_notes_publish_enabled: false,
             obfuscation_enabled: true,
             enable_mock_results: false,
@@ -418,6 +434,12 @@ impl Default for Ed2kConfig {
             reconnect_interval_secs: 30,
             keepalive_secs: 60,
             session_rotation_secs: 0,
+            max_concurrent_downloads: 1,
+            max_parallel_download_peers: 2,
+            keyword_server_attempt_budget: 3,
+            exact_hash_keyword_server_attempt_budget: 4,
+            source_server_attempt_budget: 3,
+            kad_source_supplement_max_existing_sources: 2,
             upload_queue: Ed2kUploadQueuePolicyConfig::default(),
         }
     }
@@ -1047,31 +1069,46 @@ renew_margin_secs = 300
     fn default_kad_config_enables_periodic_routing_refresh() {
         let config = EmuleAgentConfig::default();
 
-        assert_eq!(config.p2p.kad.routing_refresh_interval_secs, 300);
-        assert_eq!(config.p2p.kad.hello_intro_interval_secs, 90);
-        assert_eq!(config.p2p.kad.hello_intro_fanout, 6);
+        assert_eq!(config.p2p.kad.routing_refresh_interval_secs, 900);
+        assert_eq!(config.p2p.kad.hello_intro_interval_secs, 300);
+        assert_eq!(config.p2p.kad.hello_intro_fanout, 2);
         assert_eq!(config.p2p.kad.nodes_dat_refresh_interval_secs, 300);
-        assert_eq!(config.p2p.kad.publish_contact_fanout, 8);
+        assert_eq!(config.p2p.kad.publish_contact_fanout, 4);
         assert!(config.p2p.kad.udp_firewall_check_enabled);
-        assert_eq!(config.p2p.kad.udp_firewall_recheck_interval_secs, 900);
+        assert_eq!(config.p2p.kad.udp_firewall_recheck_interval_secs, 1_800);
         assert_eq!(config.p2p.kad.udp_firewall_check_timeout_secs, 20);
         assert_eq!(config.p2p.kad.udp_firewall_check_contact_count, 2);
         assert!(config.p2p.kad.local_store_enabled);
         assert_eq!(config.p2p.kad.local_store_keyword_ttl_secs, 86_400);
         assert_eq!(config.p2p.kad.local_store_source_ttl_secs, 21_600);
         assert_eq!(config.p2p.kad.local_store_notes_ttl_secs, 86_400);
-        assert_eq!(config.p2p.kad.max_outbound_pps, 32);
-        assert_eq!(config.p2p.kad.interactive_max_outbound_pps, 24);
-        assert_eq!(config.p2p.kad.harvest_max_outbound_pps, 4);
-        assert_eq!(config.p2p.kad.maintenance_max_outbound_pps, 2);
+        assert_eq!(config.p2p.kad.max_outbound_pps, 8);
+        assert_eq!(config.p2p.kad.interactive_max_outbound_pps, 4);
+        assert_eq!(config.p2p.kad.harvest_max_outbound_pps, 1);
+        assert_eq!(config.p2p.kad.maintenance_max_outbound_pps, 1);
         assert_eq!(config.p2p.kad.publish_max_outbound_pps, 1);
-        assert_eq!(config.p2p.kad.synthetic_publish_interval_secs, 30);
+        assert_eq!(config.p2p.kad.synthetic_publish_interval_secs, 120);
         assert_eq!(config.p2p.kad.synthetic_publish_batch_items, 1);
-        assert_eq!(config.p2p.kad.synthetic_publish_contact_fanout, 4);
+        assert_eq!(config.p2p.kad.synthetic_publish_contact_fanout, 1);
         assert_eq!(config.p2p.kad.local_store_keyword_capacity, 20_000);
         assert_eq!(config.p2p.kad.local_store_source_capacity, 20_000);
         assert_eq!(config.p2p.kad.local_store_notes_capacity, 5_000);
         assert!(!config.p2p.kad.seed_notes_publish_enabled);
+    }
+
+    #[test]
+    fn default_ed2k_config_limits_active_download_fanout() {
+        let config = EmuleAgentConfig::default();
+
+        assert_eq!(config.p2p.ed2k.max_concurrent_downloads, 1);
+        assert_eq!(config.p2p.ed2k.max_parallel_download_peers, 2);
+        assert_eq!(config.p2p.ed2k.keyword_server_attempt_budget, 3);
+        assert_eq!(config.p2p.ed2k.exact_hash_keyword_server_attempt_budget, 4);
+        assert_eq!(config.p2p.ed2k.source_server_attempt_budget, 3);
+        assert_eq!(
+            config.p2p.ed2k.kad_source_supplement_max_existing_sources,
+            2
+        );
     }
 
     #[test]

@@ -910,6 +910,7 @@ pub struct OverlordAgentEmule {
     p2p_selection_state: Arc<RwLock<ResolvedInterfaceBindingReport>>,
     active_searches: Arc<Mutex<HashMap<Uuid, ActiveSearchHandle>>>,
     active_ed2k_downloads: Arc<Mutex<HashSet<String>>>,
+    ed2k_download_gate: Arc<Semaphore>,
     restart_requested: Arc<AtomicBool>,
     restart_notify: Arc<Notify>,
     started: AtomicBool,
@@ -1184,6 +1185,9 @@ impl OverlordAgentEmule {
             Self::resolve_p2p_selection_state(&config, &interfaces, None, false, false);
         let snoop_queue_config = config.p2p.snoop_queue.clone();
         let local_store = KadLocalStore::new(KadLocalStoreConfig::from_kad_config(&config.p2p.kad));
+        let ed2k_download_gate = Arc::new(Semaphore::new(
+            config.p2p.ed2k.max_concurrent_downloads.max(1),
+        ));
         let activity_started_at = Utc::now();
 
         Ok(Self {
@@ -1206,6 +1210,7 @@ impl OverlordAgentEmule {
             p2p_selection_state: Arc::new(RwLock::new(p2p_selection_state)),
             active_searches: Arc::new(Mutex::new(HashMap::new())),
             active_ed2k_downloads: Arc::new(Mutex::new(HashSet::new())),
+            ed2k_download_gate,
             restart_requested: Arc::new(AtomicBool::new(false)),
             restart_notify: Arc::new(Notify::new()),
             started: AtomicBool::new(false),
@@ -2738,6 +2743,36 @@ fn exact_ed2k_hash_query_token(query: &str) -> Option<String> {
     }
 }
 
+fn ed2k_configured_server_attempt_budget(config: &Ed2kConfig) -> usize {
+    config
+        .server_entries
+        .len()
+        .max(config.server_endpoints.len())
+        .max(1)
+}
+
+fn ed2k_keyword_server_attempt_budget(config: &Ed2kConfig, query: &str) -> usize {
+    let configured_budget = ed2k_configured_server_attempt_budget(config);
+    if exact_ed2k_hash_query_token(query).is_some() {
+        config
+            .exact_hash_keyword_server_attempt_budget
+            .max(1)
+            .min(configured_budget)
+    } else {
+        config
+            .keyword_server_attempt_budget
+            .max(1)
+            .min(configured_budget)
+    }
+}
+
+fn ed2k_download_source_server_attempt_budget(config: &Ed2kConfig) -> usize {
+    config
+        .source_server_attempt_budget
+        .max(1)
+        .min(ed2k_configured_server_attempt_budget(config))
+}
+
 fn select_ed2k_keyword_metadata(
     results: &[Ed2kSearchFile],
     file_hash: Ed2kHash,
@@ -2885,6 +2920,8 @@ async fn resolve_hash_only_ed2k_metadata(
     }
 
     if !learned.is_complete() {
+        let active_server_attempts =
+            ed2k_keyword_server_attempt_budget(&config.p2p.ed2k, &keyword_query);
         match search_keyword_servers(
             runtime.bind_ip,
             &config.p2p.ed2k,
@@ -2893,7 +2930,7 @@ async fn resolve_hash_only_ed2k_metadata(
             (!background_search_available)
                 .then_some(preferred_endpoint)
                 .flatten(),
-            ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
+            active_server_attempts,
             &keyword_query,
             &cancel,
         )
@@ -3035,6 +3072,7 @@ async fn do_active_ed2k_keyword_search(
     };
     let query = search_query(job)?;
     let search_timeout = Duration::from_secs(config.p2p.ed2k.connect_timeout_secs.max(5));
+    let active_server_attempts = ed2k_keyword_server_attempt_budget(&config.p2p.ed2k, query);
     let files = if let Some(background_search) = background_search {
         match search_keyword_via_background_session(
             &background_search,
@@ -3068,7 +3106,7 @@ async fn do_active_ed2k_keyword_search(
                     hello_identity,
                     shared_catalog,
                     preferred_endpoint,
-                    ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
+                    active_server_attempts,
                     query,
                     &cancel,
                 )
@@ -3087,7 +3125,7 @@ async fn do_active_ed2k_keyword_search(
                     hello_identity,
                     shared_catalog,
                     preferred_endpoint,
-                    ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
+                    active_server_attempts,
                     query,
                     &cancel,
                 )
@@ -3104,7 +3142,7 @@ async fn do_active_ed2k_keyword_search(
             hello_identity,
             shared_catalog,
             preferred_endpoint,
-            ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
+            active_server_attempts,
             query,
             &cancel,
         )
@@ -5972,6 +6010,7 @@ impl OverlordAgentEmule {
         file_size: u64,
         sources: Vec<Ed2kFoundSource>,
         connect_timeout: Duration,
+        max_parallel_download_peers: usize,
         download_peer: DownloadFn,
     ) -> Result<NativeDirectDownloadOutcome>
     where
@@ -5991,14 +6030,13 @@ impl OverlordAgentEmule {
             + 'static,
         DownloadFuture: Future<Output = Result<Ed2kPeerDownloadOutcome>> + Send + 'static,
     {
-        const MAX_PARALLEL_DOWNLOAD_PEERS: usize = 5;
-
         let mut last_error: Option<anyhow::Error> = None;
         let mut accepted_incomplete_peers = 0u32;
         let mut source_iter = sources.into_iter();
         let mut active_downloads = JoinSet::new();
+        let max_parallel_download_peers = max_parallel_download_peers.max(1);
 
-        while active_downloads.len() < MAX_PARALLEL_DOWNLOAD_PEERS {
+        while active_downloads.len() < max_parallel_download_peers {
             let Some(source) = source_iter.next() else {
                 break;
             };
@@ -6100,7 +6138,7 @@ impl OverlordAgentEmule {
                 }
             }
 
-            while active_downloads.len() < MAX_PARALLEL_DOWNLOAD_PEERS {
+            while active_downloads.len() < max_parallel_download_peers {
                 let Some(source) = source_iter.next() else {
                     break;
                 };
@@ -6227,6 +6265,7 @@ impl OverlordAgentEmule {
             }
         }
 
+        let active_source_attempts = ed2k_download_source_server_attempt_budget(&config.p2p.ed2k);
         match search_source_servers(
             runtime.bind_ip,
             &config.p2p.ed2k,
@@ -6236,7 +6275,7 @@ impl OverlordAgentEmule {
             has_background_search
                 .then_some(preferred_endpoint)
                 .flatten(),
-            ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
+            active_source_attempts,
             file_hash,
             file_size,
             &cancel,
@@ -6261,35 +6300,50 @@ impl OverlordAgentEmule {
         }
         if file_size != 0 {
             let existing_source_count = sources.len();
-            let kad_sources =
-                collect_kad_ed2k_sources(&runtime.dht, file_hash, file_size, source_search_timeout)
-                    .await;
-            let kad_source_count = kad_sources.len();
-            if kad_source_count != 0 {
-                merge_download_sources(&mut sources, kad_sources);
-                let added_source_count = sources.len().saturating_sub(existing_source_count);
-                info!(
-                    "native ED2K download Kad source {} produced file_hash={} source_count={} added_source_count={} aggregated_source_count={}",
-                    if existing_source_count == 0 {
-                        "fallback"
-                    } else {
-                        "supplement"
-                    },
+            let kad_supplement_threshold =
+                config.p2p.ed2k.kad_source_supplement_max_existing_sources;
+            let should_query_kad =
+                existing_source_count == 0 || existing_source_count <= kad_supplement_threshold;
+            if should_query_kad {
+                let kad_sources = collect_kad_ed2k_sources(
+                    &runtime.dht,
                     file_hash,
-                    kad_source_count,
-                    added_source_count,
-                    sources.len()
-                );
+                    file_size,
+                    source_search_timeout,
+                )
+                .await;
+                let kad_source_count = kad_sources.len();
+                if kad_source_count != 0 {
+                    merge_download_sources(&mut sources, kad_sources);
+                    let added_source_count = sources.len().saturating_sub(existing_source_count);
+                    info!(
+                        "native ED2K download Kad source {} produced file_hash={} source_count={} added_source_count={} aggregated_source_count={}",
+                        if existing_source_count == 0 {
+                            "fallback"
+                        } else {
+                            "supplement"
+                        },
+                        file_hash,
+                        kad_source_count,
+                        added_source_count,
+                        sources.len()
+                    );
+                } else {
+                    info!(
+                        "native ED2K download Kad source {} returned no sources for file_hash={} aggregated_source_count={}",
+                        if existing_source_count == 0 {
+                            "fallback"
+                        } else {
+                            "supplement"
+                        },
+                        file_hash,
+                        sources.len()
+                    );
+                }
             } else {
                 info!(
-                    "native ED2K download Kad source {} returned no sources for file_hash={} aggregated_source_count={}",
-                    if existing_source_count == 0 {
-                        "fallback"
-                    } else {
-                        "supplement"
-                    },
-                    file_hash,
-                    sources.len()
+                    "native ED2K download Kad source supplement skipped file_hash={} existing_source_count={} threshold={}",
+                    file_hash, existing_source_count, kad_supplement_threshold
                 );
             }
         } else if sources.is_empty() {
@@ -6525,6 +6579,7 @@ impl OverlordAgentEmule {
                 file_size,
                 sources,
                 Duration::from_secs(config.p2p.ed2k.connect_timeout_secs.max(10)),
+                config.p2p.ed2k.max_parallel_download_peers,
                 |bind_ip,
                  source,
                  hello_identity,
@@ -6700,8 +6755,31 @@ impl OverlordAgentEmule {
         let config_handle = Arc::clone(&self.config);
         let agent_activity = Arc::clone(&self.agent_activity);
         let active_downloads = Arc::clone(&self.active_ed2k_downloads);
+        let download_gate = Arc::clone(&self.ed2k_download_gate);
         let ed2k_user_hash = self.ed2k_user_hash;
         tokio::spawn(async move {
+            let download_permit = match Arc::clone(&download_gate).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    info!(
+                        "native ED2K download queued behind active limit file_hash={normalized_file_hash}"
+                    );
+                    match Arc::clone(&download_gate).acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(error) => {
+                            let mut degraded_snapshot =
+                                new_activity_snapshot(AgentActivityState::Degraded, Utc::now());
+                            degraded_snapshot.query_or_target =
+                                Some(format!("ED2K download {normalized_file_hash}"));
+                            degraded_snapshot.last_error = Some(error.to_string());
+                            record_agent_degraded_activity(&agent_activity, degraded_snapshot)
+                                .await;
+                            active_downloads.lock().await.remove(&normalized_file_hash);
+                            return;
+                        }
+                    }
+                }
+            };
             let activity_key = active_ed2k_download_key(&normalized_file_hash);
             let started_at = Utc::now();
             let mut activity_snapshot =
@@ -6734,6 +6812,7 @@ impl OverlordAgentEmule {
                 }
             }
             active_downloads.lock().await.remove(&normalized_file_hash);
+            drop(download_permit);
         });
         Ok(())
     }
@@ -8103,6 +8182,7 @@ impl OverlordAgentEmule {
         let publish_observability = Arc::clone(&self.publish_observability);
         let agent_activity = Arc::clone(&self.agent_activity);
         let ed2k_shared_catalog = Arc::clone(&runtime.ed2k_shared_catalog);
+        let active_ed2k_downloads = Arc::clone(&self.active_ed2k_downloads);
         let source_publish_identity = source_publish_client_hash(self.indexer_id);
         let source_publish_settings = SourcePublishSettings {
             tcp_port: config.p2p.ed2k.listen_port,
@@ -8111,11 +8191,22 @@ impl OverlordAgentEmule {
         let notes_publish_enabled = config.p2p.kad.seed_notes_publish_enabled;
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             let mut synthetic_cursor = 0usize;
+            let mut deferred_active_download_ticks = 0u8;
             while !shutdown.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_secs(synthetic_publish_interval_secs.max(1)))
                     .await;
                 if shutdown.load(Ordering::Relaxed) || !dht.is_bootstrapped() {
                     continue;
+                }
+                if !active_ed2k_downloads.lock().await.is_empty() {
+                    deferred_active_download_ticks =
+                        deferred_active_download_ticks.saturating_add(1);
+                    if deferred_active_download_ticks < 8 {
+                        debug!("deferring synthetic publish drip while ED2K downloads are active");
+                        continue;
+                    }
+                } else {
+                    deferred_active_download_ticks = 0;
                 }
 
                 match fetch_coordinator_popular_hashes(&coordinator).await {
@@ -8242,7 +8333,8 @@ mod tests {
         build_hello_response, build_kad_hello_request_tags, build_kad_hello_response_tags,
         build_keyword_snoop_entry, build_notes_publish_tags, build_notes_snoop_entry,
         build_publish_batch_summary, build_source_publish_tags, build_source_snoop_entry,
-        current_tcp_firewalled, ed2k_file_type_search_term, effective_publish_counters,
+        current_tcp_firewalled, ed2k_download_source_server_attempt_budget,
+        ed2k_file_type_search_term, ed2k_keyword_server_attempt_budget, effective_publish_counters,
         empty_networking_config, emule_high_id_source_type, exact_ed2k_hash_query_token,
         flush_snoop_queue, keyword_target, manifest_has_ed2k_transfer_progress,
         next_passive_replay_request, next_passive_replay_request_for_family,
@@ -8290,7 +8382,6 @@ mod tests {
         fs,
         net::{Ipv4Addr, SocketAddr},
         path::Path,
-        str::FromStr,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering, Ordering as AtomicOrdering},
@@ -8504,6 +8595,7 @@ mod tests {
                 },
             ],
             Duration::from_secs(1),
+            2,
             {
                 let attempts = Arc::clone(&attempts);
                 move |_bind_ip,
@@ -8606,6 +8698,7 @@ mod tests {
                 },
             ],
             Duration::from_secs(1),
+            2,
             {
                 let attempts = Arc::clone(&attempts);
                 move |_bind_ip,
@@ -8779,29 +8872,62 @@ mod tests {
 
     #[test]
     fn exact_ed2k_hash_query_token_extracts_hash_only_queries() {
+        let exact_hash = Ed2kHash::from_bytes([0x44; 16]).to_string();
+
         assert_eq!(
-            exact_ed2k_hash_query_token("ed2k::4F1E2E7B6E257B5356D22514079A6078"),
-            Some("4f1e2e7b6e257b5356d22514079a6078".to_string())
+            exact_ed2k_hash_query_token(&format!("ed2k::{exact_hash}")),
+            Some(exact_hash.clone())
         );
         assert_eq!(
-            exact_ed2k_hash_query_token("4F1E2E7B6E257B5356D22514079A6078"),
-            Some("4f1e2e7b6e257b5356d22514079a6078".to_string())
+            exact_ed2k_hash_query_token(&exact_hash.to_ascii_uppercase()),
+            Some(exact_hash)
         );
         assert_eq!(exact_ed2k_hash_query_token("ed2k::torino train"), None);
     }
 
     #[test]
     fn keyword_target_uses_hash_token_for_exact_ed2k_hash_queries() {
+        let exact_hash = Ed2kHash::from_bytes([0x44; 16]).to_string();
+
         assert_eq!(
-            keyword_target("ed2k::4F1E2E7B6E257B5356D22514079A6078"),
-            keyword_target("4F1E2E7B6E257B5356D22514079A6078")
+            keyword_target(&format!("ed2k::{exact_hash}")),
+            keyword_target(&exact_hash.to_ascii_uppercase())
+        );
+    }
+
+    #[test]
+    fn exact_ed2k_hash_queries_use_configured_server_budgets() {
+        let mut config = EmuleAgentConfig::default();
+        config.p2p.ed2k.server_endpoints = vec![
+            "1.1.1.1:4661".to_string(),
+            "2.2.2.2:4661".to_string(),
+            "3.3.3.3:4661".to_string(),
+            "4.4.4.4:4661".to_string(),
+            "5.5.5.5:4661".to_string(),
+        ];
+        config.p2p.ed2k.keyword_server_attempt_budget = 2;
+        config.p2p.ed2k.exact_hash_keyword_server_attempt_budget = 4;
+        config.p2p.ed2k.source_server_attempt_budget = 3;
+        let exact_hash = Ed2kHash::from_bytes([0x44; 16]).to_string();
+
+        assert_eq!(
+            ed2k_keyword_server_attempt_budget(&config.p2p.ed2k, &format!("ed2k::{exact_hash}")),
+            4
+        );
+        assert_eq!(
+            ed2k_keyword_server_attempt_budget(&config.p2p.ed2k, "ubuntu linux"),
+            2
+        );
+        assert_eq!(
+            ed2k_download_source_server_attempt_budget(&config.p2p.ed2k),
+            3
         );
     }
 
     #[test]
     fn select_ed2k_keyword_metadata_prefers_exact_hash_with_size_and_name() {
-        let exact_hash = Ed2kHash::from_str("4f1e2e7b6e257b5356d22514079a6078").unwrap();
-        let other_hash = Ed2kHash::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let exact_hash = Ed2kHash::from_bytes([0x44; 16]);
+        let other_hash = Ed2kHash::from_bytes([0xAA; 16]);
         let metadata = select_ed2k_keyword_metadata(
             &[
                 Ed2kSearchFile {
@@ -8836,7 +8962,7 @@ mod tests {
 
     #[test]
     fn kad_search_result_exposes_exact_hash_metadata() {
-        let exact_hash = Ed2kHash::from_str("4f1e2e7b6e257b5356d22514079a6078").unwrap();
+        let exact_hash = Ed2kHash::from_bytes([0x44; 16]);
         let metadata = super::select_kad_keyword_metadata(
             &SearchResult {
                 hash: exact_hash,
