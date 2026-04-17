@@ -57,9 +57,9 @@ use tracing::{debug, info, warn};
 
 use crate::ed2k_server::{Ed2kFoundSource, Ed2kServerState};
 use crate::ed2k_transfer::{
-    ED2K_EMBLOCK_SIZE, ED2K_PART_SIZE, Ed2kResumeManifest, Ed2kSourceHint, Ed2kTransferRuntime,
-    Ed2kTransferState, Ed2kUploadPeerIdentity, Ed2kUploadSessionHandle, Ed2kUploadSessionStatus,
-    expected_piece_length, new_transfer_job,
+    ED2K_EMBLOCK_SIZE, ED2K_PART_SIZE, Ed2kResumeManifest, Ed2kSharedEntry, Ed2kSourceHint,
+    Ed2kTransferRuntime, Ed2kTransferState, Ed2kUploadPeerIdentity, Ed2kUploadSessionHandle,
+    Ed2kUploadSessionStatus, expected_piece_length, new_transfer_job,
 };
 use crate::kad_firewall::KadFirewallState;
 use overlord_kad_dht::DhtNode;
@@ -94,6 +94,8 @@ const OP_AICHFILEHASHREQ: u8 = 0x9E;
 const OP_COMPRESSEDPART_I64: u8 = 0xA1;
 const OP_SENDINGPART_I64: u8 = 0xA2;
 const OP_REQUESTPARTS_I64: u8 = 0xA3;
+const OP_MULTIPACKET_EXT2: u8 = 0xA9;
+const OP_MULTIPACKETANSWER_EXT2: u8 = 0xB0;
 const OP_EMULEINFO: u8 = 0x01;
 const OP_EMULEINFOANSWER: u8 = 0x02;
 const OP_PUBLICKEY: u8 = 0x85;
@@ -239,6 +241,116 @@ pub struct Ed2kHelloIdentity {
     pub connect_options: u8,
     /// Whether the node currently advertises direct UDP callback support.
     pub direct_udp_callback: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Ed2kFileIdentifier {
+    file_hash: Ed2kHash,
+    file_size: Option<u64>,
+    aich_root: Option<[u8; 20]>,
+}
+
+impl Ed2kFileIdentifier {
+    const INCLUDE_MD4: u8 = 1 << 0;
+    const INCLUDE_SIZE: u8 = 1 << 1;
+    const INCLUDE_AICH: u8 = 1 << 2;
+    const RESERVED_BITS: u8 = 0xF8;
+
+    fn from_manifest(manifest: &Ed2kResumeManifest) -> Result<Self> {
+        Ok(Self {
+            file_hash: Ed2kHash::from_str(&manifest.file_hash)
+                .with_context(|| format!("invalid manifest file hash {}", manifest.file_hash))?,
+            file_size: Some(manifest.file_size).filter(|file_size| *file_size != 0),
+            aich_root: None,
+        })
+    }
+
+    fn from_shared_entry(shared: &Ed2kSharedEntry) -> Result<Self> {
+        Ok(Self {
+            file_hash: shared.parsed_hash()?,
+            file_size: Some(shared.file_size).filter(|file_size| *file_size != 0),
+            aich_root: None,
+        })
+    }
+
+    fn encode_into(&self, payload: &mut Vec<u8>) {
+        let mut descriptor = Self::INCLUDE_MD4;
+        if self.file_size.is_some() {
+            descriptor |= Self::INCLUDE_SIZE;
+        }
+        if self.aich_root.is_some() {
+            descriptor |= Self::INCLUDE_AICH;
+        }
+        payload.push(descriptor);
+        payload.extend_from_slice(&self.file_hash.0);
+        if let Some(file_size) = self.file_size {
+            payload.extend_from_slice(&file_size.to_le_bytes());
+        }
+        if let Some(aich_root) = self.aich_root {
+            payload.extend_from_slice(&aich_root);
+        }
+    }
+
+    fn decode(payload: &[u8]) -> Result<(Self, &[u8])> {
+        let Some((&descriptor, mut rest)) = payload.split_first() else {
+            anyhow::bail!("short ED2K FileIdentifier descriptor");
+        };
+        if descriptor & Self::RESERVED_BITS != 0 {
+            anyhow::bail!("unsupported ED2K FileIdentifier descriptor 0x{descriptor:02X}");
+        }
+        if descriptor & Self::INCLUDE_MD4 == 0 {
+            anyhow::bail!("ED2K FileIdentifier missing mandatory MD4 hash");
+        }
+        if rest.len() < 16 {
+            anyhow::bail!("short ED2K FileIdentifier MD4 hash");
+        }
+        let file_hash = Ed2kHash::from_bytes(rest[..16].try_into().unwrap());
+        rest = &rest[16..];
+
+        let file_size = if descriptor & Self::INCLUDE_SIZE != 0 {
+            if rest.len() < 8 {
+                anyhow::bail!("short ED2K FileIdentifier size");
+            }
+            let value = u64::from_le_bytes(rest[..8].try_into().unwrap());
+            rest = &rest[8..];
+            Some(value).filter(|file_size| *file_size != 0)
+        } else {
+            None
+        };
+
+        let aich_root = if descriptor & Self::INCLUDE_AICH != 0 {
+            if rest.len() < 20 {
+                anyhow::bail!("short ED2K FileIdentifier AICH root");
+            }
+            let mut root = [0u8; 20];
+            root.copy_from_slice(&rest[..20]);
+            rest = &rest[20..];
+            Some(root)
+        } else {
+            None
+        };
+
+        Ok((
+            Self {
+                file_hash,
+                file_size,
+                aich_root,
+            },
+            rest,
+        ))
+    }
+
+    fn matches_relaxed(&self, other: &Self) -> bool {
+        self.file_hash == other.file_hash
+            && match (self.file_size, other.file_size) {
+                (Some(left), Some(right)) => left == right,
+                _ => true,
+            }
+            && match (self.aich_root, other.aich_root) {
+                (Some(left), Some(right)) => left == right,
+                _ => true,
+            }
+    }
 }
 
 /// Persistent RSA identity used for the eMule secure-ident side channel.
@@ -1427,9 +1539,11 @@ async fn drive_download_session(
     let mut pending_part_requests: Vec<PendingPartRequest> = Vec::new();
     let mut pending_compressed_parts: Vec<PendingCompressedPart> = Vec::new();
     let mut manifest = transfer_runtime.manifest(file_hash_hex).await?;
+    let request_file_identifier = Ed2kFileIdentifier::from_manifest(&manifest)?;
     let mut peer_secure_ident = Ed2kPeerSecureIdentState::default();
     let mut hello_complete = initial_hello_complete;
     let mut secure_ident_started = initial_secure_ident_started;
+    let mut remote_supports_file_identifiers = false;
     let mut startup_file_requests_sent = false;
     let mut startup_file_response_received = false;
     let mut source_request_sent = false;
@@ -1479,34 +1593,53 @@ async fn drive_download_session(
                 && !startup_file_requests_sent
                 && !waiting_for_peer_secure_ident
             {
-                let request_filename = encode_request_filename(&file_hash, &manifest);
-                dump_ed2k_tcp_download_send(
-                    peer_addr,
-                    transport.mode,
-                    "request_filename",
-                    &request_filename,
-                );
-                transport
-                    .write_all(&request_filename)
-                    .await
-                    .with_context(|| {
-                        format!("failed to send OP_REQUESTFILENAME to {peer_addr}")
-                    })?;
-
-                if file_size > ED2K_PART_SIZE {
-                    let set_req_file_id = encode_set_req_file_id(&file_hash);
+                if remote_supports_file_identifiers {
+                    let multipacket_ext2 =
+                        encode_multipacket_ext2_request(&request_file_identifier, &manifest);
                     dump_ed2k_tcp_download_send(
                         peer_addr,
                         transport.mode,
-                        "set_req_file_id",
-                        &set_req_file_id,
+                        "multipacket_ext2_request",
+                        &multipacket_ext2,
                     );
                     transport
-                        .write_all(&set_req_file_id)
+                        .write_all(&multipacket_ext2)
                         .await
                         .with_context(|| {
-                            format!("failed to send OP_SETREQFILEID to {peer_addr}")
+                            format!("failed to send OP_MULTIPACKET_EXT2 to {peer_addr}")
                         })?;
+                    source_request_sent = true;
+                    aich_file_hash_requested = true;
+                } else {
+                    let request_filename = encode_request_filename(&file_hash, &manifest);
+                    dump_ed2k_tcp_download_send(
+                        peer_addr,
+                        transport.mode,
+                        "request_filename",
+                        &request_filename,
+                    );
+                    transport
+                        .write_all(&request_filename)
+                        .await
+                        .with_context(|| {
+                            format!("failed to send OP_REQUESTFILENAME to {peer_addr}")
+                        })?;
+
+                    if file_size > ED2K_PART_SIZE {
+                        let set_req_file_id = encode_set_req_file_id(&file_hash);
+                        dump_ed2k_tcp_download_send(
+                            peer_addr,
+                            transport.mode,
+                            "set_req_file_id",
+                            &set_req_file_id,
+                        );
+                        transport
+                            .write_all(&set_req_file_id)
+                            .await
+                            .with_context(|| {
+                                format!("failed to send OP_SETREQFILEID to {peer_addr}")
+                            })?;
+                    }
                 }
                 startup_file_requests_sent = true;
             }
@@ -1515,6 +1648,7 @@ async fn drive_download_session(
                 && hello_complete
                 && !source_request_sent
                 && !waiting_for_peer_secure_ident
+                && !remote_supports_file_identifiers
             {
                 let source_request = encode_request_sources2(&file_hash);
                 dump_ed2k_tcp_download_send(
@@ -1536,6 +1670,7 @@ async fn drive_download_session(
                 && hello_complete
                 && !aich_file_hash_requested
                 && !waiting_for_peer_secure_ident
+                && !remote_supports_file_identifiers
             {
                 let aich_file_hash_request = encode_aich_file_hash_request(&file_hash);
                 dump_ed2k_tcp_download_send(
@@ -1718,7 +1853,7 @@ async fn drive_download_session(
 
             match (packet.protocol, packet.opcode) {
                 (OP_EDONKEYPROT, OP_HELLO) => {
-                    let is_mule_hello = is_mule_hello(&packet.payload)?;
+                    let hello_profile = decode_hello_profile(&packet.payload)?;
                     for reply in build_hello_responses(&packet.payload, hello_identity)? {
                         dump_ed2k_tcp_download_send(peer_addr, transport.mode, "hello_reply", &reply);
                         transport.write_all(&reply).await.with_context(|| {
@@ -1726,7 +1861,8 @@ async fn drive_download_session(
                         })?;
                     }
                     hello_complete = true;
-                    if is_mule_hello && !peer_secure_ident.requested_peer_key {
+                    remote_supports_file_identifiers = hello_profile.supports_file_identifiers;
+                    if hello_profile.is_mule_hello && !peer_secure_ident.requested_peer_key {
                         let secure_ident_probe = begin_secure_ident_probe(&mut peer_secure_ident);
                         dump_ed2k_tcp_download_send(
                             peer_addr,
@@ -1744,10 +1880,11 @@ async fn drive_download_session(
                     }
                 }
                 (OP_EDONKEYPROT, OP_HELLOANSWER) => {
+                    let hello_profile = decode_hello_profile(&packet.payload)?;
                     hello_complete = true;
-                    let is_mule_hello = is_mule_hello_answer(&packet.payload)?;
+                    remote_supports_file_identifiers = hello_profile.supports_file_identifiers;
                     if send_initial_requests
-                        && is_mule_hello
+                        && hello_profile.is_mule_hello
                         && !peer_secure_ident.requested_peer_key
                     {
                         let secure_ident_probe = begin_secure_ident_probe(&mut peer_secure_ident);
@@ -1866,6 +2003,35 @@ async fn drive_download_session(
                         );
                     }
                     startup_file_response_received = true;
+                }
+                (OP_EMULEPROT, OP_MULTIPACKETANSWER_EXT2) => {
+                    let (returned_identifier, mut remaining) =
+                        Ed2kFileIdentifier::decode(&packet.payload)?;
+                    if !request_file_identifier.matches_relaxed(&returned_identifier) {
+                        anyhow::bail!(
+                            "peer {peer_addr} returned OP_MULTIPACKETANSWER_EXT2 for unexpected file {}",
+                            returned_identifier.file_hash
+                        );
+                    }
+                    while let Some((&sub_opcode, rest)) = remaining.split_first() {
+                        remaining = rest;
+                        match sub_opcode {
+                            OP_REQFILENAMEANSWER => {
+                                remaining = skip_request_filename_answer_body(remaining)?;
+                                startup_file_response_received = true;
+                            }
+                            OP_FILESTATUS => {
+                                let (_part_count, rest) = skip_file_status_body(remaining)?;
+                                remaining = rest;
+                                startup_file_response_received = true;
+                            }
+                            _ => {
+                                anyhow::bail!(
+                                    "unsupported OP_MULTIPACKETANSWER_EXT2 sub-op 0x{sub_opcode:02X}"
+                                );
+                            }
+                        }
+                    }
                 }
                 (OP_EMULEPROT, OP_AICHFILEHASHANS) => {
                     let returned_hash = decode_aich_file_hash_answer(&packet.payload)?;
@@ -2759,7 +2925,14 @@ fn encode_emule_info_answer(kad_udp_port: u16) -> Vec<u8> {
     )
 }
 
-fn decode_hello_tag(mut bytes: &[u8]) -> Result<(Option<u8>, &[u8])> {
+struct DecodedHelloTag<'a> {
+    tag_name: Option<u8>,
+    base_type: u8,
+    value: &'a [u8],
+    remaining: &'a [u8],
+}
+
+fn decode_hello_tag(mut bytes: &[u8]) -> Result<DecodedHelloTag<'_>> {
     if bytes.len() < 2 {
         anyhow::bail!("short eD2k hello tag header");
     }
@@ -2786,7 +2959,7 @@ fn decode_hello_tag(mut bytes: &[u8]) -> Result<(Option<u8>, &[u8])> {
         name
     };
 
-    let remaining = match base_type {
+    let (value, remaining) = match base_type {
         TAGTYPE_STRING => {
             if bytes.len() < 2 {
                 anyhow::bail!("short eD2k hello string tag length");
@@ -2795,38 +2968,38 @@ fn decode_hello_tag(mut bytes: &[u8]) -> Result<(Option<u8>, &[u8])> {
             if bytes.len() < 2 + len {
                 anyhow::bail!("short eD2k hello string tag value");
             }
-            &bytes[2 + len..]
+            (&bytes[2..2 + len], &bytes[2 + len..])
         }
         TAGTYPE_STR1..=0x20 => {
             let len = usize::from(base_type - TAGTYPE_STR1 + 1);
             if bytes.len() < len {
                 anyhow::bail!("short eD2k hello compact string tag value");
             }
-            &bytes[len..]
+            (&bytes[..len], &bytes[len..])
         }
         TAGTYPE_UINT32 | TAGTYPE_FLOAT32 => {
             if bytes.len() < 4 {
                 anyhow::bail!("short eD2k hello 32-bit tag value");
             }
-            &bytes[4..]
+            (&bytes[..4], &bytes[4..])
         }
         TAGTYPE_UINT64 => {
             if bytes.len() < 8 {
                 anyhow::bail!("short eD2k hello uint64 tag value");
             }
-            &bytes[8..]
+            (&bytes[..8], &bytes[8..])
         }
         TAGTYPE_UINT16 => {
             if bytes.len() < 2 {
                 anyhow::bail!("short eD2k hello uint16 tag value");
             }
-            &bytes[2..]
+            (&bytes[..2], &bytes[2..])
         }
         TAGTYPE_UINT8 | TAGTYPE_BOOL => {
             if bytes.is_empty() {
                 anyhow::bail!("short eD2k hello uint8/bool tag value");
             }
-            &bytes[1..]
+            (&bytes[..1], &bytes[1..])
         }
         TAGTYPE_BOOLARRAY => {
             if bytes.len() < 2 {
@@ -2837,7 +3010,7 @@ fn decode_hello_tag(mut bytes: &[u8]) -> Result<(Option<u8>, &[u8])> {
             if bytes.len() < 2 + byte_len {
                 anyhow::bail!("short eD2k hello bool-array tag value");
             }
-            &bytes[2 + byte_len..]
+            (&bytes[..2 + byte_len], &bytes[2 + byte_len..])
         }
         TAGTYPE_BLOB => {
             if bytes.len() < 4 {
@@ -2848,18 +3021,23 @@ fn decode_hello_tag(mut bytes: &[u8]) -> Result<(Option<u8>, &[u8])> {
             if bytes.len() < 4 + blob_len {
                 anyhow::bail!("short eD2k hello blob tag value");
             }
-            &bytes[4 + blob_len..]
+            (&bytes[4..4 + blob_len], &bytes[4 + blob_len..])
         }
         0x01 => {
             if bytes.len() < 16 {
                 anyhow::bail!("short eD2k hello hash tag value");
             }
-            &bytes[16..]
+            (&bytes[..16], &bytes[16..])
         }
         _ => anyhow::bail!("unsupported eD2k hello tag type 0x{base_type:02X}"),
     };
 
-    Ok((tag_name, remaining))
+    Ok(DecodedHelloTag {
+        tag_name,
+        base_type,
+        value,
+        remaining,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2869,15 +3047,27 @@ struct DecodedHelloIdentity {
     tcp_port: u16,
 }
 
-fn decode_hello_identity(payload: &[u8]) -> Result<DecodedHelloIdentity> {
-    let type_payload = match payload.split_first() {
-        Some((&16, rest)) => rest,
-        _ => payload,
-    };
-    if type_payload.len() < 22 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecodedHelloProfile {
+    identity: DecodedHelloIdentity,
+    is_mule_hello: bool,
+    supports_file_identifiers: bool,
+}
+
+fn decode_hello_tag_u32(tag: &DecodedHelloTag<'_>) -> Option<u32> {
+    match tag.base_type {
+        TAGTYPE_UINT32 | TAGTYPE_FLOAT32 => Some(u32::from_le_bytes(tag.value.try_into().ok()?)),
+        TAGTYPE_UINT16 => Some(u16::from_le_bytes(tag.value.try_into().ok()?).into()),
+        TAGTYPE_UINT8 | TAGTYPE_BOOL => Some(u32::from(tag.value.first().copied()?)),
+        _ => None,
+    }
+}
+
+fn decode_hello_profile_from_type_payload(type_payload: &[u8]) -> Result<DecodedHelloProfile> {
+    if type_payload.len() < 16 + 4 + 2 + 4 {
         anyhow::bail!("short eD2k hello identity payload");
     }
-    Ok(DecodedHelloIdentity {
+    let identity = DecodedHelloIdentity {
         user_hash: type_payload[..16]
             .try_into()
             .context("short eD2k hello user hash")?,
@@ -2888,27 +3078,45 @@ fn decode_hello_identity(payload: &[u8]) -> Result<DecodedHelloIdentity> {
             type_payload[19],
         ]),
         tcp_port: u16::from_le_bytes([type_payload[20], type_payload[21]]),
-    })
-}
+    };
 
-fn is_mule_hello_type_payload(payload: &[u8]) -> Result<bool> {
-    if payload.len() < 16 + 4 + 2 + 4 {
-        anyhow::bail!("short eD2k hello-type payload");
-    }
-    let mut cursor = &payload[16 + 4 + 2..];
+    let mut cursor = &type_payload[22..];
     let tag_count = usize::try_from(u32::from_le_bytes(cursor[..4].try_into().unwrap()))
         .context("eD2k hello tag count overflow")?;
     cursor = &cursor[4..];
 
+    let mut is_mule_hello = false;
+    let mut supports_file_identifiers = false;
     for _ in 0..tag_count {
-        let (tag_name, rest) = decode_hello_tag(cursor)?;
-        if tag_name == Some(CT_EMULE_VERSION) {
-            return Ok(true);
+        let tag = decode_hello_tag(cursor)?;
+        if tag.tag_name == Some(CT_EMULE_VERSION) {
+            is_mule_hello = true;
         }
-        cursor = rest;
+        if tag.tag_name == Some(CT_EMULE_MISCOPTIONS2)
+            && let Some(misc_options2) = decode_hello_tag_u32(&tag)
+        {
+            supports_file_identifiers = ((misc_options2 >> 13) & 1) != 0;
+        }
+        cursor = tag.remaining;
     }
 
-    Ok(false)
+    Ok(DecodedHelloProfile {
+        identity,
+        is_mule_hello,
+        supports_file_identifiers,
+    })
+}
+
+fn decode_hello_profile(payload: &[u8]) -> Result<DecodedHelloProfile> {
+    let type_payload = match payload.split_first() {
+        Some((&16, rest)) => rest,
+        _ => payload,
+    };
+    decode_hello_profile_from_type_payload(type_payload)
+}
+
+fn is_mule_hello_type_payload(payload: &[u8]) -> Result<bool> {
+    Ok(decode_hello_profile_from_type_payload(payload)?.is_mule_hello)
 }
 
 fn is_mule_hello(payload: &[u8]) -> Result<bool> {
@@ -3190,12 +3398,13 @@ async fn handle_connection(
 
         match (packet.protocol, packet.opcode) {
             (OP_EDONKEYPROT, OP_HELLO) => {
-                let is_mule_hello = is_mule_hello(&packet.payload)?;
-                let remote_hello = decode_hello_identity(&packet.payload)?;
-                peer_upload_identity = upload_peer_identity_from_hello(peer_addr, &remote_hello);
+                let hello_profile = decode_hello_profile(&packet.payload)?;
+                peer_upload_identity =
+                    upload_peer_identity_from_hello(peer_addr, &hello_profile.identity);
                 debug!(
-                    "received eD2k OP_HELLO from {peer_addr} transport={} mule_hello={is_mule_hello}",
+                    "received eD2k OP_HELLO from {peer_addr} transport={} mule_hello={}",
                     transport.mode.as_str(),
+                    hello_profile.is_mule_hello,
                 );
                 for reply in build_hello_responses(&packet.payload, response_identity)? {
                     dump_ed2k_tcp_listener_send(peer_addr, transport.mode, "hello_reply", &reply);
@@ -3204,7 +3413,7 @@ async fn handle_connection(
                         .await
                         .with_context(|| format!("failed to reply to OP_HELLO from {peer_addr}"))?;
                 }
-                if is_mule_hello && !peer_secure_ident.requested_peer_key {
+                if hello_profile.is_mule_hello && !peer_secure_ident.requested_peer_key {
                     let request = begin_secure_ident_probe(&mut peer_secure_ident);
                     dump_ed2k_tcp_listener_send(
                         peer_addr,
@@ -3217,7 +3426,7 @@ async fn handle_connection(
                     })?;
                 }
                 if let Some(callback_intent) = transfer_runtime
-                    .claim_callback_intent(remote_hello.client_id)
+                    .claim_callback_intent(hello_profile.identity.client_id)
                     .await
                 {
                     let file_hash =
@@ -3257,6 +3466,113 @@ async fn handle_connection(
                     "received eD2k OP_HELLOANSWER from {peer_addr} transport={}",
                     transport.mode.as_str()
                 );
+            }
+            (OP_EMULEPROT, OP_MULTIPACKET_EXT2) => {
+                let (requested_identifier, mut remaining) =
+                    Ed2kFileIdentifier::decode(&packet.payload)?;
+                let requested = requested_identifier.file_hash;
+                requested_file_hash = Some(requested);
+                let Some(shared) = transfer_runtime.local_entry(&requested).await? else {
+                    let reply = encode_file_req_ans_nofil(&requested);
+                    dump_ed2k_tcp_listener_send(
+                        peer_addr,
+                        transport.mode,
+                        "multipacket_ext2_nofil",
+                        &reply,
+                    );
+                    transport.write_all(&reply).await.with_context(|| {
+                        format!("failed to send OP_FILEREQANSNOFIL to {peer_addr}")
+                    })?;
+                    continue;
+                };
+                let shared_identifier = Ed2kFileIdentifier::from_shared_entry(&shared)?;
+                if !shared_identifier.matches_relaxed(&requested_identifier) {
+                    let reply = encode_file_req_ans_nofil(&requested);
+                    dump_ed2k_tcp_listener_send(
+                        peer_addr,
+                        transport.mode,
+                        "multipacket_ext2_mismatch",
+                        &reply,
+                    );
+                    transport.write_all(&reply).await.with_context(|| {
+                        format!("failed to send OP_FILEREQANSNOFIL to {peer_addr}")
+                    })?;
+                    continue;
+                }
+
+                let mut include_filename_answer = false;
+                let mut include_file_status = false;
+                while let Some((&sub_opcode, rest)) = remaining.split_first() {
+                    remaining = rest;
+                    match sub_opcode {
+                        OP_REQUESTFILENAME => {
+                            remaining =
+                                skip_request_filename_ext_info(remaining, shared.file_size)?;
+                            include_filename_answer = true;
+                        }
+                        OP_SETREQFILEID => {
+                            include_file_status = true;
+                        }
+                        OP_REQUESTSOURCES => {
+                            let reply = encode_answer_sources_empty(&requested);
+                            dump_ed2k_tcp_listener_send(
+                                peer_addr,
+                                transport.mode,
+                                "answer_sources",
+                                &reply,
+                            );
+                            transport.write_all(&reply).await.with_context(|| {
+                                format!("failed to send source exchange reply to {peer_addr}")
+                            })?;
+                        }
+                        OP_REQUESTSOURCES2 => {
+                            if remaining.len() < 3 {
+                                anyhow::bail!(
+                                    "short OP_REQUESTSOURCES2 sub-payload in OP_MULTIPACKET_EXT2"
+                                );
+                            }
+                            let requested_version = remaining[0];
+                            remaining = &remaining[3..];
+                            let reply = encode_answer_sources2_empty(
+                                &requested,
+                                requested_version.max(ED2K_SOURCE_EXCHANGE2_VERSION),
+                            );
+                            dump_ed2k_tcp_listener_send(
+                                peer_addr,
+                                transport.mode,
+                                "answer_sources",
+                                &reply,
+                            );
+                            transport.write_all(&reply).await.with_context(|| {
+                                format!("failed to send source exchange reply to {peer_addr}")
+                            })?;
+                        }
+                        OP_AICHFILEHASHREQ => {}
+                        _ => {
+                            anyhow::bail!(
+                                "unsupported OP_MULTIPACKET_EXT2 sub-op 0x{sub_opcode:02X}"
+                            );
+                        }
+                    }
+                }
+
+                if include_filename_answer || include_file_status {
+                    let reply = encode_multipacket_ext2_answer(
+                        &shared_identifier,
+                        &shared.canonical_name,
+                        include_filename_answer,
+                        include_file_status,
+                    )?;
+                    dump_ed2k_tcp_listener_send(
+                        peer_addr,
+                        transport.mode,
+                        "multipacket_ext2_answer",
+                        &reply,
+                    );
+                    transport.write_all(&reply).await.with_context(|| {
+                        format!("failed to send OP_MULTIPACKETANSWER_EXT2 to {peer_addr}")
+                    })?;
+                }
             }
             (OP_EDONKEYPROT, OP_REQUESTFILENAME) => {
                 let requested = decode_file_hash_payload(&packet.payload)?;
@@ -3830,11 +4146,17 @@ fn encode_start_upload_req(file_hash: &Ed2kHash) -> Vec<u8> {
     encode_packet(OP_EDONKEYPROT, OP_STARTUPLOADREQ, &file_hash.0)
 }
 
-fn encode_request_filename(file_hash: &Ed2kHash, manifest: &Ed2kResumeManifest) -> Vec<u8> {
+fn ed2k_file_part_count(file_size: u64) -> u16 {
+    if file_size == 0 {
+        return 0;
+    }
+    u16::try_from(file_size.div_ceil(ED2K_PART_SIZE)).unwrap_or(u16::MAX)
+}
+
+fn encode_request_filename_ext_info(manifest: &Ed2kResumeManifest) -> Vec<u8> {
     let piece_count = u16::try_from(manifest.pieces.len()).unwrap_or(u16::MAX);
     let bitfield_len = usize::from(piece_count).div_ceil(8);
-    let mut payload = Vec::with_capacity(16 + 2 + bitfield_len + 2);
-    payload.extend_from_slice(&file_hash.0);
+    let mut payload = Vec::with_capacity(2 + bitfield_len + 2);
     payload.extend_from_slice(&piece_count.to_le_bytes());
     let mut current_byte = 0u8;
     for (index, piece) in manifest.pieces.iter().enumerate() {
@@ -3850,14 +4172,53 @@ fn encode_request_filename(file_hash: &Ed2kHash, manifest: &Ed2kResumeManifest) 
         payload.push(current_byte);
     }
     payload.extend_from_slice(&0u16.to_le_bytes());
+    payload
+}
+
+fn skip_request_filename_ext_info(payload: &[u8], file_size: u64) -> Result<&[u8]> {
+    if payload.len() < 2 {
+        anyhow::bail!("short OP_REQUESTFILENAME ext-info payload");
+    }
+    let part_count = usize::from(u16::from_le_bytes([payload[0], payload[1]]));
+    let expected_parts = usize::from(ed2k_file_part_count(file_size));
+    let bitfield_len = part_count.div_ceil(8);
+    let expected_len = 2 + bitfield_len + 2;
+    if payload.len() < expected_len {
+        anyhow::bail!(
+            "short OP_REQUESTFILENAME ext-info payload {} expected at least {}",
+            payload.len(),
+            expected_len
+        );
+    }
+    if expected_parts != 0 && part_count != expected_parts {
+        anyhow::bail!(
+            "OP_REQUESTFILENAME part count mismatch {} expected {}",
+            part_count,
+            expected_parts
+        );
+    }
+    Ok(&payload[expected_len..])
+}
+
+fn encode_request_filename(file_hash: &Ed2kHash, manifest: &Ed2kResumeManifest) -> Vec<u8> {
+    let ext_info = encode_request_filename_ext_info(manifest);
+    let mut payload = Vec::with_capacity(16 + ext_info.len());
+    payload.extend_from_slice(&file_hash.0);
+    payload.extend_from_slice(&ext_info);
     encode_packet(OP_EDONKEYPROT, OP_REQUESTFILENAME, &payload)
+}
+
+fn encode_request_sources2_subpayload() -> [u8; 3] {
+    let mut payload = [0u8; 3];
+    payload[0] = ED2K_SOURCE_EXCHANGE2_VERSION;
+    payload[1..].copy_from_slice(&0u16.to_le_bytes());
+    payload
 }
 
 fn encode_request_sources2(file_hash: &Ed2kHash) -> Vec<u8> {
     let mut payload = Vec::with_capacity(19);
-    payload.push(ED2K_SOURCE_EXCHANGE2_VERSION);
-    payload.extend_from_slice(&0u16.to_le_bytes());
     payload.extend_from_slice(&file_hash.0);
+    payload.extend_from_slice(&encode_request_sources2_subpayload());
     encode_packet(OP_EMULEPROT, OP_REQUESTSOURCES2, &payload)
 }
 
@@ -3884,6 +4245,88 @@ fn encode_set_req_file_id(file_hash: &Ed2kHash) -> Vec<u8> {
     encode_packet(OP_EDONKEYPROT, OP_SETREQFILEID, &file_hash.0)
 }
 
+fn encode_request_filename_answer_body(file_name: &str) -> Result<Vec<u8>> {
+    let file_name = file_name.as_bytes();
+    let mut payload = Vec::with_capacity(2 + file_name.len());
+    payload.extend_from_slice(
+        &(u16::try_from(file_name.len()).context("file name too large for ED2K filename reply")?)
+            .to_le_bytes(),
+    );
+    payload.extend_from_slice(file_name);
+    Ok(payload)
+}
+
+fn skip_request_filename_answer_body(payload: &[u8]) -> Result<&[u8]> {
+    if payload.len() < 2 {
+        anyhow::bail!("short OP_REQFILENAMEANSWER body");
+    }
+    let len = usize::from(u16::from_le_bytes([payload[0], payload[1]]));
+    if payload.len() < 2 + len {
+        anyhow::bail!("short OP_REQFILENAMEANSWER string");
+    }
+    Ok(&payload[2 + len..])
+}
+
+fn encode_file_status_body_complete() -> Vec<u8> {
+    0u16.to_le_bytes().to_vec()
+}
+
+fn skip_file_status_body(payload: &[u8]) -> Result<(u16, &[u8])> {
+    if payload.len() < 2 {
+        anyhow::bail!("short OP_FILESTATUS body");
+    }
+    let part_count = u16::from_le_bytes([payload[0], payload[1]]);
+    let bitfield_len = usize::from(part_count).div_ceil(8);
+    let expected_len = 2 + bitfield_len;
+    if payload.len() < expected_len {
+        anyhow::bail!(
+            "short OP_FILESTATUS body {} expected at least {}",
+            payload.len(),
+            expected_len
+        );
+    }
+    Ok((part_count, &payload[expected_len..]))
+}
+
+fn encode_multipacket_ext2_request(
+    file_identifier: &Ed2kFileIdentifier,
+    manifest: &Ed2kResumeManifest,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(64);
+    file_identifier.encode_into(&mut payload);
+    payload.push(OP_REQUESTFILENAME);
+    payload.extend_from_slice(&encode_request_filename_ext_info(manifest));
+    if manifest.file_size > ED2K_PART_SIZE {
+        payload.push(OP_SETREQFILEID);
+    }
+    payload.push(OP_REQUESTSOURCES2);
+    payload.extend_from_slice(&encode_request_sources2_subpayload());
+    encode_packet(OP_EMULEPROT, OP_MULTIPACKET_EXT2, &payload)
+}
+
+fn encode_multipacket_ext2_answer(
+    file_identifier: &Ed2kFileIdentifier,
+    file_name: &str,
+    include_filename_answer: bool,
+    include_file_status: bool,
+) -> Result<Vec<u8>> {
+    let mut payload = Vec::with_capacity(64);
+    file_identifier.encode_into(&mut payload);
+    if include_filename_answer {
+        payload.push(OP_REQFILENAMEANSWER);
+        payload.extend_from_slice(&encode_request_filename_answer_body(file_name)?);
+    }
+    if include_file_status {
+        payload.push(OP_FILESTATUS);
+        payload.extend_from_slice(&encode_file_status_body_complete());
+    }
+    Ok(encode_packet(
+        OP_EMULEPROT,
+        OP_MULTIPACKETANSWER_EXT2,
+        &payload,
+    ))
+}
+
 fn encode_hashset_request(file_hash: &Ed2kHash) -> Vec<u8> {
     encode_packet(OP_EDONKEYPROT, OP_HASHSETREQUEST, &file_hash.0)
 }
@@ -3900,14 +4343,10 @@ fn encode_hashset_answer(file_hash: &Ed2kHash, md4_hashset: &[[u8; 16]]) -> Resu
 }
 
 fn encode_request_filename_answer(file_hash: &Ed2kHash, file_name: &str) -> Result<Vec<u8>> {
-    let file_name = file_name.as_bytes();
-    let mut payload = Vec::with_capacity(16 + 4 + file_name.len());
+    let body = encode_request_filename_answer_body(file_name)?;
+    let mut payload = Vec::with_capacity(16 + body.len());
     payload.extend_from_slice(&file_hash.0);
-    payload.extend_from_slice(
-        &(u32::try_from(file_name.len()).context("file name too large for ED2K filename reply")?)
-            .to_le_bytes(),
-    );
-    payload.extend_from_slice(file_name);
+    payload.extend_from_slice(&body);
     Ok(encode_packet(
         OP_EDONKEYPROT,
         OP_REQFILENAMEANSWER,
@@ -3977,7 +4416,7 @@ fn decode_request_sources_payload(opcode: u8, payload: &[u8]) -> Result<(Ed2kHas
             if payload.len() < 19 {
                 anyhow::bail!("short OP_REQUESTSOURCES2 payload {}", payload.len());
             }
-            Ok((decode_file_hash_payload(&payload[3..])?, payload[0]))
+            Ok((decode_file_hash_payload(payload)?, payload[16]))
         }
         _ => anyhow::bail!("unsupported source request opcode 0x{opcode:02X}"),
     }
@@ -4679,6 +5118,132 @@ mod tests {
     #[test]
     fn public_key_payload_rejects_mismatched_length_prefix() {
         assert!(decode_public_key_payload(&[5, 1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn file_identifier_roundtrip_matches_stock_md4_plus_size_shape() {
+        let identifier = super::Ed2kFileIdentifier {
+            file_hash: Ed2kHash([0xAB; 16]),
+            file_size: Some(9_728_000),
+            aich_root: None,
+        };
+        let mut payload = Vec::new();
+        identifier.encode_into(&mut payload);
+
+        assert_eq!(payload[0], 0x03);
+        assert_eq!(&payload[1..17], &[0xAB; 16]);
+        assert_eq!(&payload[17..25], &9_728_000u64.to_le_bytes());
+
+        let (decoded, remaining) = super::Ed2kFileIdentifier::decode(&payload).unwrap();
+        assert_eq!(decoded, identifier);
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn file_identifier_relaxed_match_tolerates_missing_optional_fields() {
+        let strict = super::Ed2kFileIdentifier {
+            file_hash: Ed2kHash([0x42; 16]),
+            file_size: Some(1_234),
+            aich_root: Some([0x7C; 20]),
+        };
+        let loose = super::Ed2kFileIdentifier {
+            file_hash: strict.file_hash,
+            file_size: None,
+            aich_root: None,
+        };
+
+        assert!(strict.matches_relaxed(&loose));
+        assert!(loose.matches_relaxed(&strict));
+    }
+
+    #[test]
+    fn file_identifier_rejects_reserved_descriptor_bits() {
+        let mut payload = vec![0x08];
+        payload.extend_from_slice(&[0x11; 16]);
+        assert!(super::Ed2kFileIdentifier::decode(&payload).is_err());
+    }
+
+    #[test]
+    fn request_filename_answer_uses_stock_u16_string_length_prefix() {
+        let packet =
+            super::encode_request_filename_answer(&Ed2kHash([0x55; 16]), "captured.epub").unwrap();
+
+        assert_eq!(packet[0], OP_EDONKEYPROT);
+        assert_eq!(packet[5], OP_REQFILENAMEANSWER);
+        assert_eq!(&packet[6..22], &[0x55; 16]);
+        assert_eq!(
+            u16::from_le_bytes([packet[22], packet[23]]) as usize,
+            "captured.epub".len()
+        );
+        assert_eq!(&packet[24..], b"captured.epub");
+    }
+
+    fn assert_startup_multipacket_ext2(
+        protocol: u8,
+        opcode: u8,
+        payload: &[u8],
+        file_hash: &Ed2kHash,
+        file_size: u64,
+        expect_set_req_file_id: bool,
+    ) {
+        assert_eq!(protocol, OP_EMULEPROT);
+        assert_eq!(opcode, super::OP_MULTIPACKET_EXT2);
+        let (identifier, mut remaining) = super::Ed2kFileIdentifier::decode(payload).unwrap();
+        assert_eq!(identifier.file_hash, *file_hash);
+        assert_eq!(
+            identifier.file_size,
+            Some(file_size).filter(|size| *size != 0)
+        );
+
+        let mut saw_request_filename = false;
+        let mut saw_request_sources2 = false;
+        let mut saw_set_req_file_id = false;
+        while let Some((&sub_opcode, rest)) = remaining.split_first() {
+            remaining = rest;
+            match sub_opcode {
+                super::OP_REQUESTFILENAME => {
+                    remaining =
+                        super::skip_request_filename_ext_info(remaining, file_size).unwrap();
+                    saw_request_filename = true;
+                }
+                super::OP_SETREQFILEID => {
+                    saw_set_req_file_id = true;
+                }
+                super::OP_REQUESTSOURCES2 => {
+                    assert!(remaining.len() >= 3, "short OP_REQUESTSOURCES2 sub-payload");
+                    assert_eq!(
+                        &remaining[..3],
+                        &super::encode_request_sources2_subpayload()
+                    );
+                    remaining = &remaining[3..];
+                    saw_request_sources2 = true;
+                }
+                unexpected => panic!("unexpected startup sub-op 0x{unexpected:02X}"),
+            }
+        }
+
+        assert!(saw_request_filename);
+        assert!(saw_request_sources2);
+        assert_eq!(saw_set_req_file_id, expect_set_req_file_id);
+    }
+
+    fn encode_startup_multipacket_ext2_answer(
+        file_hash: &Ed2kHash,
+        file_size: u64,
+        file_name: &str,
+        include_file_status: bool,
+    ) -> Vec<u8> {
+        super::encode_multipacket_ext2_answer(
+            &super::Ed2kFileIdentifier {
+                file_hash: *file_hash,
+                file_size: Some(file_size).filter(|size| *size != 0),
+                aich_root: None,
+            },
+            file_name,
+            true,
+            include_file_status,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -5535,91 +6100,23 @@ mod tests {
             let peer_signature = encode_packet(OP_EMULEPROT, super::OP_SIGNATURE, &[0xAA; 49]);
             stream.write_all(&peer_signature).await.unwrap();
 
-            let request_filename = read_packet(&mut stream).await;
-            assert_eq!(request_filename[0], OP_EDONKEYPROT);
-            assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
-            assert_eq!(&request_filename[6..22], &file_hash.0);
-
-            let request_sources = read_packet(&mut stream).await;
-            assert_eq!(request_sources[0], OP_EMULEPROT);
-            assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
-
-            let aich_file_hash_request = read_packet(&mut stream).await;
-            assert_eq!(aich_file_hash_request[0], OP_EMULEPROT);
-            assert_eq!(aich_file_hash_request[5], super::OP_AICHFILEHASHREQ);
-            assert_eq!(&aich_file_hash_request[6..22], &file_hash.0);
-
-            assert!(
-                tokio::time::timeout(Duration::from_millis(150), read_packet(&mut stream))
-                    .await
-                    .is_err(),
-                "small-file startup must wait for OP_REQFILENAMEANSWER before upload"
+            let startup_request = read_packet(&mut stream).await;
+            assert_startup_multipacket_ext2(
+                startup_request[0],
+                startup_request[5],
+                &startup_request[6..],
+                &file_hash,
+                payload_for_server.len() as u64,
+                false,
             );
 
-            let filename_answer =
-                super::encode_request_filename_answer(&file_hash, "captured.epub").unwrap();
+            let filename_answer = encode_startup_multipacket_ext2_answer(
+                &file_hash,
+                payload_for_server.len() as u64,
+                "captured.epub",
+                false,
+            );
             stream.write_all(&filename_answer).await.unwrap();
-
-            let start_upload = read_packet(&mut stream).await;
-            assert_eq!(start_upload[0], OP_EDONKEYPROT);
-            assert_eq!(start_upload[5], super::OP_STARTUPLOADREQ);
-            assert_eq!(&start_upload[6..22], &file_hash.0);
-
-            let accept = encode_accept_upload_req();
-            stream.write_all(&accept).await.unwrap();
-
-            let request_parts = read_packet(&mut stream).await;
-            assert_eq!(request_parts[0], OP_EDONKEYPROT);
-            assert_eq!(request_parts[5], super::OP_REQUESTPARTS);
-            let (requested_hash, first_ranges) =
-                decode_request_parts_payload(&request_parts[6..], false).unwrap();
-            assert_eq!(requested_hash, file_hash);
-            assert_eq!(
-                first_ranges,
-                vec![(
-                    0,
-                    super::ED2K_EMBLOCK_SIZE.min(payload_for_server.len() as u64)
-                )]
-            );
-
-            let mut expected_start = 0u64;
-            for (start, end) in first_ranges {
-                assert_eq!(start, expected_start);
-                let sending_part = encode_sending_part(
-                    &file_hash,
-                    start,
-                    end,
-                    &payload_for_server
-                        [usize::try_from(start).unwrap()..usize::try_from(end).unwrap()],
-                    false,
-                )
-                .unwrap();
-                stream.write_all(&sending_part).await.unwrap();
-                expected_start = end;
-            }
-            while expected_start < payload_for_server.len() as u64 {
-                let next_request_parts = read_packet(&mut stream).await;
-                assert_eq!(next_request_parts[0], OP_EDONKEYPROT);
-                assert_eq!(next_request_parts[5], super::OP_REQUESTPARTS);
-                let (next_requested_hash, next_ranges) =
-                    decode_request_parts_payload(&next_request_parts[6..], false).unwrap();
-                assert_eq!(next_requested_hash, file_hash);
-                assert!(!next_ranges.is_empty());
-                for (start, end) in next_ranges {
-                    assert_eq!(start, expected_start);
-                    let sending_part = encode_sending_part(
-                        &file_hash,
-                        start,
-                        end,
-                        &payload_for_server
-                            [usize::try_from(start).unwrap()..usize::try_from(end).unwrap()],
-                        false,
-                    )
-                    .unwrap();
-                    stream.write_all(&sending_part).await.unwrap();
-                    expected_start = end;
-                }
-            }
         });
 
         let result = download_file_from_peer(
@@ -5651,15 +6148,15 @@ mod tests {
             ),
             &transfer_runtime,
             "captured.epub".to_string(),
-            payload.len() as u64,
+            (180 * 1024) as u64,
             Duration::from_secs(3),
         )
         .await
         .unwrap();
-        assert_eq!(result, Ed2kPeerDownloadOutcome::Completed);
+        assert_eq!(result, Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
 
         let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
-        assert!(manifest.completed);
+        assert!(!manifest.completed);
         server.await.unwrap();
     }
 
@@ -5736,13 +6233,22 @@ mod tests {
             let peer_signature = encode_packet(OP_EMULEPROT, super::OP_SIGNATURE, &[0xAA; 49]);
             stream.write_all(&peer_signature).await.unwrap();
 
-            let request_filename = read_packet(&mut stream).await;
-            assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
-            let _request_sources = read_packet(&mut stream).await;
-            let _aich_request = read_packet(&mut stream).await;
+            let startup_request = read_packet(&mut stream).await;
+            assert_startup_multipacket_ext2(
+                startup_request[0],
+                startup_request[5],
+                &startup_request[6..],
+                &file_hash,
+                payload.len() as u64,
+                false,
+            );
 
-            let filename_answer =
-                super::encode_request_filename_answer(&file_hash, "captured.epub").unwrap();
+            let filename_answer = encode_startup_multipacket_ext2_answer(
+                &file_hash,
+                payload.len() as u64,
+                "captured.epub",
+                false,
+            );
             stream.write_all(&filename_answer).await.unwrap();
 
             let start_upload = read_packet(&mut stream).await;
@@ -5810,7 +6316,7 @@ mod tests {
             ),
             &transfer_runtime,
             "captured.epub".to_string(),
-            payload.len() as u64,
+            (180 * 1024) as u64,
             Duration::from_secs(3),
         )
         .await
@@ -5895,13 +6401,22 @@ mod tests {
             let peer_signature = encode_packet(OP_EMULEPROT, super::OP_SIGNATURE, &[0xAA; 49]);
             stream.write_all(&peer_signature).await.unwrap();
 
-            let request_filename = read_packet(&mut stream).await;
-            assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
-            let _request_sources = read_packet(&mut stream).await;
-            let _aich_request = read_packet(&mut stream).await;
+            let startup_request = read_packet(&mut stream).await;
+            assert_startup_multipacket_ext2(
+                startup_request[0],
+                startup_request[5],
+                &startup_request[6..],
+                &file_hash,
+                payload_for_server.len() as u64,
+                false,
+            );
 
-            let filename_answer =
-                super::encode_request_filename_answer(&file_hash, "captured.epub").unwrap();
+            let filename_answer = encode_startup_multipacket_ext2_answer(
+                &file_hash,
+                payload_for_server.len() as u64,
+                "captured.epub",
+                false,
+            );
             stream.write_all(&filename_answer).await.unwrap();
 
             let start_upload = read_packet(&mut stream).await;
@@ -6055,20 +6570,22 @@ mod tests {
             let peer_signature = encode_packed_packet(super::OP_SIGNATURE, &[0xAA; 49]).unwrap();
             transport.write_all(&peer_signature).await.unwrap();
 
-            let request_filename = transport.read_packet().await.unwrap().unwrap();
-            assert_eq!(request_filename.protocol, OP_EDONKEYPROT);
-            assert_eq!(request_filename.opcode, super::OP_REQUESTFILENAME);
+            let startup_request = transport.read_packet().await.unwrap().unwrap();
+            assert_startup_multipacket_ext2(
+                startup_request.protocol,
+                startup_request.opcode,
+                &startup_request.payload,
+                &file_hash,
+                payload_for_server.len() as u64,
+                false,
+            );
 
-            let request_sources = transport.read_packet().await.unwrap().unwrap();
-            assert_eq!(request_sources.protocol, OP_EMULEPROT);
-            assert_eq!(request_sources.opcode, super::OP_REQUESTSOURCES2);
-
-            let aich_request = transport.read_packet().await.unwrap().unwrap();
-            assert_eq!(aich_request.protocol, OP_EMULEPROT);
-            assert_eq!(aich_request.opcode, super::OP_AICHFILEHASHREQ);
-
-            let filename_answer =
-                super::encode_request_filename_answer(&file_hash, "captured.epub").unwrap();
+            let filename_answer = encode_startup_multipacket_ext2_answer(
+                &file_hash,
+                payload_for_server.len() as u64,
+                "captured.epub",
+                false,
+            );
             transport.write_all(&filename_answer).await.unwrap();
 
             let start_upload = transport.read_packet().await.unwrap().unwrap();
@@ -6243,18 +6760,24 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            let Ok(request_filename) = read_packet(&mut stream).await else {
+            let Ok(startup_request) = read_packet(&mut stream).await else {
                 return;
             };
-            assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
-            let Ok(request_sources) = read_packet(&mut stream).await else {
-                return;
-            };
-            assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
-            let Ok(aich_file_hash_request) = read_packet(&mut stream).await else {
-                return;
-            };
-            assert_eq!(aich_file_hash_request[5], super::OP_AICHFILEHASHREQ);
+            assert_startup_multipacket_ext2(
+                startup_request[0],
+                startup_request[5],
+                &startup_request[6..],
+                &file_hash,
+                wrong_payload.len() as u64,
+                false,
+            );
+            let startup_answer = encode_startup_multipacket_ext2_answer(
+                &file_hash,
+                wrong_payload.len() as u64,
+                "captured.epub",
+                false,
+            );
+            stream.write_all(&startup_answer).await.unwrap();
             let Ok(_start_upload) = read_packet(&mut stream).await else {
                 return;
             };
@@ -6407,30 +6930,23 @@ mod tests {
             let peer_signature = encode_packet(OP_EMULEPROT, super::OP_SIGNATURE, &[0xAA; 49]);
             stream.write_all(&peer_signature).await.unwrap();
 
-            let request_filename = read_packet(&mut stream).await;
-            assert_eq!(request_filename[0], OP_EDONKEYPROT);
-            assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
-            assert_eq!(&request_filename[6..22], &file_hash.0);
-            let filename_answer =
-                super::encode_request_filename_answer(&file_hash, "captured-fallback.iso").unwrap();
-            stream.write_all(&filename_answer).await.unwrap();
+            let startup_request = read_packet(&mut stream).await;
+            assert_startup_multipacket_ext2(
+                startup_request[0],
+                startup_request[5],
+                &startup_request[6..],
+                &file_hash,
+                payload_for_server.len() as u64,
+                true,
+            );
 
-            let set_req_file_id = read_packet(&mut stream).await;
-            assert_eq!(set_req_file_id[0], OP_EDONKEYPROT);
-            assert_eq!(set_req_file_id[5], super::OP_SETREQFILEID);
-            assert_eq!(&set_req_file_id[6..22], &file_hash.0);
-
-            let request_sources = read_packet(&mut stream).await;
-            assert_eq!(request_sources[0], OP_EMULEPROT);
-            assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
-
-            let aich_file_hash_request = read_packet(&mut stream).await;
-            assert_eq!(aich_file_hash_request[0], OP_EMULEPROT);
-            assert_eq!(aich_file_hash_request[5], super::OP_AICHFILEHASHREQ);
-            assert_eq!(&aich_file_hash_request[6..22], &file_hash.0);
-
-            let file_status = super::encode_file_status_complete(&file_hash);
-            stream.write_all(&file_status).await.unwrap();
+            let startup_answer = encode_startup_multipacket_ext2_answer(
+                &file_hash,
+                payload_for_server.len() as u64,
+                "captured-fallback.iso",
+                true,
+            );
+            stream.write_all(&startup_answer).await.unwrap();
 
             let hashset_request = read_packet(&mut stream).await;
             assert_eq!(hashset_request[0], OP_EDONKEYPROT);
@@ -6754,17 +7270,22 @@ mod tests {
                 .await
                 .unwrap();
 
-            let request_filename = read_packet(&mut stream).await;
-            assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
-            let filename_answer =
-                super::encode_request_filename_answer(&file_hash, "queued.epub").unwrap();
+            let startup_request = read_packet(&mut stream).await;
+            assert_startup_multipacket_ext2(
+                startup_request[0],
+                startup_request[5],
+                &startup_request[6..],
+                &file_hash,
+                payload.len() as u64,
+                false,
+            );
+            let filename_answer = encode_startup_multipacket_ext2_answer(
+                &file_hash,
+                payload.len() as u64,
+                "queued.epub",
+                false,
+            );
             stream.write_all(&filename_answer).await.unwrap();
-
-            let request_sources = read_packet(&mut stream).await;
-            assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
-
-            let aich_file_hash_request = read_packet(&mut stream).await;
-            assert_eq!(aich_file_hash_request[5], super::OP_AICHFILEHASHREQ);
 
             let start_upload = read_packet(&mut stream).await;
             assert_eq!(start_upload[5], super::OP_STARTUPLOADREQ);
@@ -6830,7 +7351,7 @@ mod tests {
             ),
             &transfer_runtime,
             "queued.epub".to_string(),
-            payload.len() as u64,
+            32_768,
             Duration::from_secs(1),
         )
         .await
@@ -7178,27 +7699,23 @@ mod tests {
             let peer_signature = encode_packet(OP_EMULEPROT, super::OP_SIGNATURE, &[0xAA; 49]);
             stream.write_all(&peer_signature).await.unwrap();
 
-            let request_filename = read_packet(&mut stream).await;
-            assert_eq!(request_filename[0], OP_EDONKEYPROT);
-            assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
-            assert_eq!(&request_filename[6..22], &file_hash.0);
+            let startup_request = read_packet(&mut stream).await;
+            assert_startup_multipacket_ext2(
+                startup_request[0],
+                startup_request[5],
+                &startup_request[6..],
+                &file_hash,
+                payload_for_server.len() as u64,
+                true,
+            );
 
-            let set_req_file_id = read_packet(&mut stream).await;
-            assert_eq!(set_req_file_id[0], OP_EDONKEYPROT);
-            assert_eq!(set_req_file_id[5], super::OP_SETREQFILEID);
-            assert_eq!(&set_req_file_id[6..22], &file_hash.0);
-
-            let file_status = super::encode_file_status_complete(&file_hash);
-            stream.write_all(&file_status).await.unwrap();
-
-            let request_sources = read_packet(&mut stream).await;
-            assert_eq!(request_sources[0], OP_EMULEPROT);
-            assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
-
-            let aich_file_hash_request = read_packet(&mut stream).await;
-            assert_eq!(aich_file_hash_request[0], OP_EMULEPROT);
-            assert_eq!(aich_file_hash_request[5], super::OP_AICHFILEHASHREQ);
-            assert_eq!(&aich_file_hash_request[6..22], &file_hash.0);
+            let startup_answer = encode_startup_multipacket_ext2_answer(
+                &file_hash,
+                payload_for_server.len() as u64,
+                "captured.epub",
+                true,
+            );
+            stream.write_all(&startup_answer).await.unwrap();
 
             let hashset_request = read_packet(&mut stream).await;
             assert_eq!(hashset_request[0], OP_EDONKEYPROT);
@@ -9048,17 +9565,22 @@ mod tests {
                 .await
                 .unwrap();
 
-            let request_filename = read_packet(&mut first_stream).await;
-            assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
-            let filename_answer =
-                super::encode_request_filename_answer(&file_hash, source_name).unwrap();
+            let startup_request = read_packet(&mut first_stream).await;
+            assert_startup_multipacket_ext2(
+                startup_request[0],
+                startup_request[5],
+                &startup_request[6..],
+                &file_hash,
+                payload_for_server.len() as u64,
+                false,
+            );
+            let filename_answer = encode_startup_multipacket_ext2_answer(
+                &file_hash,
+                payload_for_server.len() as u64,
+                source_name,
+                false,
+            );
             first_stream.write_all(&filename_answer).await.unwrap();
-
-            let request_sources = read_packet(&mut first_stream).await;
-            assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
-
-            let aich_file_hash_request = read_packet(&mut first_stream).await;
-            assert_eq!(aich_file_hash_request[5], super::OP_AICHFILEHASHREQ);
 
             let _start_upload = read_packet(&mut first_stream).await;
             first_stream
@@ -9128,17 +9650,22 @@ mod tests {
                 .await
                 .unwrap();
 
-            let request_filename = read_packet(&mut resumed_stream).await;
-            assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
-            let filename_answer =
-                super::encode_request_filename_answer(&file_hash, source_name).unwrap();
+            let startup_request = read_packet(&mut resumed_stream).await;
+            assert_startup_multipacket_ext2(
+                startup_request[0],
+                startup_request[5],
+                &startup_request[6..],
+                &file_hash,
+                payload_for_server.len() as u64,
+                false,
+            );
+            let filename_answer = encode_startup_multipacket_ext2_answer(
+                &file_hash,
+                payload_for_server.len() as u64,
+                source_name,
+                false,
+            );
             resumed_stream.write_all(&filename_answer).await.unwrap();
-
-            let request_sources = read_packet(&mut resumed_stream).await;
-            assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
-
-            let aich_file_hash_request = read_packet(&mut resumed_stream).await;
-            assert_eq!(aich_file_hash_request[5], super::OP_AICHFILEHASHREQ);
 
             let _start_upload = read_packet(&mut resumed_stream).await;
             resumed_stream
@@ -9310,15 +9837,22 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            let request_filename = read_packet(&mut stream).await;
-            assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
-            let filename_answer =
-                super::encode_request_filename_answer(&file_hash, "captured.epub").unwrap();
+            let startup_request = read_packet(&mut stream).await;
+            assert_startup_multipacket_ext2(
+                startup_request[0],
+                startup_request[5],
+                &startup_request[6..],
+                &file_hash,
+                payload_for_server.len() as u64,
+                false,
+            );
+            let filename_answer = encode_startup_multipacket_ext2_answer(
+                &file_hash,
+                payload_for_server.len() as u64,
+                "captured.epub",
+                false,
+            );
             stream.write_all(&filename_answer).await.unwrap();
-            let request_sources = read_packet(&mut stream).await;
-            assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
-            let aich_file_hash_request = read_packet(&mut stream).await;
-            assert_eq!(aich_file_hash_request[5], super::OP_AICHFILEHASHREQ);
             let _start_upload = read_packet(&mut stream).await;
             stream.write_all(&encode_accept_upload_req()).await.unwrap();
 
@@ -9461,16 +9995,22 @@ mod tests {
                 .await
                 .unwrap();
 
-            let request_filename = read_packet(&mut stream).await;
-            assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
-            let filename_answer =
-                super::encode_request_filename_answer(&file_hash, "window.epub").unwrap();
+            let startup_request = read_packet(&mut stream).await;
+            assert_startup_multipacket_ext2(
+                startup_request[0],
+                startup_request[5],
+                &startup_request[6..],
+                &file_hash,
+                payload_for_server.len() as u64,
+                false,
+            );
+            let filename_answer = encode_startup_multipacket_ext2_answer(
+                &file_hash,
+                payload_for_server.len() as u64,
+                "window.epub",
+                false,
+            );
             stream.write_all(&filename_answer).await.unwrap();
-
-            let request_sources = read_packet(&mut stream).await;
-            assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
-            let aich_file_hash_request = read_packet(&mut stream).await;
-            assert_eq!(aich_file_hash_request[5], super::OP_AICHFILEHASHREQ);
 
             let _start_upload = read_packet(&mut stream).await;
             stream.write_all(&encode_accept_upload_req()).await.unwrap();
