@@ -67,6 +67,9 @@ The following remain in scope for "full parity":
       subset
 - [x] Modern `OP_HASHSETREQUEST2` / `OP_HASHSETANSWER2` transport for the
       `FileIdentifier` path with MD4 hashset coverage
+- [x] Large-file live `server.met` validation for the current
+      `FileIdentifier` / `OP_MULTIPACKET_EXT2` / `OP_HASHSETREQUEST2` /
+      compressed-part transfer path
 - [ ] Modern AICH root + part-hash generation, transport, and verification on
       the `FileIdentifier` / `OP_HASHSETANSWER2` path
 - [ ] Stock `UploadQueue.cpp`-style credit, score, LowID, and friend-slot
@@ -102,8 +105,9 @@ The active next milestone is:
    validate inbound `OP_HASHSETANSWER2` AICH payloads against the requested
    root
 3. confirm that modern AICH transport on the `FileIdentifier` path is visible
-   in private dumps and then add a dedicated large-file live scenario so that
-   `server.met` realnet evidence covers the same branch
+   in private dumps and then use the dedicated large-file live scenario as the
+   realnet evidence gate until the verifier output moves from `AICH:
+   Unavailable` to `AICH: OK`
 4. extend the same truthfulness rule to every still-advertised non-obsolete
    ED2K feature that remains unimplemented, starting with chat-captcha
 
@@ -151,8 +155,35 @@ Important limitation:
   large-file `OP_HASHSETREQUEST2` / `OP_HASHSETANSWER2` or modern AICH payload
   branch
 - the live run is therefore valid evidence for publish/download/re-offer
-  acceptance on a real server selected from `server.met`, but **not yet**
+  acceptance on a real server selected from `server.met`, but **not**
   sufficient evidence for modern AICH transport parity
+
+As of **April 17, 2026**, the dedicated large-file live `server.met` validation
+is also green for the modern `FileIdentifier` transport branch:
+
+- the real-network scenario `ed2k.server.roundtrip.realnet.large.v1` completed
+  successfully on run
+  [ed2k.server.roundtrip.realnet.large.v1-20260417-182434 run-summary.json](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.roundtrip.realnet.large.v1/ed2k.server.roundtrip.realnet.large.v1-20260417-182434/run-summary.json>)
+- the selected live server again came from the canonical imported `server.met`
+  bundle and was pinned as `145.239.2.134:4661` in
+  [run-manifest.json](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.roundtrip.realnet.large.v1/ed2k.server.roundtrip.realnet.large.v1-20260417-182434/run-manifest.json>)
+- the seeder-side harness dump shows the agent driving the modern large-file
+  startup path with `OP_MULTIPACKET_EXT2`, `OP_MULTIPACKETANSWER_EXT2`,
+  `OP_HASHSETREQUEST2`, and `OP_HASHSETANSWER2` in
+  [emule-harness-ed2k-tcp-dump-2026.04.17-18.24.40.356-p18176.jsonl](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.roundtrip.realnet.large.v1/ed2k.server.roundtrip.realnet.large.v1-20260417-182434/harness-seeder-artifacts/emule-harness-ed2k-tcp-dump-2026.04.17-18.24.40.356-p18176.jsonl>)
+- the same dump and the downloader-side harness dump confirm sustained
+  compressed-part transfer on the large-file path in
+  [harness-seeder-artifacts/emule-harness-ed2k-tcp-dump-2026.04.17-18.24.40.356-p18176.jsonl](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.roundtrip.realnet.large.v1/ed2k.server.roundtrip.realnet.large.v1-20260417-182434/harness-seeder-artifacts/emule-harness-ed2k-tcp-dump-2026.04.17-18.24.40.356-p18176.jsonl>)
+  and
+  [harness-downloader-artifacts/emule-harness-ed2k-tcp-dump-2026.04.17-18.26.30.400-p16340.jsonl](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.roundtrip.realnet.large.v1/ed2k.server.roundtrip.realnet.large.v1-20260417-182434/harness-downloader-artifacts/emule-harness-ed2k-tcp-dump-2026.04.17-18.26.30.400-p16340.jsonl>)
+- the agent completed the native large-file download in
+  [agent-stage1-artifacts/overlord-agent-emule.log](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.roundtrip.realnet.large.v1/ed2k.server.roundtrip.realnet.large.v1-20260417-182434/agent-stage1-artifacts/overlord-agent-emule.log>)
+- the harness verifier confirms the large-file parts as `MD4: OK` while still
+  reporting `AICH: Unavailable`, which is the remaining truth gap for this
+  branch, in
+  [harness-downloader-artifacts/eMule_Verbose.log](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.roundtrip.realnet.large.v1/ed2k.server.roundtrip.realnet.large.v1-20260417-182434/harness-downloader-artifacts/eMule_Verbose.log>)
+- the agent artifacts for this successful run do not contain the prior
+  `out_of_order_compressed_part_range` / `out_of_order_part_range` diagnostics
 
 ## Validation Standard
 
