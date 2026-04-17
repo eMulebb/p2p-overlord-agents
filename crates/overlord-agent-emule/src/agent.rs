@@ -124,6 +124,7 @@ const KAD_FIREWALLED_RESPONSE_TIMEOUT_SECS: u64 = 10;
 const ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS: usize = 3;
 const ED2K_BACKGROUND_SEARCH_QUEUE_CAPACITY: usize = 4;
 const ED2K_DOWNLOAD_KAD_SOURCE_CAP: usize = 64;
+const ED2K_HASH_ONLY_QUERY_PREFIX: &str = "ed2k::";
 const ACTIVITY_KEY_STARTING: &str = "starting";
 const ACTIVITY_KEY_BOOTSTRAPPING: &str = "bootstrapping";
 const ACTIVITY_KEY_FLUSHING_SNOOPS: &str = "flushing_snoops";
@@ -863,6 +864,10 @@ impl EnrichEd2kDownloadRequest {
 
 fn hash_only_ed2k_placeholder_name(file_hash: &str) -> String {
     format!("ed2k-{file_hash}.bin")
+}
+
+fn is_hash_only_ed2k_placeholder_name(name: &str, file_hash: &str) -> bool {
+    name.eq_ignore_ascii_case(&hash_only_ed2k_placeholder_name(file_hash))
 }
 
 pub struct OverlordAgentEmule {
@@ -2639,6 +2644,255 @@ fn ed2k_source_search_timeout(config: &Ed2kConfig) -> Duration {
     Duration::from_secs(config.connect_timeout_secs.max(15))
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LearnedEd2kMetadata {
+    canonical_name: Option<String>,
+    file_size: Option<u64>,
+}
+
+impl LearnedEd2kMetadata {
+    fn merge_missing_from(&mut self, other: Self) {
+        if self.canonical_name.is_none() {
+            self.canonical_name = other.canonical_name;
+        }
+        if self.file_size.is_none() {
+            self.file_size = other.file_size;
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.canonical_name.is_some() && self.file_size.is_some()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.canonical_name.is_none() && self.file_size.is_none()
+    }
+}
+
+fn normalized_optional_canonical_name(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn hash_only_ed2k_search_query(file_hash: Ed2kHash) -> String {
+    format!("{ED2K_HASH_ONLY_QUERY_PREFIX}{file_hash}")
+}
+
+fn exact_ed2k_hash_query_token(query: &str) -> Option<String> {
+    let trimmed = query.trim();
+    let candidate = trimmed
+        .strip_prefix(ED2K_HASH_ONLY_QUERY_PREFIX)
+        .unwrap_or(trimmed)
+        .trim();
+    if candidate.len() == 32 && candidate.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Some(candidate.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+fn select_ed2k_keyword_metadata(
+    results: &[Ed2kSearchFile],
+    file_hash: Ed2kHash,
+) -> Option<LearnedEd2kMetadata> {
+    results
+        .iter()
+        .filter(|result| result.file_hash == file_hash)
+        .filter_map(|result| {
+            let metadata = LearnedEd2kMetadata {
+                canonical_name: normalized_optional_canonical_name(result.file_name.as_deref()),
+                file_size: result.file_size.filter(|file_size| *file_size != 0),
+            };
+            if metadata.is_empty() {
+                None
+            } else {
+                Some((
+                    metadata.file_size.is_some(),
+                    metadata.canonical_name.is_some(),
+                    result.source_count.unwrap_or(0),
+                    metadata,
+                ))
+            }
+        })
+        .max_by_key(|(has_size, has_name, source_count, _)| (*has_size, *has_name, *source_count))
+        .map(|(_, _, _, metadata)| metadata)
+}
+
+fn select_kad_keyword_metadata(
+    result: &SearchResult,
+    file_hash: Ed2kHash,
+) -> Option<LearnedEd2kMetadata> {
+    if result.hash != file_hash {
+        return None;
+    }
+    let metadata = LearnedEd2kMetadata {
+        canonical_name: result
+            .names
+            .iter()
+            .find_map(|name| normalized_optional_canonical_name(Some(name))),
+        file_size: result.size.filter(|file_size| *file_size != 0),
+    };
+    (!metadata.is_empty()).then_some(metadata)
+}
+
+async fn collect_kad_ed2k_metadata(
+    dht: &DhtNode,
+    query: &str,
+    file_hash: Ed2kHash,
+    timeout: Duration,
+) -> Option<LearnedEd2kMetadata> {
+    let cancel = CancellationToken::new();
+    let mut stream = dht.search_keywords_with_cancel(keyword_target(query), cancel.clone());
+    let sleep = tokio::time::sleep(timeout);
+    tokio::pin!(sleep);
+    let mut learned = LearnedEd2kMetadata::default();
+
+    loop {
+        tokio::select! {
+            _ = &mut sleep => break,
+            result = stream.next() => {
+                let Some(result) = result else {
+                    break;
+                };
+                if let Some(candidate) = select_kad_keyword_metadata(&result, file_hash) {
+                    learned.merge_missing_from(candidate);
+                    if learned.is_complete() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    cancel.cancel();
+    (!learned.is_empty()).then_some(learned)
+}
+
+async fn resolve_hash_only_ed2k_metadata(
+    runtime: &AgentNetworkRuntime,
+    config: &EmuleAgentConfig,
+    file_hash: Ed2kHash,
+    ed2k_user_hash: [u8; 16],
+) -> Result<Option<LearnedEd2kMetadata>> {
+    let cancel = CancellationToken::new();
+    let mut learned = LearnedEd2kMetadata::default();
+    let shared_catalog = runtime.ed2k_shared_catalog.read().await.clone();
+    let keyword_search_timeout = ed2k_source_search_timeout(&config.p2p.ed2k);
+    let keyword_query = hash_only_ed2k_search_query(file_hash);
+    let hello_identity = Ed2kHelloIdentity {
+        user_hash: ed2k_user_hash,
+        client_id: 0,
+        tcp_port: config.p2p.ed2k.listen_port,
+        udp_port: config.p2p.kad.listen_port,
+        server_ip: 0,
+        server_port: 0,
+        connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
+        direct_udp_callback: false,
+    };
+    let (preferred_endpoint, background_search) = {
+        let server_state = runtime.ed2k_server_state.read().await;
+        if server_state.connected {
+            (
+                server_state.endpoint,
+                Some(runtime.ed2k_server_search.clone()),
+            )
+        } else {
+            (None, None)
+        }
+    };
+    let background_search_available = background_search.is_some();
+
+    if let Some(background_search) = background_search {
+        match search_keyword_via_background_session(
+            &background_search,
+            &keyword_query,
+            keyword_search_timeout,
+            &cancel,
+        )
+        .await
+        {
+            Ok(results) => {
+                if let Some(candidate) = select_ed2k_keyword_metadata(&results, file_hash) {
+                    learned.merge_missing_from(candidate);
+                    info!(
+                        "native ED2K download learned metadata from background keyword search file_hash={} file_name={} file_size={}",
+                        file_hash,
+                        learned.canonical_name.as_deref().unwrap_or("-"),
+                        learned.file_size.unwrap_or(0)
+                    );
+                } else {
+                    info!(
+                        "native ED2K download background keyword search returned no exact metadata match file_hash={}",
+                        file_hash
+                    );
+                }
+            }
+            Err(error) => warn!(
+                "native ED2K download background keyword search failed for file_hash={file_hash}: {error}"
+            ),
+        }
+    }
+
+    if !learned.is_complete() {
+        match search_keyword_servers(
+            runtime.bind_ip,
+            &config.p2p.ed2k,
+            hello_identity,
+            &shared_catalog,
+            (!background_search_available)
+                .then_some(preferred_endpoint)
+                .flatten(),
+            ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
+            &keyword_query,
+            &cancel,
+        )
+        .await
+        {
+            Ok(results) => {
+                if let Some(candidate) = select_ed2k_keyword_metadata(&results, file_hash) {
+                    learned.merge_missing_from(candidate);
+                    info!(
+                        "native ED2K download learned metadata from active server keyword search file_hash={} file_name={} file_size={}",
+                        file_hash,
+                        learned.canonical_name.as_deref().unwrap_or("-"),
+                        learned.file_size.unwrap_or(0)
+                    );
+                } else {
+                    info!(
+                        "native ED2K download active keyword search returned no exact metadata match file_hash={}",
+                        file_hash
+                    );
+                }
+            }
+            Err(error) => warn!(
+                "native ED2K download active server keyword search failed for file_hash={file_hash}: {error}"
+            ),
+        }
+    }
+
+    if !learned.is_complete()
+        && let Some(candidate) = collect_kad_ed2k_metadata(
+            &runtime.dht,
+            &keyword_query,
+            file_hash,
+            keyword_search_timeout,
+        )
+        .await
+    {
+        learned.merge_missing_from(candidate);
+        info!(
+            "native ED2K download learned metadata from Kad keyword search file_hash={} file_name={} file_size={}",
+            file_hash,
+            learned.canonical_name.as_deref().unwrap_or("-"),
+            learned.file_size.unwrap_or(0)
+        );
+    }
+
+    Ok((!learned.is_empty()).then_some(learned))
+}
+
 /// Kad source search remains a viable fallback when ED2K servers accept login
 /// traffic but never answer `OP_GETSOURCES` for a concrete file.
 fn kad_source_result_to_ed2k_found_source(result: SourceResult) -> Ed2kFoundSource {
@@ -3649,10 +3903,12 @@ fn significant_keyword_words(query: &str) -> Vec<String> {
 }
 
 fn keyword_target(query: &str) -> NodeId {
-    let first_word = significant_keyword_words(query)
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| query.to_lowercase());
+    let first_word = exact_ed2k_hash_query_token(query).unwrap_or_else(|| {
+        significant_keyword_words(query)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| query.to_lowercase())
+    });
     let mut hasher = Md4::new();
     hasher.update(first_word.as_bytes());
     let digest: [u8; 16] = hasher.finalize().into();
@@ -5900,23 +6156,37 @@ impl OverlordAgentEmule {
                 );
             }
         }
-        if sources.is_empty() && file_size != 0 {
+        if file_size != 0 {
+            let existing_source_count = sources.len();
             let kad_sources =
                 collect_kad_ed2k_sources(&runtime.dht, file_hash, file_size, source_search_timeout)
                     .await;
-            if !kad_sources.is_empty() {
-                let source_count = kad_sources.len();
+            let kad_source_count = kad_sources.len();
+            if kad_source_count != 0 {
                 merge_download_sources(&mut sources, kad_sources);
+                let added_source_count = sources.len().saturating_sub(existing_source_count);
                 info!(
-                    "native ED2K download Kad source fallback produced file_hash={} source_count={} aggregated_source_count={}",
+                    "native ED2K download Kad source {} produced file_hash={} source_count={} added_source_count={} aggregated_source_count={}",
+                    if existing_source_count == 0 {
+                        "fallback"
+                    } else {
+                        "supplement"
+                    },
                     file_hash,
-                    source_count,
+                    kad_source_count,
+                    added_source_count,
                     sources.len()
                 );
             } else {
                 info!(
-                    "native ED2K download Kad source fallback returned no sources for file_hash={}",
-                    file_hash
+                    "native ED2K download Kad source {} returned no sources for file_hash={} aggregated_source_count={}",
+                    if existing_source_count == 0 {
+                        "fallback"
+                    } else {
+                        "supplement"
+                    },
+                    file_hash,
+                    sources.len()
                 );
             }
         } else if sources.is_empty() {
@@ -5951,8 +6221,10 @@ impl OverlordAgentEmule {
             anyhow::bail!("agent networking is waiting for interface selection");
         };
         let config = config_handle.read().await.clone();
-        let canonical_name = request.canonical_name();
-        let file_size = request.file_size_or_unknown();
+        let mut canonical_name = request.canonical_name();
+        let mut file_size = request.file_size_or_unknown();
+        let adopt_learned_name =
+            is_hash_only_ed2k_placeholder_name(&canonical_name, &request.file_hash);
         let shared_catalog = runtime.ed2k_shared_catalog.read().await.clone();
         runtime
             .ed2k_transfer
@@ -5966,6 +6238,29 @@ impl OverlordAgentEmule {
             .ed2k_transfer
             .reclaim_stale_piece_requests(&request.file_hash)
             .await?;
+        if request.sources.is_empty()
+            && (file_size == 0 || adopt_learned_name)
+            && let Some(learned_metadata) =
+                resolve_hash_only_ed2k_metadata(&runtime, &config, file_hash, ed2k_user_hash)
+                    .await?
+        {
+            let manifest = runtime
+                .ed2k_transfer
+                .reconcile_job_metadata(
+                    &request.file_hash,
+                    adopt_learned_name
+                        .then_some(learned_metadata.canonical_name.as_deref())
+                        .flatten(),
+                    learned_metadata.file_size,
+                )
+                .await?;
+            canonical_name = manifest.canonical_name.clone();
+            file_size = manifest.file_size;
+            info!(
+                "native ED2K download reconciled hash-only metadata file_hash={} file_name={} file_size={}",
+                request.file_hash, canonical_name, file_size
+            );
+        }
         let hello_identity = Ed2kHelloIdentity {
             user_hash: ed2k_user_hash,
             client_id: 0,
@@ -7748,20 +8043,21 @@ mod tests {
         build_keyword_snoop_entry, build_notes_publish_tags, build_notes_snoop_entry,
         build_publish_batch_summary, build_source_publish_tags, build_source_snoop_entry,
         current_tcp_firewalled, ed2k_file_type_search_term, effective_publish_counters,
-        empty_networking_config, emule_high_id_source_type, flush_snoop_queue, keyword_target,
-        manifest_has_ed2k_transfer_progress, next_passive_replay_request,
-        next_passive_replay_request_for_family, normalize_ed2k_user_hash_markers,
-        parse_kad_hello_metadata, record_passive_replay_complete,
+        empty_networking_config, emule_high_id_source_type, exact_ed2k_hash_query_token,
+        flush_snoop_queue, keyword_target, manifest_has_ed2k_transfer_progress,
+        next_passive_replay_request, next_passive_replay_request_for_family,
+        normalize_ed2k_user_hash_markers, parse_kad_hello_metadata, record_passive_replay_complete,
         record_passive_replay_enqueue_wait, record_passive_replay_idle,
         record_passive_replay_post_failure, record_passive_replay_post_latency,
-        record_passive_replay_start, restore_snoop_queue, select_popular_hashes_for_seeding,
-        select_popular_hashes_from_fetch_result, should_request_hello_response_ack,
-        should_request_proactive_hello_res_ack, significant_keyword_words, synthetic_file_hash,
-        synthetic_popular_hashes, synthetic_publish_aich_hash, try_acquire_passive_replay_gate,
+        record_passive_replay_start, restore_snoop_queue, select_ed2k_keyword_metadata,
+        select_popular_hashes_for_seeding, select_popular_hashes_from_fetch_result,
+        should_request_hello_response_ack, should_request_proactive_hello_res_ack,
+        significant_keyword_words, synthetic_file_hash, synthetic_popular_hashes,
+        synthetic_publish_aich_hash, try_acquire_passive_replay_gate,
     };
     use crate::{
         config::SnoopQueueConfig,
-        ed2k_server::{Ed2kFoundSource, Ed2kServerState},
+        ed2k_server::{Ed2kFoundSource, Ed2kSearchFile, Ed2kServerState},
         ed2k_tcp::{
             Ed2kHelloIdentity, Ed2kPeerDownloadOutcome, Ed2kSecureIdent, emule_connect_options,
         },
@@ -7784,7 +8080,7 @@ mod tests {
         RegistrationResponse, SnoopEntry,
     };
     use overlord_agent_nat::{UPNP_MINIUPNPC_BACKEND, UPNP_RUPNP_BACKEND};
-    use overlord_kad_dht::{DhtConfig, DhtNode, PublishAttemptStats};
+    use overlord_kad_dht::{DhtConfig, DhtNode, PublishAttemptStats, SearchResult};
     use overlord_kad_proto::{
         Ed2kHash, NodeId, SearchKeyReq, SearchNotesReq, SearchSourceReq, Tag, TagName, TagValue,
         tag_name,
@@ -7794,6 +8090,7 @@ mod tests {
         fs,
         net::{Ipv4Addr, SocketAddr},
         path::Path,
+        str::FromStr,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering, Ordering as AtomicOrdering},
@@ -8278,6 +8575,82 @@ mod tests {
             hex::encode(keyword_target("Torino Train").0),
             "b2bc3aa39f375069e7c27eb83ce6baf3"
         );
+    }
+
+    #[test]
+    fn exact_ed2k_hash_query_token_extracts_hash_only_queries() {
+        assert_eq!(
+            exact_ed2k_hash_query_token("ed2k::4F1E2E7B6E257B5356D22514079A6078"),
+            Some("4f1e2e7b6e257b5356d22514079a6078".to_string())
+        );
+        assert_eq!(
+            exact_ed2k_hash_query_token("4F1E2E7B6E257B5356D22514079A6078"),
+            Some("4f1e2e7b6e257b5356d22514079a6078".to_string())
+        );
+        assert_eq!(exact_ed2k_hash_query_token("ed2k::torino train"), None);
+    }
+
+    #[test]
+    fn keyword_target_uses_hash_token_for_exact_ed2k_hash_queries() {
+        assert_eq!(
+            keyword_target("ed2k::4F1E2E7B6E257B5356D22514079A6078"),
+            keyword_target("4F1E2E7B6E257B5356D22514079A6078")
+        );
+    }
+
+    #[test]
+    fn select_ed2k_keyword_metadata_prefers_exact_hash_with_size_and_name() {
+        let exact_hash = Ed2kHash::from_str("4f1e2e7b6e257b5356d22514079a6078").unwrap();
+        let other_hash = Ed2kHash::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let metadata = select_ed2k_keyword_metadata(
+            &[
+                Ed2kSearchFile {
+                    file_hash: exact_hash,
+                    file_name: Some("".to_string()),
+                    file_size: Some(0),
+                    file_type: None,
+                    source_count: Some(100),
+                },
+                Ed2kSearchFile {
+                    file_hash: other_hash,
+                    file_name: Some("wrong.bin".to_string()),
+                    file_size: Some(123),
+                    file_type: None,
+                    source_count: Some(5),
+                },
+                Ed2kSearchFile {
+                    file_hash: exact_hash,
+                    file_name: Some("resolved.bin".to_string()),
+                    file_size: Some(4_294_967_299),
+                    file_type: Some("Pro".to_string()),
+                    source_count: Some(12),
+                },
+            ],
+            exact_hash,
+        )
+        .unwrap();
+
+        assert_eq!(metadata.canonical_name.as_deref(), Some("resolved.bin"));
+        assert_eq!(metadata.file_size, Some(4_294_967_299));
+    }
+
+    #[test]
+    fn kad_search_result_exposes_exact_hash_metadata() {
+        let exact_hash = Ed2kHash::from_str("4f1e2e7b6e257b5356d22514079a6078").unwrap();
+        let metadata = super::select_kad_keyword_metadata(
+            &SearchResult {
+                hash: exact_hash,
+                names: vec!["resolved.bin".to_string()],
+                size: Some(5_000),
+                source_count: Some(3),
+                tags: Vec::new(),
+            },
+            exact_hash,
+        )
+        .unwrap();
+
+        assert_eq!(metadata.canonical_name.as_deref(), Some("resolved.bin"));
+        assert_eq!(metadata.file_size, Some(5_000));
     }
 
     #[test]
