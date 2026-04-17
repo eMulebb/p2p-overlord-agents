@@ -19,6 +19,7 @@ traffic shape depends on it.
 - [Observations](./kad/OBSERVATIONS.md)
 - [Wire Sequences](./kad/WIRE_SEQUENCES.md)
 - [Oracle Differences](./kad/PROTOCOL_DIFFS.md)
+- [Kad Background Budget Tracker](./kad/KAD_BACKGROUND_BUDGET_TRACKER.md)
 - [Stock eMule `community-0.60` Comparison](./kad/EMULE_COMMUNITY_060_COMPARISON.md)
 
 ## ED2K

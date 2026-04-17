@@ -22,6 +22,7 @@ excluding obsolete protocol features only**.
 - [Parity Notes](./PARITY_NOTES.md)
 - [Observations](./OBSERVATIONS.md)
 - [Oracle Differences](./PROTOCOL_DIFFS.md)
+- [Kad Background Budget Tracker](./KAD_BACKGROUND_BUDGET_TRACKER.md)
 - [ED2K 0.72a Full Parity Tracker](./ED2K_072A_FULL_PARITY_TRACKER.md)
 - [Stock eMule `community-0.60` Comparison](./EMULE_COMMUNITY_060_COMPARISON.md)
 - [ED2K Parity State Machine](./ED2K_PARITY_STATE_MACHINE.md)
