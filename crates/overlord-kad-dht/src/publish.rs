@@ -7,7 +7,7 @@
 
 use crate::error::DhtError;
 use crate::traversal::{TraversalConfig, TraversalContact, TraversalKind, run_traversal};
-use overlord_kad_net::RpcManager;
+use overlord_kad_net::{RpcManager, RpcWorkClass};
 use overlord_kad_proto::constants::{
     KAD_VERSION_AICH_KEYWORD_PUBLISH, SEARCHTOLERANCE, STORE_TIMEOUT_SECS,
 };
@@ -51,12 +51,24 @@ struct PublishAttempt {
     contact: TraversalContact,
 }
 
+/// Full keyword publish payload and scheduler settings.
+#[derive(Debug, Clone)]
+pub struct KeywordPublishRequest {
+    pub keyword_hash: NodeId,
+    pub file_hash: Ed2kHash,
+    pub tags: Vec<Tag>,
+    pub aich_hash: Option<[u8; 20]>,
+    pub publish_contact_fanout: usize,
+    pub work_class: RpcWorkClass,
+}
+
 /// Send the publish RPC to all selected contacts concurrently so the live wire
 /// shape stays bursty while the caller can widen contact coverage for harvest.
 async fn execute_publish_fanout(
     rpc: &RpcManager,
     contacts: &[TraversalContact],
     packet: &KadPacket,
+    work_class: RpcWorkClass,
 ) -> Vec<(
     PublishAttempt,
     Result<KadPacket, overlord_kad_net::NetError>,
@@ -74,11 +86,12 @@ async fn execute_publish_fanout(
         };
         join_set.spawn(async move {
             let result = rpc
-                .request(
+                .request_with_class(
                     attempt.contact.addr,
                     &packet,
                     opcode::PUBLISH_RES,
                     PUBLISH_RESPONSE_TIMEOUT,
+                    work_class,
                 )
                 .await;
             (attempt, result)
@@ -141,12 +154,16 @@ fn publish_distance_high32(distance: NodeId) -> u32 {
 pub async fn publish_keyword(
     rpc: &RpcManager,
     routing_table: &tokio::sync::Mutex<overlord_kad_routing::RoutingTable>,
-    keyword_hash: NodeId,
-    file_hash: Ed2kHash,
-    tags: Vec<Tag>,
-    aich_hash: Option<[u8; 20]>,
-    publish_contact_fanout: usize,
+    request: KeywordPublishRequest,
 ) -> Result<PublishAttemptStats, DhtError> {
+    let KeywordPublishRequest {
+        keyword_hash,
+        file_hash,
+        tags,
+        aich_hash,
+        publish_contact_fanout,
+        work_class,
+    } = request;
     let target = keyword_hash;
     let initial = get_initial(routing_table, &target).await;
 
@@ -161,6 +178,7 @@ pub async fn publish_keyword(
             phase2_fanout: publish_contact_fanout.max(K),
             cancel: CancellationToken::new(),
             result_tx: None,
+            work_class,
         },
     )
     .await;
@@ -204,11 +222,12 @@ pub async fn publish_keyword(
         };
         join_set.spawn(async move {
             let result = rpc
-                .request(
+                .request_with_class(
                     attempt.contact.addr,
                     &packet,
                     opcode::PUBLISH_RES,
                     PUBLISH_RESPONSE_TIMEOUT,
+                    work_class,
                 )
                 .await;
             (attempt, result)
@@ -310,6 +329,7 @@ pub async fn publish_source(
     file_hash: Ed2kHash,
     tags: Vec<Tag>,
     publish_contact_fanout: usize,
+    work_class: RpcWorkClass,
 ) -> Result<PublishAttemptStats, DhtError> {
     let target = NodeId::from_be_bytes(file_hash.0);
     let initial = get_initial(routing_table, &target).await;
@@ -325,6 +345,7 @@ pub async fn publish_source(
             phase2_fanout: publish_contact_fanout.max(K),
             cancel: CancellationToken::new(),
             result_tx: None,
+            work_class,
         },
     )
     .await;
@@ -362,7 +383,9 @@ pub async fn publish_source(
             publisher_id,
         );
     }
-    for (attempt, result) in execute_publish_fanout(rpc, &publish_contacts, &packet).await {
+    for (attempt, result) in
+        execute_publish_fanout(rpc, &publish_contacts, &packet, work_class).await
+    {
         match result {
             Ok(KadPacket::PublishRes(response)) => {
                 stats.acked_contacts += 1;
@@ -424,6 +447,7 @@ pub async fn publish_notes(
     publisher_id: NodeId,
     tags: Vec<Tag>,
     publish_contact_fanout: usize,
+    work_class: RpcWorkClass,
 ) -> Result<PublishAttemptStats, DhtError> {
     let target = NodeId::from_be_bytes(file_hash.0);
     let initial = get_initial(routing_table, &target).await;
@@ -439,6 +463,7 @@ pub async fn publish_notes(
             phase2_fanout: publish_contact_fanout.max(K),
             cancel: CancellationToken::new(),
             result_tx: None,
+            work_class,
         },
     )
     .await;
@@ -464,7 +489,9 @@ pub async fn publish_notes(
         attempted_contacts: publish_contacts.len() as u32,
         ..PublishAttemptStats::default()
     };
-    for (attempt, result) in execute_publish_fanout(rpc, &publish_contacts, &packet).await {
+    for (attempt, result) in
+        execute_publish_fanout(rpc, &publish_contacts, &packet, work_class).await
+    {
         match result {
             Ok(KadPacket::PublishRes(response)) => {
                 stats.acked_contacts += 1;

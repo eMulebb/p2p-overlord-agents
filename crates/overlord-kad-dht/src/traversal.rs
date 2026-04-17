@@ -4,7 +4,7 @@
 //! timing for search phase 2, and the candidate-state bookkeeping that decides
 //! which contacts are still eligible to query.
 
-use overlord_kad_net::RpcManager;
+use overlord_kad_net::{RpcManager, RpcWorkClass};
 use overlord_kad_proto::{
     Ed2kHash, KadPacket, NodeId, Tag,
     constants::{
@@ -90,6 +90,8 @@ pub struct TraversalConfig {
     /// want the collected batch, but the node/API path now consumes results
     /// incrementally from this channel as packets arrive.
     pub result_tx: Option<mpsc::Sender<(Ed2kHash, Vec<Tag>)>>,
+    /// Outbound budget class used by this traversal.
+    pub work_class: RpcWorkClass,
 }
 
 /// Final traversal outcome returned to the caller.
@@ -129,6 +131,7 @@ struct SearchPhaseConfig<'a> {
     jumpstart_idle_grace: Duration,
     /// Oracle-style periodic tick for walking one closest responder at a time.
     jumpstart_tick: Duration,
+    work_class: RpcWorkClass,
     cancel: &'a CancellationToken,
     result_tx: Option<mpsc::Sender<(Ed2kHash, Vec<Tag>)>>,
 }
@@ -152,6 +155,7 @@ pub async fn run_traversal(
         phase2_fanout,
         cancel,
         result_tx,
+        work_class,
     } = config;
     let deadline = Instant::now() + timeout;
     let closest_limit = traversal_closest_limit(&search_kind, phase2_fanout);
@@ -224,7 +228,13 @@ pub async fn run_traversal(
                     recipient_id: contact.id,
                 });
                 let result = rpc
-                    .request(contact.addr, &packet, opcode::RES, query_timeout)
+                    .request_with_class(
+                        contact.addr,
+                        &packet,
+                        opcode::RES,
+                        query_timeout,
+                        work_class,
+                    )
                     .await;
                 (contact.id, result)
             });
@@ -378,6 +388,7 @@ pub async fn run_traversal(
                     last_lookup_response_at,
                     jumpstart_idle_grace: SEARCH_JUMPSTART_IDLE_GRACE,
                     jumpstart_tick: SEARCH_JUMPSTART_TICK,
+                    work_class,
                     cancel: &cancel,
                     result_tx,
                 },
@@ -407,6 +418,7 @@ async fn run_search_phase(
         last_lookup_response_at,
         jumpstart_idle_grace,
         jumpstart_tick,
+        work_class,
         cancel,
         result_tx,
     } = config;
@@ -493,7 +505,7 @@ async fn run_search_phase(
             contact.addr,
             pending_contacts.len()
         );
-        if let Err(err) = rpc.send(contact.addr, &packet).await {
+        if let Err(err) = rpc.send_with_class(contact.addr, &packet, work_class).await {
             trace!("search phase send failed for {}: {}", contact.id, err);
         }
         queried_addrs.insert(contact.addr);
@@ -1022,6 +1034,7 @@ mod tests {
                 last_lookup_response_at: None,
                 jumpstart_idle_grace: Duration::ZERO,
                 jumpstart_tick: Duration::from_millis(10),
+                work_class: RpcWorkClass::Interactive,
                 cancel: &CancellationToken::new(),
                 result_tx: Some(result_tx),
             },
@@ -1073,6 +1086,7 @@ mod tests {
                 last_lookup_response_at: None,
                 jumpstart_idle_grace: Duration::ZERO,
                 jumpstart_tick: Duration::from_millis(10),
+                work_class: RpcWorkClass::Interactive,
                 cancel: &CancellationToken::new(),
                 result_tx: None,
             },
@@ -1127,6 +1141,7 @@ mod tests {
                 last_lookup_response_at: None,
                 jumpstart_idle_grace: Duration::ZERO,
                 jumpstart_tick: Duration::from_millis(10),
+                work_class: RpcWorkClass::Interactive,
                 cancel: &CancellationToken::new(),
                 result_tx: None,
             },
@@ -1179,6 +1194,7 @@ mod tests {
                 last_lookup_response_at: None,
                 jumpstart_idle_grace: Duration::ZERO,
                 jumpstart_tick: Duration::from_millis(10),
+                work_class: RpcWorkClass::Interactive,
                 cancel: &CancellationToken::new(),
                 result_tx: None,
             },
@@ -1259,6 +1275,7 @@ mod tests {
                         last_lookup_response_at: Some(Instant::now()),
                         jumpstart_idle_grace: Duration::from_millis(15),
                         jumpstart_tick: Duration::from_millis(50),
+                        work_class: RpcWorkClass::Interactive,
                         cancel: &CancellationToken::new(),
                         result_tx: None,
                     },
@@ -1322,6 +1339,7 @@ mod tests {
                 phase2_fanout: 1,
                 cancel: CancellationToken::new(),
                 result_tx: None,
+                work_class: RpcWorkClass::Interactive,
             },
         )
         .await;

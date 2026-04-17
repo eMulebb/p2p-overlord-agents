@@ -1,6 +1,6 @@
 use crate::traversal::{TraversalConfig, TraversalContact, TraversalKind, run_traversal};
 use crate::types::{NoteResult, SearchResult, SourceResult};
-use overlord_kad_net::RpcManager;
+use overlord_kad_net::{RpcManager, RpcWorkClass};
 use overlord_kad_proto::constants::SEARCH_TIMEOUT_SECS;
 use overlord_kad_proto::{Ed2kHash, NodeId, SearchKeyReq, SearchSourceReq};
 use std::collections::HashSet;
@@ -19,6 +19,14 @@ const SEARCH_TIMEOUT: Duration = Duration::from_secs(SEARCH_TIMEOUT_SECS);
 /// from one peer. Keeping this buffer comfortably above one page train avoids
 /// turning inbound harvest volume into backpressure on the traversal loop.
 const SEARCH_RESULT_STREAM_BUFFER: usize = 2048;
+
+/// Full notes-search identity so the stream builder stays request-shaped while
+/// the public helper surface avoids long argument lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotesSearchRequest {
+    pub file_hash: Ed2kHash,
+    pub file_size: u64,
+}
 
 fn map_source_search_result(
     requested_file_hash: Ed2kHash,
@@ -39,6 +47,7 @@ pub fn search_keywords(
     result_cap: usize,
     phase2_fanout: usize,
     cancel: CancellationToken,
+    work_class: RpcWorkClass,
 ) -> impl tokio_stream::Stream<Item = SearchResult> + Send + 'static {
     search_keywords_by_request(
         rpc,
@@ -51,6 +60,7 @@ pub fn search_keywords(
         result_cap,
         phase2_fanout,
         cancel,
+        work_class,
     )
 }
 
@@ -62,6 +72,7 @@ pub fn search_keywords_by_request(
     result_cap: usize,
     phase2_fanout: usize,
     cancel: CancellationToken,
+    work_class: RpcWorkClass,
 ) -> impl tokio_stream::Stream<Item = SearchResult> + Send + 'static {
     let (tx, rx) = mpsc::channel::<SearchResult>(SEARCH_RESULT_STREAM_BUFFER);
     let request_target = request.target;
@@ -76,6 +87,7 @@ pub fn search_keywords_by_request(
             phase2_fanout,
             cancel: cancel.clone(),
             result_tx: Some(raw_tx),
+            work_class,
         };
 
         let traversal = tokio::spawn(async move {
@@ -157,30 +169,6 @@ pub fn search_keywords_by_request(
     ReceiverStream::new(rx)
 }
 
-/// Run a source search.
-pub fn search_sources(
-    rpc: RpcManager,
-    initial: Vec<TraversalContact>,
-    file_hash: Ed2kHash,
-    file_size: u64,
-    result_cap: usize,
-    phase2_fanout: usize,
-    cancel: CancellationToken,
-) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
-    search_sources_by_request(
-        rpc,
-        initial,
-        SearchSourceReq {
-            target: NodeId::from_be_bytes(file_hash.0),
-            start_position: 0,
-            size: file_size,
-        },
-        result_cap,
-        phase2_fanout,
-        cancel,
-    )
-}
-
 /// Run a source search using a prebuilt Kad source request shape.
 pub fn search_sources_by_request(
     rpc: RpcManager,
@@ -189,6 +177,7 @@ pub fn search_sources_by_request(
     result_cap: usize,
     phase2_fanout: usize,
     cancel: CancellationToken,
+    work_class: RpcWorkClass,
 ) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
     let (tx, rx) = mpsc::channel::<SourceResult>(SEARCH_RESULT_STREAM_BUFFER);
     let target = request.target;
@@ -205,6 +194,7 @@ pub fn search_sources_by_request(
             phase2_fanout,
             cancel: cancel.clone(),
             result_tx: Some(raw_tx),
+            work_class,
         };
 
         let traversal = tokio::spawn(async move {
@@ -246,26 +236,29 @@ pub fn search_sources_by_request(
 pub fn search_notes(
     rpc: RpcManager,
     initial: Vec<TraversalContact>,
-    file_hash: Ed2kHash,
-    file_size: u64,
+    request: NotesSearchRequest,
     result_cap: usize,
     phase2_fanout: usize,
     cancel: CancellationToken,
+    work_class: RpcWorkClass,
 ) -> impl tokio_stream::Stream<Item = NoteResult> + Send + 'static {
     let (tx, rx) = mpsc::channel::<NoteResult>(SEARCH_RESULT_STREAM_BUFFER);
-    let target = NodeId::from_be_bytes(file_hash.0);
+    let target = NodeId::from_be_bytes(request.file_hash.0);
 
     tokio::spawn(async move {
         let (raw_tx, mut raw_rx) =
             mpsc::channel::<(Ed2kHash, Vec<overlord_kad_proto::Tag>)>(SEARCH_RESULT_STREAM_BUFFER);
         let config = TraversalConfig {
             target,
-            search_kind: TraversalKind::Notes { size: file_size },
+            search_kind: TraversalKind::Notes {
+                size: request.file_size,
+            },
             timeout: SEARCH_TIMEOUT,
             query_timeout: QUERY_TIMEOUT,
             phase2_fanout,
             cancel: cancel.clone(),
             result_tx: Some(raw_tx),
+            work_class,
         };
 
         let traversal = tokio::spawn(async move {
@@ -285,7 +278,7 @@ pub fn search_notes(
                 break;
             }
 
-            let Some(note) = NoteResult::from_tags(file_hash, source_id, tags) else {
+            let Some(note) = NoteResult::from_tags(request.file_hash, source_id, tags) else {
                 continue;
             };
             if !seen_sources.insert(note.source_id) {

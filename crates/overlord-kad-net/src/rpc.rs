@@ -14,6 +14,7 @@ use crate::tracker::{
 };
 use crate::transport::Transport;
 use crate::wire_dump::{KadUdpDumpSummary, dump_kad_udp_packet};
+use chrono::{DateTime, Utc};
 use overlord_kad_proto::{KadPacket, NodeId, constants::opcode};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -27,10 +28,65 @@ use tracing::{debug, error, info, warn};
 /// Callback invoked when the tracker hits the oracle's massive-flood tier.
 pub type MassiveFloodHandler = Arc<dyn Fn(SocketAddr) + Send + Sync>;
 
+/// Logical outbound work class used for Kad scheduling and observability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RpcWorkClass {
+    Interactive,
+    Harvest,
+    Maintenance,
+    Publish,
+}
+
+impl RpcWorkClass {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Harvest => "harvest",
+            Self::Maintenance => "maintenance",
+            Self::Publish => "publish",
+        }
+    }
+}
+
+/// Per-class packet budgets layered underneath the global outbound safety cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RpcClassBudgetConfig {
+    pub interactive_max_outbound_pps: u32,
+    pub harvest_max_outbound_pps: u32,
+    pub maintenance_max_outbound_pps: u32,
+    pub publish_max_outbound_pps: u32,
+}
+
+impl RpcClassBudgetConfig {
+    #[must_use]
+    pub fn max_outbound_pps_for(self, work_class: RpcWorkClass) -> u32 {
+        match work_class {
+            RpcWorkClass::Interactive => self.interactive_max_outbound_pps,
+            RpcWorkClass::Harvest => self.harvest_max_outbound_pps,
+            RpcWorkClass::Maintenance => self.maintenance_max_outbound_pps,
+            RpcWorkClass::Publish => self.publish_max_outbound_pps,
+        }
+    }
+}
+
+impl Default for RpcClassBudgetConfig {
+    fn default() -> Self {
+        Self {
+            interactive_max_outbound_pps: 32,
+            harvest_max_outbound_pps: 8,
+            maintenance_max_outbound_pps: 4,
+            publish_max_outbound_pps: 2,
+        }
+    }
+}
+
 /// Configuration for RpcManager.
 pub struct RpcConfig {
     /// Max outbound packets per second. 0 = unlimited.
     pub max_outbound_pps: u32,
+    /// Per-class budgets layered underneath `max_outbound_pps`.
+    pub class_budgets: RpcClassBudgetConfig,
     /// Max inbound control packets per IP per flood window before flood-blocking.
     pub max_inbound_per_ip: u32,
     /// Max inbound SEARCH_RES packets per IP per second before flood-blocking.
@@ -50,6 +106,7 @@ impl Default for RpcConfig {
     fn default() -> Self {
         Self {
             max_outbound_pps: 50,
+            class_budgets: RpcClassBudgetConfig::default(),
             max_inbound_per_ip: 20,
             max_inbound_search_res_per_ip: 256,
             flood_window: Duration::from_secs(1),
@@ -88,15 +145,36 @@ pub struct RpcResponseOpcodeSnapshot {
     pub accepted_unsolicited: u64,
 }
 
+/// Per-class outbound budget snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcWorkClassSnapshot {
+    /// Stable outbound work class.
+    pub class: RpcWorkClass,
+    /// Configured packets-per-second budget for the class.
+    pub max_outbound_pps: u32,
+    /// Count of packets sent under this class.
+    pub sent_packets: u64,
+    /// Count of sends that had to wait for budget.
+    pub delayed_packets: u64,
+    /// Aggregate wait introduced by class/global budget acquisition.
+    pub total_wait_millis: u64,
+    /// Timestamp of the most recent successful send for this class.
+    pub last_sent_at: Option<DateTime<Utc>>,
+}
+
 /// Machine-readable snapshot of Kad RPC tracker behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcObservabilitySnapshot {
     /// Count of inbound UDP payloads that failed Kad decode.
     pub decode_failures: u64,
+    /// Global outbound safety cap.
+    pub global_max_outbound_pps: u32,
     /// Per-bucket inbound request tracker counters.
     pub tracker_buckets: Vec<RpcTrackerBucketSnapshot>,
     /// Per-opcode response handling counters.
     pub response_opcodes: Vec<RpcResponseOpcodeSnapshot>,
+    /// Per-class outbound budget counters.
+    pub work_classes: Vec<RpcWorkClassSnapshot>,
 }
 
 struct PendingEntry {
@@ -127,7 +205,13 @@ pub struct ReceivedKadPacket {
 struct RpcInner {
     transport: Arc<dyn Transport>,
     obfuscation: ObfuscationLayer,
-    rate_limiter: RateLimiter,
+    global_rate_limiter: RateLimiter,
+    interactive_rate_limiter: RateLimiter,
+    harvest_rate_limiter: RateLimiter,
+    maintenance_rate_limiter: RateLimiter,
+    publish_rate_limiter: RateLimiter,
+    max_outbound_pps: u32,
+    class_budgets: RpcClassBudgetConfig,
     tracker: Mutex<PacketTracker>,
     outbound_tracker: Mutex<OutboundRequestTracker>,
     pending: Mutex<HashMap<u64, PendingEntry>>,
@@ -164,11 +248,20 @@ struct RpcResponseCounters {
     accepted_unsolicited: u64,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct RpcWorkClassCounters {
+    sent_packets: u64,
+    delayed_packets: u64,
+    total_wait_millis: u64,
+    last_sent_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Default)]
 struct RpcObservabilityState {
     decode_failures: u64,
     tracker_buckets: HashMap<PacketTrackerBucket, RpcTrackerBucketCounters>,
     response_opcodes: HashMap<u8, RpcResponseCounters>,
+    work_classes: HashMap<RpcWorkClass, RpcWorkClassCounters>,
 }
 
 impl RpcObservabilityState {
@@ -213,7 +306,21 @@ impl RpcObservabilityState {
             .accepted_unsolicited += 1;
     }
 
-    fn snapshot(&self) -> RpcObservabilitySnapshot {
+    fn record_work_class_send(&mut self, work_class: RpcWorkClass, wait_millis: u64) {
+        let counters = self.work_classes.entry(work_class).or_default();
+        counters.sent_packets += 1;
+        counters.total_wait_millis += wait_millis;
+        if wait_millis > 0 {
+            counters.delayed_packets += 1;
+        }
+        counters.last_sent_at = Some(Utc::now());
+    }
+
+    fn snapshot(
+        &self,
+        global_max_outbound_pps: u32,
+        class_budgets: RpcClassBudgetConfig,
+    ) -> RpcObservabilitySnapshot {
         let mut tracker_buckets: Vec<_> = self
             .tracker_buckets
             .iter()
@@ -239,10 +346,37 @@ impl RpcObservabilityState {
             .collect();
         response_opcodes.sort_by_key(|opcode| opcode.opcode);
 
+        let mut work_classes = [
+            RpcWorkClass::Interactive,
+            RpcWorkClass::Harvest,
+            RpcWorkClass::Maintenance,
+            RpcWorkClass::Publish,
+        ]
+        .into_iter()
+        .map(|work_class| {
+            let counters = self
+                .work_classes
+                .get(&work_class)
+                .copied()
+                .unwrap_or_default();
+            RpcWorkClassSnapshot {
+                class: work_class,
+                max_outbound_pps: class_budgets.max_outbound_pps_for(work_class),
+                sent_packets: counters.sent_packets,
+                delayed_packets: counters.delayed_packets,
+                total_wait_millis: counters.total_wait_millis,
+                last_sent_at: counters.last_sent_at,
+            }
+        })
+        .collect::<Vec<_>>();
+        work_classes.sort_by_key(|work_class| work_class.class.label());
+
         RpcObservabilitySnapshot {
             decode_failures: self.decode_failures,
+            global_max_outbound_pps,
             tracker_buckets,
             response_opcodes,
+            work_classes,
         }
     }
 }
@@ -258,7 +392,29 @@ impl RpcManager {
         let inner = Arc::new(RpcInner {
             transport: Arc::new(transport),
             obfuscation,
-            rate_limiter: RateLimiter::new(config.max_outbound_pps),
+            global_rate_limiter: RateLimiter::new(config.max_outbound_pps),
+            interactive_rate_limiter: RateLimiter::new(
+                config
+                    .class_budgets
+                    .max_outbound_pps_for(RpcWorkClass::Interactive),
+            ),
+            harvest_rate_limiter: RateLimiter::new(
+                config
+                    .class_budgets
+                    .max_outbound_pps_for(RpcWorkClass::Harvest),
+            ),
+            maintenance_rate_limiter: RateLimiter::new(
+                config
+                    .class_budgets
+                    .max_outbound_pps_for(RpcWorkClass::Maintenance),
+            ),
+            publish_rate_limiter: RateLimiter::new(
+                config
+                    .class_budgets
+                    .max_outbound_pps_for(RpcWorkClass::Publish),
+            ),
+            max_outbound_pps: config.max_outbound_pps,
+            class_budgets: config.class_budgets,
             tracker: Mutex::new(PacketTracker::new(
                 config.max_inbound_per_ip,
                 config.max_inbound_search_res_per_ip,
@@ -636,6 +792,26 @@ impl RpcManager {
         expected_opcode: u8,
         timeout_duration: Duration,
     ) -> Result<KadPacket, NetError> {
+        self.request_with_class(
+            addr,
+            packet,
+            expected_opcode,
+            timeout_duration,
+            RpcWorkClass::Interactive,
+        )
+        .await
+    }
+
+    /// Send a packet to addr and wait for a response matching expected_opcode.
+    /// Respects both the global safety cap and the selected work-class budget.
+    pub async fn request_with_class(
+        &self,
+        addr: SocketAddr,
+        packet: &KadPacket,
+        expected_opcode: u8,
+        timeout_duration: Duration,
+        work_class: RpcWorkClass,
+    ) -> Result<KadPacket, NetError> {
         let (tx, rx) = oneshot::channel();
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
 
@@ -665,7 +841,7 @@ impl RpcManager {
         }
 
         // Send the packet
-        if let Err(e) = self.send(addr, packet).await {
+        if let Err(e) = self.send_with_class(addr, packet, work_class).await {
             // Remove the pending entry since we failed to send
             self.inner.pending.lock().unwrap().remove(&id);
             return Err(e);
@@ -711,7 +887,27 @@ impl RpcManager {
     /// Send a packet without waiting for a response.
     /// Respects the rate limiter.
     pub async fn send(&self, addr: SocketAddr, packet: &KadPacket) -> Result<(), NetError> {
-        self.inner.rate_limiter.acquire().await;
+        self.send_with_class(addr, packet, RpcWorkClass::Interactive)
+            .await
+    }
+
+    /// Send a packet without waiting for a response.
+    /// Respects both the global safety cap and the selected work-class budget.
+    pub async fn send_with_class(
+        &self,
+        addr: SocketAddr,
+        packet: &KadPacket,
+        work_class: RpcWorkClass,
+    ) -> Result<(), NetError> {
+        let budget_started = std::time::Instant::now();
+        self.rate_limiter_for_class(work_class).acquire().await;
+        self.inner.global_rate_limiter.acquire().await;
+        let wait_millis = budget_started.elapsed().as_millis() as u64;
+        self.inner
+            .observability
+            .lock()
+            .unwrap()
+            .record_work_class_send(work_class, wait_millis);
         let encoded = packet.encode()?;
         let outbound = self
             .inner
@@ -805,7 +1001,11 @@ impl RpcManager {
     /// Snapshot the current tracker and response-handling counters.
     #[must_use]
     pub fn observability(&self) -> RpcObservabilitySnapshot {
-        self.inner.observability.lock().unwrap().snapshot()
+        self.inner
+            .observability
+            .lock()
+            .unwrap()
+            .snapshot(self.inner.max_outbound_pps, self.inner.class_budgets)
     }
 
     /// Register a peer's announced receiver verify key for obfuscated replies.
@@ -817,6 +1017,15 @@ impl RpcManager {
     #[must_use]
     pub fn verify_key_for_ip(&self, ip: Ipv4Addr) -> u32 {
         self.inner.obfuscation.verify_key_for_ip(ip)
+    }
+
+    fn rate_limiter_for_class(&self, work_class: RpcWorkClass) -> &RateLimiter {
+        match work_class {
+            RpcWorkClass::Interactive => &self.inner.interactive_rate_limiter,
+            RpcWorkClass::Harvest => &self.inner.harvest_rate_limiter,
+            RpcWorkClass::Maintenance => &self.inner.maintenance_rate_limiter,
+            RpcWorkClass::Publish => &self.inner.publish_rate_limiter,
+        }
     }
 
     /// Return the latest receiver verify key learned for the peer IP behind this endpoint.
@@ -1564,6 +1773,40 @@ mod tests {
             .expect("hello response counters present");
         assert_eq!(hello_res_stats.matched_tracked, 1);
         assert_eq!(hello_res_stats.dropped_unrequested, 0);
+    }
+
+    #[tokio::test]
+    async fn test_observability_tracks_outbound_work_classes() {
+        let transport = MockTransport::new(make_local_addr());
+        let rpc = make_rpc_with_transport(transport);
+        let peer_addr = make_peer_addr();
+
+        rpc.send_with_class(peer_addr, &KadPacket::Ping, RpcWorkClass::Harvest)
+            .await
+            .unwrap();
+        rpc.send_with_class(peer_addr, &KadPacket::Ping, RpcWorkClass::Publish)
+            .await
+            .unwrap();
+
+        let snapshot = rpc.observability();
+        assert_eq!(snapshot.global_max_outbound_pps, RpcConfig::default().max_outbound_pps);
+        assert_eq!(snapshot.work_classes.len(), 4);
+
+        let harvest = snapshot
+            .work_classes
+            .iter()
+            .find(|work_class| work_class.class == RpcWorkClass::Harvest)
+            .expect("harvest class present");
+        assert_eq!(harvest.sent_packets, 1);
+        assert!(harvest.last_sent_at.is_some());
+
+        let publish = snapshot
+            .work_classes
+            .iter()
+            .find(|work_class| work_class.class == RpcWorkClass::Publish)
+            .expect("publish class present");
+        assert_eq!(publish.sent_packets, 1);
+        assert!(publish.last_sent_at.is_some());
     }
 
     #[tokio::test]

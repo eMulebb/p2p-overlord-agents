@@ -8,6 +8,9 @@ pub mod types;
 
 pub use error::DhtError;
 pub use node::{DhtConfig, DhtNode};
-pub use overlord_kad_net::{ReceivedKadPacket, RpcObservabilitySnapshot};
+pub use overlord_kad_net::{
+    ReceivedKadPacket, RpcClassBudgetConfig, RpcObservabilitySnapshot, RpcWorkClass,
+    RpcWorkClassSnapshot,
+};
 pub use publish::PublishAttemptStats;
 pub use types::{NoteResult, SearchResult, SourceResult};

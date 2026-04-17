@@ -10,8 +10,8 @@ use crate::error::DhtError;
 use crate::traversal::{TraversalConfig, TraversalContact, TraversalKind, run_traversal};
 use crate::types::{NoteResult, SearchResult, SourceResult};
 use overlord_kad_net::{
-    ObfuscationLayer, ReceivedKadPacket, RpcConfig, RpcManager, RpcObservabilitySnapshot,
-    UdpTransport,
+    ObfuscationLayer, ReceivedKadPacket, RpcClassBudgetConfig, RpcConfig, RpcManager,
+    RpcObservabilitySnapshot, RpcWorkClass, UdpTransport,
 };
 use overlord_kad_proto::{
     Ed2kHash, KadPacket, KadUdpKey, NodeId, SearchKeyReq, SearchSourceReq, Tag, constants::K,
@@ -51,6 +51,8 @@ pub struct DhtConfig {
     pub publish_contact_fanout: usize,
     /// Max outbound packets per second. 0 = unlimited.
     pub max_outbound_pps: u32,
+    /// Per-class outbound budgets layered underneath `max_outbound_pps`.
+    pub class_budgets: RpcClassBudgetConfig,
     /// Max number of phase-2 search packets to send after traversal.
     pub search_phase2_fanout: usize,
     /// Harvest-oriented keyword result cap.
@@ -82,6 +84,7 @@ impl Default for DhtConfig {
             republish_interval: Duration::from_secs(18000),
             publish_contact_fanout: 20,
             max_outbound_pps: 50,
+            class_budgets: RpcClassBudgetConfig::default(),
             search_phase2_fanout: 50,
             keyword_result_cap: 5000,
             source_result_cap: 1000,
@@ -148,6 +151,7 @@ impl DhtNode {
             obfuscation,
             RpcConfig {
                 max_outbound_pps: config.max_outbound_pps,
+                class_budgets: config.class_budgets,
                 massive_flood_handler: Some(Arc::new(move |addr| {
                     let flood_routing_table = Arc::clone(&flood_routing_table);
                     tokio::spawn(async move {
@@ -323,7 +327,21 @@ impl DhtNode {
 
     /// Send a packet without waiting for a response.
     pub async fn send_packet(&self, addr: SocketAddr, packet: &KadPacket) -> Result<(), DhtError> {
-        self.inner.rpc.send(addr, packet).await?;
+        self.send_packet_with_class(addr, packet, RpcWorkClass::Interactive)
+            .await
+    }
+
+    /// Send a packet without waiting for a response under an explicit work class.
+    pub async fn send_packet_with_class(
+        &self,
+        addr: SocketAddr,
+        packet: &KadPacket,
+        work_class: RpcWorkClass,
+    ) -> Result<(), DhtError> {
+        self.inner
+            .rpc
+            .send_with_class(addr, packet, work_class)
+            .await?;
         Ok(())
     }
 
@@ -339,10 +357,29 @@ impl DhtNode {
         expected_opcode: u8,
         timeout: Duration,
     ) -> Result<KadPacket, DhtError> {
+        self.request_packet_with_class(
+            addr,
+            packet,
+            expected_opcode,
+            timeout,
+            RpcWorkClass::Interactive,
+        )
+        .await
+    }
+
+    /// Send one Kad request and wait for the exact response opcode under an explicit work class.
+    pub async fn request_packet_with_class(
+        &self,
+        addr: SocketAddr,
+        packet: &KadPacket,
+        expected_opcode: u8,
+        timeout: Duration,
+        work_class: RpcWorkClass,
+    ) -> Result<KadPacket, DhtError> {
         Ok(self
             .inner
             .rpc
-            .request(addr, packet, expected_opcode, timeout)
+            .request_with_class(addr, packet, expected_opcode, timeout, work_class)
             .await?)
     }
 
@@ -353,6 +390,11 @@ impl DhtNode {
 
     /// Bootstrap from configured sources. Populates the routing table.
     pub async fn bootstrap(&self) -> Result<(), DhtError> {
+        self.bootstrap_with_class(RpcWorkClass::Maintenance).await
+    }
+
+    /// Bootstrap from configured sources. Populates the routing table.
+    pub async fn bootstrap_with_class(&self, work_class: RpcWorkClass) -> Result<(), DhtError> {
         let contacts = self.load_bootstrap_contacts();
 
         if contacts.is_empty() {
@@ -378,11 +420,12 @@ impl DhtNode {
             match self
                 .inner
                 .rpc
-                .request(
+                .request_with_class(
                     addr,
                     &KadPacket::BootstrapReq,
                     opcode::BOOTSTRAP_RES,
                     Duration::from_secs(5),
+                    work_class,
                 )
                 .await
             {
@@ -436,7 +479,8 @@ impl DhtNode {
         }
 
         // Run node lookup for own ID to fill routing table
-        self.lookup_nodes(&self.inner.own_id).await?;
+        self.lookup_nodes_with_class(&self.inner.own_id, work_class)
+            .await?;
 
         let size = self.inner.routing_table.lock().await.len();
         info!("bootstrap complete - routing table has {} contacts", size);
@@ -452,6 +496,16 @@ impl DhtNode {
 
     /// Iterative node lookup. Returns up to K contacts closest to target.
     pub async fn lookup_nodes(&self, target: &NodeId) -> Result<Vec<TraversalContact>, DhtError> {
+        self.lookup_nodes_with_class(target, RpcWorkClass::Interactive)
+            .await
+    }
+
+    /// Iterative node lookup. Returns up to K contacts closest to target.
+    pub async fn lookup_nodes_with_class(
+        &self,
+        target: &NodeId,
+        work_class: RpcWorkClass,
+    ) -> Result<Vec<TraversalContact>, DhtError> {
         let initial = {
             let rt = self.inner.routing_table.lock().await;
             rt.get_closest(target, K)
@@ -472,6 +526,7 @@ impl DhtNode {
             phase2_fanout: self.inner.config.search_phase2_fanout,
             cancel: CancellationToken::new(),
             result_tx: None,
+            work_class,
         };
 
         let result = run_traversal(&self.inner.rpc, initial, config).await;
@@ -514,13 +569,23 @@ impl DhtNode {
         target: NodeId,
         cancel: CancellationToken,
     ) -> impl tokio_stream::Stream<Item = SearchResult> + Send + 'static {
-        self.search_keyword_request_with_cancel(
+        self.search_keywords_with_cancel_and_class(target, cancel, RpcWorkClass::Interactive)
+    }
+
+    pub fn search_keywords_with_cancel_and_class(
+        &self,
+        target: NodeId,
+        cancel: CancellationToken,
+        work_class: RpcWorkClass,
+    ) -> impl tokio_stream::Stream<Item = SearchResult> + Send + 'static {
+        self.search_keyword_request_with_cancel_and_class(
             SearchKeyReq {
                 target,
                 start_position: 0,
                 restrictive_payload: Vec::new(),
             },
             cancel,
+            work_class,
         )
     }
 
@@ -529,7 +594,11 @@ impl DhtNode {
         &self,
         request: SearchKeyReq,
     ) -> impl tokio_stream::Stream<Item = SearchResult> + Send + 'static {
-        self.search_keyword_request_with_cancel(request, CancellationToken::new())
+        self.search_keyword_request_with_cancel_and_class(
+            request,
+            CancellationToken::new(),
+            RpcWorkClass::Interactive,
+        )
     }
 
     pub fn search_keyword_request_with_cancel(
@@ -537,10 +606,24 @@ impl DhtNode {
         request: SearchKeyReq,
         cancel: CancellationToken,
     ) -> impl tokio_stream::Stream<Item = SearchResult> + Send + 'static {
-        self.search_keyword_request_with_phase2_fanout_and_cancel(
+        self.search_keyword_request_with_cancel_and_class(
+            request,
+            cancel,
+            RpcWorkClass::Interactive,
+        )
+    }
+
+    pub fn search_keyword_request_with_cancel_and_class(
+        &self,
+        request: SearchKeyReq,
+        cancel: CancellationToken,
+        work_class: RpcWorkClass,
+    ) -> impl tokio_stream::Stream<Item = SearchResult> + Send + 'static {
+        self.search_keyword_request_with_phase2_fanout_and_cancel_and_class(
             request,
             self.inner.config.search_phase2_fanout,
             cancel,
+            work_class,
         )
     }
 
@@ -552,6 +635,23 @@ impl DhtNode {
         phase2_fanout: usize,
         cancel: CancellationToken,
     ) -> impl tokio_stream::Stream<Item = SearchResult> + Send + 'static {
+        self.search_keyword_request_with_phase2_fanout_and_cancel_and_class(
+            request,
+            phase2_fanout,
+            cancel,
+            RpcWorkClass::Interactive,
+        )
+    }
+
+    /// Replay a harvested Kad keyword request shape with an explicit phase-2
+    /// responder ceiling and outbound work class.
+    pub fn search_keyword_request_with_phase2_fanout_and_cancel_and_class(
+        &self,
+        request: SearchKeyReq,
+        phase2_fanout: usize,
+        cancel: CancellationToken,
+        work_class: RpcWorkClass,
+    ) -> impl tokio_stream::Stream<Item = SearchResult> + Send + 'static {
         let target = request.target;
         let initial = self.closest_search_contacts(target);
         crate::search::search_keywords_by_request(
@@ -561,6 +661,7 @@ impl DhtNode {
             self.inner.config.keyword_result_cap,
             phase2_fanout,
             cancel,
+            work_class,
         )
     }
 
@@ -579,7 +680,22 @@ impl DhtNode {
         file_size: u64,
         cancel: CancellationToken,
     ) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
-        self.search_source_request_with_phase2_fanout_and_cancel(
+        self.search_sources_with_cancel_and_class(
+            file_hash,
+            file_size,
+            cancel,
+            RpcWorkClass::Interactive,
+        )
+    }
+
+    pub fn search_sources_with_cancel_and_class(
+        &self,
+        file_hash: Ed2kHash,
+        file_size: u64,
+        cancel: CancellationToken,
+        work_class: RpcWorkClass,
+    ) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
+        self.search_source_request_with_phase2_fanout_and_cancel_and_class(
             SearchSourceReq {
                 target: NodeId::from_be_bytes(file_hash.0),
                 start_position: 0,
@@ -587,6 +703,7 @@ impl DhtNode {
             },
             self.inner.config.search_phase2_fanout,
             cancel,
+            work_class,
         )
     }
 
@@ -595,7 +712,11 @@ impl DhtNode {
         &self,
         request: SearchSourceReq,
     ) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
-        self.search_source_request_with_cancel(request, CancellationToken::new())
+        self.search_source_request_with_cancel_and_class(
+            request,
+            CancellationToken::new(),
+            RpcWorkClass::Interactive,
+        )
     }
 
     pub fn search_source_request_with_cancel(
@@ -603,10 +724,20 @@ impl DhtNode {
         request: SearchSourceReq,
         cancel: CancellationToken,
     ) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
-        self.search_source_request_with_phase2_fanout_and_cancel(
+        self.search_source_request_with_cancel_and_class(request, cancel, RpcWorkClass::Interactive)
+    }
+
+    pub fn search_source_request_with_cancel_and_class(
+        &self,
+        request: SearchSourceReq,
+        cancel: CancellationToken,
+        work_class: RpcWorkClass,
+    ) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
+        self.search_source_request_with_phase2_fanout_and_cancel_and_class(
             request,
             self.inner.config.search_phase2_fanout,
             cancel,
+            work_class,
         )
     }
 
@@ -618,6 +749,23 @@ impl DhtNode {
         phase2_fanout: usize,
         cancel: CancellationToken,
     ) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
+        self.search_source_request_with_phase2_fanout_and_cancel_and_class(
+            request,
+            phase2_fanout,
+            cancel,
+            RpcWorkClass::Interactive,
+        )
+    }
+
+    /// Search for file sources with an explicit phase-2 responder ceiling while
+    /// preserving the full request shape and work class.
+    pub fn search_source_request_with_phase2_fanout_and_cancel_and_class(
+        &self,
+        request: SearchSourceReq,
+        phase2_fanout: usize,
+        cancel: CancellationToken,
+        work_class: RpcWorkClass,
+    ) -> impl tokio_stream::Stream<Item = SourceResult> + Send + 'static {
         let target = request.target;
         let initial = self.closest_search_contacts(target);
         crate::search::search_sources_by_request(
@@ -627,6 +775,7 @@ impl DhtNode {
             self.inner.config.source_result_cap,
             phase2_fanout,
             cancel,
+            work_class,
         )
     }
 
@@ -664,11 +813,27 @@ impl DhtNode {
         file_size: u64,
         cancel: CancellationToken,
     ) -> impl tokio_stream::Stream<Item = NoteResult> + Send + 'static {
-        self.search_notes_with_phase2_fanout_and_cancel(
+        self.search_notes_with_cancel_and_class(
+            file_hash,
+            file_size,
+            cancel,
+            RpcWorkClass::Interactive,
+        )
+    }
+
+    pub fn search_notes_with_cancel_and_class(
+        &self,
+        file_hash: Ed2kHash,
+        file_size: u64,
+        cancel: CancellationToken,
+        work_class: RpcWorkClass,
+    ) -> impl tokio_stream::Stream<Item = NoteResult> + Send + 'static {
+        self.search_notes_with_phase2_fanout_and_cancel_and_class(
             file_hash,
             file_size,
             self.inner.config.search_phase2_fanout,
             cancel,
+            work_class,
         )
     }
 
@@ -680,16 +845,37 @@ impl DhtNode {
         phase2_fanout: usize,
         cancel: CancellationToken,
     ) -> impl tokio_stream::Stream<Item = NoteResult> + Send + 'static {
+        self.search_notes_with_phase2_fanout_and_cancel_and_class(
+            file_hash,
+            file_size,
+            phase2_fanout,
+            cancel,
+            RpcWorkClass::Interactive,
+        )
+    }
+
+    /// Search for notes/ratings with an explicit phase-2 responder ceiling and work class.
+    pub fn search_notes_with_phase2_fanout_and_cancel_and_class(
+        &self,
+        file_hash: Ed2kHash,
+        file_size: u64,
+        phase2_fanout: usize,
+        cancel: CancellationToken,
+        work_class: RpcWorkClass,
+    ) -> impl tokio_stream::Stream<Item = NoteResult> + Send + 'static {
         let target = NodeId::from_be_bytes(file_hash.0);
         let initial = self.closest_search_contacts(target);
         crate::search::search_notes(
             self.inner.rpc.clone(),
             initial,
-            file_hash,
-            file_size,
+            crate::search::NotesSearchRequest {
+                file_hash,
+                file_size,
+            },
             self.inner.config.notes_result_cap,
             phase2_fanout,
             cancel,
+            work_class,
         )
     }
 
@@ -701,14 +887,38 @@ impl DhtNode {
         tags: Vec<Tag>,
         aich_hash: Option<[u8; 20]>,
     ) -> Result<crate::publish::PublishAttemptStats, DhtError> {
-        crate::publish::publish_keyword(
-            &self.inner.rpc,
-            &self.inner.routing_table,
+        self.publish_keyword_with_class_and_fanout(
             keyword_hash,
             file_hash,
             tags,
             aich_hash,
+            RpcWorkClass::Publish,
             self.inner.config.publish_contact_fanout,
+        )
+        .await
+    }
+
+    /// Publish a keyword → file mapping under an explicit work class and fanout.
+    pub async fn publish_keyword_with_class_and_fanout(
+        &self,
+        keyword_hash: NodeId,
+        file_hash: Ed2kHash,
+        tags: Vec<Tag>,
+        aich_hash: Option<[u8; 20]>,
+        work_class: RpcWorkClass,
+        publish_contact_fanout: usize,
+    ) -> Result<crate::publish::PublishAttemptStats, DhtError> {
+        crate::publish::publish_keyword(
+            &self.inner.rpc,
+            &self.inner.routing_table,
+            crate::publish::KeywordPublishRequest {
+                keyword_hash,
+                file_hash,
+                tags,
+                aich_hash,
+                publish_contact_fanout,
+                work_class,
+            },
         )
         .await
     }
@@ -720,13 +930,33 @@ impl DhtNode {
         publisher_id: NodeId,
         tags: Vec<Tag>,
     ) -> Result<crate::publish::PublishAttemptStats, DhtError> {
+        self.publish_source_with_class_and_fanout(
+            file_hash,
+            publisher_id,
+            tags,
+            RpcWorkClass::Publish,
+            self.inner.config.publish_contact_fanout,
+        )
+        .await
+    }
+
+    /// Publish source availability for a file under an explicit work class and fanout.
+    pub async fn publish_source_with_class_and_fanout(
+        &self,
+        file_hash: Ed2kHash,
+        publisher_id: NodeId,
+        tags: Vec<Tag>,
+        work_class: RpcWorkClass,
+        publish_contact_fanout: usize,
+    ) -> Result<crate::publish::PublishAttemptStats, DhtError> {
         crate::publish::publish_source(
             &self.inner.rpc,
             &self.inner.routing_table,
             publisher_id,
             file_hash,
             tags,
-            self.inner.config.publish_contact_fanout,
+            publish_contact_fanout,
+            work_class,
         )
         .await
     }
@@ -741,13 +971,33 @@ impl DhtNode {
         publisher_id: NodeId,
         tags: Vec<Tag>,
     ) -> Result<crate::publish::PublishAttemptStats, DhtError> {
+        self.publish_notes_with_class_and_fanout(
+            file_hash,
+            publisher_id,
+            tags,
+            RpcWorkClass::Publish,
+            self.inner.config.publish_contact_fanout,
+        )
+        .await
+    }
+
+    /// Publish a note/rating under an explicit work class and fanout.
+    pub async fn publish_notes_with_class_and_fanout(
+        &self,
+        file_hash: Ed2kHash,
+        publisher_id: NodeId,
+        tags: Vec<Tag>,
+        work_class: RpcWorkClass,
+        publish_contact_fanout: usize,
+    ) -> Result<crate::publish::PublishAttemptStats, DhtError> {
         crate::publish::publish_notes(
             &self.inner.rpc,
             &self.inner.routing_table,
             file_hash,
             publisher_id,
             tags,
-            self.inner.config.publish_contact_fanout,
+            publish_contact_fanout,
+            work_class,
         )
         .await
     }

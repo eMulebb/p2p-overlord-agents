@@ -115,6 +115,10 @@ pub struct KadConfig {
     pub publish_contact_fanout: usize,
     /// Interval between random-target Kad routing refresh walks.
     pub routing_refresh_interval_secs: u64,
+    /// Interval between low-priority proactive Kad HELLO introductions.
+    pub hello_intro_interval_secs: u64,
+    /// Maximum number of peers to introduce ourselves to each HELLO round.
+    pub hello_intro_fanout: usize,
     /// Maximum delay between `nodes.dat` snapshots while the routing table changes.
     pub nodes_dat_refresh_interval_secs: u64,
     /// Whether the agent should actively verify UDP reachability using Kad helper peers.
@@ -139,11 +143,26 @@ pub struct KadConfig {
     pub local_store_source_capacity: usize,
     /// Maximum number of retained notes publish entries.
     pub local_store_notes_capacity: usize,
+    /// Global Kad outbound safety cap.
     pub max_outbound_pps: u32,
+    /// Reserved interactive Kad budget layered under `max_outbound_pps`.
+    pub interactive_max_outbound_pps: u32,
+    /// Reserved passive-harvest Kad budget layered under `max_outbound_pps`.
+    pub harvest_max_outbound_pps: u32,
+    /// Reserved maintenance Kad budget layered under `max_outbound_pps`.
+    pub maintenance_max_outbound_pps: u32,
+    /// Reserved background publish Kad budget layered under `max_outbound_pps`.
+    pub publish_max_outbound_pps: u32,
     pub search_phase2_fanout: usize,
     pub keyword_result_cap: usize,
     pub source_result_cap: usize,
     pub notes_result_cap: usize,
+    /// Interval between synthetic fallback publish drip ticks while the coordinator is unavailable.
+    pub synthetic_publish_interval_secs: u64,
+    /// Maximum number of synthetic fallback entries to publish per drip tick.
+    pub synthetic_publish_batch_items: usize,
+    /// Fanout used by low-priority synthetic fallback publishes.
+    pub synthetic_publish_contact_fanout: usize,
     /// Whether seed-popular runs should emit synthetic notes publishes in addition to
     /// keyword and source publishes.
     ///
@@ -352,11 +371,13 @@ impl Default for KadConfig {
             search_timeout_secs: 45,
             store_timeout_secs: 140,
             republish_interval_secs: 18_000,
-            publish_contact_fanout: 20,
-            routing_refresh_interval_secs: 120,
+            publish_contact_fanout: 8,
+            routing_refresh_interval_secs: 300,
+            hello_intro_interval_secs: 90,
+            hello_intro_fanout: 6,
             nodes_dat_refresh_interval_secs: 300,
             udp_firewall_check_enabled: true,
-            udp_firewall_recheck_interval_secs: 300,
+            udp_firewall_recheck_interval_secs: 900,
             udp_firewall_check_timeout_secs: 20,
             udp_firewall_check_contact_count: 2,
             local_store_enabled: true,
@@ -366,11 +387,18 @@ impl Default for KadConfig {
             local_store_keyword_capacity: 20_000,
             local_store_source_capacity: 20_000,
             local_store_notes_capacity: 5_000,
-            max_outbound_pps: 50,
+            max_outbound_pps: 32,
+            interactive_max_outbound_pps: 24,
+            harvest_max_outbound_pps: 4,
+            maintenance_max_outbound_pps: 2,
+            publish_max_outbound_pps: 1,
             search_phase2_fanout: 50,
             keyword_result_cap: 5_000,
             source_result_cap: 1_000,
             notes_result_cap: 1_000,
+            synthetic_publish_interval_secs: 30,
+            synthetic_publish_batch_items: 1,
+            synthetic_publish_contact_fanout: 4,
             seed_notes_publish_enabled: false,
             obfuscation_enabled: true,
             enable_mock_results: false,
@@ -1019,17 +1047,27 @@ renew_margin_secs = 300
     fn default_kad_config_enables_periodic_routing_refresh() {
         let config = EmuleAgentConfig::default();
 
-        assert_eq!(config.p2p.kad.routing_refresh_interval_secs, 120);
+        assert_eq!(config.p2p.kad.routing_refresh_interval_secs, 300);
+        assert_eq!(config.p2p.kad.hello_intro_interval_secs, 90);
+        assert_eq!(config.p2p.kad.hello_intro_fanout, 6);
         assert_eq!(config.p2p.kad.nodes_dat_refresh_interval_secs, 300);
-        assert_eq!(config.p2p.kad.publish_contact_fanout, 20);
+        assert_eq!(config.p2p.kad.publish_contact_fanout, 8);
         assert!(config.p2p.kad.udp_firewall_check_enabled);
-        assert_eq!(config.p2p.kad.udp_firewall_recheck_interval_secs, 300);
+        assert_eq!(config.p2p.kad.udp_firewall_recheck_interval_secs, 900);
         assert_eq!(config.p2p.kad.udp_firewall_check_timeout_secs, 20);
         assert_eq!(config.p2p.kad.udp_firewall_check_contact_count, 2);
         assert!(config.p2p.kad.local_store_enabled);
         assert_eq!(config.p2p.kad.local_store_keyword_ttl_secs, 86_400);
         assert_eq!(config.p2p.kad.local_store_source_ttl_secs, 21_600);
         assert_eq!(config.p2p.kad.local_store_notes_ttl_secs, 86_400);
+        assert_eq!(config.p2p.kad.max_outbound_pps, 32);
+        assert_eq!(config.p2p.kad.interactive_max_outbound_pps, 24);
+        assert_eq!(config.p2p.kad.harvest_max_outbound_pps, 4);
+        assert_eq!(config.p2p.kad.maintenance_max_outbound_pps, 2);
+        assert_eq!(config.p2p.kad.publish_max_outbound_pps, 1);
+        assert_eq!(config.p2p.kad.synthetic_publish_interval_secs, 30);
+        assert_eq!(config.p2p.kad.synthetic_publish_batch_items, 1);
+        assert_eq!(config.p2p.kad.synthetic_publish_contact_fanout, 4);
         assert_eq!(config.p2p.kad.local_store_keyword_capacity, 20_000);
         assert_eq!(config.p2p.kad.local_store_source_capacity, 20_000);
         assert_eq!(config.p2p.kad.local_store_notes_capacity, 5_000);

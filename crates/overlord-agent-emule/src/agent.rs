@@ -45,13 +45,14 @@ use overlord_agent_common::{
     HashType, IndexerServer, IndexerService, IndexerStats, KadHarvestFamilyObservability,
     KadHarvestObservability, KadPassiveReplayObservability, KadPassiveReplayTierSummary,
     KadPublishObservability, KadRpcObservability, KadRpcResponseOpcodeObservability,
-    KadRpcTrackerBucketObservability, PopularHash, Protocol, PublishBatchSummary, PublishCounters,
-    PublishSeedSource, RegisterRequest, ResultBatch, RunningIndexerServer, SearchEvent,
-    SearchEventStatus, SearchJob, SearchKind, SnoopEntry, SnoopObservation, Source, TagEntry,
+    KadRpcTrackerBucketObservability, KadRpcWorkClassObservability, PopularHash, Protocol,
+    PublishBatchSummary, PublishCounters, PublishSeedSource, RegisterRequest, ResultBatch,
+    RunningIndexerServer, SearchEvent, SearchEventStatus, SearchJob, SearchKind, SnoopEntry,
+    SnoopObservation, Source, TagEntry,
 };
 use overlord_kad_dht::{
-    DhtConfig, DhtNode, NoteResult, PublishAttemptStats, ReceivedKadPacket,
-    RpcObservabilitySnapshot, SearchResult, SourceResult,
+    DhtConfig, DhtNode, NoteResult, PublishAttemptStats, ReceivedKadPacket, RpcClassBudgetConfig,
+    RpcObservabilitySnapshot, RpcWorkClass, SearchResult, SourceResult,
     bootstrap::{BootstrapContact, encode_nodes_dat},
 };
 use overlord_kad_proto::{
@@ -112,8 +113,6 @@ const PASSIVE_REPLAY_CONCURRENCY: usize = 2;
 const PASSIVE_KEYWORD_THIN_RESULT_THRESHOLD: usize = 10;
 const PASSIVE_SOURCE_THIN_RESULT_THRESHOLD: usize = 3;
 const PASSIVE_NOTES_THIN_RESULT_THRESHOLD: usize = 3;
-const KAD_HELLO_INTRO_SECS: u64 = 30;
-const KAD_HELLO_INTRO_FANOUT: usize = 24;
 const KAD_EXTERNAL_PORT_DISCOVERY_MAX_ATTEMPTS: usize = 8;
 const KAD_EXTERNAL_PORT_DISCOVERY_QUERY_TIMEOUT_SECS: u64 = 3;
 const UDP_FIREWALL_HELPER_CANDIDATE_MULTIPLIER: usize = 4;
@@ -529,6 +528,14 @@ async fn update_publish_progress(
     ));
 }
 
+async fn set_synthetic_publish_queue_depth(
+    publish_observability: &Arc<Mutex<KadPublishObservability>>,
+    remaining_items: usize,
+) {
+    let mut observability = publish_observability.lock().await;
+    observability.synthetic_drip_queue_depth = Some(remaining_items as u32);
+}
+
 fn harvest_family_mut<'a>(
     observability: &'a mut KadHarvestObservability,
     entry: &SnoopEntry,
@@ -598,6 +605,7 @@ fn apply_queue_family_counts(
 fn map_rpc_observability(snapshot: RpcObservabilitySnapshot) -> KadRpcObservability {
     KadRpcObservability {
         decode_failures: snapshot.decode_failures,
+        global_max_outbound_pps: snapshot.global_max_outbound_pps,
         tracker_buckets: snapshot
             .tracker_buckets
             .into_iter()
@@ -617,6 +625,18 @@ fn map_rpc_observability(snapshot: RpcObservabilitySnapshot) -> KadRpcObservabil
                 matched_tracked: opcode.matched_tracked,
                 dropped_unrequested: opcode.dropped_unrequested,
                 accepted_unsolicited: opcode.accepted_unsolicited,
+            })
+            .collect(),
+        work_classes: snapshot
+            .work_classes
+            .into_iter()
+            .map(|work_class| KadRpcWorkClassObservability {
+                class: work_class.class.label().to_string(),
+                max_outbound_pps: work_class.max_outbound_pps,
+                sent_packets: work_class.sent_packets,
+                delayed_packets: work_class.delayed_packets,
+                total_wait_millis: work_class.total_wait_millis,
+                last_sent_at: work_class.last_sent_at,
             })
             .collect(),
     }
@@ -1785,6 +1805,12 @@ impl OverlordAgentEmule {
             republish_interval: Duration::from_secs(config.p2p.kad.republish_interval_secs),
             publish_contact_fanout: config.p2p.kad.publish_contact_fanout,
             max_outbound_pps: config.p2p.kad.max_outbound_pps,
+            class_budgets: RpcClassBudgetConfig {
+                interactive_max_outbound_pps: config.p2p.kad.interactive_max_outbound_pps,
+                harvest_max_outbound_pps: config.p2p.kad.harvest_max_outbound_pps,
+                maintenance_max_outbound_pps: config.p2p.kad.maintenance_max_outbound_pps,
+                publish_max_outbound_pps: config.p2p.kad.publish_max_outbound_pps,
+            },
             search_phase2_fanout: config.p2p.kad.search_phase2_fanout,
             keyword_result_cap: config.p2p.kad.keyword_result_cap,
             source_result_cap: config.p2p.kad.source_result_cap,
@@ -2149,10 +2175,11 @@ async fn run_passive_keyword_replay(
         );
         let mut stream = context
             .dht
-            .search_keyword_request_with_phase2_fanout_and_cancel(
+            .search_keyword_request_with_phase2_fanout_and_cancel_and_class(
                 request.clone(),
                 responder_ceiling,
                 CancellationToken::new(),
+                RpcWorkClass::Harvest,
             );
         while let Some(result) = stream.next().await {
             if !seen_hashes.insert(result.hash) {
@@ -2246,10 +2273,11 @@ async fn run_passive_source_replay(
         let cancel = CancellationToken::new();
         let mut stream = context
             .dht
-            .search_source_request_with_phase2_fanout_and_cancel(
+            .search_source_request_with_phase2_fanout_and_cancel_and_class(
                 request.clone(),
                 responder_ceiling,
                 cancel.clone(),
+                RpcWorkClass::Harvest,
             );
         while let Some(result) = stream.next().await {
             let source_key = (result.ip, result.tcp_port, result.udp_port);
@@ -2334,12 +2362,15 @@ async fn run_passive_notes_replay(
             "kad passive notes replay tier start target={} responder_ceiling={} size={}",
             request.target, responder_ceiling, request.size
         );
-        let mut stream = context.dht.search_notes_with_phase2_fanout_and_cancel(
-            file_hash,
-            request.size,
-            responder_ceiling,
-            CancellationToken::new(),
-        );
+        let mut stream = context
+            .dht
+            .search_notes_with_phase2_fanout_and_cancel_and_class(
+                file_hash,
+                request.size,
+                responder_ceiling,
+                CancellationToken::new(),
+                RpcWorkClass::Harvest,
+            );
         while let Some(result) = stream.next().await {
             if !seen_note_sources.insert(result.source_id) {
                 continue;
@@ -2404,7 +2435,11 @@ async fn do_active_keyword_search(
     cancel: CancellationToken,
 ) -> Result<SearchRunStats> {
     let target = keyword_target(search_query(job)?);
-    let mut stream = dht.search_keywords_with_cancel(target, cancel.clone());
+    let mut stream = dht.search_keywords_with_cancel_and_class(
+        target,
+        cancel.clone(),
+        RpcWorkClass::Interactive,
+    );
     let callback_client = CoordinatorClient::new(&job.callback_url)?;
     let mut files = Vec::new();
     let mut seen = 0usize;
@@ -2463,7 +2498,12 @@ async fn do_active_source_search(
     let file_hash = search_file_hash(job)?;
     let file_size = search_file_size(job)?;
     let callback_client = CoordinatorClient::new(&job.callback_url)?;
-    let mut stream = dht.search_sources_with_cancel(file_hash, file_size, cancel);
+    let mut stream = dht.search_sources_with_cancel_and_class(
+        file_hash,
+        file_size,
+        cancel,
+        RpcWorkClass::Interactive,
+    );
     let mut files = Vec::new();
     let mut stats = SearchRunStats::default();
 
@@ -2503,7 +2543,12 @@ async fn do_active_notes_search(
     let file_hash = search_file_hash(job)?;
     let file_size = search_file_size(job)?;
     let callback_client = CoordinatorClient::new(&job.callback_url)?;
-    let mut stream = dht.search_notes_with_cancel(file_hash, file_size, cancel);
+    let mut stream = dht.search_notes_with_cancel_and_class(
+        file_hash,
+        file_size,
+        cancel,
+        RpcWorkClass::Interactive,
+    );
     let mut files = Vec::new();
     let mut stats = SearchRunStats::default();
 
@@ -2744,7 +2789,11 @@ async fn collect_kad_ed2k_metadata(
     timeout: Duration,
 ) -> Option<LearnedEd2kMetadata> {
     let cancel = CancellationToken::new();
-    let mut stream = dht.search_keywords_with_cancel(keyword_target(query), cancel.clone());
+    let mut stream = dht.search_keywords_with_cancel_and_class(
+        keyword_target(query),
+        cancel.clone(),
+        RpcWorkClass::Interactive,
+    );
     let sleep = tokio::time::sleep(timeout);
     tokio::pin!(sleep);
     let mut learned = LearnedEd2kMetadata::default();
@@ -2929,7 +2978,12 @@ async fn collect_kad_ed2k_sources(
     timeout: Duration,
 ) -> Vec<Ed2kFoundSource> {
     let cancel = CancellationToken::new();
-    let mut stream = dht.search_sources_with_cancel(file_hash, file_size, cancel.clone());
+    let mut stream = dht.search_sources_with_cancel_and_class(
+        file_hash,
+        file_size,
+        cancel.clone(),
+        RpcWorkClass::Interactive,
+    );
     let sleep = tokio::time::sleep(timeout);
     tokio::pin!(sleep);
     let mut sources = Vec::new();
@@ -3269,6 +3323,8 @@ struct PublishExecutionContext<'a> {
     agent_activity: &'a Arc<Mutex<AgentActivityTracker>>,
     activity_key: Option<&'a str>,
     notes_publish_enabled: bool,
+    work_class: RpcWorkClass,
+    publish_contact_fanout: usize,
 }
 
 async fn run_publish_batch_with_gate<T, Operation, OperationFuture>(
@@ -3283,43 +3339,42 @@ where
     operation().await
 }
 
-/// Chooses coordinator-provided hashes when available and otherwise falls back to the
-/// built-in synthetic seed set.
-fn select_popular_hashes_for_seeding(
-    hashes: Vec<PopularHash>,
-) -> (PublishSeedSource, Vec<PopularHash>) {
-    if hashes.is_empty() {
-        (
-            PublishSeedSource::SyntheticFallback,
-            synthetic_popular_hashes(),
-        )
-    } else {
-        (PublishSeedSource::Coordinator, hashes)
-    }
-}
-
-/// Applies the synthetic fallback whenever the coordinator cannot currently provide a seed set.
-fn select_popular_hashes_from_fetch_result(
-    fetch_result: Result<Vec<PopularHash>>,
-) -> (PublishSeedSource, Vec<PopularHash>) {
-    match fetch_result {
-        Ok(hashes) => select_popular_hashes_for_seeding(hashes),
-        Err(error) => {
-            warn!("coordinator popular-hash fetch failed; using synthetic fallback: {error}");
-            (
-                PublishSeedSource::SyntheticFallback,
-                synthetic_popular_hashes(),
-            )
-        }
-    }
-}
-
-/// Fetches the current seed set from the coordinator and degrades to the synthetic fallback
-/// whenever the coordinator is offline or returns no popular hashes.
-async fn fetch_popular_hashes_for_seeding(
+async fn fetch_coordinator_popular_hashes(
     coordinator: &CoordinatorClient,
-) -> (PublishSeedSource, Vec<PopularHash>) {
-    select_popular_hashes_from_fetch_result(coordinator.popular_hashes().await)
+) -> Result<Option<Vec<PopularHash>>> {
+    let hashes = coordinator.popular_hashes().await?;
+    Ok((!hashes.is_empty()).then_some(hashes))
+}
+
+fn synthetic_publish_queue_depth(cursor: usize) -> usize {
+    let total = SYNTHETIC_POPULAR_SEEDS.len();
+    if total == 0 {
+        return 0;
+    }
+    let normalized = cursor % total;
+    if normalized == 0 {
+        total
+    } else {
+        total - normalized
+    }
+}
+
+fn next_synthetic_publish_batch(cursor: &mut usize, batch_items: usize) -> Vec<PopularHash> {
+    if SYNTHETIC_POPULAR_SEEDS.is_empty() {
+        return Vec::new();
+    }
+
+    let total = SYNTHETIC_POPULAR_SEEDS.len();
+    let start = *cursor % total;
+    let batch_len = batch_items.max(1).min(total);
+    let batch = (0..batch_len)
+        .map(|offset| {
+            let index = (start + offset) % total;
+            synthetic_popular_hash(index, &SYNTHETIC_POPULAR_SEEDS[index])
+        })
+        .collect::<Vec<_>>();
+    *cursor = (start + batch_len) % total;
+    batch
 }
 
 /// Publishes one seeding batch and logs which source produced it.
@@ -3353,19 +3408,18 @@ async fn seed_popular_from_source(
     .await
 }
 
-/// Fetches the current seed set and runs one publish batch against it.
-///
-/// This is the long-lived seeding state machine used after bootstrap and during
-/// periodic republish cycles.
-async fn seed_popular_from_coordinator_or_fallback(
+async fn seed_popular_with_activity(
     dht: &DhtNode,
     source_publish_identity: NodeId,
     source_publish_settings: SourcePublishSettings,
-    coordinator: &CoordinatorClient,
+    source: PublishSeedSource,
+    hashes: Vec<PopularHash>,
     shared_catalog: &Ed2kSharedCatalog,
     context: PublishExecutionContext<'_>,
-) -> Result<()> {
-    let (source, hashes) = fetch_popular_hashes_for_seeding(coordinator).await;
+) -> Result<bool> {
+    if hashes.is_empty() {
+        return Ok(false);
+    }
     let publish_started_at = Utc::now();
     let activity_key = publish_activity_key(source, publish_started_at);
     let mut activity_snapshot =
@@ -3396,7 +3450,7 @@ async fn seed_popular_from_coordinator_or_fallback(
     match result {
         Ok(()) => {
             clear_agent_degraded_activity(context.agent_activity).await;
-            Ok(())
+            Ok(true)
         }
         Err(error) => {
             let mut degraded_snapshot =
@@ -3407,6 +3461,35 @@ async fn seed_popular_from_coordinator_or_fallback(
             Err(error)
         }
     }
+}
+
+async fn seed_coordinator_popular_if_available(
+    dht: &DhtNode,
+    source_publish_identity: NodeId,
+    source_publish_settings: SourcePublishSettings,
+    coordinator: &CoordinatorClient,
+    shared_catalog: &Ed2kSharedCatalog,
+    context: PublishExecutionContext<'_>,
+) -> Result<bool> {
+    let hashes = match fetch_coordinator_popular_hashes(coordinator).await {
+        Ok(Some(hashes)) => hashes,
+        Ok(None) => return Ok(false),
+        Err(error) => {
+            warn!("coordinator popular-hash fetch failed; deferring to synthetic drip: {error}");
+            return Ok(false);
+        }
+    };
+
+    seed_popular_with_activity(
+        dht,
+        source_publish_identity,
+        source_publish_settings,
+        PublishSeedSource::Coordinator,
+        hashes,
+        shared_catalog,
+        context,
+    )
+    .await
 }
 
 /// Returns the eMule high-ID source type used for source publishes in the non-firewalled case.
@@ -3613,11 +3696,13 @@ async fn seed_popular_impl(
             raw_hash
         );
         match dht
-            .publish_keyword(
+            .publish_keyword_with_class_and_fanout(
                 keyword_hash,
                 file_hash,
                 keyword_tags,
                 Some(keyword_aich_hash),
+                context.work_class,
+                context.publish_contact_fanout,
             )
             .await
         {
@@ -3654,7 +3739,13 @@ async fn seed_popular_impl(
             raw_hash
         );
         match dht
-            .publish_source(file_hash, source_publish_identity, source_tags)
+            .publish_source_with_class_and_fanout(
+                file_hash,
+                source_publish_identity,
+                source_tags,
+                context.work_class,
+                context.publish_contact_fanout,
+            )
             .await
         {
             Ok(stats) => {
@@ -3688,7 +3779,13 @@ async fn seed_popular_impl(
                 notes_publish_identity
             );
             match dht
-                .publish_notes(file_hash, notes_publish_identity, notes_tags)
+                .publish_notes_with_class_and_fanout(
+                    file_hash,
+                    notes_publish_identity,
+                    notes_tags,
+                    context.work_class,
+                    context.publish_contact_fanout,
+                )
                 .await
             {
                 Ok(stats) => {
@@ -5693,6 +5790,10 @@ impl IndexerService for OverlordAgentEmule {
             publish_observability.latest_source_batch.as_ref(),
             publish_observability.last_seed_at,
         );
+        publish_observability.synthetic_drip_interval_secs =
+            Some(config.p2p.kad.synthetic_publish_interval_secs);
+        publish_observability.synthetic_drip_batch_items =
+            Some(config.p2p.kad.synthetic_publish_batch_items as u32);
         publish_observability.log_file = Some(current_log_file_status(&config));
         let mut harvest_observability = self.harvest_observability.lock().await.clone();
         apply_queue_family_counts(&mut harvest_observability, queue_family_counts);
@@ -5821,6 +5922,8 @@ impl IndexerService for OverlordAgentEmule {
                 agent_activity: &self.agent_activity,
                 activity_key: Some(activity_key.as_str()),
                 notes_publish_enabled,
+                work_class: RpcWorkClass::Publish,
+                publish_contact_fanout: config.p2p.kad.publish_contact_fanout,
             },
         )
         .await;
@@ -6682,7 +6785,10 @@ impl OverlordAgentEmule {
                 let target = random_routing_refresh_target();
                 let started_at = Instant::now();
                 let contacts_before = dht.routing_contacts().await.len();
-                match dht.lookup_nodes(&target).await {
+                match dht
+                    .lookup_nodes_with_class(&target, RpcWorkClass::Maintenance)
+                    .await
+                {
                     Ok(closest) => {
                         let contacts_after = dht.routing_contacts().await.len();
                         info!(
@@ -6725,6 +6831,10 @@ impl OverlordAgentEmule {
             obfuscation_enabled: config.p2p.ed2k.obfuscation_enabled,
         };
         let notes_publish_enabled = config.p2p.kad.seed_notes_publish_enabled;
+        let publish_contact_fanout = config.p2p.kad.publish_contact_fanout;
+        let synthetic_publish_interval_secs = config.p2p.kad.synthetic_publish_interval_secs;
+        let synthetic_publish_batch_items = config.p2p.kad.synthetic_publish_batch_items;
+        let synthetic_publish_contact_fanout = config.p2p.kad.synthetic_publish_contact_fanout;
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             let bootstrap_started_at = Utc::now();
             let mut bootstrap_snapshot =
@@ -6737,12 +6847,12 @@ impl OverlordAgentEmule {
             )
             .await;
             while !shutdown.load(Ordering::Relaxed) && !dht.is_bootstrapped() {
-                match dht.bootstrap().await {
+                match dht.bootstrap_with_class(RpcWorkClass::Maintenance).await {
                     Ok(()) => {
                         if let Err(error) = persist_nodes_dat_for(&dht, &state_paths).await {
                             warn!("failed to persist nodes.dat after bootstrap: {error}");
                         }
-                        if let Err(error) = seed_popular_from_coordinator_or_fallback(
+                        if let Err(error) = seed_coordinator_popular_if_available(
                             &dht,
                             source_publish_identity,
                             source_publish_settings,
@@ -6755,12 +6865,19 @@ impl OverlordAgentEmule {
                                 agent_activity: &agent_activity,
                                 activity_key: None,
                                 notes_publish_enabled,
+                                work_class: RpcWorkClass::Publish,
+                                publish_contact_fanout,
                             },
                         )
                         .await
                         {
-                            debug!("post-bootstrap seeding failed: {error}");
+                            debug!("post-bootstrap coordinator seeding failed: {error}");
                         }
+                        set_synthetic_publish_queue_depth(
+                            &publish_observability,
+                            SYNTHETIC_POPULAR_SEEDS.len(),
+                        )
+                        .await;
                         finish_agent_activity(
                             &agent_activity,
                             ACTIVITY_KEY_BOOTSTRAPPING,
@@ -7098,10 +7215,12 @@ impl OverlordAgentEmule {
         let ed2k_server_state = Arc::clone(&runtime.ed2k_server_state);
         let kad_firewall = Arc::clone(&runtime.kad_firewall);
         let shutdown = Arc::clone(&runtime.shutdown);
+        let hello_intro_interval_secs = config.p2p.kad.hello_intro_interval_secs;
+        let hello_intro_fanout = config.p2p.kad.hello_intro_fanout;
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             let mut introduced = std::collections::HashSet::new();
             while !shutdown.load(Ordering::Relaxed) {
-                tokio::time::sleep(Duration::from_secs(KAD_HELLO_INTRO_SECS)).await;
+                tokio::time::sleep(Duration::from_secs(hello_intro_interval_secs.max(1))).await;
                 if shutdown.load(Ordering::Relaxed) || !dht.is_bootstrapped() {
                     continue;
                 }
@@ -7128,7 +7247,7 @@ impl OverlordAgentEmule {
                     .collect::<Vec<_>>();
                 contacts.shuffle(&mut rand::thread_rng());
 
-                for (contact, addr) in contacts.into_iter().take(KAD_HELLO_INTRO_FANOUT) {
+                for (contact, addr) in contacts.into_iter().take(hello_intro_fanout.max(1)) {
                     let request_ack = should_request_proactive_hello_res_ack(
                         contact.kad_version,
                         peer_has_known_udp_key(dht.known_peer_key(addr), contact.udp_key),
@@ -7155,7 +7274,14 @@ impl OverlordAgentEmule {
                         contact.kad_version,
                         request_ack
                     );
-                    if let Err(error) = dht.send_packet(addr, &KadPacket::HelloReq(hello)).await {
+                    if let Err(error) = dht
+                        .send_packet_with_class(
+                            addr,
+                            &KadPacket::HelloReq(hello),
+                            RpcWorkClass::Maintenance,
+                        )
+                        .await
+                    {
                         debug!("failed to send Kad hello request to {addr}: {error}");
                         continue;
                     }
@@ -7972,6 +8098,78 @@ impl OverlordAgentEmule {
         let coordinator = self.coordinator.clone();
         let dht = runtime.dht.clone();
         let shutdown = Arc::clone(&runtime.shutdown);
+        let local_store = Arc::clone(&self.local_store);
+        let publish_batch_gate = Arc::clone(&self.publish_batch_gate);
+        let publish_observability = Arc::clone(&self.publish_observability);
+        let agent_activity = Arc::clone(&self.agent_activity);
+        let ed2k_shared_catalog = Arc::clone(&runtime.ed2k_shared_catalog);
+        let source_publish_identity = source_publish_client_hash(self.indexer_id);
+        let source_publish_settings = SourcePublishSettings {
+            tcp_port: config.p2p.ed2k.listen_port,
+            obfuscation_enabled: config.p2p.ed2k.obfuscation_enabled,
+        };
+        let notes_publish_enabled = config.p2p.kad.seed_notes_publish_enabled;
+        runtime.tasks.lock().await.push(tokio::spawn(async move {
+            let mut synthetic_cursor = 0usize;
+            while !shutdown.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_secs(synthetic_publish_interval_secs.max(1)))
+                    .await;
+                if shutdown.load(Ordering::Relaxed) || !dht.is_bootstrapped() {
+                    continue;
+                }
+
+                match fetch_coordinator_popular_hashes(&coordinator).await {
+                    Ok(Some(_)) => {
+                        set_synthetic_publish_queue_depth(
+                            &publish_observability,
+                            SYNTHETIC_POPULAR_SEEDS.len(),
+                        )
+                        .await;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        debug!("synthetic publish drip coordinator fetch failed: {error}");
+                    }
+                }
+
+                let batch = next_synthetic_publish_batch(
+                    &mut synthetic_cursor,
+                    synthetic_publish_batch_items,
+                );
+                let remaining_items = synthetic_publish_queue_depth(synthetic_cursor);
+                set_synthetic_publish_queue_depth(&publish_observability, remaining_items).await;
+                if batch.is_empty() {
+                    continue;
+                }
+                if let Err(error) = seed_popular_with_activity(
+                    &dht,
+                    source_publish_identity,
+                    source_publish_settings,
+                    PublishSeedSource::SyntheticFallback,
+                    batch,
+                    &ed2k_shared_catalog,
+                    PublishExecutionContext {
+                        local_store: &local_store,
+                        publish_batch_gate: &publish_batch_gate,
+                        publish_observability: &publish_observability,
+                        agent_activity: &agent_activity,
+                        activity_key: None,
+                        notes_publish_enabled,
+                        work_class: RpcWorkClass::Publish,
+                        publish_contact_fanout: synthetic_publish_contact_fanout,
+                    },
+                )
+                .await
+                {
+                    debug!("synthetic publish drip failed: {error}");
+                }
+            }
+        }));
+
+        let coordinator = self.coordinator.clone();
+        let dht = runtime.dht.clone();
+        let shutdown = Arc::clone(&runtime.shutdown);
         let republish_secs = config.p2p.kad.republish_interval_secs;
         let local_store = Arc::clone(&self.local_store);
         let publish_batch_gate = Arc::clone(&self.publish_batch_gate);
@@ -7990,7 +8188,7 @@ impl OverlordAgentEmule {
                 if shutdown.load(Ordering::Relaxed) || !dht.is_bootstrapped() {
                     continue;
                 }
-                if let Err(error) = seed_popular_from_coordinator_or_fallback(
+                if let Err(error) = seed_coordinator_popular_if_available(
                     &dht,
                     source_publish_identity,
                     source_publish_settings,
@@ -8003,11 +8201,13 @@ impl OverlordAgentEmule {
                         agent_activity: &agent_activity,
                         activity_key: None,
                         notes_publish_enabled,
+                        work_class: RpcWorkClass::Publish,
+                        publish_contact_fanout,
                     },
                 )
                 .await
                 {
-                    debug!("republish cycle failed: {error}");
+                    debug!("coordinator republish cycle failed: {error}");
                 }
             }
         }));
@@ -8046,14 +8246,14 @@ mod tests {
         empty_networking_config, emule_high_id_source_type, exact_ed2k_hash_query_token,
         flush_snoop_queue, keyword_target, manifest_has_ed2k_transfer_progress,
         next_passive_replay_request, next_passive_replay_request_for_family,
-        normalize_ed2k_user_hash_markers, parse_kad_hello_metadata, record_passive_replay_complete,
-        record_passive_replay_enqueue_wait, record_passive_replay_idle,
-        record_passive_replay_post_failure, record_passive_replay_post_latency,
-        record_passive_replay_start, restore_snoop_queue, select_ed2k_keyword_metadata,
-        select_popular_hashes_for_seeding, select_popular_hashes_from_fetch_result,
-        should_request_hello_response_ack, should_request_proactive_hello_res_ack,
-        significant_keyword_words, synthetic_file_hash, synthetic_popular_hashes,
-        synthetic_publish_aich_hash, try_acquire_passive_replay_gate,
+        next_synthetic_publish_batch, normalize_ed2k_user_hash_markers, parse_kad_hello_metadata,
+        record_passive_replay_complete, record_passive_replay_enqueue_wait,
+        record_passive_replay_idle, record_passive_replay_post_failure,
+        record_passive_replay_post_latency, record_passive_replay_start, restore_snoop_queue,
+        select_ed2k_keyword_metadata, should_request_hello_response_ack,
+        should_request_proactive_hello_res_ack, significant_keyword_words, synthetic_file_hash,
+        synthetic_popular_hash, synthetic_popular_hashes, synthetic_publish_aich_hash,
+        synthetic_publish_queue_depth, try_acquire_passive_replay_gate,
     };
     use crate::{
         config::SnoopQueueConfig,
@@ -8076,8 +8276,8 @@ mod tests {
     use overlord_agent_common::{
         AgentInterfacesView, ConfigUpdate, CoordinatorClient, HarvestFamily, HashType,
         IndexerRegistration, IndexerService, KadHarvestObservability, KadPassiveReplayTierSummary,
-        PopularHash, Protocol, PublishCounters, PublishSeedSource, RegisterRequest,
-        RegistrationResponse, SnoopEntry,
+        Protocol, PublishCounters, PublishSeedSource, RegisterRequest, RegistrationResponse,
+        SnoopEntry,
     };
     use overlord_agent_nat::{UPNP_MINIUPNPC_BACKEND, UPNP_RUPNP_BACKEND};
     use overlord_kad_dht::{DhtConfig, DhtNode, PublishAttemptStats, SearchResult};
@@ -8740,35 +8940,56 @@ mod tests {
     }
 
     #[test]
-    fn seeding_prefers_coordinator_hashes_when_present() {
-        let coordinator_hashes = vec![PopularHash {
-            hash: HashType::Ed2k("00112233445566778899aabbccddeeff".to_string()),
-            canonical_name: "ubuntu linux".to_string(),
-            size: 3_221_225_472,
-            source_count: 42,
-        }];
-
-        let (source, selected) = select_popular_hashes_for_seeding(coordinator_hashes.clone());
-
-        assert_eq!(source, PublishSeedSource::Coordinator);
-        assert_eq!(selected, coordinator_hashes);
+    fn synthetic_publish_queue_depth_tracks_remaining_rotation_window() {
+        assert_eq!(
+            synthetic_publish_queue_depth(0),
+            SYNTHETIC_POPULAR_SEEDS.len()
+        );
+        assert_eq!(
+            synthetic_publish_queue_depth(1),
+            SYNTHETIC_POPULAR_SEEDS.len() - 1
+        );
+        assert_eq!(
+            synthetic_publish_queue_depth(SYNTHETIC_POPULAR_SEEDS.len()),
+            SYNTHETIC_POPULAR_SEEDS.len()
+        );
     }
 
     #[test]
-    fn seeding_falls_back_to_synthetic_hashes_when_empty() {
-        let (source, selected) = select_popular_hashes_for_seeding(Vec::new());
+    fn synthetic_publish_batch_wraps_and_advances_cursor() {
+        let total = SYNTHETIC_POPULAR_SEEDS.len();
+        let mut cursor = total - 1;
 
-        assert_eq!(source, PublishSeedSource::SyntheticFallback);
-        assert_eq!(selected.len(), SYNTHETIC_POPULAR_SEEDS.len());
+        let batch = next_synthetic_publish_batch(&mut cursor, 3);
+
+        assert_eq!(batch.len(), 3);
+        assert_eq!(
+            batch[0],
+            synthetic_popular_hash(total - 1, &SYNTHETIC_POPULAR_SEEDS[total - 1])
+        );
+        assert_eq!(
+            batch[1],
+            synthetic_popular_hash(0, &SYNTHETIC_POPULAR_SEEDS[0])
+        );
+        assert_eq!(
+            batch[2],
+            synthetic_popular_hash(1, &SYNTHETIC_POPULAR_SEEDS[1])
+        );
+        assert_eq!(cursor, 2);
     }
 
     #[test]
-    fn seeding_falls_back_to_synthetic_hashes_when_fetch_fails() {
-        let (source, selected) =
-            select_popular_hashes_from_fetch_result(Err(anyhow::anyhow!("coordinator offline")));
+    fn synthetic_publish_batch_treats_zero_request_as_single_item_drip() {
+        let mut cursor = 0;
 
-        assert_eq!(source, PublishSeedSource::SyntheticFallback);
-        assert_eq!(selected.len(), SYNTHETIC_POPULAR_SEEDS.len());
+        let batch = next_synthetic_publish_batch(&mut cursor, 0);
+
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            batch[0],
+            synthetic_popular_hash(0, &SYNTHETIC_POPULAR_SEEDS[0])
+        );
+        assert_eq!(cursor, 1);
     }
 
     #[test]

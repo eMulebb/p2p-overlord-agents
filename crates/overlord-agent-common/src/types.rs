@@ -224,6 +224,9 @@ pub struct KadPublishObservability {
     pub keyword_counters: PublishCounters,
     #[serde(default)]
     pub source_counters: PublishCounters,
+    pub synthetic_drip_interval_secs: Option<u64>,
+    pub synthetic_drip_batch_items: Option<u32>,
+    pub synthetic_drip_queue_depth: Option<u32>,
     pub log_file: Option<AgentLogFileStatus>,
 }
 
@@ -313,14 +316,28 @@ pub struct KadRpcResponseOpcodeObservability {
     pub accepted_unsolicited: u64,
 }
 
+/// Aggregate outbound-budget counters for one Kad work class.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KadRpcWorkClassObservability {
+    pub class: String,
+    pub max_outbound_pps: u32,
+    pub sent_packets: u64,
+    pub delayed_packets: u64,
+    pub total_wait_millis: u64,
+    pub last_sent_at: Option<DateTime<Utc>>,
+}
+
 /// Machine-readable Kad RPC tracker and response-handling counters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct KadRpcObservability {
     pub decode_failures: u64,
+    pub global_max_outbound_pps: u32,
     #[serde(default)]
     pub tracker_buckets: Vec<KadRpcTrackerBucketObservability>,
     #[serde(default)]
     pub response_opcodes: Vec<KadRpcResponseOpcodeObservability>,
+    #[serde(default)]
+    pub work_classes: Vec<KadRpcWorkClassObservability>,
 }
 
 /// Kad search-request family observed on the wire.

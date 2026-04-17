@@ -19,8 +19,9 @@ pub use types::{
     HarvestReplayRecord, HashType, IndexerRegistration, IndexerStats,
     KadHarvestFamilyObservability, KadHarvestObservability, KadPassiveReplayObservability,
     KadPassiveReplayTierSummary, KadPublishObservability, KadRpcObservability,
-    KadRpcResponseOpcodeObservability, KadRpcTrackerBucketObservability, PopularHash, Protocol,
-    PublishBatchSummary, PublishCounters, PublishSeedSource, RegisterRequest, RegistrationResponse,
-    ResultBatch, SearchCancelRequest, SearchEvent, SearchEventStatus, SearchJob, SearchKind,
-    SnoopEntry, SnoopObservation, Source, TagEntry,
+    KadRpcResponseOpcodeObservability, KadRpcTrackerBucketObservability,
+    KadRpcWorkClassObservability, PopularHash, Protocol, PublishBatchSummary, PublishCounters,
+    PublishSeedSource, RegisterRequest, RegistrationResponse, ResultBatch, SearchCancelRequest,
+    SearchEvent, SearchEventStatus, SearchJob, SearchKind, SnoopEntry, SnoopObservation, Source,
+    TagEntry,
 };
