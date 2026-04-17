@@ -1144,7 +1144,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_search_phase_replays_source_request_shape() {
+    async fn test_run_search_phase_replays_source_request_wire_shape() {
         let transport = Arc::new(MockTransport::new("127.0.0.1:0".parse().unwrap()));
         let rpc = RpcManager::new(
             Arc::clone(&transport),
@@ -1188,11 +1188,27 @@ mod tests {
         let outgoing = transport.drain_outgoing();
         assert_eq!(outgoing.len(), 1);
         assert_eq!(outgoing[0].0, contact.addr);
+        assert_eq!(outgoing[0].1[0], OP_KADEMLIAHEADER);
+        assert_eq!(
+            outgoing[0].1[1],
+            overlord_kad_proto::opcode::SEARCH_SOURCE_REQ
+        );
+        assert_eq!(&outgoing[0].1[2..18], &source_request.target.0);
+        assert_eq!(
+            &outgoing[0].1[18..20],
+            &source_request.start_position.to_le_bytes()
+        );
+        assert_eq!(&outgoing[0].1[20..28], &source_request.size.to_le_bytes());
+
         let packet = KadPacket::decode(&outgoing[0].1).unwrap();
         let KadPacket::SearchSourceReq(request) = packet else {
             panic!("expected SearchSourceReq");
         };
-        assert_eq!(request, source_request);
+        assert_eq!(request.target, source_request.target);
+        // The legacy source-page offset stays on the wire, but the decoder
+        // normalizes it because the runtime only issues page-zero source lookups.
+        assert_eq!(request.start_position, 0);
+        assert_eq!(request.size, source_request.size);
     }
 
     #[tokio::test]

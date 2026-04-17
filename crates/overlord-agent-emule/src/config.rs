@@ -941,6 +941,7 @@ state_dir = "{state_dir}"
     #[test]
     fn coordinator_networking_keeps_locally_authoritative_sections() {
         let temp_root = unique_test_dir("overlord-agent-emule-config-authority");
+        fs::create_dir_all(&temp_root).unwrap();
         let config_path = temp_root.join("overlord.toml");
         fs::write(
             &config_path,

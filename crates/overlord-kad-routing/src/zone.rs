@@ -329,15 +329,20 @@ mod tests {
     }
 
     fn make_id_with_bit(depth: u32, wanted_bit: bool, discriminator: u8) -> [u8; 16] {
-        for candidate in 0u8..=u8::MAX {
-            let mut id = [0u8; 16];
-            id[0] = candidate;
-            id[15] = discriminator;
-            if NodeId::from_bytes(id).bit(depth) == wanted_bit {
-                return id;
-            }
+        let chunk_idx = (depth / 32) as usize;
+        assert!(chunk_idx < 4, "depth {depth} exceeds NodeId width");
+        let bit_idx = 31 - (depth % 32);
+        let byte_index = chunk_idx * 4 + (bit_idx / 8) as usize;
+        let mask = 1u8 << (bit_idx % 8);
+
+        let mut id = [discriminator; 16];
+        if wanted_bit {
+            id[byte_index] |= mask;
+        } else {
+            id[byte_index] &= !mask;
         }
-        panic!("failed to find id for depth={depth} wanted_bit={wanted_bit}");
+        assert_eq!(NodeId::from_bytes(id).bit(depth), wanted_bit);
+        id
     }
 
     fn make_full_leaf(depth: u32, zone_index: usize, right_contacts: usize) -> RoutingZone {
