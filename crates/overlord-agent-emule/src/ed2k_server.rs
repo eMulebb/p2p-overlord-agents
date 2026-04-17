@@ -87,9 +87,12 @@ const MAX_SERVER_DECOMPRESSED_PACKET_LEN: usize = 250_000;
 
 const EDONKEY_VERSION: u32 = 0x3C;
 const EMULE_VERSION_MAJOR: u32 = 0;
-const EMULE_VERSION_MINOR: u32 = 60;
-const EMULE_VERSION_UPDATE: u32 = 3;
-const HELLO_NICKNAME: &str = "https://emule-project.net";
+const EMULE_VERSION_MINOR: u32 = 72;
+const EMULE_VERSION_UPDATE: u32 = 0;
+// Stock eMule reads the nick from preferences. Until the agent grows an
+// operator-configurable nick surface, keep a neutral stock-like default
+// instead of the earlier project URL identity.
+const HELLO_NICKNAME: &str = "eMule";
 
 const TAGTYPE_HASH: u8 = 0x01;
 const TAGTYPE_STRING: u8 = 0x02;
@@ -3264,13 +3267,17 @@ fn push_short_u8_tag(payload: &mut Vec<u8>, name: u8, value: u8) {
     payload.push(value);
 }
 
-fn push_string_tag(payload: &mut Vec<u8>, name: u8, value: &str) {
-    let value_bytes = value.as_bytes();
-    let type_byte = if (1..=16).contains(&value_bytes.len()) {
-        TAGTYPE_STR1 + u8::try_from(value_bytes.len() - 1).expect("string tag length fits in u8")
+fn ed2k_string_tag_type(len: usize) -> u8 {
+    if (1..=16).contains(&len) {
+        TAGTYPE_STR1 + u8::try_from(len - 1).expect("string tag length fits in u8")
     } else {
         TAGTYPE_STRING
-    };
+    }
+}
+
+fn push_string_tag(payload: &mut Vec<u8>, name: u8, value: &str) {
+    let value_bytes = value.as_bytes();
+    let type_byte = ed2k_string_tag_type(value_bytes.len());
     payload.push(type_byte);
     payload.extend_from_slice(&1u16.to_le_bytes());
     payload.push(name);
@@ -3286,11 +3293,7 @@ fn push_string_tag(payload: &mut Vec<u8>, name: u8, value: &str) {
 
 fn push_short_string_tag(payload: &mut Vec<u8>, name: u8, value: &str) {
     let value_bytes = value.as_bytes();
-    let type_byte = if (1..=16).contains(&value_bytes.len()) {
-        TAGTYPE_STR1 + u8::try_from(value_bytes.len() - 1).expect("string tag length fits in u8")
-    } else {
-        TAGTYPE_STRING
-    };
+    let type_byte = ed2k_string_tag_type(value_bytes.len());
     payload.push(TAG_SHORT_NAME_MASK | type_byte);
     payload.push(name);
     if type_byte == TAGTYPE_STRING {
@@ -3904,12 +3907,13 @@ mod tests {
         SERVER_TCP_FLAG_TCPOBFUSCATION, SERVER_UDP_FLAG_UDPOBFUSCATION, ST_DESCRIPTION,
         ST_SERVERNAME, ServerSession, TAG_SHORT_NAME_MASK, TAGTYPE_UINT32, biguint_to_fixed_be,
         decode_found_sources, decode_search_result_page, decode_search_results,
-        decode_server_ident, decode_server_payload, derive_server_cipher, encode_login_request,
-        encode_offer_files_payload, encode_packet, encode_search_request, encode_source_request,
-        format_server_flags, ipv4_from_client_id, login_identity_for_server_transport,
-        new_ed2k_server_search_channel, search_keyword_via_background_session,
-        search_source_via_background_session, server_capabilities, should_use_server_obfuscation,
-        source_request_opcode, validate_found_sources,
+        decode_server_ident, decode_server_payload, derive_server_cipher, ed2k_string_tag_type,
+        encode_login_request, encode_offer_files_payload, encode_packet, encode_search_request,
+        encode_source_request, format_server_flags, ipv4_from_client_id,
+        login_identity_for_server_transport, new_ed2k_server_search_channel,
+        search_keyword_via_background_session, search_source_via_background_session,
+        server_capabilities, should_use_server_obfuscation, source_request_opcode,
+        validate_found_sources,
     };
     use crate::{
         ed2k_tcp::{Ed2kHelloIdentity, emule_connect_options},
@@ -3955,7 +3959,12 @@ mod tests {
             connect_options: emule_connect_options(true),
             direct_udp_callback: false,
         });
-        let nickname_tag_header = [super::TAGTYPE_STRING, 0x01, 0x00, CT_NAME];
+        let nickname_tag_header = [
+            ed2k_string_tag_type(HELLO_NICKNAME.len()),
+            0x01,
+            0x00,
+            CT_NAME,
+        ];
         let version_tag_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_VERSION];
         let server_flags_tag_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_SERVER_FLAGS];
         let emule_version_tag_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_EMULE_VERSION];
@@ -4034,7 +4043,7 @@ mod tests {
     }
 
     #[test]
-    fn login_request_matches_oracle_plaintext_sample() {
+    fn login_request_matches_stock_072a_plaintext_sample() {
         let packet = encode_packet(
             OP_LOGINREQUEST,
             &encode_login_request(Ed2kHelloIdentity {
@@ -4055,7 +4064,7 @@ mod tests {
         .unwrap();
 
         let expected = decode(
-            "e3520000000173bec566140e7e6083c450c9af026f83000000004fb60400000002010001190068747470733a2f2f656d756c652d70726f6a6563742e6e6574030100113c0000000301002019010000030100fb80f10000",
+            "e33c0000000173bec566140e7e6083c450c9af026f83000000004fb60400000015010001654d756c65030100113c0000000301002019010000030100fb00200100",
         )
         .unwrap();
 
@@ -4063,7 +4072,7 @@ mod tests {
     }
 
     #[test]
-    fn login_request_matches_oracle_obfuscated_preference_sample() {
+    fn login_request_matches_stock_072a_obfuscated_preference_sample() {
         let packet = encode_packet(
             OP_LOGINREQUEST,
             &encode_login_request(Ed2kHelloIdentity {
@@ -4084,7 +4093,7 @@ mod tests {
         .unwrap();
 
         let expected = decode(
-            "e3520000000173bec566140e7e6083c450c9af026f83000000004fb60400000002010001190068747470733a2f2f656d756c652d70726f6a6563742e6e6574030100113c0000000301002019070000030100fb80f10000",
+            "e33c0000000173bec566140e7e6083c450c9af026f83000000004fb60400000015010001654d756c65030100113c0000000301002019070000030100fb00200100",
         )
         .unwrap();
 

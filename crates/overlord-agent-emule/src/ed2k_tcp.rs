@@ -115,8 +115,8 @@ const ED2K_UPLOAD_PACKET_FRAGMENT_LEN: usize = 10_240;
 const EMULE_PROTOCOL_VERSION: u8 = 0x01;
 const EDONKEY_VERSION: u32 = 0x3C;
 const EMULE_VERSION_MAJOR: u32 = 0;
-const EMULE_VERSION_MINOR: u32 = 60;
-const EMULE_VERSION_UPDATE: u32 = 3;
+const EMULE_VERSION_MINOR: u32 = 72;
+const EMULE_VERSION_UPDATE: u32 = 0;
 const EMULE_VERSION_SHORT: u8 = EMULE_VERSION_MINOR as u8;
 const EMULE_SECURE_IDENT_VERSION: u32 = 3;
 const EMULE_INFO_FEATURES: u32 = 3;
@@ -162,7 +162,10 @@ const ED2K_SECURE_IDENT_KEY_BITS: usize = 384;
 const ED2K_SECURE_IDENT_SIGNATURE_NEEDED: u8 = 1;
 const ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED: u8 = 2;
 
-const HELLO_NICKNAME: &str = "https://emule-project.net";
+// Stock eMule reads the nick from preferences. Until the agent grows an
+// operator-configurable nick surface, keep a neutral stock-like default
+// instead of the earlier project URL identity.
+const HELLO_NICKNAME: &str = "eMule";
 
 /// One decoded eD2k TCP packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2575,16 +2578,22 @@ pub const fn emule_connect_options(obfuscation_enabled: bool) -> u8 {
 fn encode_hello_request(identity: Ed2kHelloIdentity) -> Vec<u8> {
     let mut payload = Vec::with_capacity(96);
     payload.push(16);
-    payload.extend_from_slice(&encode_hello_type_payload(identity));
+    payload.extend_from_slice(&encode_hello_type_payload(
+        identity,
+        append_emule_hello_request_tags,
+    ));
     encode_packet(OP_EDONKEYPROT, OP_HELLO, &payload)
 }
 
-fn encode_hello_type_payload(identity: Ed2kHelloIdentity) -> Vec<u8> {
+fn encode_hello_type_payload(
+    identity: Ed2kHelloIdentity,
+    append_tags: fn(&mut Vec<u8>, Ed2kHelloIdentity),
+) -> Vec<u8> {
     let mut payload = Vec::with_capacity(96);
     payload.extend_from_slice(&identity.user_hash);
     payload.extend_from_slice(&identity.client_id.to_le_bytes());
     payload.extend_from_slice(&identity.tcp_port.to_le_bytes());
-    append_emule_hello_tags(&mut payload, identity);
+    append_tags(&mut payload, identity);
     payload.extend_from_slice(&identity.server_ip.to_le_bytes());
     payload.extend_from_slice(&identity.server_port.to_le_bytes());
     payload
@@ -2601,13 +2610,17 @@ fn push_ed2k_u32_tag(payload: &mut Vec<u8>, name: u8, value: u32) {
     payload.extend_from_slice(&value.to_le_bytes());
 }
 
-fn push_ed2k_string_tag(payload: &mut Vec<u8>, name: u8, value: &str) {
-    let value_bytes = value.as_bytes();
-    let type_byte = if (1..=16).contains(&value_bytes.len()) {
-        TAGTYPE_STR1 + u8::try_from(value_bytes.len() - 1).expect("string tag length fits in u8")
+fn ed2k_string_tag_type(len: usize) -> u8 {
+    if (1..=16).contains(&len) {
+        TAGTYPE_STR1 + u8::try_from(len - 1).expect("string tag length fits in u8")
     } else {
         TAGTYPE_STRING
-    };
+    }
+}
+
+fn push_ed2k_string_tag(payload: &mut Vec<u8>, name: u8, value: &str) {
+    let value_bytes = value.as_bytes();
+    let type_byte = ed2k_string_tag_type(value_bytes.len());
     encode_ed2k_short_tag_header(payload, type_byte, name);
     if type_byte == TAGTYPE_STRING {
         payload.extend_from_slice(
@@ -2628,11 +2641,12 @@ fn emule_misc_options1() -> u32 {
     let source_exchange_version = 4u32;
     let extended_requests_version = 2u32;
     let comments_version = 1u32;
-    let peer_cache = 1u32;
+    // Recent stock eMule no longer advertises peer cache support.
+    let peer_cache = 0u32;
     let no_view_shared_files = 1u32;
-    // Do not advertise multipacket support until the downloader and listener
-    // actually speak the oracle-style packed startup/request variants.
-    let multipacket = 0u32;
+    // Recent live-network captures and the local 0.72a source both advertise
+    // the packed/multipacket startup profile on the peer hello path.
+    let multipacket = 1u32;
     let preview_supported = 0u32;
     (supports_aich << 29)
         | (supports_unicode << 28)
@@ -2649,16 +2663,17 @@ fn emule_misc_options1() -> u32 {
 }
 
 fn emule_misc_options2(connect_options: u8, direct_udp_callback: bool) -> u32 {
-    // File identifiers are coupled to multipacket-ext2 and hashsetrequest2 in
-    // the oracle. Keep the advert conservative until those paths exist here.
-    let supports_file_identifiers = 0u32;
+    // Mirror the recent eMule hello profile instead of the older conservative
+    // advert. The runtime already exchanges the newer sources2 and AICH probe
+    // path that recent peers expect during startup.
+    let supports_file_identifiers = 1u32;
     let direct_udp_callback = u32::from(direct_udp_callback);
     let supports_captcha = 1u32;
     let supports_source_exchange2 = 1u32;
     let requires_crypt_layer = 0u32;
     let requests_crypt_layer = u32::from((connect_options & EMULE_CRYPT_REQUESTS) != 0);
     let supports_crypt_layer = u32::from((connect_options & EMULE_CRYPT_SUPPORTS) != 0);
-    let ext_multipacket = 0u32;
+    let ext_multipacket = 1u32;
     let supports_large_files = 1u32;
     let kad_version = EMULE_ADVERTISED_KAD_VERSION;
     (supports_file_identifiers << 13)
@@ -2677,7 +2692,15 @@ fn emule_version_tag() -> u32 {
     (EMULE_VERSION_MAJOR << 17) | (EMULE_VERSION_MINOR << 10) | (EMULE_VERSION_UPDATE << 7)
 }
 
-fn append_emule_hello_tags(payload: &mut Vec<u8>, identity: Ed2kHelloIdentity) {
+fn append_emule_hello_request_tags(payload: &mut Vec<u8>, identity: Ed2kHelloIdentity) {
+    append_recent_emule_hello_tags(payload, identity);
+}
+
+fn append_emule_hello_answer_tags(payload: &mut Vec<u8>, identity: Ed2kHelloIdentity) {
+    append_recent_emule_hello_tags(payload, identity);
+}
+
+fn append_recent_emule_hello_tags(payload: &mut Vec<u8>, identity: Ed2kHelloIdentity) {
     payload.extend_from_slice(&6u32.to_le_bytes());
     push_ed2k_string_tag(payload, CT_NAME, HELLO_NICKNAME);
     push_ed2k_u32_tag(payload, CT_VERSION, EDONKEY_VERSION);
@@ -2701,7 +2724,7 @@ fn encode_hello_answer(identity: Ed2kHelloIdentity) -> Vec<u8> {
     encode_packet(
         OP_EDONKEYPROT,
         OP_HELLOANSWER,
-        &encode_hello_type_payload(identity),
+        &encode_hello_type_payload(identity, append_emule_hello_answer_tags),
     )
 }
 
@@ -4569,17 +4592,17 @@ mod tests {
         Ed2kPeerSecureIdentState, Ed2kSecureIdent, Ed2kTransport, Ed2kTransportMode,
         FirewallCheckUdpRequest, HELLO_NICKNAME, OP_EDONKEYPROT, OP_EMULEINFO, OP_EMULEINFOANSWER,
         OP_EMULEPROT, OP_FILESTATUS, OP_FWCHECKUDPREQ, OP_HELLO, OP_HELLOANSWER,
-        OP_REQFILENAMEANSWER, OP_REQUESTPARTS, OP_SECIDENTSTATE, TAGTYPE_STRING, TAGTYPE_UINT32,
+        OP_REQFILENAMEANSWER, OP_REQUESTPARTS, OP_SECIDENTSTATE, TAGTYPE_UINT32,
         begin_secure_ident_probe, build_hello_responses, connect_callback_peer,
         decode_incoming_obfuscation_header, decode_peer_payload, decode_public_key_payload,
         decode_request_parts_payload, decode_secident_state, derive_obfuscation_key,
-        download_file_from_peer, drive_download_session, emule_connect_options,
-        emule_misc_options1, emule_misc_options2, emule_version_tag, encode_accept_upload_req,
-        encode_emule_info_answer, encode_emule_info_request, encode_hello_answer,
-        encode_hello_request, encode_incoming_obfuscation_response, encode_packed_packet,
-        encode_packet, encode_secident_state, encode_sending_part, enrich_hello_identity,
-        is_mule_hello, next_download_read_timeout, request_udp_firewall_check,
-        select_download_window_limits,
+        download_file_from_peer, drive_download_session, ed2k_string_tag_type,
+        emule_connect_options, emule_misc_options1, emule_misc_options2, emule_version_tag,
+        encode_accept_upload_req, encode_emule_info_answer, encode_emule_info_request,
+        encode_hello_answer, encode_hello_request, encode_incoming_obfuscation_response,
+        encode_packed_packet, encode_packet, encode_secident_state, encode_sending_part,
+        enrich_hello_identity, is_mule_hello, next_download_read_timeout,
+        request_udp_firewall_check, select_download_window_limits,
     };
     use crate::{
         ed2k_server::{Ed2kFoundSource, Ed2kServerState},
@@ -4896,7 +4919,12 @@ mod tests {
             connect_options: emule_connect_options(true),
             direct_udp_callback: false,
         });
-        let expected_name_header = [TAGTYPE_STRING, 0x01, 0x00, CT_NAME];
+        let expected_name_header = [
+            ed2k_string_tag_type(HELLO_NICKNAME.len()),
+            0x01,
+            0x00,
+            CT_NAME,
+        ];
         let expected_u32_version_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_VERSION];
         let expected_udp_ports_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_EMULE_UDPPORTS];
         let expected_misc1_header = [TAGTYPE_UINT32, 0x01, 0x00, CT_EMULE_MISCOPTIONS1];
@@ -4988,7 +5016,7 @@ mod tests {
     }
 
     #[test]
-    fn hello_answer_matches_oracle_plaintext_sample() {
+    fn hello_answer_matches_stock_072a_plaintext_sample() {
         let packet = encode_hello_answer(Ed2kHelloIdentity {
             user_hash: [
                 0x73, 0xBE, 0xC5, 0x66, 0x14, 0x0E, 0x7E, 0x60, 0x83, 0xC4, 0x50, 0xC9, 0xAF, 0x02,
@@ -5004,7 +5032,7 @@ mod tests {
         });
 
         let expected = decode(
-            "e3680000004c73bec566140e7e6083c450c9af026f8395581b524fb60600000002010001190068747470733a2f2f656d756c652d70726f6a6563742e6e6574030100113c000000030100f951b651b6030100fa1e421334030100fe3a2c0000030100fb80f10000b07b02ef8810",
+            "e3520000004c73bec566140e7e6083c450c9af026f8395581b524fb60600000015010001654d756c65030100113c000000030100f951b651b6030100fa16421334030100fe3a2c0000030100fb00200100b07b02ef8810",
         )
         .unwrap();
 
