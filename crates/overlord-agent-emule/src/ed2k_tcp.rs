@@ -96,6 +96,8 @@ const OP_SENDINGPART_I64: u8 = 0xA2;
 const OP_REQUESTPARTS_I64: u8 = 0xA3;
 const OP_MULTIPACKET_EXT2: u8 = 0xA9;
 const OP_MULTIPACKETANSWER_EXT2: u8 = 0xB0;
+const OP_HASHSETREQUEST2: u8 = 0xB1;
+const OP_HASHSETANSWER2: u8 = 0xB2;
 const OP_EMULEINFO: u8 = 0x01;
 const OP_EMULEINFOANSWER: u8 = 0x02;
 const OP_PUBLICKEY: u8 = 0x85;
@@ -351,6 +353,56 @@ impl Ed2kFileIdentifier {
                 _ => true,
             }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ed2kHashsetRequestOptions {
+    request_md4: bool,
+    request_aich: bool,
+}
+
+impl Ed2kHashsetRequestOptions {
+    const REQUEST_MD4: u8 = 1 << 0;
+    const REQUEST_AICH: u8 = 1 << 1;
+
+    fn encode(self) -> u8 {
+        (if self.request_md4 {
+            Self::REQUEST_MD4
+        } else {
+            0
+        }) | (if self.request_aich {
+            Self::REQUEST_AICH
+        } else {
+            0
+        })
+    }
+
+    const fn decode(options: u8) -> Self {
+        Self {
+            request_md4: options & Self::REQUEST_MD4 != 0,
+            request_aich: options & Self::REQUEST_AICH != 0,
+        }
+    }
+
+    const fn has_known_request(self) -> bool {
+        self.request_md4 || self.request_aich
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Ed2kAichHashset {
+    master_hash: [u8; 20],
+    part_hashes: Vec<[u8; 20]>,
+}
+
+type Ed2kMd4Hashset = Vec<[u8; 16]>;
+type Ed2kMd4HashsetDecode<'a> = (Ed2kHash, Ed2kMd4Hashset, &'a [u8]);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Ed2kHashsetAnswer2 {
+    file_identifier: Ed2kFileIdentifier,
+    md4_hashset: Option<Ed2kMd4Hashset>,
+    aich_hashset: Option<Ed2kAichHashset>,
 }
 
 /// Persistent RSA identity used for the eMule secure-ident side channel.
@@ -658,6 +710,8 @@ fn ed2k_opcode_name(protocol: u8, opcode: u8) -> &'static str {
         (OP_EMULEPROT, OP_COMPRESSEDPART_I64) => "OP_COMPRESSEDPART_I64",
         (OP_EMULEPROT, OP_SENDINGPART_I64) => "OP_SENDINGPART_I64",
         (OP_EMULEPROT, OP_REQUESTPARTS_I64) => "OP_REQUESTPARTS_I64",
+        (OP_EMULEPROT, OP_HASHSETREQUEST2) => "OP_HASHSETREQUEST2",
+        (OP_EMULEPROT, OP_HASHSETANSWER2) => "OP_HASHSETANSWER2",
         (OP_EMULEPROT, OP_PUBLICKEY) => "OP_PUBLICKEY",
         (OP_EMULEPROT, OP_SIGNATURE) => "OP_SIGNATURE",
         (OP_EMULEPROT, OP_SECIDENTSTATE) => "OP_SECIDENTSTATE",
@@ -1404,7 +1458,7 @@ pub(crate) async fn connect_callback_peer(
 /// public peers accept more readily than our earlier minimal flow:
 ///
 /// `OP_HELLO -> OP_HELLOANSWER -> secure-ident -> OP_REQUESTFILENAME ->
-/// OP_SETREQFILEID -> OP_HASHSETREQUEST/ANSWER -> OP_STARTUPLOADREQ ->
+/// OP_SETREQFILEID -> OP_HASHSETREQUEST2/ANSWER2 -> OP_STARTUPLOADREQ ->
 /// OP_ACCEPTUPLOADREQ -> OP_REQUESTPARTS`
 ///
 /// Public peers that the oracle downloaded from were closing on our earlier
@@ -1700,7 +1754,17 @@ async fn drive_download_session(
                         .store_md4_hashset(file_hash_hex, Vec::new())
                         .await?;
                 } else {
-                    let hashset_request = encode_hashset_request(&file_hash);
+                    let hashset_request = if remote_supports_file_identifiers {
+                        encode_hashset_request2(
+                            &request_file_identifier,
+                            Ed2kHashsetRequestOptions {
+                                request_md4: true,
+                                request_aich: false,
+                            },
+                        )?
+                    } else {
+                        encode_hashset_request(&file_hash)
+                    };
                     dump_ed2k_tcp_download_send(
                         peer_addr,
                         transport.mode,
@@ -1711,7 +1775,11 @@ async fn drive_download_session(
                         .write_all(&hashset_request)
                         .await
                         .with_context(|| {
-                            format!("failed to send OP_HASHSETREQUEST to {peer_addr}")
+                            if remote_supports_file_identifiers {
+                                format!("failed to send OP_HASHSETREQUEST2 to {peer_addr}")
+                            } else {
+                                format!("failed to send OP_HASHSETREQUEST to {peer_addr}")
+                            }
                         })?;
                     hashset_requested = true;
                     hashset_requested_at = Some(tokio::time::Instant::now());
@@ -1990,6 +2058,22 @@ async fn drive_download_session(
                     manifest = transfer_runtime
                         .store_md4_hashset(file_hash_hex, hashset)
                         .await?;
+                }
+                (OP_EMULEPROT, OP_HASHSETANSWER2) => {
+                    let hashset_answer = decode_hashset_answer2(&packet.payload)?;
+                    if !request_file_identifier
+                        .matches_relaxed(&hashset_answer.file_identifier)
+                    {
+                        anyhow::bail!(
+                            "peer {peer_addr} returned OP_HASHSETANSWER2 for unexpected file {}",
+                            hashset_answer.file_identifier.file_hash
+                        );
+                    }
+                    if let Some(hashset) = hashset_answer.md4_hashset {
+                        manifest = transfer_runtime
+                            .store_md4_hashset(file_hash_hex, hashset)
+                            .await?;
+                    }
                 }
                 (OP_EDONKEYPROT, OP_REQFILENAMEANSWER) => {
                     startup_file_response_received = true;
@@ -2830,8 +2914,8 @@ fn emule_misc_options1() -> u32 {
 
 fn emule_misc_options2(connect_options: u8, direct_udp_callback: bool) -> u32 {
     // Mirror the recent eMule hello profile instead of the older conservative
-    // advert. The runtime already exchanges the newer sources2 and AICH probe
-    // path that recent peers expect during startup.
+    // advert. The runtime already exchanges the newer sources2, EXT2, and
+    // hashset-request2 startup path that recent peers expect.
     let supports_file_identifiers = 1u32;
     let direct_udp_callback = u32::from(direct_udp_callback);
     let supports_captcha = 1u32;
@@ -3675,6 +3759,35 @@ async fn handle_connection(
                     .await
                     .with_context(|| format!("failed to send OP_HASHSETANSWER to {peer_addr}"))?;
             }
+            (OP_EMULEPROT, OP_HASHSETREQUEST2) => {
+                let (requested_identifier, request_options) =
+                    decode_hashset_request2(&packet.payload)?;
+                let requested = requested_identifier.file_hash;
+                requested_file_hash = Some(requested);
+                if !request_options.has_known_request() {
+                    continue;
+                }
+                let reply = if let Some(shared) = transfer_runtime.local_entry(&requested).await? {
+                    let shared_identifier = Ed2kFileIdentifier::from_shared_entry(&shared)?;
+                    if !shared_identifier.matches_relaxed(&requested_identifier) {
+                        encode_file_req_ans_nofil(&requested)
+                    } else {
+                        let md4_hashset = if request_options.request_md4 {
+                            transfer_runtime.md4_hashset(&requested).await?
+                        } else {
+                            None
+                        };
+                        encode_hashset_answer2(&shared_identifier, md4_hashset.as_deref(), None)?
+                    }
+                } else {
+                    encode_file_req_ans_nofil(&requested)
+                };
+                dump_ed2k_tcp_listener_send(peer_addr, transport.mode, "hashset_request", &reply);
+                transport
+                    .write_all(&reply)
+                    .await
+                    .with_context(|| format!("failed to send OP_HASHSETANSWER2 to {peer_addr}"))?;
+            }
             (OP_EMULEPROT, OP_REQUESTSOURCES) | (OP_EMULEPROT, OP_REQUESTSOURCES2) => {
                 let (requested, requested_version) =
                     decode_request_sources_payload(packet.opcode, &packet.payload)?;
@@ -4331,15 +4444,81 @@ fn encode_hashset_request(file_hash: &Ed2kHash) -> Vec<u8> {
     encode_packet(OP_EDONKEYPROT, OP_HASHSETREQUEST, &file_hash.0)
 }
 
+fn encode_hashset_request2(
+    file_identifier: &Ed2kFileIdentifier,
+    request_options: Ed2kHashsetRequestOptions,
+) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        request_options.has_known_request(),
+        "OP_HASHSETREQUEST2 expects at least one known hashset request"
+    );
+    let mut payload = Vec::with_capacity(46);
+    file_identifier.encode_into(&mut payload);
+    payload.push(request_options.encode());
+    Ok(encode_packet(OP_EMULEPROT, OP_HASHSETREQUEST2, &payload))
+}
+
 fn encode_hashset_answer(file_hash: &Ed2kHash, md4_hashset: &[[u8; 16]]) -> Result<Vec<u8>> {
-    let count = u16::try_from(md4_hashset.len()).context("MD4 hashset entry count exceeds u16")?;
     let mut payload = Vec::with_capacity(16 + 2 + (md4_hashset.len() * 16));
+    encode_md4_hashset_body(file_hash, md4_hashset, &mut payload)?;
+    Ok(encode_packet(OP_EDONKEYPROT, OP_HASHSETANSWER, &payload))
+}
+
+fn encode_hashset_answer2(
+    file_identifier: &Ed2kFileIdentifier,
+    md4_hashset: Option<&[[u8; 16]]>,
+    aich_hashset: Option<&Ed2kAichHashset>,
+) -> Result<Vec<u8>> {
+    let mut payload = Vec::with_capacity(48);
+    file_identifier.encode_into(&mut payload);
+
+    let include_md4 = md4_hashset.is_some_and(|hashset| {
+        !hashset.is_empty()
+            || file_identifier
+                .file_size
+                .is_some_and(|file_size| file_size > ED2K_PART_SIZE)
+    });
+    let include_aich = aich_hashset.is_some();
+    payload.push(
+        Ed2kHashsetRequestOptions {
+            request_md4: include_md4,
+            request_aich: include_aich,
+        }
+        .encode(),
+    );
+    if let Some(hashset) = md4_hashset.filter(|_| include_md4) {
+        encode_md4_hashset_body(&file_identifier.file_hash, hashset, &mut payload)?;
+    }
+    if let Some(hashset) = aich_hashset {
+        encode_aich_hashset_body(hashset, &mut payload)?;
+    }
+
+    Ok(encode_packet(OP_EMULEPROT, OP_HASHSETANSWER2, &payload))
+}
+
+fn encode_md4_hashset_body(
+    file_hash: &Ed2kHash,
+    md4_hashset: &[[u8; 16]],
+    payload: &mut Vec<u8>,
+) -> Result<()> {
+    let count = u16::try_from(md4_hashset.len()).context("MD4 hashset entry count exceeds u16")?;
     payload.extend_from_slice(&file_hash.0);
     payload.extend_from_slice(&count.to_le_bytes());
     for part_hash in md4_hashset {
         payload.extend_from_slice(part_hash);
     }
-    Ok(encode_packet(OP_EDONKEYPROT, OP_HASHSETANSWER, &payload))
+    Ok(())
+}
+
+fn encode_aich_hashset_body(hashset: &Ed2kAichHashset, payload: &mut Vec<u8>) -> Result<()> {
+    let count =
+        u16::try_from(hashset.part_hashes.len()).context("AICH hashset entry count exceeds u16")?;
+    payload.extend_from_slice(&hashset.master_hash);
+    payload.extend_from_slice(&count.to_le_bytes());
+    for part_hash in &hashset.part_hashes {
+        payload.extend_from_slice(part_hash);
+    }
+    Ok(())
 }
 
 fn encode_request_filename_answer(file_hash: &Ed2kHash, file_name: &str) -> Result<Vec<u8>> {
@@ -4352,6 +4531,19 @@ fn encode_request_filename_answer(file_hash: &Ed2kHash, file_name: &str) -> Resu
         OP_REQFILENAMEANSWER,
         &payload,
     ))
+}
+
+fn decode_hashset_request2(
+    payload: &[u8],
+) -> Result<(Ed2kFileIdentifier, Ed2kHashsetRequestOptions)> {
+    let (file_identifier, remaining) = Ed2kFileIdentifier::decode(payload)?;
+    let Some((&options, rest)) = remaining.split_first() else {
+        anyhow::bail!("short OP_HASHSETREQUEST2 payload");
+    };
+    if !rest.is_empty() {
+        anyhow::bail!("trailing OP_HASHSETREQUEST2 payload {}", rest.len());
+    }
+    Ok((file_identifier, Ed2kHashsetRequestOptions::decode(options)))
 }
 
 fn decode_request_parts_payload(
@@ -4468,6 +4660,59 @@ fn encode_request_parts_batch(file_hash: &Ed2kHash, ranges: &[(u64, u64)]) -> Re
 }
 
 fn decode_hashset_answer(payload: &[u8]) -> Result<(Ed2kHash, Vec<[u8; 16]>)> {
+    let (file_hash, hashset, remaining) = decode_md4_hashset_body(payload)?;
+    if !remaining.is_empty() {
+        anyhow::bail!("trailing OP_HASHSETANSWER payload {}", remaining.len());
+    }
+    Ok((file_hash, hashset))
+}
+
+fn decode_hashset_answer2(payload: &[u8]) -> Result<Ed2kHashsetAnswer2> {
+    let (file_identifier, remaining) = Ed2kFileIdentifier::decode(payload)?;
+    let Some((&options, mut remaining)) = remaining.split_first() else {
+        anyhow::bail!("short OP_HASHSETANSWER2 payload");
+    };
+    let options = Ed2kHashsetRequestOptions::decode(options);
+    let md4_hashset = if options.request_md4 {
+        let (returned_hash, hashset, rest) = decode_md4_hashset_body(remaining)?;
+        if returned_hash != file_identifier.file_hash {
+            anyhow::bail!(
+                "OP_HASHSETANSWER2 MD4 section was for {} instead of {}",
+                returned_hash,
+                file_identifier.file_hash
+            );
+        }
+        remaining = rest;
+        Some(hashset)
+    } else {
+        None
+    };
+    let aich_hashset = if options.request_aich {
+        let (hashset, rest) = decode_aich_hashset_body(remaining)?;
+        if let Some(expected_root) = file_identifier.aich_root
+            && hashset.master_hash != expected_root
+        {
+            anyhow::bail!(
+                "OP_HASHSETANSWER2 AICH section root mismatch for {}",
+                file_identifier.file_hash
+            );
+        }
+        remaining = rest;
+        Some(hashset)
+    } else {
+        None
+    };
+    if !remaining.is_empty() {
+        anyhow::bail!("trailing OP_HASHSETANSWER2 payload {}", remaining.len());
+    }
+    Ok(Ed2kHashsetAnswer2 {
+        file_identifier,
+        md4_hashset,
+        aich_hashset,
+    })
+}
+
+fn decode_md4_hashset_body(payload: &[u8]) -> Result<Ed2kMd4HashsetDecode<'_>> {
     if payload.len() < 18 {
         anyhow::bail!("short OP_HASHSETANSWER payload {}", payload.len());
     }
@@ -4475,9 +4720,9 @@ fn decode_hashset_answer(payload: &[u8]) -> Result<(Ed2kHash, Vec<[u8; 16]>)> {
     hash.copy_from_slice(&payload[..16]);
     let count = usize::from(u16::from_le_bytes([payload[16], payload[17]]));
     let expected = 18 + (count * 16);
-    if payload.len() != expected {
+    if payload.len() < expected {
         anyhow::bail!(
-            "invalid OP_HASHSETANSWER payload length {} expected {}",
+            "short OP_HASHSETANSWER payload length {} expected at least {}",
             payload.len(),
             expected
         );
@@ -4490,7 +4735,39 @@ fn decode_hashset_answer(payload: &[u8]) -> Result<(Ed2kHash, Vec<[u8; 16]>)> {
         hashset.push(part_hash);
         cursor += 16;
     }
-    Ok((Ed2kHash::from_bytes(hash), hashset))
+    Ok((Ed2kHash::from_bytes(hash), hashset, &payload[cursor..]))
+}
+
+fn decode_aich_hashset_body(payload: &[u8]) -> Result<(Ed2kAichHashset, &[u8])> {
+    if payload.len() < 22 {
+        anyhow::bail!("short AICH hashset body {}", payload.len());
+    }
+    let mut master_hash = [0u8; 20];
+    master_hash.copy_from_slice(&payload[..20]);
+    let count = usize::from(u16::from_le_bytes([payload[20], payload[21]]));
+    let expected = 22 + (count * 20);
+    if payload.len() < expected {
+        anyhow::bail!(
+            "short AICH hashset body {} expected at least {}",
+            payload.len(),
+            expected
+        );
+    }
+    let mut part_hashes = Vec::with_capacity(count);
+    let mut cursor = 22usize;
+    for _ in 0..count {
+        let mut part_hash = [0u8; 20];
+        part_hash.copy_from_slice(&payload[cursor..cursor + 20]);
+        part_hashes.push(part_hash);
+        cursor += 20;
+    }
+    Ok((
+        Ed2kAichHashset {
+            master_hash,
+            part_hashes,
+        },
+        &payload[cursor..],
+    ))
 }
 
 fn decode_sending_part_payload(
@@ -5161,6 +5438,60 @@ mod tests {
         let mut payload = vec![0x08];
         payload.extend_from_slice(&[0x11; 16]);
         assert!(super::Ed2kFileIdentifier::decode(&payload).is_err());
+    }
+
+    #[test]
+    fn hashset_request2_roundtrip_preserves_file_identifier_and_request_bits() {
+        let file_identifier = super::Ed2kFileIdentifier {
+            file_hash: Ed2kHash([0x31; 16]),
+            file_size: Some(ED2K_PART_SIZE + 1),
+            aich_root: Some([0x7C; 20]),
+        };
+        let packet = super::encode_hashset_request2(
+            &file_identifier,
+            super::Ed2kHashsetRequestOptions {
+                request_md4: true,
+                request_aich: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(packet[0], OP_EMULEPROT);
+        assert_eq!(packet[5], super::OP_HASHSETREQUEST2);
+
+        let (decoded_identifier, decoded_options) =
+            super::decode_hashset_request2(&packet[6..]).unwrap();
+        assert_eq!(decoded_identifier, file_identifier);
+        assert!(decoded_options.request_md4);
+        assert!(decoded_options.request_aich);
+    }
+
+    #[test]
+    fn hashset_answer2_roundtrip_preserves_modern_md4_and_aich_sections() {
+        let file_identifier = super::Ed2kFileIdentifier {
+            file_hash: Ed2kHash([0x44; 16]),
+            file_size: Some(ED2K_PART_SIZE + 1),
+            aich_root: Some([0x7D; 20]),
+        };
+        let md4_hashset = vec![[0x11; 16], [0x22; 16]];
+        let aich_hashset = super::Ed2kAichHashset {
+            master_hash: [0x7D; 20],
+            part_hashes: vec![[0x55; 20], [0x66; 20]],
+        };
+        let packet = super::encode_hashset_answer2(
+            &file_identifier,
+            Some(&md4_hashset),
+            Some(&aich_hashset),
+        )
+        .unwrap();
+
+        assert_eq!(packet[0], OP_EMULEPROT);
+        assert_eq!(packet[5], super::OP_HASHSETANSWER2);
+
+        let decoded = super::decode_hashset_answer2(&packet[6..]).unwrap();
+        assert_eq!(decoded.file_identifier, file_identifier);
+        assert_eq!(decoded.md4_hashset.unwrap(), md4_hashset);
+        assert_eq!(decoded.aich_hashset.unwrap(), aich_hashset);
     }
 
     #[test]
@@ -6949,11 +7280,28 @@ mod tests {
             stream.write_all(&startup_answer).await.unwrap();
 
             let hashset_request = read_packet(&mut stream).await;
-            assert_eq!(hashset_request[0], OP_EDONKEYPROT);
-            assert_eq!(hashset_request[5], super::OP_HASHSETREQUEST);
-            assert_eq!(&hashset_request[6..22], &file_hash.0);
+            assert_eq!(hashset_request[0], OP_EMULEPROT);
+            assert_eq!(hashset_request[5], super::OP_HASHSETREQUEST2);
+            let (requested_identifier, request_options) =
+                super::decode_hashset_request2(&hashset_request[6..]).unwrap();
+            assert_eq!(requested_identifier.file_hash, file_hash);
+            assert_eq!(
+                requested_identifier.file_size,
+                Some(payload_for_server.len() as u64)
+            );
+            assert!(request_options.request_md4);
+            assert!(!request_options.request_aich);
 
-            let hashset_answer = super::encode_hashset_answer(&file_hash, &md4_hashset).unwrap();
+            let hashset_answer = super::encode_hashset_answer2(
+                &super::Ed2kFileIdentifier {
+                    file_hash,
+                    file_size: Some(payload_for_server.len() as u64),
+                    aich_root: None,
+                },
+                Some(&md4_hashset),
+                None,
+            )
+            .unwrap();
             stream.write_all(&hashset_answer).await.unwrap();
 
             let start_upload = read_packet(&mut stream).await;
@@ -7718,16 +8066,33 @@ mod tests {
             stream.write_all(&startup_answer).await.unwrap();
 
             let hashset_request = read_packet(&mut stream).await;
-            assert_eq!(hashset_request[0], OP_EDONKEYPROT);
-            assert_eq!(hashset_request[5], super::OP_HASHSETREQUEST);
-            assert_eq!(&hashset_request[6..22], &file_hash.0);
+            assert_eq!(hashset_request[0], OP_EMULEPROT);
+            assert_eq!(hashset_request[5], super::OP_HASHSETREQUEST2);
+            let (requested_identifier, request_options) =
+                super::decode_hashset_request2(&hashset_request[6..]).unwrap();
+            assert_eq!(requested_identifier.file_hash, file_hash);
+            assert_eq!(
+                requested_identifier.file_size,
+                Some(payload_for_server.len() as u64)
+            );
+            assert!(request_options.request_md4);
+            assert!(!request_options.request_aich);
 
             let start_upload = read_packet(&mut stream).await;
             assert_eq!(start_upload[0], OP_EDONKEYPROT);
             assert_eq!(start_upload[5], super::OP_STARTUPLOADREQ);
             assert_eq!(&start_upload[6..22], &file_hash.0);
 
-            let hashset_answer = super::encode_hashset_answer(&file_hash, &md4_hashset).unwrap();
+            let hashset_answer = super::encode_hashset_answer2(
+                &super::Ed2kFileIdentifier {
+                    file_hash,
+                    file_size: Some(payload_for_server.len() as u64),
+                    aich_root: None,
+                },
+                Some(&md4_hashset),
+                None,
+            )
+            .unwrap();
             stream.write_all(&hashset_answer).await.unwrap();
 
             let accept = encode_accept_upload_req();
@@ -8155,6 +8520,26 @@ mod tests {
             u16::from_le_bytes([source_answer[23], source_answer[24]]),
             0
         );
+
+        let modern_hashset_request = super::encode_hashset_request2(
+            &super::Ed2kFileIdentifier::from_manifest(&manifest).unwrap(),
+            super::Ed2kHashsetRequestOptions {
+                request_md4: true,
+                request_aich: false,
+            },
+        )
+        .unwrap();
+        stream.write_all(&modern_hashset_request).await.unwrap();
+        let modern_hashset_answer =
+            read_until_opcode(&mut stream, OP_EMULEPROT, super::OP_HASHSETANSWER2).await;
+        let returned = super::decode_hashset_answer2(&modern_hashset_answer[6..]).unwrap();
+        assert_eq!(returned.file_identifier.file_hash, file_hash);
+        assert_eq!(
+            returned.file_identifier.file_size,
+            Some(payload.len() as u64)
+        );
+        assert!(returned.md4_hashset.is_none());
+        assert!(returned.aich_hashset.is_none());
 
         stream
             .write_all(&super::encode_aich_file_hash_request(&file_hash))
