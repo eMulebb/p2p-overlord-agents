@@ -811,10 +811,10 @@ struct EnrichEd2kDownloadRequest {
     kind: String,
     #[serde(alias = "file_hash")]
     file_hash: String,
-    #[serde(alias = "file_name", alias = "canonical_name")]
-    file_name: String,
-    #[serde(alias = "file_size")]
-    file_size: u64,
+    #[serde(default, alias = "file_name", alias = "canonical_name")]
+    file_name: Option<String>,
+    #[serde(default, alias = "file_size")]
+    file_size: Option<u64>,
     #[serde(default)]
     sources: Vec<EnrichEd2kDownloadSource>,
 }
@@ -844,6 +844,25 @@ impl EnrichEd2kDownloadSource {
             source_server: None,
         })
     }
+}
+
+impl EnrichEd2kDownloadRequest {
+    fn canonical_name(&self) -> String {
+        self.file_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| hash_only_ed2k_placeholder_name(&self.file_hash))
+    }
+
+    fn file_size_or_unknown(&self) -> u64 {
+        self.file_size.unwrap_or(0)
+    }
+}
+
+fn hash_only_ed2k_placeholder_name(file_hash: &str) -> String {
+    format!("ed2k-{file_hash}.bin")
 }
 
 pub struct OverlordAgentEmule {
@@ -5881,7 +5900,7 @@ impl OverlordAgentEmule {
                 );
             }
         }
-        if sources.is_empty() {
+        if sources.is_empty() && file_size != 0 {
             let kad_sources =
                 collect_kad_ed2k_sources(&runtime.dht, file_hash, file_size, source_search_timeout)
                     .await;
@@ -5900,6 +5919,11 @@ impl OverlordAgentEmule {
                     file_hash
                 );
             }
+        } else if sources.is_empty() {
+            info!(
+                "native ED2K download skipped Kad source fallback for file_hash={} because file_size is unknown",
+                file_hash
+            );
         }
         info!(
             "native ED2K download source acquisition completed file_hash={} aggregated_source_count={} background_search_enabled={}",
@@ -5927,13 +5951,15 @@ impl OverlordAgentEmule {
             anyhow::bail!("agent networking is waiting for interface selection");
         };
         let config = config_handle.read().await.clone();
+        let canonical_name = request.canonical_name();
+        let file_size = request.file_size_or_unknown();
         let shared_catalog = runtime.ed2k_shared_catalog.read().await.clone();
         runtime
             .ed2k_transfer
             .ensure_job(&new_transfer_job(
                 file_hash,
-                request.file_name.clone(),
-                request.file_size,
+                canonical_name.clone(),
+                file_size,
             ))
             .await?;
         runtime
@@ -5955,7 +5981,7 @@ impl OverlordAgentEmule {
                 &runtime,
                 &config,
                 file_hash,
-                request.file_size,
+                file_size,
                 ed2k_user_hash,
             )
             .await?
@@ -6015,8 +6041,8 @@ impl OverlordAgentEmule {
                     .register_callback_intent(Ed2kCallbackIntent {
                         client_id: source.client_id,
                         file_hash: request.file_hash.clone(),
-                        canonical_name: request.file_name.clone(),
-                        file_size: request.file_size,
+                        canonical_name: canonical_name.clone(),
+                        file_size,
                         source: Ed2kSourceHint {
                             ip: source.ip.to_string(),
                             tcp_port: source.tcp_port,
@@ -6097,8 +6123,8 @@ impl OverlordAgentEmule {
                 Arc::clone(&runtime.ed2k_secure_ident),
                 Arc::clone(&runtime.ed2k_transfer),
                 request.file_hash.clone(),
-                request.file_name.clone(),
-                request.file_size,
+                canonical_name.clone(),
+                file_size,
                 sources,
                 Duration::from_secs(config.p2p.ed2k.connect_timeout_secs.max(10)),
                 |bind_ip,
@@ -6133,8 +6159,8 @@ impl OverlordAgentEmule {
                     format!(
                         "file_hash={} file_name={} expected_size={} manifest_size={} verified_ranges={} completed={}",
                         request.file_hash,
-                        request.file_name,
-                        request.file_size,
+                        manifest.canonical_name,
+                        file_size,
                         manifest.file_size,
                         manifest.verified_ranges.len(),
                         manifest.completed
@@ -6142,7 +6168,7 @@ impl OverlordAgentEmule {
                 );
                 info!(
                     "native ED2K download completed file_hash={} file_name={} size={}",
-                    request.file_hash, request.file_name, request.file_size
+                    request.file_hash, manifest.canonical_name, manifest.file_size
                 );
                 return Ok(());
             }
@@ -6283,8 +6309,9 @@ impl OverlordAgentEmule {
             let mut activity_snapshot =
                 new_activity_snapshot(AgentActivityState::Downloading, started_at);
             activity_snapshot.protocol = Some(Protocol::Ed2k);
+            let activity_name = request.canonical_name();
             activity_snapshot.query_or_target =
-                Some(format!("{} ({})", request.file_name, normalized_file_hash));
+                Some(format!("{} ({})", activity_name, normalized_file_hash));
             begin_agent_activity(&agent_activity, activity_key.clone(), activity_snapshot).await;
 
             let outcome = Self::start_native_ed2k_download(
@@ -8185,8 +8212,8 @@ mod tests {
             .spawn_native_ed2k_download(EnrichEd2kDownloadRequest {
                 kind: "ed2k_download".to_string(),
                 file_hash: file_hash_hex.clone(),
-                file_name: "captured-resume.iso".to_string(),
-                file_size: payload.len() as u64,
+                file_name: Some("captured-resume.iso".to_string()),
+                file_size: Some(payload.len() as u64),
                 sources: vec![EnrichEd2kDownloadSource {
                     ip: Ipv4Addr::LOCALHOST,
                     tcp_port: peer_port,

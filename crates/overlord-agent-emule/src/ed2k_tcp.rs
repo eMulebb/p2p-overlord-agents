@@ -1576,7 +1576,6 @@ pub(crate) async fn download_file_from_peer(
             transfer_runtime,
             file_hash,
             &file_hash_hex,
-            file_size,
             timeout,
             true,
             false,
@@ -1617,7 +1616,6 @@ async fn drive_download_session(
     transfer_runtime: &Ed2kTransferRuntime,
     file_hash: Ed2kHash,
     file_hash_hex: &str,
-    file_size: u64,
     timeout: Duration,
     send_initial_requests: bool,
     initial_hello_complete: bool,
@@ -1632,7 +1630,7 @@ async fn drive_download_session(
     let mut pending_part_requests: Vec<PendingPartRequest> = Vec::new();
     let mut pending_compressed_parts: Vec<PendingCompressedPart> = Vec::new();
     let mut manifest = transfer_runtime.manifest(file_hash_hex).await?;
-    let request_file_identifier = Ed2kFileIdentifier::from_manifest(&manifest)?;
+    let mut request_file_identifier = Ed2kFileIdentifier::from_manifest(&manifest)?;
     let mut peer_secure_ident = Ed2kPeerSecureIdentState::default();
     let mut hello_complete = initial_hello_complete;
     let mut secure_ident_started = initial_secure_ident_started;
@@ -1718,7 +1716,7 @@ async fn drive_download_session(
                             format!("failed to send OP_REQUESTFILENAME to {peer_addr}")
                         })?;
 
-                    if file_size > ED2K_PART_SIZE {
+                    if manifest.file_size > ED2K_PART_SIZE {
                         let set_req_file_id = encode_set_req_file_id(&file_hash);
                         dump_ed2k_tcp_download_send(
                             peer_addr,
@@ -1783,12 +1781,13 @@ async fn drive_download_session(
 
             if send_initial_requests
                 && hello_complete
+                && manifest.file_size != 0
                 && !manifest.md4_hashset_acquired
                 && !hashset_requested
                 && !waiting_for_peer_secure_ident
                 && startup_file_response_received
             {
-                if file_size <= ED2K_PART_SIZE {
+                if manifest.file_size <= ED2K_PART_SIZE {
                     manifest = transfer_runtime
                         .store_md4_hashset(file_hash_hex, Vec::new())
                         .await?;
@@ -1829,6 +1828,7 @@ async fn drive_download_session(
                 .is_some_and(|requested_at| requested_at.elapsed() >= HASHSET_STALL_UPLOAD_FALLBACK);
             if send_initial_requests
                 && hello_complete
+                && manifest.file_size != 0
                 && (manifest.md4_hashset_acquired || hashset_request_stalled)
                 && !upload_requested
                 && !waiting_for_peer_secure_ident
@@ -1865,7 +1865,7 @@ async fn drive_download_session(
                         transfer_runtime,
                         file_hash: &file_hash,
                         file_hash_hex,
-                        file_size,
+                        file_size: manifest.file_size,
                         manifest: &manifest,
                         active_piece_request: &mut active_piece_request,
                         pending_part_requests: &mut pending_part_requests,
@@ -2108,6 +2108,15 @@ async fn drive_download_session(
                             hashset_answer.file_identifier.file_hash
                         );
                     }
+                    reconcile_download_manifest_metadata(
+                        transfer_runtime,
+                        file_hash_hex,
+                        &mut manifest,
+                        &mut request_file_identifier,
+                        &hashset_answer.file_identifier,
+                        None,
+                    )
+                    .await?;
                     if let Some(hashset) = hashset_answer.md4_hashset {
                         manifest = transfer_runtime
                             .store_md4_hashset(file_hash_hex, hashset)
@@ -2115,6 +2124,23 @@ async fn drive_download_session(
                     }
                 }
                 (OP_EDONKEYPROT, OP_REQFILENAMEANSWER) => {
+                    let (returned_hash, returned_file_name) =
+                        decode_request_filename_answer(&packet.payload)?;
+                    if returned_hash != file_hash {
+                        anyhow::bail!(
+                            "OP_REQFILENAMEANSWER hash mismatch {} expected {}",
+                            returned_hash,
+                            file_hash
+                        );
+                    }
+                    manifest = transfer_runtime
+                        .reconcile_job_metadata(
+                            file_hash_hex,
+                            Some(returned_file_name.as_str()),
+                            None,
+                        )
+                        .await?;
+                    request_file_identifier = Ed2kFileIdentifier::from_manifest(&manifest)?;
                     startup_file_response_received = true;
                 }
                 (OP_EDONKEYPROT, OP_FILESTATUS) => {
@@ -2136,17 +2162,19 @@ async fn drive_download_session(
                             returned_identifier.file_hash
                         );
                     }
+                    let mut returned_file_name = None;
                     while let Some((&sub_opcode, rest)) = remaining.split_first() {
                         remaining = rest;
                         match sub_opcode {
                             OP_REQFILENAMEANSWER => {
-                                remaining = skip_request_filename_answer_body(remaining)?;
-                                startup_file_response_received = true;
+                                let (file_name, rest) =
+                                    decode_request_filename_answer_body(remaining)?;
+                                remaining = rest;
+                                returned_file_name = Some(file_name);
                             }
                             OP_FILESTATUS => {
                                 let (_part_count, rest) = skip_file_status_body(remaining)?;
                                 remaining = rest;
-                                startup_file_response_received = true;
                             }
                             _ => {
                                 anyhow::bail!(
@@ -2155,6 +2183,16 @@ async fn drive_download_session(
                             }
                         }
                     }
+                    reconcile_download_manifest_metadata(
+                        transfer_runtime,
+                        file_hash_hex,
+                        &mut manifest,
+                        &mut request_file_identifier,
+                        &returned_identifier,
+                        returned_file_name.as_deref(),
+                    )
+                    .await?;
+                    startup_file_response_received = true;
                 }
                 (OP_EMULEPROT, OP_AICHFILEHASHANS) => {
                     let returned_hash = decode_aich_file_hash_answer(&packet.payload)?;
@@ -3546,7 +3584,6 @@ async fn handle_connection(
                         transfer_runtime,
                         file_hash,
                         &callback_intent.file_hash,
-                        callback_intent.file_size,
                         ED2K_CONNECTION_IDLE_TIMEOUT,
                         true,
                         true,
@@ -4383,7 +4420,7 @@ fn encode_request_filename_answer_body(file_name: &str) -> Result<Vec<u8>> {
     Ok(payload)
 }
 
-fn skip_request_filename_answer_body(payload: &[u8]) -> Result<&[u8]> {
+fn decode_request_filename_answer_body(payload: &[u8]) -> Result<(String, &[u8])> {
     if payload.len() < 2 {
         anyhow::bail!("short OP_REQFILENAMEANSWER body");
     }
@@ -4391,7 +4428,22 @@ fn skip_request_filename_answer_body(payload: &[u8]) -> Result<&[u8]> {
     if payload.len() < 2 + len {
         anyhow::bail!("short OP_REQFILENAMEANSWER string");
     }
-    Ok(&payload[2 + len..])
+    Ok((
+        String::from_utf8_lossy(&payload[2..2 + len]).into_owned(),
+        &payload[2 + len..],
+    ))
+}
+
+fn decode_request_filename_answer(payload: &[u8]) -> Result<(Ed2kHash, String)> {
+    let file_hash = decode_file_hash_payload(payload)?;
+    let (file_name, remaining) = decode_request_filename_answer_body(&payload[16..])?;
+    if !remaining.is_empty() {
+        anyhow::bail!(
+            "unexpected trailing OP_REQFILENAMEANSWER payload of {} bytes",
+            remaining.len()
+        );
+    }
+    Ok((file_hash, file_name))
 }
 
 fn encode_file_status_body_complete() -> Vec<u8> {
@@ -5041,6 +5093,29 @@ async fn flush_buffered_download_prefixes(
         }
         break;
     }
+    Ok(())
+}
+
+async fn reconcile_download_manifest_metadata(
+    transfer_runtime: &Ed2kTransferRuntime,
+    file_hash_hex: &str,
+    manifest: &mut Ed2kResumeManifest,
+    request_file_identifier: &mut Ed2kFileIdentifier,
+    peer_file_identifier: &Ed2kFileIdentifier,
+    peer_file_name: Option<&str>,
+) -> Result<()> {
+    let learned_size = peer_file_identifier.file_size;
+    let learned_name = peer_file_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    if learned_size.is_none() && learned_name.is_none() {
+        return Ok(());
+    }
+
+    *manifest = transfer_runtime
+        .reconcile_job_metadata(file_hash_hex, learned_name, learned_size)
+        .await?;
+    *request_file_identifier = Ed2kFileIdentifier::from_manifest(manifest)?;
     Ok(())
 }
 
@@ -6782,6 +6857,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hash_only_small_file_download_learns_metadata_from_startup_answer() {
+        async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
+            let mut header = [0u8; 6];
+            stream.read_exact(&mut header).await.unwrap();
+            let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+            let mut packet = header.to_vec();
+            let mut payload = vec![0u8; packet_len - 1];
+            stream.read_exact(&mut payload).await.unwrap();
+            packet.extend_from_slice(&payload);
+            packet
+        }
+
+        let root = unique_test_dir("ed2k-hash-only-small-file-download");
+        let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+        let payload = vec![0x41; 180 * 1024];
+        let file_hash = overlord_kad_proto::Ed2kHash::from_bytes(Md4::digest(&payload).into());
+        let file_hash_hex = file_hash.to_string();
+        let placeholder_name = format!("ed2k-{file_hash_hex}.bin");
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let peer_public_key = Arc::new(
+            Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+                .unwrap(),
+        );
+        let payload_for_server = payload.clone();
+        let peer_public_key_for_server = Arc::clone(&peer_public_key);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            let hello = read_packet(&mut stream).await;
+            assert_eq!(hello[5], OP_HELLO);
+
+            let hello_answer = encode_hello_answer(Ed2kHelloIdentity {
+                user_hash: [0x42; 16],
+                client_id: 0x5912_0559,
+                tcp_port: peer_addr.port(),
+                udp_port: 0,
+                server_ip: 0,
+                server_port: 0,
+                connect_options: emule_connect_options(false),
+                direct_udp_callback: false,
+            });
+            stream.write_all(&hello_answer).await.unwrap();
+
+            let secure_ident_probe = read_packet(&mut stream).await;
+            assert_eq!(secure_ident_probe[5], OP_SECIDENTSTATE);
+            let peer_challenge =
+                encode_secident_state(ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, 0x4436_EEAC);
+            stream.write_all(&peer_challenge).await.unwrap();
+
+            let public_key = read_packet(&mut stream).await;
+            assert_eq!(public_key[5], super::OP_PUBLICKEY);
+            let peer_public_key_packet = encode_packet(
+                OP_EMULEPROT,
+                super::OP_PUBLICKEY,
+                &peer_public_key_for_server.public_key_payload().unwrap(),
+            );
+            stream.write_all(&peer_public_key_packet).await.unwrap();
+
+            let signature = read_packet(&mut stream).await;
+            assert_eq!(signature[5], super::OP_SIGNATURE);
+            let peer_signature = encode_packet(OP_EMULEPROT, super::OP_SIGNATURE, &[0xAA; 49]);
+            stream.write_all(&peer_signature).await.unwrap();
+
+            let startup_request = read_packet(&mut stream).await;
+            assert_startup_multipacket_ext2(
+                startup_request[0],
+                startup_request[5],
+                &startup_request[6..],
+                &file_hash,
+                0,
+                false,
+            );
+
+            let filename_answer = encode_startup_multipacket_ext2_answer(
+                &file_hash,
+                payload_for_server.len() as u64,
+                "captured.epub",
+                false,
+            );
+            stream.write_all(&filename_answer).await.unwrap();
+
+            let start_upload = read_packet(&mut stream).await;
+            assert_eq!(start_upload[5], super::OP_STARTUPLOADREQ);
+            let accept = encode_accept_upload_req();
+            stream.write_all(&accept).await.unwrap();
+
+            let request_parts = read_packet(&mut stream).await;
+            assert_eq!(request_parts[5], super::OP_REQUESTPARTS);
+            let (requested_hash, ranges) =
+                decode_request_parts_payload(&request_parts[6..], false).unwrap();
+            assert_eq!(requested_hash, file_hash);
+            let (start, end) = ranges[0];
+
+            let packet = encode_sending_part(
+                &file_hash,
+                start,
+                end,
+                &payload_for_server[usize::try_from(start).unwrap()..usize::try_from(end).unwrap()],
+                false,
+            )
+            .unwrap();
+            stream.write_all(&packet).await.unwrap();
+        });
+
+        let result = download_file_from_peer(
+            Ipv4Addr::LOCALHOST,
+            &Ed2kFoundSource {
+                file_hash,
+                ip: Ipv4Addr::LOCALHOST,
+                tcp_port: peer_addr.port(),
+                client_id: u32::from_le_bytes(Ipv4Addr::LOCALHOST.octets()),
+                low_id: false,
+                obfuscated: false,
+                obfuscation_options: None,
+                user_hash: None,
+                source_server: None,
+            },
+            Ed2kHelloIdentity {
+                user_hash: [0x11; 16],
+                client_id: 0,
+                tcp_port: 41001,
+                udp_port: 41000,
+                server_ip: 0,
+                server_port: 0,
+                connect_options: emule_connect_options(false),
+                direct_udp_callback: false,
+            },
+            &Arc::new(
+                Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+                    .unwrap(),
+            ),
+            &transfer_runtime,
+            placeholder_name,
+            0,
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, Ed2kPeerDownloadOutcome::Completed);
+
+        let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
+        assert!(manifest.completed);
+        assert_eq!(manifest.canonical_name, "captured.epub");
+        assert_eq!(manifest.file_size, payload.len() as u64);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn small_file_download_accepts_split_compressed_part_frames() {
         async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
             let mut header = [0u8; 6];
@@ -8065,7 +8290,6 @@ mod tests {
             &transfer_runtime,
             file_hash,
             &file_hash_hex,
-            payload.len() as u64,
             Duration::from_secs(3),
             true,
             true,

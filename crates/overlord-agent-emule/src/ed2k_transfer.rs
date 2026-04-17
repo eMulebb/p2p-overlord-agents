@@ -643,6 +643,62 @@ impl Ed2kTransferRuntime {
         Ok(manifest)
     }
 
+    /// Reconcile canonical metadata for an existing transfer after a peer
+    /// reveals a better file name or previously unknown file size.
+    pub async fn reconcile_job_metadata(
+        &self,
+        file_hash: &str,
+        canonical_name: Option<&str>,
+        file_size: Option<u64>,
+    ) -> Result<Ed2kResumeManifest> {
+        let _guard = self.manifest_io.lock().await;
+        let mut manifest = self.load_manifest_unlocked(file_hash).await?;
+        let mut changed = false;
+
+        if let Some(canonical_name) = canonical_name.map(str::trim)
+            && !canonical_name.is_empty()
+            && manifest.canonical_name != canonical_name
+        {
+            manifest.canonical_name = canonical_name.to_string();
+            changed = true;
+        }
+
+        if let Some(file_size) = file_size.filter(|file_size| *file_size != 0) {
+            if manifest.file_size == 0 {
+                if manifest_has_structural_progress(&manifest) {
+                    anyhow::bail!(
+                        "cannot adopt ED2K file size {} for {} after transfer progress already exists",
+                        file_size,
+                        file_hash
+                    );
+                }
+                manifest.file_size = file_size;
+                manifest.pieces = (0..piece_count(file_size, manifest.piece_size))
+                    .map(|piece_index| Ed2kPieceState {
+                        piece_index,
+                        state: Ed2kTransferState::Missing,
+                        bytes_written: 0,
+                    })
+                    .collect();
+                changed = true;
+            } else if manifest.file_size != file_size {
+                anyhow::bail!(
+                    "refusing to change ED2K file size for {} from {} to {}",
+                    file_hash,
+                    manifest.file_size,
+                    file_size
+                );
+            }
+        }
+
+        if changed {
+            self.store_manifest_unlocked(&manifest).await?;
+            self.upsert_verified_catalog_entry(&manifest).await;
+        }
+
+        Ok(manifest)
+    }
+
     /// Persist the canonical ED2K MD4 hashset after validating it against the
     /// expected file hash.
     pub async fn store_md4_hashset(
@@ -1230,6 +1286,13 @@ fn validate_md4_hashset(file_hash: &str, md4_hashset: &[[u8; 16]]) -> Result<()>
     Ok(())
 }
 
+fn manifest_has_structural_progress(manifest: &Ed2kResumeManifest) -> bool {
+    manifest.completed
+        || manifest.md4_hashset_acquired
+        || !manifest.verified_ranges.is_empty()
+        || manifest.pieces.iter().any(|piece| piece.bytes_written != 0)
+}
+
 fn verify_piece_against_manifest(
     manifest: &Ed2kResumeManifest,
     piece_index: u32,
@@ -1357,6 +1420,35 @@ mod tests {
             shared
                 .iter()
                 .any(|entry| entry.file_hash == job.file_hash && entry.verified_complete)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_job_metadata_adopts_unknown_size_and_name() {
+        let root = unique_test_dir("ed2k-transfer-reconcile-metadata");
+        let runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+        let file_hash = Ed2kHash::from_bytes([0x61; 16]);
+        let placeholder_job = new_transfer_job(file_hash, "ed2k-placeholder.bin".to_string(), 0);
+        let initial = runtime.ensure_job(&placeholder_job).await.unwrap();
+        assert_eq!(initial.file_size, 0);
+        assert!(initial.pieces.is_empty());
+
+        let updated = runtime
+            .reconcile_job_metadata(
+                &placeholder_job.file_hash,
+                Some("ubuntu-live.iso"),
+                Some(ED2K_PART_SIZE + 7),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.canonical_name, "ubuntu-live.iso");
+        assert_eq!(updated.file_size, ED2K_PART_SIZE + 7);
+        assert_eq!(updated.pieces.len(), 2);
+        assert!(
+            updated
+                .pieces
+                .iter()
+                .all(|piece| piece.state == Ed2kTransferState::Missing)
         );
     }
 

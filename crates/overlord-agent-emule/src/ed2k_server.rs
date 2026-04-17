@@ -2921,11 +2921,16 @@ fn encode_search_string_param(payload: &mut Vec<u8>, value: &str) -> Result<()> 
     Ok(())
 }
 
-/// Encode the oracle-shaped ED2K local-server source request payload.
+/// Encode the ED2K local-server source request payload.
 ///
 /// Modern eMule sends the file hash plus file size in the TCP local-server
 /// source-request path. Large files use the `0` sentinel followed by a `u64`.
+/// When the caller does not yet know the file size, fall back to the legacy
+/// hash-only payload so hash-only live probes can still acquire sources.
 fn encode_source_request(file_hash: Ed2kHash, file_size: u64) -> Vec<u8> {
+    if file_size == 0 {
+        return file_hash.0.to_vec();
+    }
     let mut payload = Vec::with_capacity(28);
     payload.extend_from_slice(&file_hash.0);
     if file_size > u64::from(u32::MAX) {
@@ -4393,6 +4398,13 @@ mod tests {
             734_003_200
         );
         assert_eq!(payload.len(), 20);
+    }
+
+    #[test]
+    fn source_request_encoding_uses_hash_only_shape_when_size_is_unknown() {
+        let payload = encode_source_request(Ed2kHash([0xEF; 16]), 0);
+
+        assert_eq!(payload, vec![0xEF; 16]);
     }
 
     #[test]
