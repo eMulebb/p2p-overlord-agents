@@ -69,6 +69,9 @@ The following remain in scope for "full parity":
       `FileIdentifier` path with MD4 hashset coverage
 - [x] Hash-only native download bootstrap that learns canonical name and file
       size from peer startup metadata on the active `FileIdentifier` path
+- [x] Hash-only live source acquisition that resolves metadata via exact
+      `ed2k::<hash>` server keyword search and still runs Kad source
+      supplementation once size is known
 - [x] Large-file live `server.met` validation for the current
       `FileIdentifier` / `OP_MULTIPACKET_EXT2` / `OP_HASHSETREQUEST2` /
       compressed-part transfer path
@@ -190,6 +193,21 @@ is also green for the modern `FileIdentifier` transport branch:
   [harness-downloader-artifacts/eMule_Verbose.log](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.roundtrip.realnet.large.v1/ed2k.server.roundtrip.realnet.large.v1-20260417-182434/harness-downloader-artifacts/eMule_Verbose.log>)
 - the agent artifacts for this successful run do not contain the prior
   `out_of_order_compressed_part_range` / `out_of_order_part_range` diagnostics
+
+As of **April 17, 2026**, an additional private local-vector probe against the
+canonical imported `server.met` pool confirms the hash-only live search path:
+
+- the agent now issues exact background ED2K keyword search queries using the
+  `ed2k::<hash>` form, reconciles manifest name and size from the matching live
+  server result before source acquisition, and then proceeds to `OP_GETSOURCES`
+  with the learned size
+- the same live probe also confirms that Kad source search is now executed as a
+  supplement after server-assisted discovery once the file size is known,
+  instead of remaining a zero-source fallback only
+- the tested private vector remained single-source in that run, so this is
+  evidence that the search path is truthful and wider than before, but **not**
+  yet evidence that live multi-source acquisition is consistently available for
+  arbitrary vectors
 
 ## Validation Standard
 
