@@ -67,6 +67,10 @@ where
             .route("/api/internal/search", post(post_search::<S>))
             .route("/api/internal/search/cancel", post(post_cancel_search::<S>))
             .route("/api/internal/enrich", post(post_enrich::<S>))
+            .route(
+                "/api/internal/ingest-local-file",
+                post(post_ingest_local_file::<S>),
+            )
             .route("/api/internal/seed-popular", post(post_seed_popular::<S>))
             .route("/api/internal/config-update", post(post_config_update::<S>))
             .with_state(state);
@@ -215,6 +219,23 @@ where
     }
 }
 
+async fn post_ingest_local_file<S>(
+    State(state): State<AppState<S>>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse
+where
+    S: IndexerService,
+{
+    match state.service.ingest_local_file(payload).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 async fn post_seed_popular<S>(
     State(state): State<AppState<S>>,
     Json(payload): Json<Vec<PopularHash>>,
@@ -225,7 +246,7 @@ where
     match state.service.seed_popular(payload).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         Err(error) => (
-            StatusCode::NOT_IMPLEMENTED,
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": error.to_string() })),
         )
             .into_response(),

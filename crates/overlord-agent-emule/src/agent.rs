@@ -78,8 +78,8 @@ use crate::ed2k_tcp::{
     enrich_hello_identity, request_udp_firewall_check, run_ed2k_listener,
 };
 use crate::ed2k_transfer::{
-    Ed2kCallbackIntent, Ed2kResumeManifest, Ed2kSharedCatalog, Ed2kSharedEntry, Ed2kSourceHint,
-    Ed2kTransferRuntime, Ed2kUploadQueueConfig, new_transfer_job,
+    Ed2kCallbackIntent, Ed2kLocalIngestSummary, Ed2kResumeManifest, Ed2kSharedCatalog,
+    Ed2kSharedEntry, Ed2kSourceHint, Ed2kTransferRuntime, Ed2kUploadQueueConfig, new_transfer_job,
 };
 use crate::kad_firewall::{
     ExternalPortDiscoveryOutcome, FirewallUdpPacketOutcome, FirewalledResponseOutcome,
@@ -840,6 +840,15 @@ struct EnrichEd2kDownloadRequest {
     sources: Vec<EnrichEd2kDownloadSource>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IngestLocalFileRequest {
+    #[serde(alias = "source_path", alias = "file_path")]
+    source_path: String,
+    #[serde(default, alias = "canonical_name", alias = "file_name")]
+    canonical_name: Option<String>,
+}
+
 impl EnrichEd2kDownloadSource {
     fn into_found_source(self, file_hash: Ed2kHash) -> Result<Ed2kFoundSource> {
         let user_hash = self
@@ -879,6 +888,17 @@ impl EnrichEd2kDownloadRequest {
 
     fn file_size_or_unknown(&self) -> u64 {
         self.file_size.unwrap_or(0)
+    }
+}
+
+impl IngestLocalFileRequest {
+    fn canonical_name(&self) -> Result<String> {
+        self.canonical_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+            .ok_or_else(|| anyhow::anyhow!("local ingest payload requires canonicalName"))
     }
 }
 
@@ -5921,6 +5941,13 @@ impl IndexerService for OverlordAgentEmule {
         self.spawn_native_ed2k_download(request).await
     }
 
+    async fn ingest_local_file(&self, payload: Value) -> Result<Value> {
+        let request: IngestLocalFileRequest = serde_json::from_value(payload)
+            .context("invalid local ingest payload for overlord-agent-emule")?;
+        serde_json::to_value(self.ingest_local_file_impl(request).await?)
+            .context("failed to encode local ingest response")
+    }
+
     async fn seed_popular(&self, hashes: Vec<PopularHash>) -> Result<()> {
         let runtime = self.runtime.lock().await.clone();
         let Some(runtime) = runtime else {
@@ -6815,6 +6842,20 @@ impl OverlordAgentEmule {
             drop(download_permit);
         });
         Ok(())
+    }
+
+    async fn ingest_local_file_impl(
+        &self,
+        request: IngestLocalFileRequest,
+    ) -> Result<Ed2kLocalIngestSummary> {
+        let runtime = self.runtime.lock().await.clone();
+        let Some(runtime) = runtime else {
+            anyhow::bail!("agent networking is waiting for interface selection");
+        };
+        runtime
+            .ed2k_transfer
+            .ingest_local_file(Path::new(&request.source_path), &request.canonical_name()?)
+            .await
     }
 
     async fn await_callback_transfer_completion(

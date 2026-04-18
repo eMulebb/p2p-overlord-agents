@@ -472,6 +472,19 @@ pub(crate) struct Ed2kAichHashset {
     pub part_hashes: Vec<[u8; 20]>,
 }
 
+/// Summary returned after a local payload is ingested into the transfer store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Ed2kLocalIngestSummary {
+    pub file_hash: String,
+    pub canonical_name: String,
+    pub file_size: u64,
+    pub md4_hashset_count: usize,
+    pub aich_root: String,
+    pub aich_hashset_count: usize,
+    pub transfer_dir: String,
+}
+
 /// One pending LowID callback download intent remembered until a peer calls back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ed2kCallbackIntent {
@@ -1158,6 +1171,95 @@ impl Ed2kTransferRuntime {
         self.load_manifest_unlocked(file_hash).await
     }
 
+    /// Copy a local payload into the canonical ED2K transfer store and expose
+    /// it as a fully verified shared file.
+    pub async fn ingest_local_file(
+        &self,
+        source_path: &Path,
+        canonical_name: &str,
+    ) -> Result<Ed2kLocalIngestSummary> {
+        let canonical_name = canonical_name.trim();
+        if canonical_name.is_empty() {
+            anyhow::bail!("local ED2K ingest requires a non-empty canonical name");
+        }
+        let source_path = source_path.canonicalize().with_context(|| {
+            format!(
+                "failed to resolve local ingest source {}",
+                source_path.display()
+            )
+        })?;
+        let metadata = tokio::fs::metadata(&source_path).await.with_context(|| {
+            format!(
+                "failed to stat local ingest source {}",
+                source_path.display()
+            )
+        })?;
+        if metadata.len() == 0 {
+            anyhow::bail!("local ED2K ingest does not support zero-sized payloads");
+        }
+
+        let _guard = self.manifest_io.lock().await;
+        let (file_hash, md4_hashset) =
+            build_md4_hashset_from_payload(&source_path, metadata.len())?;
+        let job = new_transfer_job(file_hash, canonical_name.to_string(), metadata.len());
+        let transfer_dir = self.transfer_dir(&job.file_hash);
+        tokio::fs::create_dir_all(&transfer_dir)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create ED2K transfer directory {}",
+                    transfer_dir.display()
+                )
+            })?;
+        let payload_path = transfer_dir.join(PAYLOAD_FILE_NAME);
+        let source_matches_payload = payload_path.exists()
+            && payload_path.canonicalize().ok().as_deref() == Some(source_path.as_path());
+        if !source_matches_payload {
+            tokio::fs::copy(&source_path, &payload_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to copy local ingest payload {} -> {}",
+                        source_path.display(),
+                        payload_path.display()
+                    )
+                })?;
+        }
+
+        let aich_hashset = build_aich_hashset_from_payload(&payload_path, metadata.len())?;
+        let mut manifest = Ed2kResumeManifest::new(&job);
+        manifest.completed = true;
+        manifest.md4_hashset_acquired = true;
+        manifest.md4_hashset = md4_hashset.iter().map(hex::encode).collect();
+        manifest.aich_hashset_acquired = true;
+        manifest.aich_root = Some(hex::encode(aich_hashset.master_hash));
+        manifest.aich_hashset = aich_hashset.part_hashes.iter().map(hex::encode).collect();
+        manifest.pieces = (0..piece_count(manifest.file_size, manifest.piece_size))
+            .map(|piece_index| Ed2kPieceState {
+                piece_index,
+                state: Ed2kTransferState::Verified,
+                bytes_written: expected_piece_length(
+                    manifest.file_size,
+                    manifest.piece_size,
+                    u64::from(piece_index),
+                ),
+            })
+            .collect();
+        rebuild_verified_ranges(&mut manifest);
+        self.store_manifest_unlocked(&manifest).await?;
+        self.upsert_verified_catalog_entry(&manifest).await;
+
+        Ok(Ed2kLocalIngestSummary {
+            file_hash: manifest.file_hash,
+            canonical_name: manifest.canonical_name,
+            file_size: manifest.file_size,
+            md4_hashset_count: manifest.md4_hashset.len(),
+            aich_root: manifest.aich_root.unwrap_or_default(),
+            aich_hashset_count: manifest.aich_hashset.len(),
+            transfer_dir: transfer_dir.display().to_string(),
+        })
+    }
+
     /// Admit or refresh one inbound uploader session and return the queue-visible state.
     pub async fn begin_upload_session(
         &self,
@@ -1394,6 +1496,57 @@ fn validate_md4_hashset(file_hash: &str, md4_hashset: &[[u8; 16]]) -> Result<()>
     Ok(())
 }
 
+fn build_md4_hashset_from_payload(
+    payload_path: &Path,
+    file_size: u64,
+) -> Result<(Ed2kHash, Vec<[u8; 16]>)> {
+    if file_size == 0 {
+        anyhow::bail!("cannot build ED2K MD4 hashset for zero-sized file");
+    }
+    let mut file = fs::File::open(payload_path)
+        .with_context(|| format!("failed to open ED2K payload {}", payload_path.display()))?;
+    if file_size < ED2K_PART_SIZE {
+        let digest = read_md4_digest_from_reader(&mut file, file_size)?;
+        return Ok((Ed2kHash::from_bytes(digest), Vec::new()));
+    }
+
+    let part_count = chunk_count_for_size(file_size, ED2K_PART_SIZE);
+    let mut part_hashes = Vec::with_capacity(usize::try_from(part_count + 1).unwrap_or(0));
+    let mut remaining = file_size;
+    while remaining > 0 {
+        let part_size = remaining.min(ED2K_PART_SIZE);
+        part_hashes.push(read_md4_digest_from_reader(&mut file, part_size)?);
+        remaining -= part_size;
+    }
+    if file_size % ED2K_PART_SIZE == 0 {
+        part_hashes.push(read_md4_digest_from_reader(&mut file, 0)?);
+    }
+
+    let mut file_hasher = Md4::new();
+    for part_hash in &part_hashes {
+        file_hasher.update(part_hash);
+    }
+    Ok((
+        Ed2kHash::from_bytes(file_hasher.finalize().into()),
+        part_hashes,
+    ))
+}
+
+fn read_md4_digest_from_reader(file: &mut fs::File, size: u64) -> Result<[u8; 16]> {
+    let mut hasher = Md4::new();
+    let mut remaining = size;
+    let mut buffer = vec![0u8; 65_536];
+    while remaining > 0 {
+        let chunk_len =
+            usize::try_from(remaining.min(u64::try_from(buffer.len()).unwrap_or(0))).unwrap_or(0);
+        file.read_exact(&mut buffer[..chunk_len])
+            .context("failed to read ED2K MD4 payload data")?;
+        hasher.update(&buffer[..chunk_len]);
+        remaining -= u64::try_from(chunk_len).unwrap_or(0);
+    }
+    Ok(hasher.finalize().into())
+}
+
 pub(crate) fn decode_aich_hash_hex(hash: &str) -> Result<[u8; 20]> {
     let bytes = hex::decode(hash).with_context(|| format!("invalid AICH hash {hash}"))?;
     let len = bytes.len();
@@ -1457,29 +1610,6 @@ fn validate_aich_hashset(file_size: u64, aich_hashset: &Ed2kAichHashset) -> Resu
     Ok(())
 }
 
-fn read_aich_block_hashes(payload_path: &Path, file_size: u64) -> Result<Vec<[u8; 20]>> {
-    let mut file = fs::File::open(payload_path)
-        .with_context(|| format!("failed to open AICH payload {}", payload_path.display()))?;
-    let mut block_hashes = Vec::new();
-    let mut remaining = file_size;
-    let mut buffer = vec![0u8; usize::try_from(ED2K_EMBLOCK_SIZE).unwrap_or(0)];
-    while remaining > 0 {
-        let block_len = usize::try_from(remaining.min(ED2K_EMBLOCK_SIZE)).unwrap_or(0);
-        file.read_exact(&mut buffer[..block_len]).with_context(|| {
-            format!(
-                "failed to read AICH block data from {}",
-                payload_path.display()
-            )
-        })?;
-        let digest = Sha1::digest(&buffer[..block_len]);
-        let mut hash = [0u8; 20];
-        hash.copy_from_slice(&digest);
-        block_hashes.push(hash);
-        remaining -= u64::try_from(block_len).unwrap_or(0);
-    }
-    Ok(block_hashes)
-}
-
 fn reconstruct_aich_root_from_part_hashes(
     file_size: u64,
     part_hashes: &[[u8; 20]],
@@ -1532,93 +1662,101 @@ fn build_aich_hashset_from_payload(payload_path: &Path, file_size: u64) -> Resul
     if file_size == 0 {
         anyhow::bail!("cannot build AICH hashset for zero-sized file");
     }
-    let block_hashes = read_aich_block_hashes(payload_path, file_size)?;
-    let root = build_aich_tree_node(0, file_size, true, &block_hashes)?;
-    let part_count = usize::from(expected_aich_hash_count(file_size));
-    let mut part_hashes = Vec::with_capacity(part_count);
-    for part_index in 0..part_count {
-        let start = u64::try_from(part_index).unwrap_or(0) * ED2K_PART_SIZE;
-        let size = (file_size - start).min(ED2K_PART_SIZE);
-        let hash = root
-            .find_hash(start, size)
-            .with_context(|| format!("missing AICH part hash for part {part_index}"))?;
-        part_hashes.push(hash);
+    let mut file = fs::File::open(payload_path)
+        .with_context(|| format!("failed to open AICH payload {}", payload_path.display()))?;
+    if file_size <= ED2K_PART_SIZE {
+        let master_hash = build_aich_part_root_from_reader(&mut file, file_size, true)?;
+        return Ok(Ed2kAichHashset {
+            master_hash,
+            part_hashes: Vec::new(),
+        });
     }
+
+    let mut part_hashes = Vec::with_capacity(usize::from(expected_aich_hash_count(file_size)));
+    collect_aich_part_hashes_from_reader(&mut file, file_size, true, &mut part_hashes)?;
+    let master_hash = reconstruct_aich_root_from_part_hashes(file_size, &part_hashes)?;
     Ok(Ed2kAichHashset {
-        master_hash: root.hash,
+        master_hash,
         part_hashes,
     })
 }
 
-#[derive(Debug)]
-struct AichTreeNode {
-    start: u64,
+fn collect_aich_part_hashes_from_reader(
+    file: &mut fs::File,
     size: u64,
-    hash: [u8; 20],
-    left: Option<Box<AichTreeNode>>,
-    right: Option<Box<AichTreeNode>>,
-}
-
-impl AichTreeNode {
-    fn find_hash(&self, start: u64, size: u64) -> Option<[u8; 20]> {
-        if self.start == start && self.size == size {
-            return Some(self.hash);
-        }
-        self.left
-            .as_ref()
-            .and_then(|node| node.find_hash(start, size))
-            .or_else(|| {
-                self.right
-                    .as_ref()
-                    .and_then(|node| node.find_hash(start, size))
-            })
+    is_left_branch: bool,
+    part_hashes: &mut Vec<[u8; 20]>,
+) -> Result<()> {
+    if size <= ED2K_PART_SIZE {
+        part_hashes.push(build_aich_part_root_from_reader(
+            file,
+            size,
+            is_left_branch,
+        )?);
+        return Ok(());
     }
+
+    let part_count = chunk_count_for_size(size, ED2K_PART_SIZE);
+    let left_size = ((part_count + u64::from(is_left_branch)) / 2) * ED2K_PART_SIZE;
+    let right_size = size - left_size;
+    collect_aich_part_hashes_from_reader(file, left_size, true, part_hashes)?;
+    collect_aich_part_hashes_from_reader(file, right_size, false, part_hashes)
 }
 
-fn build_aich_tree_node(
-    start: u64,
+fn build_aich_part_root_from_reader(
+    file: &mut fs::File,
+    part_size: u64,
+    is_left_branch: bool,
+) -> Result<[u8; 20]> {
+    let block_hashes = read_aich_block_hashes_from_reader(file, part_size)?;
+    build_aich_block_tree_root(part_size, is_left_branch, &block_hashes, 0)
+}
+
+fn read_aich_block_hashes_from_reader(file: &mut fs::File, size: u64) -> Result<Vec<[u8; 20]>> {
+    let mut block_hashes = Vec::with_capacity(
+        usize::try_from(chunk_count_for_size(size, ED2K_EMBLOCK_SIZE)).unwrap_or(0),
+    );
+    let mut remaining = size;
+    let mut buffer = vec![0u8; usize::try_from(ED2K_EMBLOCK_SIZE).unwrap_or(0)];
+    while remaining > 0 {
+        let block_len = usize::try_from(remaining.min(ED2K_EMBLOCK_SIZE)).unwrap_or(0);
+        file.read_exact(&mut buffer[..block_len])
+            .context("failed to read AICH block data from payload")?;
+        let digest = Sha1::digest(&buffer[..block_len]);
+        let mut hash = [0u8; 20];
+        hash.copy_from_slice(&digest);
+        block_hashes.push(hash);
+        remaining -= u64::try_from(block_len).unwrap_or(0);
+    }
+    Ok(block_hashes)
+}
+
+fn build_aich_block_tree_root(
     size: u64,
     is_left_branch: bool,
     block_hashes: &[[u8; 20]],
-) -> Result<AichTreeNode> {
-    let base_size = if size <= ED2K_PART_SIZE {
-        ED2K_EMBLOCK_SIZE
-    } else {
-        ED2K_PART_SIZE
-    };
-    if size <= base_size {
-        let block_index =
-            usize::try_from(start / ED2K_EMBLOCK_SIZE).context("AICH block index exceeds usize")?;
-        let hash = block_hashes
-            .get(block_index)
+    block_offset: usize,
+) -> Result<[u8; 20]> {
+    if size <= ED2K_EMBLOCK_SIZE {
+        return block_hashes
+            .get(block_offset)
             .copied()
-            .with_context(|| format!("missing AICH block hash at index {block_index}"))?;
-        return Ok(AichTreeNode {
-            start,
-            size,
-            hash,
-            left: None,
-            right: None,
-        });
+            .with_context(|| format!("missing AICH block hash at index {block_offset}"));
     }
 
-    let block_count = size / base_size + u64::from(size % base_size != 0);
-    let left_size = ((block_count + u64::from(is_left_branch)) / 2) * base_size;
+    let block_count = chunk_count_for_size(size, ED2K_EMBLOCK_SIZE);
+    let left_size = ((block_count + u64::from(is_left_branch)) / 2) * ED2K_EMBLOCK_SIZE;
     let right_size = size - left_size;
-    let left = Box::new(build_aich_tree_node(start, left_size, true, block_hashes)?);
-    let right = Box::new(build_aich_tree_node(
-        start + left_size,
-        right_size,
-        false,
-        block_hashes,
-    )?);
-    Ok(AichTreeNode {
-        start,
-        size,
-        hash: sha1_pair(left.hash, right.hash),
-        left: Some(left),
-        right: Some(right),
-    })
+    let left_hash = build_aich_block_tree_root(left_size, true, block_hashes, block_offset)?;
+    let right_offset = block_offset
+        + usize::try_from(chunk_count_for_size(left_size, ED2K_EMBLOCK_SIZE))
+            .context("AICH block offset exceeds usize")?;
+    let right_hash = build_aich_block_tree_root(right_size, false, block_hashes, right_offset)?;
+    Ok(sha1_pair(left_hash, right_hash))
+}
+
+fn chunk_count_for_size(size: u64, chunk_size: u64) -> u64 {
+    size / chunk_size + u64::from(size % chunk_size != 0)
 }
 
 fn sha1_pair(left: [u8; 20], right: [u8; 20]) -> [u8; 20] {
@@ -1698,7 +1836,7 @@ mod tests {
     use super::{
         ED2K_PART_SIZE, Ed2kResumeManifest, Ed2kSharedEntry, Ed2kSourceHint, Ed2kTransferRuntime,
         Ed2kTransferState, Ed2kUploadPeerIdentity, Ed2kUploadQueueConfig, Ed2kUploadSessionStatus,
-        MANIFEST_FILE_NAME, new_transfer_job,
+        MANIFEST_FILE_NAME, PAYLOAD_FILE_NAME, new_transfer_job,
     };
     use crate::paths::unique_test_dir;
     use md4::{Digest, Md4};
@@ -1706,11 +1844,24 @@ mod tests {
     use overlord_kad_proto::Ed2kHash;
     use std::{
         fs,
+        io::Write,
         net::{IpAddr, Ipv4Addr},
         path::Path,
         str::FromStr,
         time::Duration,
     };
+
+    fn write_repeating_pattern_file(path: &Path, size: usize, pattern: &[u8]) {
+        assert!(!pattern.is_empty());
+        let mut payload = Vec::with_capacity(size);
+        while payload.len() < size {
+            let remaining = size - payload.len();
+            let chunk_len = remaining.min(pattern.len());
+            payload.extend_from_slice(&pattern[..chunk_len]);
+        }
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(&payload).unwrap();
+    }
 
     #[tokio::test]
     async fn ensure_job_tracks_verified_parts_via_md4_hashset() {
@@ -1916,6 +2067,72 @@ mod tests {
             local_entry.aich_root.as_deref(),
             Some("050066b767710d1bd84377e71b1b23e522cce4af")
         );
+    }
+
+    #[test]
+    fn build_aich_hashset_matches_stock_tracing_harness_large_roundtrip_fixture() {
+        let root = unique_test_dir("ed2k-transfer-stock-aich-fixture");
+        let transfer_dir = Path::new(&root).join("fixture");
+        fs::create_dir_all(&transfer_dir).unwrap();
+        let payload_path = transfer_dir.join(PAYLOAD_FILE_NAME);
+        write_repeating_pattern_file(
+            &payload_path,
+            10_485_760,
+            b"ubuntu-linux-ed2k-private-roundtrip-large",
+        );
+
+        let rebuilt = super::build_aich_hashset_from_payload(&payload_path, 10_485_760).unwrap();
+        assert_eq!(
+            hex::encode(rebuilt.master_hash),
+            "050066b767710d1bd84377e71b1b23e522cce4af"
+        );
+        assert_eq!(
+            rebuilt
+                .part_hashes
+                .iter()
+                .map(hex::encode)
+                .collect::<Vec<_>>(),
+            vec![
+                "80ebdc35e9618aa7617fa988f756a33b79aa0d6c".to_string(),
+                "b05ae2f6c5a179ec4b7ecffdcc18045151be0437".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_local_file_marks_payload_complete_with_stock_aich_identity() {
+        let root = unique_test_dir("ed2k-transfer-local-ingest");
+        let runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+        let source_dir = Path::new(&root).join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source_path = source_dir.join("ubuntu-linux-private-roundtrip-large.bin");
+        write_repeating_pattern_file(
+            &source_path,
+            10_485_760,
+            b"ubuntu-linux-ed2k-private-roundtrip-large",
+        );
+
+        let summary = runtime
+            .ingest_local_file(&source_path, "ubuntu-linux-private-roundtrip-large.bin")
+            .await
+            .unwrap();
+        assert_eq!(summary.file_size, 10_485_760);
+        assert_eq!(summary.md4_hashset_count, 2);
+        assert_eq!(summary.aich_hashset_count, 2);
+        assert_eq!(
+            summary.aich_root,
+            "050066b767710d1bd84377e71b1b23e522cce4af"
+        );
+
+        let manifest = runtime.manifest(&summary.file_hash).await.unwrap();
+        assert!(manifest.completed);
+        assert!(manifest.aich_hashset_acquired);
+        assert_eq!(
+            manifest.aich_root.as_deref(),
+            Some("050066b767710d1bd84377e71b1b23e522cce4af")
+        );
+        assert_eq!(manifest.md4_hashset.len(), 2);
+        assert_eq!(manifest.aich_hashset.len(), 2);
     }
 
     #[tokio::test]

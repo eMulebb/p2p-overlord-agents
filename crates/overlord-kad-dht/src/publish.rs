@@ -134,12 +134,14 @@ fn select_publish_contacts(
 
 /// Return whether this contact would accept a Kad publish for `target`.
 ///
-/// The eMule publish handlers reject requests whose XOR distance first 32-bit
-/// chunk exceeds `SEARCHTOLERANCE`. Unlike our traversal search jump-start, we
-/// intentionally do not keep a LAN exemption here because local loopback test
-/// clusters still enforce the distance gate on receive.
+/// The stock eMule publish handlers reject requests whose XOR distance first
+/// 32-bit chunk exceeds `SEARCHTOLERANCE`, but they bypass that gate for LAN
+/// peers. Our local loopback parity clusters now deliberately run in that LAN
+/// mode, so publish fanout has to mirror the same exemption instead of
+/// suppressing loopback contacts before the packet is sent.
 fn publish_target_is_within_tolerance(target: NodeId, contact: &TraversalContact) -> bool {
     match contact.addr.ip() {
+        IpAddr::V4(ip) if ip.is_private() || ip.is_loopback() || ip.is_link_local() => true,
         IpAddr::V4(_) => publish_distance_high32(target.distance(&contact.id)) <= SEARCHTOLERANCE,
         IpAddr::V6(_) => false,
     }
@@ -638,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_tolerance_uses_strict_distance_even_for_loopback_contacts() {
+    fn publish_tolerance_accepts_loopback_contacts_even_when_far() {
         let target = NodeId::ZERO;
         let far_loopback = TraversalContact {
             id: NodeId::from_bytes([0xFF; 16]),
@@ -646,7 +648,7 @@ mod tests {
             version: 9,
         };
 
-        assert!(!publish_target_is_within_tolerance(target, &far_loopback));
+        assert!(publish_target_is_within_tolerance(target, &far_loopback));
     }
 
     #[test]

@@ -32,6 +32,10 @@ pub trait IndexerService: Send + Sync + 'static {
         anyhow::bail!("seed_popular is not implemented for this agent")
     }
 
+    async fn ingest_local_file(&self, _payload: Value) -> Result<Value> {
+        anyhow::bail!("ingest_local_file is not implemented for this agent")
+    }
+
     async fn flush_snoop(&self) -> Result<Vec<SnoopEntry>> {
         Ok(Vec::new())
     }
