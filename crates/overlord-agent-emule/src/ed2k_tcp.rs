@@ -3436,6 +3436,15 @@ async fn handle_connection(
     transfer_runtime: &Arc<Ed2kTransferRuntime>,
     hello_identity: Ed2kHelloIdentity,
 ) -> Result<()> {
+    let local_addr = stream
+        .local_addr()
+        .with_context(|| format!("failed to resolve local eD2k listener address for {peer_addr}"))?;
+    dump_ed2k_tcp_listener_meta(
+        peer_addr,
+        None,
+        "tcp_accept",
+        format!("local_addr={local_addr}"),
+    );
     let kad_udp_port = dht
         .bind_addr()
         .context("failed to resolve Kad bind address for eD2k hello response")?
@@ -3446,12 +3455,37 @@ async fn handle_connection(
     };
     let response_identity =
         enrich_hello_identity(response_identity, server_state, kad_firewall).await;
-    let mut transport = tokio::time::timeout(
+    let mut transport = match tokio::time::timeout(
         ED2K_CONNECTION_IDLE_TIMEOUT,
         Ed2kTransport::accept(stream, hello_identity.user_hash),
     )
     .await
-    .context("timed out waiting for initial eD2k peer bytes")??;
+    {
+        Ok(Ok(transport)) => transport,
+        Ok(Err(error)) => {
+            dump_ed2k_tcp_listener_meta(
+                peer_addr,
+                None,
+                "accept_failed",
+                format!("local_addr={local_addr} error={error:#}"),
+            );
+            return Err(error).with_context(|| {
+                format!("failed to accept inbound eD2k peer transport from {peer_addr}")
+            });
+        }
+        Err(_) => {
+            dump_ed2k_tcp_listener_meta(
+                peer_addr,
+                None,
+                "accept_timeout",
+                format!(
+                    "local_addr={local_addr} idle_timeout_secs={}",
+                    ED2K_CONNECTION_IDLE_TIMEOUT.as_secs()
+                ),
+            );
+            anyhow::bail!("timed out waiting for initial eD2k peer bytes");
+        }
+    };
     transport
         .stream
         .set_nodelay(true)
