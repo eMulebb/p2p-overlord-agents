@@ -75,8 +75,10 @@ The following remain in scope for "full parity":
 - [x] Large-file live `server.met` validation for the current
       `FileIdentifier` / `OP_MULTIPACKET_EXT2` / `OP_HASHSETREQUEST2` /
       compressed-part transfer path
-- [ ] Modern AICH root + part-hash generation, transport, and verification on
-      the `FileIdentifier` / `OP_HASHSETANSWER2` path
+- [x] Modern AICH transport and verifier acceptance on the active
+      `FileIdentifier` / `OP_HASHSETREQUEST2` / `OP_HASHSETANSWER2` path
+- [ ] Stock-truthful local AICH root + part-hash generation for locally
+      completed payloads without relying on peer-supplied AICH
 - [ ] Stock `UploadQueue.cpp`-style credit, score, LowID, and friend-slot
       behavior
 - [ ] Full buddy / callback matrix and buddy-tag parity for firewalled mode
@@ -111,23 +113,23 @@ explicitly synthetic fixtures instead of committing live-network vectors.
 
 The active next milestone is:
 
-1. persist a truthful AICH root and part-hash set in the transfer/shared-file
-   runtime instead of keeping `FileIdentifier.aich_root` empty on the active
-   ED2K path
-2. answer `OP_HASHSETREQUEST2` with AICH data when the peer requests it and
-   validate inbound `OP_HASHSETANSWER2` AICH payloads against the requested
-   root
-3. confirm that modern AICH transport on the `FileIdentifier` path is visible
-   in private dumps and then use the dedicated large-file live scenario as the
-   realnet evidence gate until the verifier output moves from `AICH:
-   Unavailable` to `AICH: OK`
-4. extend the same truthfulness rule to every still-advertised non-obsolete
+1. keep the network-learned AICH identity authoritative wherever the active
+   path has already validated it
+2. align the local AICH builder with the stock tracing harness so locally
+   completed payloads generate the same root and part-hash set without
+   peer-supplied AICH
+3. keep the deterministic private large-file loopback gates green on the direct
+   ED2K and Kad-discovered paths while the builder changes land
+4. rerun the dedicated large-file realnet scenario until the same stock-truthful
+   local generation path also stays green outside the local harness matrix
+5. extend the same truthfulness rule to every still-advertised non-obsolete
    ED2K feature that remains unimplemented, starting with chat-captcha
 
 This remains the highest-leverage next step because the downloader and listener
-now use the modern `FileIdentifier` + `EXT2` + `HASHSETREQUEST2` transport, so
-the largest remaining truth gap is the still-modern AICH payload that stock
-`v0.72a` drives through that exact path.
+now use the modern `FileIdentifier` + `EXT2` + `HASHSETREQUEST2` transport and
+the active-path verifier already accepts truthful AICH there, so the largest
+remaining truth gap is local generation matching stock `v0.72a` for the same
+payload.
 
 ## Current Evidence
 
@@ -216,6 +218,34 @@ canonical imported `server.met` pool confirms the hash-only live search path:
   evidence that the search path is truthful and wider than before, but **not**
   yet evidence that live multi-source acquisition is consistently available for
   arbitrary vectors
+
+As of **April 19, 2026**, deterministic local large-file loopback coverage is
+also green for the active modern path:
+
+- the private roundtrip scenario
+  [ed2k.server.emule-harness.agent.roundtrip.private.large.v1-20260418-211341 run-summary.json](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.emule-harness.agent.roundtrip.private.large.v1/ed2k.server.emule-harness.agent.roundtrip.private.large.v1-20260418-211341/run-summary.json>)
+  completed successfully with `2148532224` bytes, exported AICH links,
+  stage1/stage2 `OP_HASHSETREQUEST2` and `OP_HASHSETANSWER2` AICH coverage,
+  compressed parts, and harness verifier `AICH: OK`
+- the Kad harness->agent scenario
+  [kad.emule-harness.agent.download.private.large.v1-20260418-220231 run-summary.json](</C:/tmp/p2p-overlord/overlord-tooling/runs/kad.emule-harness.agent.download.private.large.v1/kad.emule-harness.agent.download.private.large.v1-20260418-220231/run-summary.json>)
+  completed successfully in obfuscated mode and confirms Kad-discovered
+  large-file transfer with exported AICH sidecar data, `OP_HASHSETREQUEST2` /
+  `OP_HASHSETANSWER2` AICH exchange, and compressed parts
+- the reverse Kad agent->harness scenario
+  [kad.agent.emule-harness.download.private.large.v1-20260418-235210 run-summary.json](</C:/tmp/p2p-overlord/overlord-tooling/runs/kad.agent.emule-harness.download.private.large.v1/kad.agent.emule-harness.download.private.large.v1-20260418-235210/run-summary.json>)
+  completed successfully in obfuscated mode after fixing the source-publish
+  identity byte order
+- the same reverse-Kad run shows the corrected source discovery and obfuscated
+  direct-connect path in
+  [emule-harness-kad-trace.log](</C:/tmp/p2p-overlord/overlord-tooling/runs/kad.agent.emule-harness.download.private.large.v1/kad.agent.emule-harness.download.private.large.v1-20260418-235210/downloader-harness-profile/logs/emule-harness-kad-trace.log>)
+  and the harness confirms `Sending HashSet Request: MD4 Yes, AICH Yes` plus
+  repeated per-part `MD4: OK - AICH: OK` in
+  [eMule_Verbose.log](</C:/tmp/p2p-overlord/overlord-tooling/runs/kad.agent.emule-harness.download.private.large.v1/kad.agent.emule-harness.download.private.large.v1-20260418-235210/downloader-harness-profile/logs/eMule_Verbose.log>)
+
+This closes the previous reverse-Kad obfuscated transport blocker. The
+remaining `ITEM_031` gap is local AICH generation matching stock for the same
+payload, not active-path transport or verifier acceptance.
 
 ## Validation Standard
 

@@ -2,6 +2,34 @@
 
 Running note for Kad oracle-parity findings that affect live behavior.
 
+## 2026-04-19
+
+- Local `>2 GiB` reverse-Kad harness<-agent runs exposed a source-publish
+  identity mismatch on the obfuscated path:
+  - the agent was publishing the ED2K user hash in raw MD4 byte order
+  - stock eMule Kad source identity uses `CUInt128` 32-bit chunk order on the
+    Kad publish/search path
+- Overlord parity adjustments landed:
+  - Kad source publish now uses eMule chunk order for the published client hash
+  - local source-search response mapping now converts that published identity
+    back into the canonical ED2K user hash seen by the downloader
+  - the agent listener now emits explicit inbound ED2K accept-failure events
+  - the tracing harness now logs source-search results, source-connect
+    decisions, and socket connect/close/timeout phases on the reverse path
+- Result:
+  - the local run
+    `kad.agent.emule-harness.download.private.large.v1-20260418-235210`
+    completed successfully in obfuscated mode
+  - the harness discovered the corrected user hash, completed the obfuscated
+    direct TCP connect, exchanged `OP_HASHSETREQUEST2` /
+    `OP_HASHSETANSWER2`, transferred compressed parts, and verified the large
+    file with repeated `MD4: OK - AICH: OK`
+- Remaining non-protocol annoyance:
+  - the debug tracing harness still spends a long post-download rehash on the
+    finished `.part` before promotion into `Incoming`
+  - local large-file orchestration should treat that as slow finalization, not
+    as a transport stall
+
 ## 2026-03-24
 
 - Transport parity adjustment landed in `overlord-kad-net`:
