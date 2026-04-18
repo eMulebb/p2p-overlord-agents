@@ -120,6 +120,7 @@ const SRVCAP_LARGEFILES: u32 = 0x0100;
 const SRVCAP_SUPPORTCRYPT: u32 = 0x0200;
 const SRVCAP_REQUESTCRYPT: u32 = 0x0400;
 const SRVCAP_REQUIRECRYPT: u32 = 0x0800;
+const SOURCE_OBFUSCATION_USER_HASH_PRESENT: u8 = 0x80;
 const SRVCAP_UDP_NEWTAGS_LARGEFILES: u32 = 0x0001;
 
 const SERVER_TCP_FLAG_COMPRESSION: u32 = 0x0000_0001;
@@ -2859,12 +2860,10 @@ fn encode_search_request(term: &str) -> Result<Vec<u8>> {
 }
 
 fn login_identity_for_server_transport(
-    mut identity: Ed2kHelloIdentity,
+    identity: Ed2kHelloIdentity,
     use_server_obfuscation: bool,
 ) -> Ed2kHelloIdentity {
-    if !use_server_obfuscation {
-        identity.connect_options = 0;
-    }
+    let _ = use_server_obfuscation;
     identity
 }
 
@@ -3666,7 +3665,7 @@ fn decode_found_sources_from(
             let options = cursor[0];
             cursor = &cursor[1..];
             obfuscation_options = Some(options);
-            if options & 0x08 != 0 {
+            if options & SOURCE_OBFUSCATION_USER_HASH_PRESENT != 0 {
                 if cursor.len() < 16 {
                     anyhow::bail!("short ED2K obfuscated source user hash");
                 }
@@ -3909,7 +3908,8 @@ mod tests {
         OP_EDONKEYPROT, OP_GETSERVERLIST, OP_GETSOURCES, OP_GETSOURCES_OBFU, OP_LOGINREQUEST,
         OP_OFFERFILES, OP_PACKEDPROT, ResolvedServerEntry, SERVER_OBFUSCATION_PRIME_BYTES,
         SERVER_OBFUSCATION_PUBLIC_KEY_LEN, SERVER_TCP_FLAG_COMPRESSION, SERVER_TCP_FLAG_LARGEFILES,
-        SERVER_TCP_FLAG_TCPOBFUSCATION, SERVER_UDP_FLAG_UDPOBFUSCATION, ST_DESCRIPTION,
+        SERVER_TCP_FLAG_TCPOBFUSCATION, SERVER_UDP_FLAG_UDPOBFUSCATION,
+        SOURCE_OBFUSCATION_USER_HASH_PRESENT, ST_DESCRIPTION,
         ST_SERVERNAME, ServerSession, TAG_SHORT_NAME_MASK, TAGTYPE_UINT32, biguint_to_fixed_be,
         decode_found_sources, decode_search_result_page, decode_search_results,
         decode_server_ident, decode_server_payload, derive_server_cipher, ed2k_string_tag_type,
@@ -4229,7 +4229,7 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_server_sessions_clear_crypt_capability_bits() {
+    fn plaintext_server_sessions_preserve_crypt_capability_bits() {
         let identity = login_identity_for_server_transport(
             Ed2kHelloIdentity {
                 user_hash: [0x33; 16],
@@ -4244,7 +4244,7 @@ mod tests {
             false,
         );
 
-        assert_eq!(identity.connect_options, 0);
+        assert_eq!(identity.connect_options, emule_connect_options(true));
     }
 
     #[test]
@@ -4387,6 +4387,35 @@ mod tests {
         assert_eq!(sources[0].ip, ipv4_from_client_id(client_id));
         assert!(sources[0].low_id);
         assert!(!sources[0].is_direct_dialable());
+    }
+
+    #[test]
+    fn found_sources_decoder_extracts_obfuscated_sources_with_user_hash() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0xCC; 16]);
+        payload.push(1);
+        payload.extend_from_slice(&[10, 20, 30, 40]);
+        payload.extend_from_slice(&4662u16.to_le_bytes());
+        payload.push(SOURCE_OBFUSCATION_USER_HASH_PRESENT | 0x03);
+        payload.extend_from_slice(&[0x61; 16]);
+
+        let sources = decode_found_sources(&payload, true).unwrap();
+        let client_id = u32::from_le_bytes([10, 20, 30, 40]);
+
+        assert_eq!(
+            sources,
+            vec![Ed2kFoundSource {
+                file_hash: Ed2kHash([0xCC; 16]),
+                ip: Ipv4Addr::new(10, 20, 30, 40),
+                tcp_port: 4662,
+                client_id,
+                low_id: false,
+                obfuscated: true,
+                obfuscation_options: Some(SOURCE_OBFUSCATION_USER_HASH_PRESENT | 0x03),
+                user_hash: Some([0x61; 16]),
+                source_server: None,
+            }]
+        );
     }
 
     #[test]
