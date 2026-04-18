@@ -30,13 +30,14 @@ pub struct NotesSearchRequest {
 
 fn map_source_search_result(
     requested_file_hash: Ed2kHash,
+    source_id: Ed2kHash,
     tags: Vec<overlord_kad_proto::Tag>,
 ) -> Option<SourceResult> {
     // Kad SEARCH_RES entries for source searches use the entry-id slot for the
     // publishing/source identity, not the requested file hash. Preserve the
     // source endpoint from the result tags, but always pin the logical file
     // hash to the original request target.
-    SourceResult::from_tags(requested_file_hash, tags)
+    SourceResult::from_tags(requested_file_hash, source_id, tags)
 }
 
 /// Run a keyword search. Returns a Stream of results.
@@ -207,14 +208,15 @@ pub fn search_sources_by_request(
                 _ = cancel.cancelled() => break,
                 next = raw_rx.recv() => next,
             };
-            let Some((_source_id, tags)) = next else {
+            let Some((source_id, tags)) = next else {
                 break;
             };
             if seen_sources.len() >= result_cap {
                 break;
             }
 
-            let Some(source) = map_source_search_result(requested_file_hash, tags) else {
+            let Some(source) = map_source_search_result(requested_file_hash, source_id, tags)
+            else {
                 continue;
             };
             let source_key = (source.ip, source.tcp_port, source.udp_port);
@@ -367,9 +369,10 @@ mod tests {
             Tag::new_short(tag_name::SOURCEUPORT, TagValue::U16(42072)),
         ];
 
-        let source =
-            map_source_search_result(requested_file_hash, tags).expect("source search result");
+        let source = map_source_search_result(requested_file_hash, source_identity, tags)
+            .expect("source search result");
         assert_eq!(source.file_hash, requested_file_hash);
+        assert_eq!(source.source_id, source_identity);
         assert_ne!(source.file_hash, source_identity);
         assert_eq!(source.ip, std::net::Ipv4Addr::new(127, 0, 0, 1));
         assert_eq!(source.tcp_port, 42062);

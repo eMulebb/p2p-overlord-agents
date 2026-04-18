@@ -74,24 +74,29 @@ impl SearchResult {
 #[derive(Debug, Clone)]
 pub struct SourceResult {
     pub file_hash: Ed2kHash,
+    pub source_id: Ed2kHash,
     pub ip: Ipv4Addr,
     pub tcp_port: u16,
     pub udp_port: u16,
+    pub obfuscation_options: Option<u8>,
 }
 
 impl SourceResult {
-    pub fn from_tags(file_hash: Ed2kHash, tags: Vec<Tag>) -> Option<Self> {
+    pub fn from_tags(file_hash: Ed2kHash, source_id: Ed2kHash, tags: Vec<Tag>) -> Option<Self> {
         let mut ip: Option<Ipv4Addr> = None;
         let mut tcp_port: u16 = 0;
         let mut udp_port: u16 = 0;
+        let mut obfuscation_options = None;
 
         for tag in &tags {
             match &tag.name {
-                TagName::Short(n) if *n == tag_name::SOURCEIP => {
-                    if let TagValue::U32(v) = &tag.value {
-                        ip = Some(Ipv4Addr::from(v.to_be_bytes()));
+                TagName::Short(n) if *n == tag_name::SOURCEIP => match &tag.value {
+                    TagValue::UInt(v) if u32::try_from(*v).is_ok() => {
+                        ip = Some(Ipv4Addr::from((*v as u32).to_be_bytes()));
                     }
-                }
+                    TagValue::U32(v) => ip = Some(Ipv4Addr::from(v.to_be_bytes())),
+                    _ => {}
+                },
                 TagName::Short(n) if *n == tag_name::SOURCEPORT => match &tag.value {
                     TagValue::UInt(v) => tcp_port = *v as u16,
                     TagValue::U16(v) => tcp_port = *v,
@@ -104,6 +109,19 @@ impl SourceResult {
                     TagValue::U16(v) => udp_port = *v,
                     TagValue::U32(v) => udp_port = *v as u16,
                     TagValue::U8(v) => udp_port = (*v).into(),
+                    _ => {}
+                },
+                TagName::Short(n) if *n == tag_name::ENCRYPTION => match &tag.value {
+                    TagValue::UInt(v) if u8::try_from(*v).is_ok() => {
+                        obfuscation_options = Some(*v as u8)
+                    }
+                    TagValue::U32(v) if u8::try_from(*v).is_ok() => {
+                        obfuscation_options = Some(*v as u8)
+                    }
+                    TagValue::U16(v) if u8::try_from(*v).is_ok() => {
+                        obfuscation_options = Some(*v as u8)
+                    }
+                    TagValue::U8(v) => obfuscation_options = Some(*v),
                     _ => {}
                 },
                 _ => {}
@@ -121,9 +139,11 @@ impl SourceResult {
 
         Some(SourceResult {
             file_hash,
+            source_id,
             ip,
             tcp_port,
             udp_port,
+            obfuscation_options,
         })
     }
 }
@@ -230,29 +250,35 @@ mod tests {
     #[test]
     fn test_source_result_from_emule_source_tags() {
         let hash = Ed2kHash::from_bytes([4u8; 16]);
+        let source_id = Ed2kHash::from_bytes([5u8; 16]);
         let tags = vec![
             Tag::new_short(tag_name::SOURCEIP, TagValue::U32(0x01020304)),
             Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(4662)),
             Tag::new_short(tag_name::SOURCEUPORT, TagValue::U16(4672)),
             Tag::new_short(tag_name::SOURCETYPE, TagValue::U8(1)),
+            Tag::new_short(tag_name::ENCRYPTION, TagValue::U8(0x03)),
         ];
-        let result = SourceResult::from_tags(hash, tags).expect("source result");
+        let result = SourceResult::from_tags(hash, source_id, tags).expect("source result");
+        assert_eq!(result.source_id, source_id);
         assert_eq!(result.ip, Ipv4Addr::new(1, 2, 3, 4));
         assert_eq!(result.tcp_port, 4662);
         assert_eq!(result.udp_port, 4672);
+        assert_eq!(result.obfuscation_options, Some(0x03));
     }
 
     #[test]
     fn test_source_result_accepts_unknown_source_type_when_endpoint_is_valid() {
         let hash = Ed2kHash::from_bytes([7u8; 16]);
+        let source_id = Ed2kHash::from_bytes([8u8; 16]);
         let tags = vec![
             Tag::new_short(tag_name::SOURCEIP, TagValue::U32(0x01020304)),
             Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(4662)),
             Tag::new_short(tag_name::SOURCETYPE, TagValue::U8(2)),
         ];
-        let result = SourceResult::from_tags(hash, tags).expect("harvest source result");
+        let result = SourceResult::from_tags(hash, source_id, tags).expect("harvest source result");
         assert_eq!(result.ip, Ipv4Addr::new(1, 2, 3, 4));
         assert_eq!(result.udp_port, 4662);
+        assert_eq!(result.obfuscation_options, None);
     }
 
     #[test]

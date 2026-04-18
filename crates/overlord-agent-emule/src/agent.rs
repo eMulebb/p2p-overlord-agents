@@ -3008,9 +3008,9 @@ fn kad_source_result_to_ed2k_found_source(result: SourceResult) -> Ed2kFoundSour
         tcp_port: result.tcp_port,
         client_id: u32::from(result.ip),
         low_id: false,
-        obfuscated: false,
-        obfuscation_options: None,
-        user_hash: None,
+        obfuscated: result.obfuscation_options.is_some(),
+        obfuscation_options: result.obfuscation_options,
+        user_hash: Some(result.source_id.0),
         source_server: None,
     }
 }
@@ -3024,6 +3024,14 @@ fn manifest_has_ed2k_transfer_progress(manifest: &Ed2kResumeManifest) -> bool {
         || manifest.md4_hashset_acquired
         || !manifest.verified_ranges.is_empty()
         || manifest.pieces.iter().any(|piece| piece.bytes_written != 0)
+}
+
+fn is_retryable_direct_download_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|inner| inner.kind() == std::io::ErrorKind::ConnectionRefused)
+    })
 }
 
 /// Collects Kad-advertised ED2K sources for a bounded window so downloads can
@@ -3559,13 +3567,12 @@ fn emule_high_id_source_type(file_size: u64) -> u32 {
     }
 }
 
-/// Derive a stable 16-byte source-publish identity from the persisted indexer UUID.
+/// Reuse the persisted eD2k user hash as the Kad source-publish identity.
 ///
-/// The oracle source-publish path sends the eMule client hash rather than the Kad node ID in the
-/// second `KADEMLIA2_PUBLISH_SOURCE_REQ` field. We do not yet persist a separate client hash, so
-/// we reuse the stable indexer UUID bytes to keep the identity fixed across restarts.
-fn source_publish_client_hash(indexer_id: Uuid) -> NodeId {
-    NodeId::from_bytes(*indexer_id.as_bytes())
+/// The oracle source-publish path sends the eMule client hash rather than the
+/// Kad node ID in the second `KADEMLIA2_PUBLISH_SOURCE_REQ` field.
+fn source_publish_client_hash(ed2k_user_hash: [u8; 16]) -> NodeId {
+    NodeId::from_bytes(ed2k_user_hash)
 }
 
 /// Applies the classic eMule client marker bytes to an ED2K user hash.
@@ -3633,7 +3640,7 @@ fn build_source_publish_tags(
     source_publish_settings: SourcePublishSettings,
     file_size: u64,
 ) -> Vec<Tag> {
-    vec![
+    let mut tags = vec![
         Tag::new_short(
             tag_name::SOURCETYPE,
             TagValue::UInt(u64::from(emule_high_id_source_type(file_size))),
@@ -3644,15 +3651,25 @@ fn build_source_publish_tags(
             tag_name::SOURCEPORT,
             TagValue::UInt(u64::from(source_publish_settings.tcp_port)),
         ),
-        Tag::new_short(tag_name::SOURCEUPORT, TagValue::U16(bind_addr.port())),
-        Tag::filesize(file_size),
-        Tag::new_short(
-            tag_name::ENCRYPTION,
-            TagValue::U8(emule_source_encryption_options(
-                source_publish_settings.obfuscation_enabled,
-            )),
-        ),
-    ]
+    ];
+    if let SocketAddr::V4(addr) = bind_addr {
+        tags.push(Tag::new_short(
+            tag_name::SOURCEIP,
+            TagValue::U32(u32::from_be_bytes(addr.ip().octets())),
+        ));
+    }
+    tags.push(Tag::new_short(
+        tag_name::SOURCEUPORT,
+        TagValue::U16(bind_addr.port()),
+    ));
+    tags.push(Tag::filesize(file_size));
+    tags.push(Tag::new_short(
+        tag_name::ENCRYPTION,
+        TagValue::U8(emule_source_encryption_options(
+            source_publish_settings.obfuscation_enabled,
+        )),
+    ));
+    tags
 }
 
 /// Builds a deterministic notes-publish payload for controlled live validation.
@@ -5953,7 +5970,7 @@ impl IndexerService for OverlordAgentEmule {
         let Some(runtime) = runtime else {
             anyhow::bail!("agent networking is waiting for interface selection");
         };
-        let source_publish_identity = source_publish_client_hash(self.indexer_id);
+        let source_publish_identity = source_publish_client_hash(self.ed2k_user_hash);
         let config = self.config.read().await;
         let source_publish_settings = SourcePublishSettings {
             tcp_port: config.p2p.ed2k.listen_port,
@@ -6057,113 +6074,22 @@ impl OverlordAgentEmule {
             + 'static,
         DownloadFuture: Future<Output = Result<Ed2kPeerDownloadOutcome>> + Send + 'static,
     {
-        let mut last_error: Option<anyhow::Error> = None;
-        let mut accepted_incomplete_peers = 0u32;
-        let mut source_iter = sources.into_iter();
-        let mut active_downloads = JoinSet::new();
         let max_parallel_download_peers = max_parallel_download_peers.max(1);
-
-        while active_downloads.len() < max_parallel_download_peers {
-            let Some(source) = source_iter.next() else {
-                break;
+        let retry_deadline =
+            if !sources.is_empty() && sources.iter().all(|source| source.ip.is_loopback()) {
+                Some(tokio::time::Instant::now() + Duration::from_secs(360))
+            } else {
+                None
             };
-            let transfer_runtime = Arc::clone(&transfer_runtime);
-            let secure_ident = Arc::clone(&secure_ident);
-            let download_peer = download_peer.clone();
-            let file_name = file_name.clone();
-            let file_hash_hex = file_hash_hex.clone();
-            let peer_addr = SocketAddr::new(IpAddr::V4(source.ip), source.tcp_port);
-            info!(
-                "native ED2K download attempt file_hash={} peer={}:{} client_id={} obfuscated={} has_user_hash={}",
-                file_hash_hex,
-                source.ip,
-                source.tcp_port,
-                source.client_id,
-                source.obfuscated,
-                source.user_hash.is_some()
-            );
-            dump_ed2k_tcp_download_meta(
-                peer_addr,
-                None,
-                "attempt_start",
-                format!(
-                    "file_hash={} client_id={} obfuscated={} has_user_hash={}",
-                    file_hash_hex,
-                    source.client_id,
-                    source.obfuscated,
-                    source.user_hash.is_some()
-                ),
-            );
-            active_downloads.spawn(async move {
-                let result = download_peer(
-                    bind_ip,
-                    source,
-                    hello_identity,
-                    secure_ident,
-                    transfer_runtime,
-                    file_name,
-                    file_size,
-                    connect_timeout,
-                )
-                .await;
-                (peer_addr, result)
-            });
-        }
+        let retry_sources = sources;
+        let mut retry_round = 0u32;
+        let mut last_error: Option<anyhow::Error> = None;
 
-        while let Some(joined) = active_downloads.join_next().await {
-            let (peer_addr, result) = joined.context("native ED2K download worker panicked")?;
-            match result {
-                Ok(Ed2kPeerDownloadOutcome::Completed) => {
-                    let manifest = transfer_runtime.manifest(&file_hash_hex).await?;
-                    dump_ed2k_tcp_download_meta(
-                        peer_addr,
-                        None,
-                        "attempt_success",
-                        format!(
-                            "file_hash={} manifest_completed={} verified_ranges={} file_size={}",
-                            file_hash_hex,
-                            manifest.completed,
-                            manifest.verified_ranges.len(),
-                            manifest.file_size
-                        ),
-                    );
-                    if manifest.completed {
-                        active_downloads.abort_all();
-                        while active_downloads.join_next().await.is_some() {}
-                        return Ok(NativeDirectDownloadOutcome {
-                            completed: true,
-                            accepted_incomplete_peers,
-                            last_error,
-                        });
-                    }
-                }
-                Ok(Ed2kPeerDownloadOutcome::AcceptedButIncomplete) => {
-                    accepted_incomplete_peers += 1;
-                    dump_ed2k_tcp_download_meta(
-                        peer_addr,
-                        None,
-                        "attempt_accepted_incomplete",
-                        format!("file_hash={file_hash_hex}"),
-                    );
-                    info!(
-                        "native ED2K download peer accepted session but did not complete file_hash={} peer={}",
-                        file_hash_hex, peer_addr
-                    );
-                }
-                Err(error) => {
-                    dump_ed2k_tcp_download_meta(
-                        peer_addr,
-                        None,
-                        "attempt_failure",
-                        format!("file_hash={} error={error}", file_hash_hex),
-                    );
-                    warn!(
-                        "native ED2K download peer failed file_hash={} peer={}: {error}",
-                        file_hash_hex, peer_addr
-                    );
-                    last_error = Some(error);
-                }
-            }
+        loop {
+            let mut accepted_incomplete_peers = 0u32;
+            let mut retryable_error_seen = false;
+            let mut source_iter = retry_sources.clone().into_iter();
+            let mut active_downloads = JoinSet::new();
 
             while active_downloads.len() < max_parallel_download_peers {
                 let Some(source) = source_iter.next() else {
@@ -6189,11 +6115,12 @@ impl OverlordAgentEmule {
                     None,
                     "attempt_start",
                     format!(
-                        "file_hash={} client_id={} obfuscated={} has_user_hash={}",
+                        "file_hash={} client_id={} obfuscated={} has_user_hash={} retry_round={}",
                         file_hash_hex,
                         source.client_id,
                         source.obfuscated,
-                        source.user_hash.is_some()
+                        source.user_hash.is_some(),
+                        retry_round
                     ),
                 );
                 active_downloads.spawn(async move {
@@ -6211,13 +6138,144 @@ impl OverlordAgentEmule {
                     (peer_addr, result)
                 });
             }
-        }
 
-        Ok(NativeDirectDownloadOutcome {
-            completed: transfer_runtime.manifest(&file_hash_hex).await?.completed,
-            accepted_incomplete_peers,
-            last_error,
-        })
+            while let Some(joined) = active_downloads.join_next().await {
+                let (peer_addr, result) = joined.context("native ED2K download worker panicked")?;
+                match result {
+                    Ok(Ed2kPeerDownloadOutcome::Completed) => {
+                        let manifest = transfer_runtime.manifest(&file_hash_hex).await?;
+                        dump_ed2k_tcp_download_meta(
+                            peer_addr,
+                            None,
+                            "attempt_success",
+                            format!(
+                                "file_hash={} manifest_completed={} verified_ranges={} file_size={}",
+                                file_hash_hex,
+                                manifest.completed,
+                                manifest.verified_ranges.len(),
+                                manifest.file_size
+                            ),
+                        );
+                        if manifest.completed {
+                            active_downloads.abort_all();
+                            while active_downloads.join_next().await.is_some() {}
+                            return Ok(NativeDirectDownloadOutcome {
+                                completed: true,
+                                accepted_incomplete_peers,
+                                last_error: last_error
+                                    .as_ref()
+                                    .map(|error| anyhow::anyhow!(error.to_string())),
+                            });
+                        }
+                    }
+                    Ok(Ed2kPeerDownloadOutcome::AcceptedButIncomplete) => {
+                        accepted_incomplete_peers += 1;
+                        dump_ed2k_tcp_download_meta(
+                            peer_addr,
+                            None,
+                            "attempt_accepted_incomplete",
+                            format!("file_hash={file_hash_hex}"),
+                        );
+                        info!(
+                            "native ED2K download peer accepted session but did not complete file_hash={} peer={}",
+                            file_hash_hex, peer_addr
+                        );
+                    }
+                    Err(error) => {
+                        retryable_error_seen |= is_retryable_direct_download_error(&error);
+                        dump_ed2k_tcp_download_meta(
+                            peer_addr,
+                            None,
+                            "attempt_failure",
+                            format!("file_hash={} error={error}", file_hash_hex),
+                        );
+                        warn!(
+                            "native ED2K download peer failed file_hash={} peer={}: {error}",
+                            file_hash_hex, peer_addr
+                        );
+                        last_error = Some(error);
+                    }
+                }
+
+                while active_downloads.len() < max_parallel_download_peers {
+                    let Some(source) = source_iter.next() else {
+                        break;
+                    };
+                    let transfer_runtime = Arc::clone(&transfer_runtime);
+                    let secure_ident = Arc::clone(&secure_ident);
+                    let download_peer = download_peer.clone();
+                    let file_name = file_name.clone();
+                    let file_hash_hex = file_hash_hex.clone();
+                    let peer_addr = SocketAddr::new(IpAddr::V4(source.ip), source.tcp_port);
+                    info!(
+                        "native ED2K download attempt file_hash={} peer={}:{} client_id={} obfuscated={} has_user_hash={}",
+                        file_hash_hex,
+                        source.ip,
+                        source.tcp_port,
+                        source.client_id,
+                        source.obfuscated,
+                        source.user_hash.is_some()
+                    );
+                    dump_ed2k_tcp_download_meta(
+                        peer_addr,
+                        None,
+                        "attempt_start",
+                        format!(
+                            "file_hash={} client_id={} obfuscated={} has_user_hash={} retry_round={}",
+                            file_hash_hex,
+                            source.client_id,
+                            source.obfuscated,
+                            source.user_hash.is_some(),
+                            retry_round
+                        ),
+                    );
+                    active_downloads.spawn(async move {
+                        let result = download_peer(
+                            bind_ip,
+                            source,
+                            hello_identity,
+                            secure_ident,
+                            transfer_runtime,
+                            file_name,
+                            file_size,
+                            connect_timeout,
+                        )
+                        .await;
+                        (peer_addr, result)
+                    });
+                }
+            }
+
+            let outcome = NativeDirectDownloadOutcome {
+                completed: transfer_runtime.manifest(&file_hash_hex).await?.completed,
+                accepted_incomplete_peers,
+                last_error: last_error
+                    .as_ref()
+                    .map(|error| anyhow::anyhow!(error.to_string())),
+            };
+            if outcome.completed || outcome.accepted_incomplete_peers != 0 {
+                return Ok(outcome);
+            }
+
+            let Some(deadline) = retry_deadline else {
+                return Ok(outcome);
+            };
+            if !retryable_error_seen || tokio::time::Instant::now() >= deadline {
+                return Ok(outcome);
+            }
+
+            let last_error_summary = outcome
+                .last_error
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "connection refused".to_string());
+            retry_round += 1;
+            info!(
+                "native ED2K download retrying loopback sources file_hash={} retry_round={} reason={}",
+                file_hash_hex, retry_round, last_error_summary
+            );
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
     }
 
     async fn native_ed2k_download_sources(
@@ -6945,7 +7003,7 @@ impl OverlordAgentEmule {
         let publish_observability = Arc::clone(&self.publish_observability);
         let agent_activity = Arc::clone(&self.agent_activity);
         let ed2k_shared_catalog = Arc::clone(&runtime.ed2k_shared_catalog);
-        let source_publish_identity = source_publish_client_hash(self.indexer_id);
+        let source_publish_identity = source_publish_client_hash(self.ed2k_user_hash);
         let source_publish_settings = SourcePublishSettings {
             tcp_port: config.p2p.ed2k.listen_port,
             obfuscation_enabled: config.p2p.ed2k.obfuscation_enabled,
@@ -8224,7 +8282,7 @@ impl OverlordAgentEmule {
         let agent_activity = Arc::clone(&self.agent_activity);
         let ed2k_shared_catalog = Arc::clone(&runtime.ed2k_shared_catalog);
         let active_ed2k_downloads = Arc::clone(&self.active_ed2k_downloads);
-        let source_publish_identity = source_publish_client_hash(self.indexer_id);
+        let source_publish_identity = source_publish_client_hash(self.ed2k_user_hash);
         let source_publish_settings = SourcePublishSettings {
             tcp_port: config.p2p.ed2k.listen_port,
             obfuscation_enabled: config.p2p.ed2k.obfuscation_enabled,
@@ -8308,7 +8366,7 @@ impl OverlordAgentEmule {
         let publish_observability = Arc::clone(&self.publish_observability);
         let agent_activity = Arc::clone(&self.agent_activity);
         let ed2k_shared_catalog = Arc::clone(&runtime.ed2k_shared_catalog);
-        let source_publish_identity = source_publish_client_hash(self.indexer_id);
+        let source_publish_identity = source_publish_client_hash(self.ed2k_user_hash);
         let source_publish_settings = SourcePublishSettings {
             tcp_port: config.p2p.ed2k.listen_port,
             obfuscation_enabled: config.p2p.ed2k.obfuscation_enabled,
@@ -8377,16 +8435,17 @@ mod tests {
         current_tcp_firewalled, ed2k_download_source_server_attempt_budget,
         ed2k_file_type_search_term, ed2k_keyword_server_attempt_budget, effective_publish_counters,
         empty_networking_config, emule_high_id_source_type, exact_ed2k_hash_query_token,
-        flush_snoop_queue, keyword_target, manifest_has_ed2k_transfer_progress,
-        next_passive_replay_request, next_passive_replay_request_for_family,
-        next_synthetic_publish_batch, normalize_ed2k_user_hash_markers, parse_kad_hello_metadata,
-        record_passive_replay_complete, record_passive_replay_enqueue_wait,
-        record_passive_replay_idle, record_passive_replay_post_failure,
-        record_passive_replay_post_latency, record_passive_replay_start, restore_snoop_queue,
-        select_ed2k_keyword_metadata, should_request_hello_response_ack,
-        should_request_proactive_hello_res_ack, significant_keyword_words, synthetic_file_hash,
-        synthetic_popular_hash, synthetic_popular_hashes, synthetic_publish_aich_hash,
-        synthetic_publish_queue_depth, try_acquire_passive_replay_gate,
+        flush_snoop_queue, kad_source_result_to_ed2k_found_source, keyword_target,
+        manifest_has_ed2k_transfer_progress, next_passive_replay_request,
+        next_passive_replay_request_for_family, next_synthetic_publish_batch,
+        normalize_ed2k_user_hash_markers, parse_kad_hello_metadata, record_passive_replay_complete,
+        record_passive_replay_enqueue_wait, record_passive_replay_idle,
+        record_passive_replay_post_failure, record_passive_replay_post_latency,
+        record_passive_replay_start, restore_snoop_queue, select_ed2k_keyword_metadata,
+        should_request_hello_response_ack, should_request_proactive_hello_res_ack,
+        significant_keyword_words, synthetic_file_hash, synthetic_popular_hash,
+        synthetic_popular_hashes, synthetic_publish_aich_hash, synthetic_publish_queue_depth,
+        try_acquire_passive_replay_gate,
     };
     use crate::{
         config::SnoopQueueConfig,
@@ -8413,7 +8472,7 @@ mod tests {
         SnoopEntry,
     };
     use overlord_agent_nat::{UPNP_MINIUPNPC_BACKEND, UPNP_RUPNP_BACKEND};
-    use overlord_kad_dht::{DhtConfig, DhtNode, PublishAttemptStats, SearchResult};
+    use overlord_kad_dht::{DhtConfig, DhtNode, PublishAttemptStats, SearchResult, SourceResult};
     use overlord_kad_proto::{
         Ed2kHash, NodeId, SearchKeyReq, SearchNotesReq, SearchSourceReq, Tag, TagName, TagValue,
         tag_name,
@@ -8673,6 +8732,100 @@ mod tests {
         assert_eq!(outcome.accepted_incomplete_peers, 0);
         assert!(outcome.last_error.is_some());
         assert_eq!(*attempts.lock().await, vec![41001, 41002]);
+        let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
+        assert!(manifest.completed);
+    }
+
+    #[tokio::test]
+    async fn native_direct_download_retries_loopback_peer_after_connection_refused() {
+        let temp_root = unique_test_dir("overlord-agent-emule-loopback-refused-retry");
+        let transfer_runtime = Arc::new(Ed2kTransferRuntime::load_or_create(&temp_root).unwrap());
+        let payload = b"captured small file payload".repeat(32);
+        let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
+        let file_hash_hex = file_hash.to_string();
+        transfer_runtime
+            .ensure_job(&new_transfer_job(
+                file_hash,
+                "captured.epub".to_string(),
+                payload.len() as u64,
+            ))
+            .await
+            .unwrap();
+        let secure_ident =
+            Arc::new(Ed2kSecureIdent::load_or_create(&temp_root.join("secure-ident.der")).unwrap());
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let payload = Arc::new(payload);
+        let file_hash_hex_for_download = file_hash_hex.clone();
+        let success_after_attempt = 3usize;
+        let outcome = OverlordAgentEmule::run_native_ed2k_direct_downloads(
+            Ipv4Addr::LOCALHOST,
+            Ed2kHelloIdentity {
+                user_hash: [0x11; 16],
+                client_id: 0,
+                tcp_port: 41001,
+                udp_port: 41000,
+                server_ip: 0,
+                server_port: 0,
+                connect_options: emule_connect_options(false),
+                direct_udp_callback: false,
+            },
+            secure_ident,
+            Arc::clone(&transfer_runtime),
+            file_hash_hex.clone(),
+            "captured.epub".to_string(),
+            payload.len() as u64,
+            vec![Ed2kFoundSource {
+                file_hash,
+                ip: Ipv4Addr::LOCALHOST,
+                tcp_port: 41001,
+                client_id: 1,
+                low_id: false,
+                obfuscated: false,
+                obfuscation_options: None,
+                user_hash: None,
+                source_server: None,
+            }],
+            Duration::from_secs(1),
+            1,
+            {
+                let attempts = Arc::clone(&attempts);
+                move |_bind_ip,
+                      source,
+                      _hello_identity,
+                      _secure_ident,
+                      transfer_runtime,
+                      _file_name,
+                      _file_size,
+                      _connect_timeout| {
+                    let attempts = Arc::clone(&attempts);
+                    let payload = Arc::clone(&payload);
+                    let file_hash_hex = file_hash_hex_for_download.clone();
+                    async move {
+                        attempts.lock().await.push(source.tcp_port);
+                        let attempt_count = attempts.lock().await.len();
+                        if attempt_count < success_after_attempt {
+                            return Err(anyhow::anyhow!(std::io::Error::from(
+                                std::io::ErrorKind::ConnectionRefused
+                            )));
+                        }
+                        transfer_runtime
+                            .store_md4_hashset(&file_hash_hex, Vec::new())
+                            .await?;
+                        transfer_runtime
+                            .store_piece_data(&file_hash_hex, 0, payload.as_slice())
+                            .await?;
+                        Ok(Ed2kPeerDownloadOutcome::Completed)
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.completed);
+        assert_eq!(outcome.accepted_incomplete_peers, 0);
+        assert!(outcome.last_error.is_some());
+        assert_eq!(*attempts.lock().await, vec![41001, 41001, 41001]);
         let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
         assert!(manifest.completed);
     }
@@ -10065,6 +10218,7 @@ mod tests {
             vec![
                 Tag::new_short(tag_name::SOURCETYPE, TagValue::UInt(1)),
                 Tag::new_short(tag_name::SOURCEPORT, TagValue::UInt(41001)),
+                Tag::new_short(tag_name::SOURCEIP, TagValue::U32(0x0A36_CECE)),
                 Tag::new_short(tag_name::SOURCEUPORT, TagValue::U16(41000)),
                 Tag::filesize(2_097_152),
                 Tag::new_short(tag_name::ENCRYPTION, TagValue::U8(0)),
@@ -10087,6 +10241,23 @@ mod tests {
             tags.last(),
             Some(&Tag::new_short(tag_name::ENCRYPTION, TagValue::U8(3)))
         );
+    }
+
+    #[test]
+    fn kad_source_results_preserve_obfuscation_and_user_hash_metadata() {
+        let source = kad_source_result_to_ed2k_found_source(SourceResult {
+            file_hash: Ed2kHash::from_bytes([0x44; 16]),
+            source_id: Ed2kHash::from_bytes([0x55; 16]),
+            ip: Ipv4Addr::new(127, 0, 0, 2),
+            tcp_port: 4662,
+            udp_port: 4672,
+            obfuscation_options: Some(0x03),
+        });
+
+        assert!(source.obfuscated);
+        assert_eq!(source.obfuscation_options, Some(0x03));
+        assert_eq!(source.user_hash, Some([0x55; 16]));
+        assert_eq!(source.ip, Ipv4Addr::new(127, 0, 0, 2));
     }
 
     #[test]
