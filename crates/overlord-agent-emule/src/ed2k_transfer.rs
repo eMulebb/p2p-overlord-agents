@@ -13,6 +13,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
+    io::Read,
     net::IpAddr,
     path::{Path, PathBuf},
     str::FromStr,
@@ -24,8 +25,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use md4::{Digest, Md4};
+use md4::{Digest as Md4Digest, Md4};
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use tokio::sync::{Mutex, RwLock};
 
 use overlord_agent_common::{HashType, PopularHash};
@@ -356,6 +358,9 @@ pub struct Ed2kSharedEntry {
     pub compatibility_hint: bool,
     /// Source count carried over from seed/popular-hash inputs when known.
     pub source_count_hint: Option<u32>,
+    /// Canonical AICH root in lowercase hex when known.
+    #[serde(default)]
+    pub aich_root: Option<String>,
 }
 
 impl Ed2kSharedEntry {
@@ -372,6 +377,7 @@ impl Ed2kSharedEntry {
             verified_ranges: Vec::new(),
             compatibility_hint: true,
             source_count_hint: Some(hash.source_count),
+            aich_root: None,
         })
     }
 
@@ -386,6 +392,7 @@ impl Ed2kSharedEntry {
             verified_ranges: manifest.verified_ranges.clone(),
             compatibility_hint: false,
             source_count_hint: None,
+            aich_root: manifest.aich_root.clone(),
         }
     }
 
@@ -458,6 +465,13 @@ pub struct Ed2kSourceHint {
     pub user_hash: Option<String>,
 }
 
+/// Canonical AICH master hash plus per-part hashes for one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Ed2kAichHashset {
+    pub master_hash: [u8; 20],
+    pub part_hashes: Vec<[u8; 20]>,
+}
+
 /// One pending LowID callback download intent remembered until a peer calls back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ed2kCallbackIntent {
@@ -494,6 +508,13 @@ pub struct Ed2kResumeManifest {
     /// list is empty and the file hash itself is the verification authority.
     #[serde(default)]
     pub md4_hashset: Vec<String>,
+    /// Whether the canonical AICH part-hash set for this file has been
+    /// learned or derived locally.
+    pub aich_hashset_acquired: bool,
+    /// Canonical AICH root in lowercase hex when known.
+    pub aich_root: Option<String>,
+    /// Canonical AICH per-part hashes in lowercase hex.
+    pub aich_hashset: Vec<String>,
     /// Upload-safe verified ranges.
     pub verified_ranges: Vec<Ed2kSharedRange>,
     /// Piece states keyed by piece index.
@@ -515,6 +536,9 @@ impl Ed2kResumeManifest {
             completed: false,
             md4_hashset_acquired: false,
             md4_hashset: Vec::new(),
+            aich_hashset_acquired: false,
+            aich_root: None,
+            aich_hashset: Vec::new(),
             verified_ranges: Vec::new(),
             pieces: (0..piece_count)
                 .map(|piece_index| Ed2kPieceState {
@@ -724,6 +748,63 @@ impl Ed2kTransferRuntime {
         Ok(manifest)
     }
 
+    /// Persist the canonical ED2K AICH root and part hashset after validating
+    /// the payload against the expected file size.
+    pub async fn store_aich_hashset(
+        &self,
+        file_hash: &str,
+        aich_hashset: Ed2kAichHashset,
+    ) -> Result<Ed2kResumeManifest> {
+        let _guard = self.manifest_io.lock().await;
+        let mut manifest = self.load_manifest_unlocked(file_hash).await?;
+        if let Some(existing_root) = manifest.aich_root.as_deref() {
+            let existing_root = decode_aich_hash_hex(existing_root)?;
+            if existing_root != aich_hashset.master_hash {
+                anyhow::bail!(
+                    "refusing to replace AICH root for {} with conflicting data",
+                    file_hash
+                );
+            }
+        }
+        validate_aich_hashset(manifest.file_size, &aich_hashset)?;
+        manifest.aich_root = Some(hex::encode(aich_hashset.master_hash));
+        manifest.aich_hashset = aich_hashset.part_hashes.iter().map(hex::encode).collect();
+        manifest.aich_hashset_acquired = true;
+        self.store_manifest_unlocked(&manifest).await?;
+        self.upsert_verified_catalog_entry(&manifest).await;
+        Ok(manifest)
+    }
+
+    /// Persist only the canonical AICH root learned from peer file metadata.
+    pub async fn reconcile_aich_root(
+        &self,
+        file_hash: &str,
+        aich_root: Option<[u8; 20]>,
+    ) -> Result<Ed2kResumeManifest> {
+        let _guard = self.manifest_io.lock().await;
+        let mut manifest = self.load_manifest_unlocked(file_hash).await?;
+        let mut changed = false;
+        if let Some(aich_root) = aich_root {
+            let encoded = hex::encode(aich_root);
+            if let Some(existing_root) = manifest.aich_root.as_deref() {
+                if existing_root != encoded {
+                    anyhow::bail!(
+                        "refusing to replace AICH root for {} with conflicting metadata",
+                        file_hash
+                    );
+                }
+            } else {
+                manifest.aich_root = Some(encoded);
+                changed = true;
+            }
+        }
+        if changed {
+            self.store_manifest_unlocked(&manifest).await?;
+            self.upsert_verified_catalog_entry(&manifest).await;
+        }
+        Ok(manifest)
+    }
+
     /// Record one remembered source hint for a job.
     pub async fn remember_source(&self, file_hash: &str, source: Ed2kSourceHint) -> Result<()> {
         let _guard = self.manifest_io.lock().await;
@@ -870,6 +951,12 @@ impl Ed2kTransferRuntime {
         }
         rebuild_verified_ranges(&mut manifest);
         manifest.completed = manifest.is_fully_verified();
+        if manifest.completed {
+            refresh_completed_manifest_aich_hashset(
+                &self.transfer_dir(manifest.file_hash.as_str()),
+                &mut manifest,
+            )?;
+        }
         self.upsert_verified_catalog_entry(&manifest).await;
         self.store_manifest_unlocked(&manifest).await
     }
@@ -955,6 +1042,12 @@ impl Ed2kTransferRuntime {
             }
             rebuild_verified_ranges(&mut manifest);
             manifest.completed = manifest.is_fully_verified();
+            if manifest.completed {
+                refresh_completed_manifest_aich_hashset(
+                    &self.transfer_dir(manifest.file_hash.as_str()),
+                    &mut manifest,
+                )?;
+            }
             if piece_completed {
                 self.upsert_verified_catalog_entry(&manifest).await;
             }
@@ -1041,6 +1134,21 @@ impl Ed2kTransferRuntime {
             })
             .collect::<Result<Vec<_>>>()
             .map(Some)
+    }
+
+    /// Return the canonical AICH root plus per-part hashes for this file when known.
+    pub async fn aich_hashset(&self, file_hash: &Ed2kHash) -> Result<Option<Ed2kAichHashset>> {
+        let hash_hex = file_hash.to_string();
+        let path = self.transfer_dir(&hash_hex).join(MANIFEST_FILE_NAME);
+        if !tokio::fs::try_exists(&path).await? {
+            return Ok(None);
+        }
+        let _guard = self.manifest_io.lock().await;
+        let manifest = self.load_manifest_unlocked(&hash_hex).await?;
+        if !manifest.aich_hashset_acquired || manifest.aich_root.is_none() {
+            return Ok(None);
+        }
+        decode_manifest_aich_hashset(&manifest).map(Some)
     }
 
     /// Returns the persisted manifest for orchestration code that needs to read
@@ -1286,9 +1394,248 @@ fn validate_md4_hashset(file_hash: &str, md4_hashset: &[[u8; 16]]) -> Result<()>
     Ok(())
 }
 
+pub(crate) fn decode_aich_hash_hex(hash: &str) -> Result<[u8; 20]> {
+    let bytes = hex::decode(hash).with_context(|| format!("invalid AICH hash {hash}"))?;
+    let len = bytes.len();
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid AICH hash length {len}"))
+}
+
+fn decode_manifest_aich_hashset(manifest: &Ed2kResumeManifest) -> Result<Ed2kAichHashset> {
+    let root = manifest
+        .aich_root
+        .as_deref()
+        .context("AICH root not available in manifest")?;
+    let master_hash = decode_aich_hash_hex(root)?;
+    let part_hashes = manifest
+        .aich_hashset
+        .iter()
+        .map(|hash| decode_aich_hash_hex(hash))
+        .collect::<Result<Vec<_>>>()?;
+    if manifest.aich_hashset_acquired {
+        validate_aich_hashset(
+            manifest.file_size,
+            &Ed2kAichHashset {
+                master_hash,
+                part_hashes: part_hashes.clone(),
+            },
+        )?;
+    }
+    Ok(Ed2kAichHashset {
+        master_hash,
+        part_hashes,
+    })
+}
+
+fn expected_aich_hash_count(file_size: u64) -> u16 {
+    if file_size <= ED2K_PART_SIZE {
+        return 0;
+    }
+    let count = (file_size + ED2K_PART_SIZE - 1) / ED2K_PART_SIZE;
+    u16::try_from(count).unwrap_or(u16::MAX)
+}
+
+fn validate_aich_hashset(file_size: u64, aich_hashset: &Ed2kAichHashset) -> Result<()> {
+    let expected = usize::from(expected_aich_hash_count(file_size));
+    if aich_hashset.part_hashes.len() != expected {
+        anyhow::bail!(
+            "unexpected AICH hashset length {} expected {} for file size {}",
+            aich_hashset.part_hashes.len(),
+            expected,
+            file_size
+        );
+    }
+    if expected == 0 {
+        return Ok(());
+    }
+    let reconstructed =
+        reconstruct_aich_root_from_part_hashes(file_size, &aich_hashset.part_hashes)?;
+    if reconstructed != aich_hashset.master_hash {
+        anyhow::bail!("AICH hashset does not reconstruct the advertised master hash");
+    }
+    Ok(())
+}
+
+fn read_aich_block_hashes(payload_path: &Path, file_size: u64) -> Result<Vec<[u8; 20]>> {
+    let mut file = fs::File::open(payload_path)
+        .with_context(|| format!("failed to open AICH payload {}", payload_path.display()))?;
+    let mut block_hashes = Vec::new();
+    let mut remaining = file_size;
+    let mut buffer = vec![0u8; usize::try_from(ED2K_EMBLOCK_SIZE).unwrap_or(0)];
+    while remaining > 0 {
+        let block_len = usize::try_from(remaining.min(ED2K_EMBLOCK_SIZE)).unwrap_or(0);
+        file.read_exact(&mut buffer[..block_len]).with_context(|| {
+            format!(
+                "failed to read AICH block data from {}",
+                payload_path.display()
+            )
+        })?;
+        let digest = Sha1::digest(&buffer[..block_len]);
+        let mut hash = [0u8; 20];
+        hash.copy_from_slice(&digest);
+        block_hashes.push(hash);
+        remaining -= u64::try_from(block_len).unwrap_or(0);
+    }
+    Ok(block_hashes)
+}
+
+fn reconstruct_aich_root_from_part_hashes(
+    file_size: u64,
+    part_hashes: &[[u8; 20]],
+) -> Result<[u8; 20]> {
+    fn build_part_root(
+        start: u64,
+        size: u64,
+        is_left_branch: bool,
+        part_hashes: &[[u8; 20]],
+    ) -> Result<[u8; 20]> {
+        if size <= ED2K_PART_SIZE {
+            let part_index =
+                usize::try_from(start / ED2K_PART_SIZE).context("AICH part index exceeds usize")?;
+            return part_hashes
+                .get(part_index)
+                .copied()
+                .with_context(|| format!("missing AICH part hash at index {part_index}"));
+        }
+        let part_count = size / ED2K_PART_SIZE + u64::from(size % ED2K_PART_SIZE != 0);
+        let left_size = ((part_count + u64::from(is_left_branch)) / 2) * ED2K_PART_SIZE;
+        let right_size = size - left_size;
+        let left = build_part_root(start, left_size, true, part_hashes)?;
+        let right = build_part_root(start + left_size, right_size, false, part_hashes)?;
+        Ok(sha1_pair(left, right))
+    }
+
+    build_part_root(0, file_size, true, part_hashes)
+}
+
+fn refresh_completed_manifest_aich_hashset(
+    transfer_dir: &Path,
+    manifest: &mut Ed2kResumeManifest,
+) -> Result<()> {
+    // Once a modern peer has supplied a canonical AICH identity, keep serving
+    // that network-learned root/hashset instead of replacing it on completion.
+    // Completion-time synthesis is only for files that finished without any
+    // prior AICH metadata.
+    if manifest.aich_root.is_some() {
+        return Ok(());
+    }
+    let payload_path = transfer_dir.join(PAYLOAD_FILE_NAME);
+    let aich_hashset = build_aich_hashset_from_payload(&payload_path, manifest.file_size)?;
+    manifest.aich_root = Some(hex::encode(aich_hashset.master_hash));
+    manifest.aich_hashset = aich_hashset.part_hashes.iter().map(hex::encode).collect();
+    manifest.aich_hashset_acquired = true;
+    Ok(())
+}
+
+fn build_aich_hashset_from_payload(payload_path: &Path, file_size: u64) -> Result<Ed2kAichHashset> {
+    if file_size == 0 {
+        anyhow::bail!("cannot build AICH hashset for zero-sized file");
+    }
+    let block_hashes = read_aich_block_hashes(payload_path, file_size)?;
+    let root = build_aich_tree_node(0, file_size, true, &block_hashes)?;
+    let part_count = usize::from(expected_aich_hash_count(file_size));
+    let mut part_hashes = Vec::with_capacity(part_count);
+    for part_index in 0..part_count {
+        let start = u64::try_from(part_index).unwrap_or(0) * ED2K_PART_SIZE;
+        let size = (file_size - start).min(ED2K_PART_SIZE);
+        let hash = root
+            .find_hash(start, size)
+            .with_context(|| format!("missing AICH part hash for part {part_index}"))?;
+        part_hashes.push(hash);
+    }
+    Ok(Ed2kAichHashset {
+        master_hash: root.hash,
+        part_hashes,
+    })
+}
+
+#[derive(Debug)]
+struct AichTreeNode {
+    start: u64,
+    size: u64,
+    hash: [u8; 20],
+    left: Option<Box<AichTreeNode>>,
+    right: Option<Box<AichTreeNode>>,
+}
+
+impl AichTreeNode {
+    fn find_hash(&self, start: u64, size: u64) -> Option<[u8; 20]> {
+        if self.start == start && self.size == size {
+            return Some(self.hash);
+        }
+        self.left
+            .as_ref()
+            .and_then(|node| node.find_hash(start, size))
+            .or_else(|| {
+                self.right
+                    .as_ref()
+                    .and_then(|node| node.find_hash(start, size))
+            })
+    }
+}
+
+fn build_aich_tree_node(
+    start: u64,
+    size: u64,
+    is_left_branch: bool,
+    block_hashes: &[[u8; 20]],
+) -> Result<AichTreeNode> {
+    let base_size = if size <= ED2K_PART_SIZE {
+        ED2K_EMBLOCK_SIZE
+    } else {
+        ED2K_PART_SIZE
+    };
+    if size <= base_size {
+        let block_index =
+            usize::try_from(start / ED2K_EMBLOCK_SIZE).context("AICH block index exceeds usize")?;
+        let hash = block_hashes
+            .get(block_index)
+            .copied()
+            .with_context(|| format!("missing AICH block hash at index {block_index}"))?;
+        return Ok(AichTreeNode {
+            start,
+            size,
+            hash,
+            left: None,
+            right: None,
+        });
+    }
+
+    let block_count = size / base_size + u64::from(size % base_size != 0);
+    let left_size = ((block_count + u64::from(is_left_branch)) / 2) * base_size;
+    let right_size = size - left_size;
+    let left = Box::new(build_aich_tree_node(start, left_size, true, block_hashes)?);
+    let right = Box::new(build_aich_tree_node(
+        start + left_size,
+        right_size,
+        false,
+        block_hashes,
+    )?);
+    Ok(AichTreeNode {
+        start,
+        size,
+        hash: sha1_pair(left.hash, right.hash),
+        left: Some(left),
+        right: Some(right),
+    })
+}
+
+fn sha1_pair(left: [u8; 20], right: [u8; 20]) -> [u8; 20] {
+    let mut hasher = Sha1::new();
+    hasher.update(left);
+    hasher.update(right);
+    let digest = hasher.finalize();
+    let mut hash = [0u8; 20];
+    hash.copy_from_slice(&digest);
+    hash
+}
+
 fn manifest_has_structural_progress(manifest: &Ed2kResumeManifest) -> bool {
     manifest.completed
         || manifest.md4_hashset_acquired
+        || manifest.aich_hashset_acquired
+        || manifest.aich_root.is_some()
         || !manifest.verified_ranges.is_empty()
         || manifest.pieces.iter().any(|piece| piece.bytes_written != 0)
 }
@@ -1351,14 +1698,16 @@ mod tests {
     use super::{
         ED2K_PART_SIZE, Ed2kResumeManifest, Ed2kSharedEntry, Ed2kSourceHint, Ed2kTransferRuntime,
         Ed2kTransferState, Ed2kUploadPeerIdentity, Ed2kUploadQueueConfig, Ed2kUploadSessionStatus,
-        new_transfer_job,
+        MANIFEST_FILE_NAME, new_transfer_job,
     };
     use crate::paths::unique_test_dir;
     use md4::{Digest, Md4};
     use overlord_agent_common::{HashType, PopularHash};
     use overlord_kad_proto::Ed2kHash;
     use std::{
+        fs,
         net::{IpAddr, Ipv4Addr},
+        path::Path,
         str::FromStr,
         time::Duration,
     };
@@ -1421,6 +1770,216 @@ mod tests {
                 .iter()
                 .any(|entry| entry.file_hash == job.file_hash && entry.verified_complete)
         );
+    }
+
+    #[tokio::test]
+    async fn completed_manifest_persists_and_reloads_truthful_aich_hashset() {
+        let root = unique_test_dir("ed2k-transfer-runtime-aich");
+        let runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+        let first_piece = vec![0x31; ED2K_PART_SIZE as usize];
+        let last_piece = vec![0x7A; 32_768];
+        let first_piece_hash: [u8; 16] = Md4::digest(&first_piece).into();
+        let last_piece_hash: [u8; 16] = Md4::digest(&last_piece).into();
+        let mut file_hasher = Md4::new();
+        file_hasher.update(first_piece_hash);
+        file_hasher.update(last_piece_hash);
+        let file_hash = Ed2kHash::from_bytes(file_hasher.finalize().into());
+        let job = new_transfer_job(
+            file_hash,
+            "captured-aich.iso".to_string(),
+            u64::try_from(first_piece.len() + last_piece.len()).unwrap(),
+        );
+
+        runtime.ensure_job(&job).await.unwrap();
+        runtime
+            .store_md4_hashset(&job.file_hash, vec![first_piece_hash, last_piece_hash])
+            .await
+            .unwrap();
+        runtime
+            .store_piece_data(&job.file_hash, 0, &first_piece)
+            .await
+            .unwrap();
+        runtime
+            .store_piece_data(&job.file_hash, 1, &last_piece)
+            .await
+            .unwrap();
+
+        let manifest = runtime.manifest(&job.file_hash).await.unwrap();
+        assert!(manifest.completed);
+        assert!(manifest.aich_hashset_acquired);
+        assert_eq!(manifest.aich_hashset.len(), 2);
+        let stored_root = manifest.aich_root.clone().expect("missing AICH root");
+        let reloaded_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+        let reloaded = reloaded_runtime
+            .aich_hashset(&Ed2kHash::from_str(&job.file_hash).unwrap())
+            .await
+            .unwrap()
+            .expect("missing reloaded AICH hashset");
+        assert_eq!(hex::encode(reloaded.master_hash), stored_root);
+        assert_eq!(reloaded.part_hashes.len(), 2);
+
+        let local_entry = reloaded_runtime
+            .local_entry(&Ed2kHash::from_str(&job.file_hash).unwrap())
+            .await
+            .unwrap()
+            .expect("missing local entry");
+        assert_eq!(local_entry.aich_root.as_deref(), Some(stored_root.as_str()));
+    }
+
+    #[tokio::test]
+    async fn completed_manifest_preserves_remote_aich_identity_over_local_rebuild() {
+        let root = unique_test_dir("ed2k-transfer-runtime-remote-aich");
+        let runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+        let first_piece = vec![0x31; ED2K_PART_SIZE as usize];
+        let last_piece_len = usize::try_from(10_485_760u64 - ED2K_PART_SIZE).unwrap();
+        let last_piece = vec![0x7A; last_piece_len];
+        let first_piece_hash: [u8; 16] = Md4::digest(&first_piece).into();
+        let last_piece_hash: [u8; 16] = Md4::digest(&last_piece).into();
+        let mut file_hasher = Md4::new();
+        file_hasher.update(first_piece_hash);
+        file_hasher.update(last_piece_hash);
+        let file_hash = Ed2kHash::from_bytes(file_hasher.finalize().into());
+        let job = new_transfer_job(
+            file_hash,
+            "captured-remote-aich.iso".to_string(),
+            u64::try_from(first_piece.len() + last_piece.len()).unwrap(),
+        );
+
+        runtime.ensure_job(&job).await.unwrap();
+        runtime
+            .store_md4_hashset(&job.file_hash, vec![first_piece_hash, last_piece_hash])
+            .await
+            .unwrap();
+
+        let remote_aich = super::Ed2kAichHashset {
+            master_hash: hex::decode("050066b767710d1bd84377e71b1b23e522cce4af")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            part_hashes: vec![
+                hex::decode("80ebdc35e9618aa7617fa988f756a33b79aa0d6c")
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                hex::decode("b05ae2f6c5a179ec4b7ecffdcc18045151be0437")
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ],
+        };
+        runtime
+            .store_aich_hashset(&job.file_hash, remote_aich.clone())
+            .await
+            .unwrap();
+
+        runtime
+            .store_piece_data(&job.file_hash, 0, &first_piece)
+            .await
+            .unwrap();
+        runtime
+            .store_piece_data(&job.file_hash, 1, &last_piece)
+            .await
+            .unwrap();
+
+        let manifest = runtime.manifest(&job.file_hash).await.unwrap();
+        assert!(manifest.completed);
+        assert!(manifest.aich_hashset_acquired);
+        assert_eq!(
+            manifest.aich_root.as_deref(),
+            Some("050066b767710d1bd84377e71b1b23e522cce4af")
+        );
+        assert_eq!(
+            manifest.aich_hashset,
+            vec![
+                "80ebdc35e9618aa7617fa988f756a33b79aa0d6c".to_string(),
+                "b05ae2f6c5a179ec4b7ecffdcc18045151be0437".to_string(),
+            ]
+        );
+
+        let transfer_dir = Path::new(&root).join(job.file_hash.as_str());
+        let rebuilt = super::build_aich_hashset_from_payload(
+            &transfer_dir.join(super::PAYLOAD_FILE_NAME),
+            manifest.file_size,
+        )
+        .unwrap();
+        assert_ne!(
+            hex::encode(rebuilt.master_hash),
+            manifest.aich_root.clone().unwrap()
+        );
+
+        let local_entry = runtime
+            .local_entry(&Ed2kHash::from_str(&job.file_hash).unwrap())
+            .await
+            .unwrap()
+            .expect("missing local entry");
+        assert_eq!(
+            local_entry.aich_root.as_deref(),
+            Some("050066b767710d1bd84377e71b1b23e522cce4af")
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_job_rebuilds_legacy_manifest_missing_aich_fields() {
+        let root = unique_test_dir("ed2k-transfer-legacy-aich-manifest");
+        let file_hash = hex::encode([0x41; 16]);
+        let transfer_dir = Path::new(&root).join(&file_hash);
+        fs::create_dir_all(&transfer_dir).unwrap();
+        fs::write(
+            transfer_dir.join(MANIFEST_FILE_NAME),
+            format!(
+                "{{\"file_hash\":\"{}\",\"canonical_name\":\"legacy.iso\",\"file_size\":{},\"piece_size\":{},\"completed\":false,\"md4_hashset_acquired\":false,\"md4_hashset\":[],\"verified_ranges\":[],\"pieces\":[],\"sources\":[]}}",
+                file_hash,
+                ED2K_PART_SIZE + 1,
+                ED2K_PART_SIZE,
+            ),
+        )
+        .unwrap();
+
+        let runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+        let rebuilt = runtime
+            .ensure_job(&new_transfer_job(
+                Ed2kHash::from_str(&file_hash).unwrap(),
+                "legacy.iso".to_string(),
+                ED2K_PART_SIZE + 1,
+            ))
+            .await
+            .unwrap();
+        assert!(!rebuilt.aich_hashset_acquired);
+        assert!(rebuilt.aich_root.is_none());
+        assert!(rebuilt.aich_hashset.is_empty());
+
+        let quarantined = fs::read_dir(&transfer_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("resume-manifest.json.corrupt-"))
+            .collect::<Vec<_>>();
+        assert_eq!(quarantined.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn store_aich_hashset_rejects_internally_inconsistent_root() {
+        let root = unique_test_dir("ed2k-transfer-invalid-aich");
+        let runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+        let file_hash = Ed2kHash::from_bytes([0x61; 16]);
+        let job = new_transfer_job(
+            file_hash,
+            "invalid-aich.iso".to_string(),
+            ED2K_PART_SIZE + 7,
+        );
+        runtime.ensure_job(&job).await.unwrap();
+
+        let error = runtime
+            .store_aich_hashset(
+                &job.file_hash,
+                super::Ed2kAichHashset {
+                    master_hash: [0x44; 20],
+                    part_hashes: vec![[0x11; 20], [0x22; 20]],
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("does not reconstruct"));
     }
 
     #[tokio::test]

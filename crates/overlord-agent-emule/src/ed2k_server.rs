@@ -4257,6 +4257,7 @@ mod tests {
             verified_ranges: Vec::new(),
             compatibility_hint: true,
             source_count_hint: Some(12),
+            aich_root: None,
         }];
         let packet = encode_packet(
             OP_OFFERFILES,

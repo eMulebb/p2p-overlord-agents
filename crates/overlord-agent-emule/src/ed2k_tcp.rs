@@ -57,9 +57,10 @@ use tracing::{debug, info, warn};
 
 use crate::ed2k_server::{Ed2kFoundSource, Ed2kServerState};
 use crate::ed2k_transfer::{
-    ED2K_EMBLOCK_SIZE, ED2K_PART_SIZE, Ed2kResumeManifest, Ed2kSharedEntry, Ed2kSourceHint,
-    Ed2kTransferRuntime, Ed2kTransferState, Ed2kUploadPeerIdentity, Ed2kUploadSessionHandle,
-    Ed2kUploadSessionStatus, expected_piece_length, new_transfer_job,
+    ED2K_EMBLOCK_SIZE, ED2K_PART_SIZE, Ed2kAichHashset, Ed2kResumeManifest, Ed2kSharedEntry,
+    Ed2kSourceHint, Ed2kTransferRuntime, Ed2kTransferState, Ed2kUploadPeerIdentity,
+    Ed2kUploadSessionHandle, Ed2kUploadSessionStatus, decode_aich_hash_hex, expected_piece_length,
+    new_transfer_job,
 };
 use crate::kad_firewall::KadFirewallState;
 use overlord_kad_dht::DhtNode;
@@ -263,7 +264,11 @@ impl Ed2kFileIdentifier {
             file_hash: Ed2kHash::from_str(&manifest.file_hash)
                 .with_context(|| format!("invalid manifest file hash {}", manifest.file_hash))?,
             file_size: Some(manifest.file_size).filter(|file_size| *file_size != 0),
-            aich_root: None,
+            aich_root: manifest
+                .aich_root
+                .as_deref()
+                .map(decode_aich_hash_hex)
+                .transpose()?,
         })
     }
 
@@ -271,7 +276,11 @@ impl Ed2kFileIdentifier {
         Ok(Self {
             file_hash: shared.parsed_hash()?,
             file_size: Some(shared.file_size).filter(|file_size| *file_size != 0),
-            aich_root: None,
+            aich_root: shared
+                .aich_root
+                .as_deref()
+                .map(decode_aich_hash_hex)
+                .transpose()?,
         })
     }
 
@@ -387,12 +396,6 @@ impl Ed2kHashsetRequestOptions {
     const fn has_known_request(self) -> bool {
         self.request_md4 || self.request_aich
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Ed2kAichHashset {
-    master_hash: [u8; 20],
-    part_hashes: Vec<[u8; 20]>,
 }
 
 type Ed2kMd4Hashset = Vec<[u8; 16]>;
@@ -1797,7 +1800,8 @@ async fn drive_download_session(
                             &request_file_identifier,
                             Ed2kHashsetRequestOptions {
                                 request_md4: true,
-                                request_aich: false,
+                                request_aich: manifest.file_size > ED2K_PART_SIZE
+                                    && request_file_identifier.aich_root.is_some(),
                             },
                         )?
                     } else {
@@ -2121,6 +2125,12 @@ async fn drive_download_session(
                         manifest = transfer_runtime
                             .store_md4_hashset(file_hash_hex, hashset)
                             .await?;
+                    }
+                    if let Some(hashset) = hashset_answer.aich_hashset {
+                        manifest = transfer_runtime
+                            .store_aich_hashset(file_hash_hex, hashset)
+                            .await?;
+                        request_file_identifier = Ed2kFileIdentifier::from_manifest(&manifest)?;
                     }
                 }
                 (OP_EDONKEYPROT, OP_REQFILENAMEANSWER) => {
@@ -3828,7 +3838,16 @@ async fn handle_connection(
                         } else {
                             None
                         };
-                        encode_hashset_answer2(&shared_identifier, md4_hashset.as_deref(), None)?
+                        let aich_hashset = if request_options.request_aich {
+                            transfer_runtime.aich_hashset(&requested).await?
+                        } else {
+                            None
+                        };
+                        encode_hashset_answer2(
+                            &shared_identifier,
+                            md4_hashset.as_deref(),
+                            aich_hashset.as_ref(),
+                        )?
                     }
                 } else {
                     encode_file_req_ans_nofil(&requested)
@@ -5109,11 +5128,16 @@ async fn reconcile_download_manifest_metadata(
         .map(str::trim)
         .filter(|name| !name.is_empty());
     if learned_size.is_none() && learned_name.is_none() {
-        return Ok(());
+        if peer_file_identifier.aich_root.is_none() {
+            return Ok(());
+        }
     }
 
     *manifest = transfer_runtime
         .reconcile_job_metadata(file_hash_hex, learned_name, learned_size)
+        .await?;
+    *manifest = transfer_runtime
+        .reconcile_aich_root(file_hash_hex, peer_file_identifier.aich_root)
         .await?;
     *request_file_identifier = Ed2kFileIdentifier::from_manifest(manifest)?;
     Ok(())
@@ -5614,6 +5638,19 @@ mod tests {
     }
 
     #[test]
+    fn file_identifier_from_manifest_includes_persisted_aich_root() {
+        let file_hash = Ed2kHash([0x52; 16]);
+        let job = new_transfer_job(file_hash, "captured.iso".to_string(), ED2K_PART_SIZE + 1);
+        let mut manifest = Ed2kResumeManifest::new(&job);
+        manifest.aich_root = Some(hex::encode([0x7E; 20]));
+
+        let identifier = super::Ed2kFileIdentifier::from_manifest(&manifest).unwrap();
+        assert_eq!(identifier.file_hash, file_hash);
+        assert_eq!(identifier.file_size, Some(ED2K_PART_SIZE + 1));
+        assert_eq!(identifier.aich_root, Some([0x7E; 20]));
+    }
+
+    #[test]
     fn file_identifier_relaxed_match_tolerates_missing_optional_fields() {
         let strict = super::Ed2kFileIdentifier {
             file_hash: Ed2kHash([0x42; 16]),
@@ -5692,6 +5729,26 @@ mod tests {
     }
 
     #[test]
+    fn hashset_answer2_rejects_mismatched_aich_section_root() {
+        let file_identifier = super::Ed2kFileIdentifier {
+            file_hash: Ed2kHash([0x44; 16]),
+            file_size: Some(ED2K_PART_SIZE + 1),
+            aich_root: Some([0x7D; 20]),
+        };
+        let packet = super::encode_hashset_answer2(
+            &file_identifier,
+            None,
+            Some(&super::Ed2kAichHashset {
+                master_hash: [0x6D; 20],
+                part_hashes: vec![[0x55; 20], [0x66; 20]],
+            }),
+        )
+        .unwrap();
+
+        assert!(super::decode_hashset_answer2(&packet[6..]).is_err());
+    }
+
+    #[test]
     fn request_filename_answer_uses_stock_u16_string_length_prefix() {
         let packet =
             super::encode_request_filename_answer(&Ed2kHash([0x55; 16]), "captured.epub").unwrap();
@@ -5755,23 +5812,30 @@ mod tests {
         assert_eq!(saw_set_req_file_id, expect_set_req_file_id);
     }
 
+    fn encode_startup_multipacket_ext2_answer_with_identifier(
+        file_identifier: &super::Ed2kFileIdentifier,
+        file_name: &str,
+        include_file_status: bool,
+    ) -> Vec<u8> {
+        super::encode_multipacket_ext2_answer(file_identifier, file_name, true, include_file_status)
+            .unwrap()
+    }
+
     fn encode_startup_multipacket_ext2_answer(
         file_hash: &Ed2kHash,
         file_size: u64,
         file_name: &str,
         include_file_status: bool,
     ) -> Vec<u8> {
-        super::encode_multipacket_ext2_answer(
+        encode_startup_multipacket_ext2_answer_with_identifier(
             &super::Ed2kFileIdentifier {
                 file_hash: *file_hash,
                 file_size: Some(file_size).filter(|size| *size != 0),
                 aich_root: None,
             },
             file_name,
-            true,
             include_file_status,
         )
-        .unwrap()
     }
 
     #[test]
@@ -7555,6 +7619,38 @@ mod tests {
             ))
             .await
             .unwrap();
+        let source_root = unique_test_dir("ed2k-large-file-secure-ident-order-source");
+        let source_runtime = Ed2kTransferRuntime::load_or_create(&source_root).unwrap();
+        source_runtime
+            .ensure_job(&new_transfer_job(
+                file_hash,
+                "captured.iso".to_string(),
+                payload.len() as u64,
+            ))
+            .await
+            .unwrap();
+        source_runtime
+            .store_md4_hashset(&file_hash_hex, md4_hashset.clone())
+            .await
+            .unwrap();
+        source_runtime
+            .store_piece_data(&file_hash_hex, 0, &payload[..ED2K_PART_SIZE as usize])
+            .await
+            .unwrap();
+        source_runtime
+            .store_piece_data(&file_hash_hex, 1, &payload[ED2K_PART_SIZE as usize..])
+            .await
+            .unwrap();
+        let source_aich = source_runtime
+            .aich_hashset(&file_hash)
+            .await
+            .unwrap()
+            .expect("missing source AICH hashset");
+        let source_identifier = super::Ed2kFileIdentifier {
+            file_hash,
+            file_size: Some(payload.len() as u64),
+            aich_root: Some(source_aich.master_hash),
+        };
 
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let peer_addr = listener.local_addr().unwrap();
@@ -7618,9 +7714,8 @@ mod tests {
                 true,
             );
 
-            let startup_answer = encode_startup_multipacket_ext2_answer(
-                &file_hash,
-                payload_for_server.len() as u64,
+            let startup_answer = encode_startup_multipacket_ext2_answer_with_identifier(
+                &source_identifier,
                 "captured-fallback.iso",
                 true,
             );
@@ -7637,16 +7732,12 @@ mod tests {
                 Some(payload_for_server.len() as u64)
             );
             assert!(request_options.request_md4);
-            assert!(!request_options.request_aich);
+            assert!(request_options.request_aich);
 
             let hashset_answer = super::encode_hashset_answer2(
-                &super::Ed2kFileIdentifier {
-                    file_hash,
-                    file_size: Some(payload_for_server.len() as u64),
-                    aich_root: None,
-                },
+                &source_identifier,
                 Some(&md4_hashset),
-                None,
+                Some(&source_aich),
             )
             .unwrap();
             stream.write_all(&hashset_answer).await.unwrap();
@@ -7764,6 +7855,8 @@ mod tests {
 
         let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
         assert!(manifest.completed);
+        assert!(manifest.aich_hashset_acquired);
+        assert_eq!(manifest.aich_hashset.len(), 2);
         server.await.unwrap();
     }
 
@@ -8898,6 +8991,158 @@ mod tests {
         let accept_upload =
             read_until_opcode(&mut stream, OP_EDONKEYPROT, super::OP_ACCEPTUPLOADREQ).await;
         assert_eq!(accept_upload.len(), 6);
+
+        drop(stream);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn listener_hashset_request2_returns_aich_when_available() {
+        async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
+            let mut header = [0u8; 6];
+            stream.read_exact(&mut header).await.unwrap();
+            let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+            let mut packet = header.to_vec();
+            let mut payload = vec![0u8; packet_len - 1];
+            stream.read_exact(&mut payload).await.unwrap();
+            packet.extend_from_slice(&payload);
+            packet
+        }
+
+        async fn read_until_opcode(stream: &mut TcpStream, protocol: u8, opcode: u8) -> Vec<u8> {
+            loop {
+                let packet = read_packet(stream).await;
+                if packet[0] == protocol && packet[5] == opcode {
+                    return packet;
+                }
+            }
+        }
+
+        let mut payload = vec![0x5A; ED2K_PART_SIZE as usize];
+        payload.extend_from_slice(&vec![0x37; 32_768]);
+        let md4_hashset = payload
+            .chunks(ED2K_PART_SIZE as usize)
+            .map(|chunk| Md4::digest(chunk).into())
+            .collect::<Vec<[u8; 16]>>();
+        let file_hash = Ed2kHash::from_bytes(
+            Md4::digest(md4_hashset.iter().flatten().copied().collect::<Vec<u8>>()).into(),
+        );
+        let file_hash_hex = file_hash.to_string();
+        let root = unique_test_dir("ed2k-upload-listener-modern-aich");
+        let transfer_runtime = Arc::new(Ed2kTransferRuntime::load_or_create(&root).unwrap());
+        let job = new_transfer_job(
+            file_hash,
+            "listener-aich.iso".to_string(),
+            payload.len() as u64,
+        );
+        transfer_runtime.ensure_job(&job).await.unwrap();
+        transfer_runtime
+            .store_md4_hashset(&file_hash_hex, md4_hashset.clone())
+            .await
+            .unwrap();
+        transfer_runtime
+            .store_piece_data(&file_hash_hex, 0, &payload[..ED2K_PART_SIZE as usize])
+            .await
+            .unwrap();
+        transfer_runtime
+            .store_piece_data(&file_hash_hex, 1, &payload[ED2K_PART_SIZE as usize..])
+            .await
+            .unwrap();
+        let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
+        assert!(manifest.aich_hashset_acquired);
+        let requested_identifier = super::Ed2kFileIdentifier::from_manifest(&manifest).unwrap();
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let dht = DhtNode::new(DhtConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            node_id: NodeId::from_bytes([0x5D; 16]),
+            udp_key: 0x5566_7788,
+            ..DhtConfig::default()
+        })
+        .await
+        .unwrap();
+        let server_state = Arc::new(RwLock::new(Ed2kServerState::default()));
+        let kad_firewall = Arc::new(Mutex::new(KadFirewallState::default()));
+        let secure_ident = Arc::new(
+            Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+                .unwrap(),
+        );
+        let hello_identity = Ed2kHelloIdentity {
+            user_hash: [0x31; 16],
+            client_id: 0x1357_2468,
+            tcp_port: 41011,
+            udp_port: 41010,
+            server_ip: 0,
+            server_port: 0,
+            connect_options: emule_connect_options(false),
+            direct_udp_callback: false,
+        };
+
+        let server = tokio::spawn({
+            let transfer_runtime = Arc::clone(&transfer_runtime);
+            let server_state = Arc::clone(&server_state);
+            let kad_firewall = Arc::clone(&kad_firewall);
+            let secure_ident = Arc::clone(&secure_ident);
+            async move {
+                let (stream, remote_addr) = listener.accept().await.unwrap();
+                super::handle_connection(
+                    stream,
+                    remote_addr,
+                    &dht,
+                    &server_state,
+                    &kad_firewall,
+                    &secure_ident,
+                    &transfer_runtime,
+                    hello_identity,
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let mut stream = TcpStream::connect(peer_addr).await.unwrap();
+        stream
+            .write_all(&encode_hello_request(Ed2kHelloIdentity {
+                user_hash: [0x41; 16],
+                client_id: 0x2468_1357,
+                tcp_port: 4662,
+                udp_port: 4672,
+                server_ip: 0,
+                server_port: 0,
+                connect_options: emule_connect_options(false),
+                direct_udp_callback: false,
+            }))
+            .await
+            .unwrap();
+        let _ = read_until_opcode(&mut stream, OP_EDONKEYPROT, OP_HELLOANSWER).await;
+
+        let modern_hashset_request = super::encode_hashset_request2(
+            &requested_identifier,
+            super::Ed2kHashsetRequestOptions {
+                request_md4: true,
+                request_aich: true,
+            },
+        )
+        .unwrap();
+        stream.write_all(&modern_hashset_request).await.unwrap();
+        let modern_hashset_answer =
+            read_until_opcode(&mut stream, OP_EMULEPROT, super::OP_HASHSETANSWER2).await;
+        let returned = super::decode_hashset_answer2(&modern_hashset_answer[6..]).unwrap();
+        assert_eq!(returned.file_identifier.file_hash, file_hash);
+        assert_eq!(
+            returned.file_identifier.aich_root,
+            requested_identifier.aich_root
+        );
+        assert_eq!(returned.md4_hashset.unwrap().len(), 2);
+        let returned_aich = returned
+            .aich_hashset
+            .expect("missing returned AICH hashset");
+        assert_eq!(
+            returned_aich.master_hash,
+            requested_identifier.aich_root.unwrap()
+        );
+        assert_eq!(returned_aich.part_hashes.len(), 2);
 
         drop(stream);
         server.await.unwrap();
