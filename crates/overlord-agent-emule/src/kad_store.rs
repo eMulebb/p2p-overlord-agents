@@ -230,7 +230,7 @@ impl KadLocalStore {
             .skip(offset)
             .take(limit)
             .map(|entry| SearchResultEntry {
-                entry_id: Ed2kHash::from_bytes(entry.publisher_id.to_be_bytes()),
+                entry_id: source_entry_id(entry.publisher_id),
                 tags: source_result_tags(entry),
             })
             .collect::<Vec<_>>();
@@ -332,6 +332,10 @@ fn source_result_tags(entry: &StoredSourcePublish) -> Vec<Tag> {
         ));
     }
     tags
+}
+
+fn source_entry_id(publisher_id: NodeId) -> Ed2kHash {
+    Ed2kHash::from_bytes(publisher_id.to_be_bytes())
 }
 
 fn stored_file_size(tags: &[Tag]) -> Option<u64> {
@@ -492,7 +496,7 @@ fn tag_fingerprint(tags: &[Tag]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{KadLocalStore, KadLocalStoreConfig, stored_file_size};
+    use super::{KadLocalStore, KadLocalStoreConfig, source_entry_id, stored_file_size};
     use chrono::{DateTime, TimeZone, Utc};
     use overlord_kad_proto::{
         Ed2kHash, NodeId, PublishEntry, SearchKeyReq, SearchNotesReq, SearchSourceReq, Tag,
@@ -561,9 +565,18 @@ mod tests {
     fn source_store_eviction_keeps_newest_entries() {
         let mut store = KadLocalStore::new(config());
         let target = NodeId::from_bytes([3; 16]);
-        let publisher_one = NodeId::from_bytes([4; 16]);
-        let publisher_two = NodeId::from_bytes([5; 16]);
-        let publisher_three = NodeId::from_bytes([6; 16]);
+        let publisher_one = NodeId::from_bytes([
+            0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05, 0x0C, 0x0B, 0x0A, 0x09,
+            0x10, 0x0F, 0x0E, 0x0D,
+        ]);
+        let publisher_two = NodeId::from_bytes([
+            0x14, 0x13, 0x12, 0x11, 0x18, 0x17, 0x16, 0x15, 0x1C, 0x1B, 0x1A, 0x19,
+            0x20, 0x1F, 0x1E, 0x1D,
+        ]);
+        let publisher_three = NodeId::from_bytes([
+            0x24, 0x23, 0x22, 0x21, 0x28, 0x27, 0x26, 0x25, 0x2C, 0x2B, 0x2A, 0x29,
+            0x30, 0x2F, 0x2E, 0x2D,
+        ]);
         let tags = vec![
             Tag::filesize(456),
             Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(4662)),
@@ -605,14 +618,8 @@ mod tests {
             )
             .expect("source response");
         assert_eq!(response.results.len(), 2);
-        assert_eq!(
-            response.results[0].entry_id,
-            Ed2kHash::from_bytes(publisher_two.to_be_bytes())
-        );
-        assert_eq!(
-            response.results[1].entry_id,
-            Ed2kHash::from_bytes(publisher_three.to_be_bytes())
-        );
+        assert_eq!(response.results[0].entry_id, source_entry_id(publisher_two));
+        assert_eq!(response.results[1].entry_id, source_entry_id(publisher_three));
         assert!(response.results.iter().all(|entry| {
             entry
                 .tags

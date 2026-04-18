@@ -3567,12 +3567,22 @@ fn emule_high_id_source_type(file_size: u64) -> u32 {
     }
 }
 
+/// eMule Kad carries 128-bit search/source entry IDs in 32-bit little-endian
+/// chunk order rather than raw MD4 byte order.
+fn emule_kad_chunk_order(bytes: [u8; 16]) -> [u8; 16] {
+    let mut ordered = [0u8; 16];
+    for (dst, src) in ordered.chunks_exact_mut(4).zip(bytes.chunks_exact(4)) {
+        dst.copy_from_slice(&[src[3], src[2], src[1], src[0]]);
+    }
+    ordered
+}
+
 /// Reuse the persisted eD2k user hash as the Kad source-publish identity.
 ///
 /// The oracle source-publish path sends the eMule client hash rather than the
 /// Kad node ID in the second `KADEMLIA2_PUBLISH_SOURCE_REQ` field.
 fn source_publish_client_hash(ed2k_user_hash: [u8; 16]) -> NodeId {
-    NodeId::from_bytes(ed2k_user_hash)
+    NodeId::from_bytes(emule_kad_chunk_order(ed2k_user_hash))
 }
 
 /// Applies the classic eMule client marker bytes to an ED2K user hash.
@@ -8443,6 +8453,7 @@ mod tests {
         record_passive_replay_post_failure, record_passive_replay_post_latency,
         record_passive_replay_start, restore_snoop_queue, select_ed2k_keyword_metadata,
         should_request_hello_response_ack, should_request_proactive_hello_res_ack,
+        source_publish_client_hash,
         significant_keyword_words, synthetic_file_hash, synthetic_popular_hash,
         synthetic_popular_hashes, synthetic_publish_aich_hash, synthetic_publish_queue_depth,
         try_acquire_passive_replay_gate,
@@ -10241,6 +10252,25 @@ mod tests {
             tags.last(),
             Some(&Tag::new_short(tag_name::ENCRYPTION, TagValue::U8(3)))
         );
+    }
+
+    #[test]
+    fn source_publish_identity_uses_emule_kad_chunk_order() {
+        let user_hash = [
+            0xB4, 0x22, 0xCF, 0x1A, 0x44, 0x0E, 0x71, 0x6B, 0xD2, 0xE1, 0xDD, 0x6E,
+            0x77, 0x21, 0x6F, 0xE4,
+        ];
+
+        let publisher_id = source_publish_client_hash(user_hash);
+
+        assert_eq!(
+            publisher_id.0,
+            [
+                0x1A, 0xCF, 0x22, 0xB4, 0x6B, 0x71, 0x0E, 0x44, 0x6E, 0xDD, 0xE1, 0xD2,
+                0xE4, 0x6F, 0x21, 0x77,
+            ]
+        );
+        assert_eq!(publisher_id.to_be_bytes(), user_hash);
     }
 
     #[test]
