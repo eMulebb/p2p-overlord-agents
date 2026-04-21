@@ -61,5 +61,7 @@ Shared protocol reference docs currently reused by the ED2K work:
 
 ## Repo Guards
 
-- `../scripts/windows/tracked_file_privacy_guard.ps1` validates tracked files
-  for local user-profile path leaks and configured personal-name filename leaks.
+- From `../p2p-overlord-tooling`, run
+  `python -m overlord_tooling guard-tracked-files --repo-root ../p2p-overlord-agents`
+  to validate tracked files for local path leaks and configured personal-name
+  filename leaks.

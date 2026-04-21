@@ -32,7 +32,8 @@
     {
       "id": "public-kademlia-paper-url-policy-entry",
       "reason": "Allow the policy entry that documents the public Stanford Kademlia paper URL exception.",
-      "regex": "tracked_file_privacy_guard_policy\\.v1\\.json:.*public Stanford Kademlia paper URL|tracked_file_privacy_guard_policy\\.v1\\.json:.*kpos"
+      "regex": "schemas/privacy-guard/policy\\.v1\\.json:.*public Stanford Kademlia paper URL|schemas/privacy-guard/policy\\.v1\\.json:.*kpos"
     }
   ]
 }
+

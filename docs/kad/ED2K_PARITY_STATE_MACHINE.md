@@ -348,10 +348,9 @@ Do not collapse these buckets:
 ## Code Ownership
 
 - runtime orchestration:
-  `p2p-overlord-tooling/orchestration/Invoke-RealnetKadSearchDownloadParityScenario.ps1`
+  `p2p-overlord-tooling/tests/e2e/`
 - agent session helpers and deterministic runs:
-  `p2p-overlord-tooling/subsystems/agent/helper-agent-*.ps1`
-  `p2p-overlord-tooling/orchestration/Invoke-ValidateEd2kServerTriplet.ps1`
+  `p2p-overlord-tooling/tests/e2e/lib/`
 - ED2K downloader and listener protocol:
   `crates/overlord-agent-emule/src/ed2k_tcp.rs`
 - ED2K server session and source search:
