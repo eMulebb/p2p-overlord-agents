@@ -14,7 +14,10 @@
 //! - keep the TCP session alive with empty `OP_OFFERFILES` packets
 
 use std::{
-    fs, io,
+    collections::hash_map::DefaultHasher,
+    fs,
+    hash::{Hash, Hasher},
+    io,
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
@@ -286,6 +289,7 @@ struct ServerSession {
     probe_search_sent: bool,
     offer_files_sent: bool,
     offer_files_sent_at: Option<Instant>,
+    offer_files_catalog_fingerprint: Option<u64>,
     assigned_client_id: Option<u32>,
     server_flags: Option<u32>,
     server_list_requested: bool,
@@ -996,6 +1000,7 @@ impl ServerSession {
             probe_search_sent: false,
             offer_files_sent: false,
             offer_files_sent_at: None,
+            offer_files_catalog_fingerprint: None,
             assigned_client_id: None,
             server_flags: None,
             server_list_requested: false,
@@ -1634,8 +1639,16 @@ async fn run_one_server_session(
             }
             _ = tokio::time::sleep(context.keepalive_interval) => {
                 if session.last_tx.elapsed() >= context.keepalive_interval {
-                    session.send_packet(OP_OFFERFILES, &0u32.to_le_bytes()).await?;
-                    debug!("sent ED2K server keepalive to {}", server.base_endpoint());
+                    send_offer_files_advertisement(
+                        &mut session,
+                        &context.shared_catalog,
+                        context.hello_identity.tcp_port,
+                    )
+                    .await?;
+                    if session.last_tx.elapsed() >= context.keepalive_interval {
+                        session.send_packet(OP_OFFERFILES, &0u32.to_le_bytes()).await?;
+                        debug!("sent ED2K server keepalive to {}", server.base_endpoint());
+                    }
                 }
                 if let Some(socket) = server_udp_socket.as_ref()
                     && let Err(error) = send_server_udp_status_request(socket, server).await
@@ -3010,6 +3023,12 @@ fn offered_files_catalog(shared_catalog: &[Ed2kSharedEntry]) -> Vec<([u8; 16], S
     offered_files
 }
 
+fn offer_files_catalog_fingerprint(shared_catalog: &[Ed2kSharedEntry]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    offered_files_catalog(shared_catalog).hash(&mut hasher);
+    hasher.finish()
+}
+
 fn popular_hash_offer_file(hash: &Ed2kSharedEntry) -> Option<([u8; 16], String, u32, u8)> {
     let file_hash = hash.parsed_hash().ok()?;
     let file_size = u32::try_from(hash.file_size).unwrap_or(u32::MAX);
@@ -3346,28 +3365,35 @@ async fn send_offer_files_advertisement(
     shared_catalog: &Ed2kSharedCatalog,
     tcp_port: u16,
 ) -> Result<()> {
-    if session.offer_files_sent {
+    let shared_catalog = shared_catalog.read().await.clone();
+    let catalog_fingerprint = offer_files_catalog_fingerprint(&shared_catalog);
+    if session.offer_files_sent
+        && session.offer_files_catalog_fingerprint == Some(catalog_fingerprint)
+    {
         return Ok(());
     }
-    let shared_catalog = shared_catalog.read().await.clone();
     let payload = encode_offer_files_payload(
         &shared_catalog,
         session.assigned_client_id,
         tcp_port,
         session.server_flags,
     );
+    let was_sent = session.offer_files_sent;
     session.send_packet(OP_OFFERFILES, &payload).await?;
     session.offer_files_sent = true;
     session.offer_files_sent_at = Some(Instant::now());
+    session.offer_files_catalog_fingerprint = Some(catalog_fingerprint);
     session.set_phase(
         ServerSessionPhase::OfferFilesSent,
         format!(
-            "sent offer-files advertisement entries={}",
+            "{} offer-files advertisement entries={}",
+            if was_sent { "refreshed" } else { "sent" },
             offered_files_catalog(&shared_catalog).len()
         ),
     );
     debug!(
-        "sent ED2K offer-files advertisement to {}",
+        "{} ED2K offer-files advertisement to {}",
+        if was_sent { "refreshed" } else { "sent" },
         session.endpoint
     );
     Ok(())
@@ -3909,13 +3935,13 @@ mod tests {
         OP_OFFERFILES, OP_PACKEDPROT, ResolvedServerEntry, SERVER_OBFUSCATION_PRIME_BYTES,
         SERVER_OBFUSCATION_PUBLIC_KEY_LEN, SERVER_TCP_FLAG_COMPRESSION, SERVER_TCP_FLAG_LARGEFILES,
         SERVER_TCP_FLAG_TCPOBFUSCATION, SERVER_UDP_FLAG_UDPOBFUSCATION,
-        SOURCE_OBFUSCATION_USER_HASH_PRESENT, ST_DESCRIPTION,
-        ST_SERVERNAME, ServerSession, TAG_SHORT_NAME_MASK, TAGTYPE_UINT32, biguint_to_fixed_be,
-        decode_found_sources, decode_search_result_page, decode_search_results,
-        decode_server_ident, decode_server_payload, derive_server_cipher, ed2k_string_tag_type,
-        encode_login_request, encode_offer_files_payload, encode_packet, encode_search_request,
-        encode_source_request, format_server_flags, ipv4_from_client_id,
-        login_identity_for_server_transport, new_ed2k_server_search_channel,
+        SOURCE_OBFUSCATION_USER_HASH_PRESENT, ST_DESCRIPTION, ST_SERVERNAME, ServerSession,
+        TAG_SHORT_NAME_MASK, TAGTYPE_UINT32, biguint_to_fixed_be, decode_found_sources,
+        decode_search_result_page, decode_search_results, decode_server_ident,
+        decode_server_payload, derive_server_cipher, ed2k_string_tag_type, encode_login_request,
+        encode_offer_files_payload, encode_packet, encode_search_request, encode_source_request,
+        format_server_flags, ipv4_from_client_id, login_identity_for_server_transport,
+        new_ed2k_server_search_channel, offer_files_catalog_fingerprint,
         search_keyword_via_background_session, search_source_via_background_session,
         server_capabilities, should_use_server_obfuscation, source_request_opcode,
         validate_found_sources,
@@ -4277,6 +4303,36 @@ mod tests {
         .unwrap();
 
         assert_eq!(packet, expected);
+    }
+
+    #[test]
+    fn offer_files_fingerprint_changes_when_shared_catalog_changes() {
+        let base_catalog = vec![Ed2kSharedEntry {
+            file_hash: hex::encode(OFFER_FILE_SAMPLE_HASH),
+            canonical_name: OFFER_FILE_SAMPLE_NAME.to_string(),
+            file_size: u64::from(OFFER_FILE_SAMPLE_SIZE),
+            verified_complete: false,
+            verified_ranges: Vec::new(),
+            compatibility_hint: true,
+            source_count_hint: Some(12),
+            aich_root: None,
+        }];
+        let mut expanded_catalog = base_catalog.clone();
+        expanded_catalog.push(Ed2kSharedEntry {
+            file_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            canonical_name: "new-shared-file.bin".to_string(),
+            file_size: 42_000,
+            verified_complete: true,
+            verified_ranges: Vec::new(),
+            compatibility_hint: false,
+            source_count_hint: None,
+            aich_root: None,
+        });
+
+        assert_ne!(
+            offer_files_catalog_fingerprint(&base_catalog),
+            offer_files_catalog_fingerprint(&expanded_catalog)
+        );
     }
 
     #[test]
