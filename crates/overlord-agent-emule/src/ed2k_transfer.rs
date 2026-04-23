@@ -29,6 +29,7 @@ use md4::{Digest as Md4Digest, Md4};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use tokio::sync::{Mutex, RwLock};
+use tracing::debug;
 
 use overlord_agent_common::{HashType, PopularHash};
 use overlord_kad_proto::Ed2kHash;
@@ -38,6 +39,8 @@ pub(crate) const ED2K_PART_SIZE: u64 = 9_728_000;
 pub(crate) const ED2K_EMBLOCK_SIZE: u64 = 184_320;
 const MANIFEST_FILE_NAME: &str = "resume-manifest.json";
 const PAYLOAD_FILE_NAME: &str = "pieces.bin";
+const ED2K_RESUME_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
+const ED2K_RESUME_CHECKPOINT_BYTES: u64 = ED2K_EMBLOCK_SIZE * 16;
 
 /// Upload-slot and waiting-queue policy used by the inbound ED2K listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -581,8 +584,16 @@ pub struct Ed2kTransferRuntime {
     shared_catalog: Ed2kSharedCatalog,
     callback_intents: Arc<RwLock<Vec<Ed2kCallbackIntent>>>,
     manifest_io: Arc<Mutex<()>>,
+    manifest_cache: Arc<Mutex<HashMap<String, Ed2kResumeManifest>>>,
+    manifest_checkpoint_state: Arc<Mutex<HashMap<String, Ed2kManifestCheckpointState>>>,
     upload_queue: Arc<Mutex<Ed2kUploadQueueState>>,
     next_upload_connection_id: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Ed2kManifestCheckpointState {
+    persisted_bytes_written: u64,
+    last_persisted_at: Instant,
 }
 
 impl Ed2kTransferRuntime {
@@ -608,6 +619,8 @@ impl Ed2kTransferRuntime {
             shared_catalog,
             callback_intents: Arc::new(RwLock::new(Vec::new())),
             manifest_io: Arc::new(Mutex::new(())),
+            manifest_cache: Arc::new(Mutex::new(HashMap::new())),
+            manifest_checkpoint_state: Arc::new(Mutex::new(HashMap::new())),
             upload_queue: Arc::new(Mutex::new(Ed2kUploadQueueState::new(upload_queue_config))),
             next_upload_connection_id: AtomicU64::new(1),
         })
@@ -990,6 +1003,7 @@ impl Ed2kTransferRuntime {
     ) -> Result<bool> {
         let _guard = self.manifest_io.lock().await;
         let mut manifest = self.load_manifest_unlocked(file_hash).await?;
+        let block_received_at = Instant::now();
         let piece_size = manifest.piece_size;
         let piece_start = u64::from(piece_index) * piece_size;
         let expected_piece_len =
@@ -1011,23 +1025,32 @@ impl Ed2kTransferRuntime {
         }
 
         let payload_path = self.transfer_dir(file_hash).join(PAYLOAD_FILE_NAME);
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&payload_path)
-            .await
-            .with_context(|| format!("failed to open piece store {}", payload_path.display()))?;
+        let mut file = Some(
+            tokio::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&payload_path)
+                .await
+                .with_context(|| {
+                    format!("failed to open piece store {}", payload_path.display())
+                })?,
+        );
         use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-        file.seek(std::io::SeekFrom::Start(start)).await?;
-        file.write_all(data).await?;
-        file.flush().await?;
+        let file_handle = file.as_mut().expect("piece store handle missing");
+        file_handle.seek(std::io::SeekFrom::Start(start)).await?;
+        file_handle.write_all(data).await?;
 
         let next_piece_bytes_written = current_piece_bytes_written + data_len;
         let mut piece_completed = false;
+        let mut checkpoint_reason = None;
         if next_piece_bytes_written == expected_piece_len {
+            file.as_mut()
+                .expect("piece store handle missing")
+                .flush()
+                .await?;
             let mut piece_bytes = vec![0u8; usize::try_from(expected_piece_len).unwrap_or(0)];
-            drop(file);
+            drop(file.take());
             let mut read_file = tokio::fs::OpenOptions::new()
                 .read(true)
                 .open(&payload_path)
@@ -1049,9 +1072,11 @@ impl Ed2kTransferRuntime {
                 piece.bytes_written = expected_piece_len;
                 piece.state = Ed2kTransferState::Verified;
                 piece_completed = true;
+                checkpoint_reason = Some("piece_verified");
             } else {
                 piece.state = Ed2kTransferState::Missing;
                 piece.bytes_written = 0;
+                checkpoint_reason = Some("piece_verification_failed");
             }
             rebuild_verified_ranges(&mut manifest);
             manifest.completed = manifest.is_fully_verified();
@@ -1074,7 +1099,32 @@ impl Ed2kTransferRuntime {
             piece.state = Ed2kTransferState::Requested;
         }
 
-        self.store_manifest_unlocked(&manifest).await?;
+        let should_checkpoint = checkpoint_reason.is_some()
+            || self.should_checkpoint_manifest_unlocked(&manifest).await;
+        if should_checkpoint {
+            if checkpoint_reason.is_none() {
+                checkpoint_reason = Some("periodic_progress");
+            }
+            if let Some(file_handle) = file.as_mut() {
+                file_handle.flush().await?;
+            }
+            drop(file.take());
+            self.store_manifest_unlocked(&manifest).await?;
+        } else {
+            drop(file.take());
+            self.cache_manifest_unlocked(&manifest).await;
+        }
+        debug!(
+            file_hash = %manifest.file_hash,
+            piece_index,
+            start,
+            end,
+            block_write_ms = block_received_at.elapsed().as_millis(),
+            checkpoint = should_checkpoint,
+            checkpoint_reason = checkpoint_reason.unwrap_or("cached_only"),
+            completed = manifest.completed,
+            "ED2K append_piece_block applied"
+        );
         Ok(piece_completed)
     }
 
@@ -1345,12 +1395,17 @@ impl Ed2kTransferRuntime {
     }
 
     async fn load_manifest_unlocked(&self, file_hash: &str) -> Result<Ed2kResumeManifest> {
+        if let Some(manifest) = self.manifest_cache.lock().await.get(file_hash).cloned() {
+            return Ok(manifest);
+        }
         let path = self.transfer_dir(file_hash).join(MANIFEST_FILE_NAME);
         let bytes = tokio::fs::read(&path)
             .await
             .with_context(|| format!("failed to read ED2K manifest {}", path.display()))?;
-        serde_json::from_slice(&bytes)
-            .with_context(|| format!("failed to decode ED2K manifest {}", path.display()))
+        let manifest = serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to decode ED2K manifest {}", path.display()))?;
+        self.mark_manifest_persisted_unlocked(&manifest).await;
+        Ok(manifest)
     }
 
     async fn store_manifest_unlocked(&self, manifest: &Ed2kResumeManifest) -> Result<()> {
@@ -1367,12 +1422,55 @@ impl Ed2kTransferRuntime {
         let encoded = serde_json::to_vec_pretty(manifest)?;
         tokio::fs::write(&path, encoded)
             .await
-            .with_context(|| format!("failed to write ED2K manifest {}", path.display()))
+            .with_context(|| format!("failed to write ED2K manifest {}", path.display()))?;
+        self.mark_manifest_persisted_unlocked(manifest).await;
+        Ok(())
+    }
+
+    async fn cache_manifest_unlocked(&self, manifest: &Ed2kResumeManifest) {
+        self.manifest_cache
+            .lock()
+            .await
+            .insert(manifest.file_hash.clone(), manifest.clone());
+    }
+
+    async fn mark_manifest_persisted_unlocked(&self, manifest: &Ed2kResumeManifest) {
+        self.cache_manifest_unlocked(manifest).await;
+        self.manifest_checkpoint_state.lock().await.insert(
+            manifest.file_hash.clone(),
+            Ed2kManifestCheckpointState {
+                persisted_bytes_written: manifest_progress_bytes(manifest),
+                last_persisted_at: Instant::now(),
+            },
+        );
+    }
+
+    async fn should_checkpoint_manifest_unlocked(&self, manifest: &Ed2kResumeManifest) -> bool {
+        let current_progress = manifest_progress_bytes(manifest);
+        let mut states = self.manifest_checkpoint_state.lock().await;
+        let state = states.entry(manifest.file_hash.clone()).or_insert_with(|| {
+            Ed2kManifestCheckpointState {
+                persisted_bytes_written: current_progress,
+                last_persisted_at: Instant::now(),
+            }
+        });
+        let dirty_bytes = current_progress.saturating_sub(state.persisted_bytes_written);
+        dirty_bytes >= ED2K_RESUME_CHECKPOINT_BYTES
+            || (dirty_bytes != 0
+                && state.last_persisted_at.elapsed() >= ED2K_RESUME_CHECKPOINT_INTERVAL)
     }
 
     fn transfer_dir(&self, file_hash: &str) -> PathBuf {
         self.root_dir.join(file_hash)
     }
+}
+
+fn manifest_progress_bytes(manifest: &Ed2kResumeManifest) -> u64 {
+    manifest
+        .pieces
+        .iter()
+        .map(|piece| piece.bytes_written)
+        .sum::<u64>()
 }
 
 fn load_catalog_from_manifests(root_dir: &Path) -> Result<Vec<Ed2kSharedEntry>> {
@@ -1863,6 +1961,11 @@ mod tests {
         file.write_all(&payload).unwrap();
     }
 
+    fn read_manifest_from_disk(root: &Path, file_hash: &str) -> Ed2kResumeManifest {
+        serde_json::from_slice(&fs::read(root.join(file_hash).join(MANIFEST_FILE_NAME)).unwrap())
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn ensure_job_tracks_verified_parts_via_md4_hashset() {
         let root = unique_test_dir("ed2k-transfer-runtime");
@@ -2271,6 +2374,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_piece_block_keeps_partial_progress_in_memory_until_checkpoint() {
+        let root = unique_test_dir("ed2k-transfer-cached-partial-progress");
+        let runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+        let payload = vec![0x5Au8; 65_536];
+        let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
+        let job = new_transfer_job(
+            file_hash,
+            "cached-progress.bin".to_string(),
+            payload.len() as u64,
+        );
+        runtime.ensure_job(&job).await.unwrap();
+        runtime
+            .store_md4_hashset(&job.file_hash, Vec::new())
+            .await
+            .unwrap();
+        runtime
+            .claim_next_missing_part(&job.file_hash)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let split = 8_192usize;
+        let piece_completed = runtime
+            .append_piece_block(&job.file_hash, 0, 0, split as u64, &payload[..split])
+            .await
+            .unwrap();
+        assert!(!piece_completed);
+
+        let cached_manifest = runtime.manifest(&job.file_hash).await.unwrap();
+        assert_eq!(
+            cached_manifest.pieces[0].state,
+            Ed2kTransferState::Requested
+        );
+        assert_eq!(cached_manifest.pieces[0].bytes_written, split as u64);
+
+        let persisted_manifest = read_manifest_from_disk(&root, &job.file_hash);
+        assert_eq!(
+            persisted_manifest.pieces[0].state,
+            Ed2kTransferState::Requested
+        );
+        assert_eq!(persisted_manifest.pieces[0].bytes_written, 0);
+    }
+
+    #[tokio::test]
     async fn reclaim_stale_piece_requests_restores_missing_state_with_progress() {
         let root = unique_test_dir("ed2k-transfer-reclaim-stale-request");
         let runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
@@ -2300,6 +2447,71 @@ mod tests {
         let manifest = runtime.manifest(&job.file_hash).await.unwrap();
         assert_eq!(manifest.pieces[0].state, Ed2kTransferState::Missing);
         assert_eq!(manifest.pieces[0].bytes_written, split as u64);
+    }
+
+    #[tokio::test]
+    async fn append_piece_block_persists_piece_completion_after_cached_progress() {
+        let root = unique_test_dir("ed2k-transfer-piece-completion-checkpoint");
+        let runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+        let payload = vec![0x6Bu8; 65_536];
+        let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
+        let job = new_transfer_job(
+            file_hash,
+            "completion-checkpoint.bin".to_string(),
+            payload.len() as u64,
+        );
+        runtime.ensure_job(&job).await.unwrap();
+        runtime
+            .store_md4_hashset(&job.file_hash, Vec::new())
+            .await
+            .unwrap();
+        runtime
+            .claim_next_missing_part(&job.file_hash)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let split = 8_192usize;
+        let first_completed = runtime
+            .append_piece_block(&job.file_hash, 0, 0, split as u64, &payload[..split])
+            .await
+            .unwrap();
+        assert!(!first_completed);
+
+        let final_completed = runtime
+            .append_piece_block(
+                &job.file_hash,
+                0,
+                split as u64,
+                payload.len() as u64,
+                &payload[split..],
+            )
+            .await
+            .unwrap();
+        assert!(final_completed);
+
+        let persisted_manifest = read_manifest_from_disk(&root, &job.file_hash);
+        assert!(persisted_manifest.completed);
+        assert_eq!(
+            persisted_manifest.pieces[0].state,
+            Ed2kTransferState::Verified
+        );
+        assert_eq!(
+            persisted_manifest.pieces[0].bytes_written,
+            payload.len() as u64
+        );
+
+        let reloaded_runtime = Ed2kTransferRuntime::load_or_create(Path::new(&root)).unwrap();
+        let reloaded_manifest = reloaded_runtime.manifest(&job.file_hash).await.unwrap();
+        assert!(reloaded_manifest.completed);
+        assert_eq!(
+            reloaded_manifest.pieces[0].state,
+            Ed2kTransferState::Verified
+        );
+        assert_eq!(
+            reloaded_manifest.pieces[0].bytes_written,
+            payload.len() as u64
+        );
     }
 
     #[tokio::test]
