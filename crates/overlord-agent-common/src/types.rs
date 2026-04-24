@@ -118,6 +118,8 @@ pub struct IndexerStats {
     pub indexer_id: Uuid,
     pub protocol: Protocol,
     pub peers_connected: u32,
+    #[serde(default)]
+    pub kad_bootstrapped: bool,
     pub crawl_rate: f32,
     pub snoop_queue_depth: u32,
     pub staging_queue_depth: u32,

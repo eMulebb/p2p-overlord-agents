@@ -5893,6 +5893,9 @@ impl IndexerService for OverlordAgentEmule {
                 .as_ref()
                 .map(|runtime| runtime.dht.routing_table_size() as u32)
                 .unwrap_or(0),
+            kad_bootstrapped: runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.dht.is_bootstrapped()),
             crawl_rate,
             snoop_queue_depth: queue_depth,
             staging_queue_depth: 0,
@@ -8453,10 +8456,9 @@ mod tests {
         record_passive_replay_post_failure, record_passive_replay_post_latency,
         record_passive_replay_start, restore_snoop_queue, select_ed2k_keyword_metadata,
         should_request_hello_response_ack, should_request_proactive_hello_res_ack,
-        source_publish_client_hash,
-        significant_keyword_words, synthetic_file_hash, synthetic_popular_hash,
-        synthetic_popular_hashes, synthetic_publish_aich_hash, synthetic_publish_queue_depth,
-        try_acquire_passive_replay_gate,
+        significant_keyword_words, source_publish_client_hash, synthetic_file_hash,
+        synthetic_popular_hash, synthetic_popular_hashes, synthetic_publish_aich_hash,
+        synthetic_publish_queue_depth, try_acquire_passive_replay_gate,
     };
     use crate::{
         config::SnoopQueueConfig,
@@ -10257,8 +10259,8 @@ mod tests {
     #[test]
     fn source_publish_identity_uses_emule_kad_chunk_order() {
         let user_hash = [
-            0xB4, 0x22, 0xCF, 0x1A, 0x44, 0x0E, 0x71, 0x6B, 0xD2, 0xE1, 0xDD, 0x6E,
-            0x77, 0x21, 0x6F, 0xE4,
+            0xB4, 0x22, 0xCF, 0x1A, 0x44, 0x0E, 0x71, 0x6B, 0xD2, 0xE1, 0xDD, 0x6E, 0x77, 0x21,
+            0x6F, 0xE4,
         ];
 
         let publisher_id = source_publish_client_hash(user_hash);
@@ -10266,8 +10268,8 @@ mod tests {
         assert_eq!(
             publisher_id.0,
             [
-                0x1A, 0xCF, 0x22, 0xB4, 0x6B, 0x71, 0x0E, 0x44, 0x6E, 0xDD, 0xE1, 0xD2,
-                0xE4, 0x6F, 0x21, 0x77,
+                0x1A, 0xCF, 0x22, 0xB4, 0x6B, 0x71, 0x0E, 0x44, 0x6E, 0xDD, 0xE1, 0xD2, 0xE4, 0x6F,
+                0x21, 0x77,
             ]
         );
         assert_eq!(publisher_id.to_be_bytes(), user_hash);

@@ -323,6 +323,7 @@ mod tests {
                 indexer_id: self.indexer_id,
                 protocol: Protocol::Kad2,
                 peers_connected: 0,
+                kad_bootstrapped: false,
                 crawl_rate: 0.0,
                 snoop_queue_depth: 0,
                 staging_queue_depth: 0,
