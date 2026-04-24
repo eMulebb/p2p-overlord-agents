@@ -1616,7 +1616,7 @@ fn build_md4_hashset_from_payload(
         part_hashes.push(read_md4_digest_from_reader(&mut file, part_size)?);
         remaining -= part_size;
     }
-    if file_size % ED2K_PART_SIZE == 0 {
+    if file_size.is_multiple_of(ED2K_PART_SIZE) {
         part_hashes.push(read_md4_digest_from_reader(&mut file, 0)?);
     }
 
@@ -1683,7 +1683,7 @@ fn expected_aich_hash_count(file_size: u64) -> u16 {
     if file_size <= ED2K_PART_SIZE {
         return 0;
     }
-    let count = (file_size + ED2K_PART_SIZE - 1) / ED2K_PART_SIZE;
+    let count = file_size.div_ceil(ED2K_PART_SIZE);
     u16::try_from(count).unwrap_or(u16::MAX)
 }
 
@@ -1726,7 +1726,7 @@ fn reconstruct_aich_root_from_part_hashes(
                 .copied()
                 .with_context(|| format!("missing AICH part hash at index {part_index}"));
         }
-        let part_count = size / ED2K_PART_SIZE + u64::from(size % ED2K_PART_SIZE != 0);
+        let part_count = size / ED2K_PART_SIZE + u64::from(!size.is_multiple_of(ED2K_PART_SIZE));
         let left_size = ((part_count + u64::from(is_left_branch)) / 2) * ED2K_PART_SIZE;
         let right_size = size - left_size;
         let left = build_part_root(start, left_size, true, part_hashes)?;
@@ -1854,7 +1854,7 @@ fn build_aich_block_tree_root(
 }
 
 fn chunk_count_for_size(size: u64, chunk_size: u64) -> u64 {
-    size / chunk_size + u64::from(size % chunk_size != 0)
+    size / chunk_size + u64::from(!size.is_multiple_of(chunk_size))
 }
 
 fn sha1_pair(left: [u8; 20], right: [u8; 20]) -> [u8; 20] {

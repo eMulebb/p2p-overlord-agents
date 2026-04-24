@@ -2984,16 +2984,15 @@ fn encode_udp_source_request(
     }
 }
 
-fn source_request_opcode(
-    connect_options: u8,
-    server_flags: Option<u32>,
-) -> u8 {
+fn source_request_opcode(connect_options: u8, server_flags: Option<u32>) -> u8 {
     // A source-search session may still need the obfuscated reply family even
     // when the TCP session itself stayed plaintext because the configured
     // server entry lacked an obfuscation port. Once OP_IDCHANGE confirms the
     // server supports TCP obfuscation, prefer the obfuscated found-sources
     // shape so peer user-hash metadata is preserved.
-    if connect_options != 0 && server_flags.unwrap_or_default() & SERVER_TCP_FLAG_TCPOBFUSCATION != 0 {
+    if connect_options != 0
+        && server_flags.unwrap_or_default() & SERVER_TCP_FLAG_TCPOBFUSCATION != 0
+    {
         OP_GETSOURCES_OBFU
     } else {
         OP_GETSOURCES
@@ -4509,10 +4508,7 @@ mod tests {
             source_request_opcode(0x00, Some(SERVER_TCP_FLAG_TCPOBFUSCATION)),
             OP_GETSOURCES
         );
-        assert_eq!(
-            source_request_opcode(0x01, Some(0)),
-            OP_GETSOURCES
-        );
+        assert_eq!(source_request_opcode(0x01, Some(0)), OP_GETSOURCES);
     }
 
     #[test]

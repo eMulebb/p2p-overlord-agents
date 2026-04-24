@@ -3436,9 +3436,9 @@ async fn handle_connection(
     transfer_runtime: &Arc<Ed2kTransferRuntime>,
     hello_identity: Ed2kHelloIdentity,
 ) -> Result<()> {
-    let local_addr = stream
-        .local_addr()
-        .with_context(|| format!("failed to resolve local eD2k listener address for {peer_addr}"))?;
+    let local_addr = stream.local_addr().with_context(|| {
+        format!("failed to resolve local eD2k listener address for {peer_addr}")
+    })?;
     dump_ed2k_tcp_listener_meta(
         peer_addr,
         None,
@@ -5161,10 +5161,9 @@ async fn reconcile_download_manifest_metadata(
     let learned_name = peer_file_name
         .map(str::trim)
         .filter(|name| !name.is_empty());
-    if learned_size.is_none() && learned_name.is_none() {
-        if peer_file_identifier.aich_root.is_none() {
-            return Ok(());
-        }
+    if learned_size.is_none() && learned_name.is_none() && peer_file_identifier.aich_root.is_none()
+    {
+        return Ok(());
     }
 
     *manifest = transfer_runtime
