@@ -2111,11 +2111,8 @@ async fn search_sources_on_server(
                     format!("dispatching source search file_hash={file_hash}"),
                 );
                 let source_request = encode_source_request(file_hash, file_size);
-                let opcode = source_request_opcode(
-                    login_identity.connect_options,
-                    session.server_flags,
-                    use_server_obfuscation,
-                );
+                let opcode =
+                    source_request_opcode(login_identity.connect_options, session.server_flags);
                 session.send_packet(opcode, &source_request).await?;
             }
             OP_FOUNDSOURCES | OP_FOUNDSOURCES_OBFU => {
@@ -2528,11 +2525,7 @@ async fn start_background_server_search(
                 format!("dispatching background source search file_hash={file_hash}"),
             );
             let source_request = encode_source_request(file_hash, file_size);
-            let opcode = source_request_opcode(
-                connect_options,
-                session.server_flags,
-                session.send_cipher.is_some(),
-            );
+            let opcode = source_request_opcode(connect_options, session.server_flags);
             session.send_packet(opcode, &source_request).await?;
             if let Some(socket) = server_udp_socket
                 && let Err(error) =
@@ -2994,12 +2987,13 @@ fn encode_udp_source_request(
 fn source_request_opcode(
     connect_options: u8,
     server_flags: Option<u32>,
-    use_obfuscated_transport: bool,
 ) -> u8 {
-    if connect_options != 0
-        && use_obfuscated_transport
-        && server_flags.unwrap_or_default() & SERVER_TCP_FLAG_TCPOBFUSCATION != 0
-    {
+    // A source-search session may still need the obfuscated reply family even
+    // when the TCP session itself stayed plaintext because the configured
+    // server entry lacked an obfuscation port. Once OP_IDCHANGE confirms the
+    // server supports TCP obfuscation, prefer the obfuscated found-sources
+    // shape so peer user-hash metadata is preserved.
+    if connect_options != 0 && server_flags.unwrap_or_default() & SERVER_TCP_FLAG_TCPOBFUSCATION != 0 {
         OP_GETSOURCES_OBFU
     } else {
         OP_GETSOURCES
@@ -4508,15 +4502,15 @@ mod tests {
     #[test]
     fn source_request_opcode_uses_obfuscated_variant_when_supported() {
         assert_eq!(
-            source_request_opcode(0x01, Some(SERVER_TCP_FLAG_TCPOBFUSCATION), true),
+            source_request_opcode(0x01, Some(SERVER_TCP_FLAG_TCPOBFUSCATION)),
             OP_GETSOURCES_OBFU
         );
         assert_eq!(
-            source_request_opcode(0x00, Some(SERVER_TCP_FLAG_TCPOBFUSCATION), true),
+            source_request_opcode(0x00, Some(SERVER_TCP_FLAG_TCPOBFUSCATION)),
             OP_GETSOURCES
         );
         assert_eq!(
-            source_request_opcode(0x01, Some(SERVER_TCP_FLAG_TCPOBFUSCATION), false),
+            source_request_opcode(0x01, Some(0)),
             OP_GETSOURCES
         );
     }
