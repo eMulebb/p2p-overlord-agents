@@ -123,6 +123,8 @@ const KAD_FIREWALLED_RESPONSE_TIMEOUT_SECS: u64 = 10;
 const ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS: usize = 3;
 const ED2K_BACKGROUND_SEARCH_QUEUE_CAPACITY: usize = 4;
 const ED2K_DOWNLOAD_KAD_SOURCE_CAP: usize = 64;
+const ED2K_DOWNLOAD_KAD_SOURCE_TIMEOUT_FLOOR_SECS: u64 = 45;
+const ED2K_DOWNLOAD_KAD_SOURCE_RETRY_DELAY_MS: u64 = 500;
 const ED2K_HASH_ONLY_QUERY_PREFIX: &str = "ed2k::";
 const ACTIVITY_KEY_STARTING: &str = "starting";
 const ACTIVITY_KEY_BOOTSTRAPPING: &str = "bootstrapping";
@@ -3062,36 +3064,77 @@ async fn collect_kad_ed2k_sources(
     file_size: u64,
     timeout: Duration,
 ) -> Vec<Ed2kFoundSource> {
-    let cancel = CancellationToken::new();
-    let mut stream = dht.search_sources_with_cancel_and_class(
-        file_hash,
-        file_size,
-        cancel.clone(),
-        RpcWorkClass::Interactive,
-    );
-    let sleep = tokio::time::sleep(timeout);
-    tokio::pin!(sleep);
     let mut sources = Vec::new();
+    let deadline = Instant::now() + timeout;
+    let retry_delay = Duration::from_millis(ED2K_DOWNLOAD_KAD_SOURCE_RETRY_DELAY_MS);
+    let mut attempts = 0usize;
 
     loop {
-        tokio::select! {
-            _ = &mut sleep => break,
-            result = stream.next() => {
-                let Some(result) = result else {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        attempts += 1;
+        let cancel = CancellationToken::new();
+        let mut stream = dht.search_sources_with_cancel_and_class(
+            file_hash,
+            file_size,
+            cancel.clone(),
+            RpcWorkClass::Interactive,
+        );
+        let sleep = tokio::time::sleep(remaining);
+        tokio::pin!(sleep);
+
+        loop {
+            tokio::select! {
+                _ = &mut sleep => {
+                    cancel.cancel();
                     break;
-                };
-                merge_download_sources(
-                    &mut sources,
-                    vec![kad_source_result_to_ed2k_found_source(result)],
-                );
-                if sources.len() >= ED2K_DOWNLOAD_KAD_SOURCE_CAP {
-                    break;
+                }
+                result = stream.next() => {
+                    let Some(result) = result else {
+                        break;
+                    };
+                    merge_download_sources(
+                        &mut sources,
+                        vec![kad_source_result_to_ed2k_found_source(result)],
+                    );
+                    if sources.len() >= ED2K_DOWNLOAD_KAD_SOURCE_CAP {
+                        cancel.cancel();
+                        info!(
+                            "Kad source lookup reached cap file_hash={} attempts={} source_count={}",
+                            file_hash,
+                            attempts,
+                            sources.len()
+                        );
+                        return sources;
+                    }
                 }
             }
         }
+
+        cancel.cancel();
+        if !sources.is_empty() {
+            info!(
+                "Kad source lookup produced file_hash={} attempts={} source_count={}",
+                file_hash,
+                attempts,
+                sources.len()
+            );
+            return sources;
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining <= retry_delay {
+            break;
+        }
+        tokio::time::sleep(retry_delay).await;
     }
 
-    cancel.cancel();
+    info!(
+        "Kad source lookup exhausted file_hash={} attempts={} source_count=0",
+        file_hash, attempts
+    );
     sources
 }
 
@@ -6460,7 +6503,9 @@ impl OverlordAgentEmule {
                     &runtime.dht,
                     file_hash,
                     file_size,
-                    source_search_timeout,
+                    source_search_timeout.max(Duration::from_secs(
+                        ED2K_DOWNLOAD_KAD_SOURCE_TIMEOUT_FLOOR_SECS,
+                    )),
                 )
                 .await;
                 let kad_source_count = kad_sources.len();
