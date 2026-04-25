@@ -4770,14 +4770,6 @@ fn build_kad_hello_request_tags(
     Vec::new()
 }
 
-fn peer_has_known_udp_key(known_peer_key: Option<KadUdpKey>, contact_udp_key: KadUdpKey) -> bool {
-    known_peer_key.unwrap_or(contact_udp_key) != KadUdpKey::ZERO
-}
-
-fn should_request_proactive_hello_res_ack(peer_version: u8, peer_has_udp_key: bool) -> bool {
-    peer_version >= 8 && peer_has_udp_key
-}
-
 fn should_request_hello_response_ack(
     peer_version: u8,
     receiver_verify_key_valid: bool,
@@ -7439,10 +7431,8 @@ impl OverlordAgentEmule {
                 contacts.shuffle(&mut rand::thread_rng());
 
                 for (contact, addr) in contacts.into_iter().take(hello_intro_fanout.max(1)) {
-                    let request_ack = should_request_proactive_hello_res_ack(
-                        contact.kad_version,
-                        peer_has_known_udp_key(dht.known_peer_key(addr), contact.udp_key),
-                    );
+                    // eMule requests HELLO_RES_ACK from HELLO_RES, not from proactive HELLO_REQ.
+                    let request_ack = false;
                     let hello = match build_hello_request(
                         &dht,
                         &ed2k_listener,
@@ -8455,10 +8445,10 @@ mod tests {
         record_passive_replay_enqueue_wait, record_passive_replay_idle,
         record_passive_replay_post_failure, record_passive_replay_post_latency,
         record_passive_replay_start, restore_snoop_queue, select_ed2k_keyword_metadata,
-        should_request_hello_response_ack, should_request_proactive_hello_res_ack,
-        significant_keyword_words, source_publish_client_hash, synthetic_file_hash,
-        synthetic_popular_hash, synthetic_popular_hashes, synthetic_publish_aich_hash,
-        synthetic_publish_queue_depth, try_acquire_passive_replay_gate,
+        should_request_hello_response_ack, significant_keyword_words, source_publish_client_hash,
+        synthetic_file_hash, synthetic_popular_hash, synthetic_popular_hashes,
+        synthetic_publish_aich_hash, synthetic_publish_queue_depth,
+        try_acquire_passive_replay_gate,
     };
     use crate::{
         config::SnoopQueueConfig,
@@ -10186,13 +10176,6 @@ mod tests {
         let tags = build_kad_hello_request_tags(41000, false, false, false, false);
 
         assert!(tags.is_empty());
-    }
-
-    #[test]
-    fn proactive_hello_ack_requires_known_peer_udp_key() {
-        assert!(!should_request_proactive_hello_res_ack(8, false));
-        assert!(should_request_proactive_hello_res_ack(8, true));
-        assert!(!should_request_proactive_hello_res_ack(7, true));
     }
 
     #[test]

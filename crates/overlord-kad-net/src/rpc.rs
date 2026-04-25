@@ -446,9 +446,6 @@ impl RpcManager {
                             sender_verify_key,
                             receiver_verify_key_valid,
                         } = inner.obfuscation.decrypt(from, &data);
-                        if let Some(sender_verify_key) = sender_verify_key {
-                            inner.obfuscation.register_peer_key(from, sender_verify_key);
-                        }
                         debug!("packet from {} was_obfuscated={}", from, was_obfuscated);
 
                         // 3. Parse packet
@@ -505,6 +502,11 @@ impl RpcManager {
                         }
                         if let Some(kad_version) = inbound.kad_version {
                             inner.obfuscation.register_peer_version(from, kad_version);
+                        }
+                        if should_learn_sender_verify_key(response_opcode)
+                            && let Some(sender_verify_key) = sender_verify_key
+                        {
+                            inner.obfuscation.register_peer_key(from, sender_verify_key);
                         }
 
                         debug!(
@@ -1120,6 +1122,32 @@ fn is_publish_opcode(opcode_value: u8) -> bool {
             | opcode::PUBLISH_NOTES_REQ
             | opcode::PUBLISH_RES
             | opcode::PUBLISH_RES_ACK
+    )
+}
+
+fn should_learn_sender_verify_key(opcode_value: u8) -> bool {
+    matches!(
+        opcode_value,
+        opcode::BOOTSTRAP_REQ
+            | opcode::BOOTSTRAP_RES
+            | opcode::HELLO_REQ
+            | opcode::HELLO_RES
+            | opcode::HELLO_RES_ACK
+            | opcode::REQ
+            | opcode::SEARCH_KEY_REQ
+            | opcode::SEARCH_SOURCE_REQ
+            | opcode::SEARCH_NOTES_REQ
+            | opcode::PUBLISH_KEY_REQ
+            | opcode::PUBLISH_SOURCE_REQ
+            | opcode::PUBLISH_NOTES_REQ
+            | opcode::PUBLISH_RES
+            | opcode::PUBLISH_RES_ACK
+            | opcode::FIREWALLED_REQ
+            | opcode::FIREWALLED2_REQ
+            | opcode::FINDBUDDY_REQ
+            | opcode::FINDBUDDY_RES
+            | opcode::CALLBACK_REQ
+            | opcode::PING
     )
 }
 
@@ -1922,6 +1950,73 @@ mod tests {
             restrictive_payload: Vec::new(),
         });
         rpc.send(peer_addr, &search).await.unwrap();
+
+        let outgoing = transport.drain_outgoing();
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0].0, peer_addr);
+        assert_ne!(outgoing[0].1[0] & 0x03, 0x02);
+        assert_ne!(outgoing[0].1[0], overlord_kad_proto::OP_KADEMLIAHEADER);
+    }
+
+    #[tokio::test]
+    async fn test_lookup_search_response_does_not_teach_receiver_verify_key() {
+        let transport = Arc::new(MockTransport::new(make_local_addr()));
+        let inject_tx = transport.injector();
+        let local_node_id = NodeId::from_bytes([0xAA; 16]);
+        let rpc = make_rpc_with_shared_transport(
+            Arc::clone(&transport),
+            ObfuscationLayer::new(local_node_id, 0x1234_5678, true),
+        );
+        let mut subscriber = rpc.subscribe();
+        let _handle = rpc.start();
+
+        let peer_addr = make_peer_addr();
+        let peer_node_id = NodeId::from_bytes([0x44; 16]);
+        let peer_obfuscation = ObfuscationLayer::new(peer_node_id, 0x5566_7788, true);
+        let local_addr = make_local_addr();
+        let peer_ip = match peer_addr.ip() {
+            std::net::IpAddr::V4(ip) => ip,
+            std::net::IpAddr::V6(_) => unreachable!(),
+        };
+        peer_obfuscation.register_peer_identity(local_addr, local_node_id);
+        peer_obfuscation.register_peer_version(local_addr, 8);
+        peer_obfuscation.register_peer_key(local_addr, rpc.verify_key_for_ip(peer_ip));
+
+        let search_res = KadPacket::SearchRes(overlord_kad_proto::SearchRes {
+            sender_id: peer_node_id,
+            target: NodeId::from_bytes([0x55; 16]),
+            results: Vec::new(),
+        });
+        let encrypted_search_res = peer_obfuscation.encrypt(
+            local_addr,
+            opcode::SEARCH_RES,
+            &search_res.encode().unwrap(),
+        );
+        let _ = inject_tx.send((encrypted_search_res, peer_addr)).await;
+
+        let received = tokio::time::timeout(Duration::from_secs(1), subscriber.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(received.packet, KadPacket::SearchRes(_)));
+        assert_eq!(
+            received.sender_verify_key,
+            Some(peer_obfuscation.verify_key_for_ip(match local_addr.ip() {
+                std::net::IpAddr::V4(ip) => ip,
+                std::net::IpAddr::V6(_) => unreachable!(),
+            }))
+        );
+
+        rpc.send(
+            peer_addr,
+            &KadPacket::Firewalled2Req(overlord_kad_proto::Firewalled2Req {
+                tcp_port: 4662,
+                user_hash: overlord_kad_proto::Ed2kHash::ZERO,
+                connect_options: 0,
+            }),
+        )
+        .await
+        .unwrap();
 
         let outgoing = transport.drain_outgoing();
         assert_eq!(outgoing.len(), 1);
