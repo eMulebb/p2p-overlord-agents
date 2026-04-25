@@ -125,6 +125,8 @@ const ED2K_BACKGROUND_SEARCH_QUEUE_CAPACITY: usize = 4;
 const ED2K_DOWNLOAD_KAD_SOURCE_CAP: usize = 64;
 const ED2K_DOWNLOAD_KAD_SOURCE_TIMEOUT_FLOOR_SECS: u64 = 45;
 const ED2K_DOWNLOAD_KAD_SOURCE_RETRY_DELAY_MS: u64 = 500;
+const ED2K_DOWNLOAD_SOURCE_REQUERY_ROUNDS: usize = 2;
+const ED2K_DOWNLOAD_SOURCE_REQUERY_DELAY_SECS: u64 = 5;
 const ED2K_HASH_ONLY_QUERY_PREFIX: &str = "ed2k::";
 const ACTIVITY_KEY_STARTING: &str = "starting";
 const ACTIVITY_KEY_BOOTSTRAPPING: &str = "bootstrapping";
@@ -831,6 +833,8 @@ struct NativeDirectDownloadOutcome {
     accepted_incomplete_peers: u32,
     last_error: Option<anyhow::Error>,
 }
+
+type Ed2kSourceAttemptKey = (Ipv4Addr, u16, Option<[u8; 16]>, Option<u8>);
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3054,6 +3058,40 @@ fn is_retryable_direct_download_error(error: &anyhow::Error) -> bool {
             .downcast_ref::<std::io::Error>()
             .is_some_and(|inner| inner.kind() == std::io::ErrorKind::ConnectionRefused)
     })
+}
+
+fn ed2k_source_attempt_key(source: &Ed2kFoundSource) -> Ed2kSourceAttemptKey {
+    (
+        source.ip,
+        source.tcp_port,
+        source.user_hash,
+        source.obfuscation_options,
+    )
+}
+
+fn sort_native_ed2k_download_sources(sources: &mut [Ed2kFoundSource]) {
+    // Prefer direct, obfuscation-ready sources first, matching eMule's bias
+    // toward peers that can complete the initial secure handshake.
+    sources.sort_by_key(|source| {
+        (
+            !source.is_direct_dialable(),
+            source.user_hash.is_none(),
+            source.obfuscation_options.is_none(),
+        )
+    });
+}
+
+fn new_direct_ed2k_source_count(
+    sources: &[Ed2kFoundSource],
+    attempted_direct_sources: &HashSet<Ed2kSourceAttemptKey>,
+) -> usize {
+    sources
+        .iter()
+        .filter(|source| {
+            source.is_direct_dialable()
+                && !attempted_direct_sources.contains(&ed2k_source_attempt_key(source))
+        })
+        .count()
 }
 
 /// Collects Kad-advertised ED2K sources for a bounded window so downloads can
@@ -6624,7 +6662,8 @@ impl OverlordAgentEmule {
             connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
             direct_udp_callback: false,
         };
-        let mut sources = if request.sources.is_empty() {
+        let auto_acquire_sources = request.sources.is_empty();
+        let mut sources = if auto_acquire_sources {
             Self::native_ed2k_download_sources(
                 &runtime,
                 &config,
@@ -6644,232 +6683,285 @@ impl OverlordAgentEmule {
             anyhow::bail!("no ED2K sources available for {}", request.file_hash);
         }
 
-        // Prefer sources with user-hash metadata first so obfuscation-capable
-        // peers get the first attempt without blocking on more complex ranking.
-        sources.sort_by_key(|source| {
-            (
-                !source.is_direct_dialable(),
-                source.user_hash.is_none(),
-                source.obfuscation_options.is_none(),
-            )
-        });
+        sort_native_ed2k_download_sources(&mut sources);
 
-        let pre_filter_source_count = sources.len();
-        let post_filter_source_count = sources
-            .iter()
-            .filter(|source| source.is_direct_dialable())
-            .count();
-        let callback_only_sources: Vec<_> = sources
-            .iter()
-            .filter(|source| source.low_id)
-            .cloned()
-            .collect();
-        let skipped_low_id_sources = callback_only_sources.len();
-        info!(
-            "native ED2K download source filtering file_hash={} pre_filter_source_count={} callback_only_source_count={} post_filter_source_count={}",
-            request.file_hash,
-            pre_filter_source_count,
-            skipped_low_id_sources,
-            post_filter_source_count
-        );
-        if skipped_low_id_sources != 0 {
-            info!(
-                "native ED2K download filtered callback-only sources file_hash={} skipped_low_id_sources={}",
-                request.file_hash, skipped_low_id_sources
-            );
-        }
         // Low-ID peers often arrive noticeably later than direct ED2K connects
         // because the server-mediated callback has to propagate first.
         let callback_timeout = Duration::from_secs(config.p2p.ed2k.connect_timeout_secs.max(30));
-        if !callback_only_sources.is_empty() {
-            let cancel = CancellationToken::new();
-            for source in &callback_only_sources {
-                runtime
-                    .ed2k_transfer
-                    .register_callback_intent(Ed2kCallbackIntent {
-                        client_id: source.client_id,
-                        file_hash: request.file_hash.clone(),
-                        canonical_name: canonical_name.clone(),
-                        file_size,
-                        source: Ed2kSourceHint {
-                            ip: source.ip.to_string(),
-                            tcp_port: source.tcp_port,
-                            user_hash: source.user_hash.map(hex::encode),
-                        },
-                    })
-                    .await;
+        let mut attempted_direct_sources = HashSet::new();
+        let mut requested_callback_sources = HashSet::new();
+        let mut had_direct_sources = false;
+        let mut accepted_incomplete_peers = 0u32;
+        let mut last_direct_error: Option<anyhow::Error> = None;
+        let mut source_requery_round = 0usize;
+
+        loop {
+            sort_native_ed2k_download_sources(&mut sources);
+            let pre_filter_source_count = sources.len();
+            let post_filter_source_count = sources
+                .iter()
+                .filter(|source| source.is_direct_dialable())
+                .count();
+            let callback_only_sources: Vec<_> = sources
+                .iter()
+                .filter(|source| source.low_id)
+                .cloned()
+                .collect();
+            let skipped_low_id_sources = callback_only_sources.len();
+            info!(
+                "native ED2K download source filtering file_hash={} pre_filter_source_count={} callback_only_source_count={} post_filter_source_count={} requery_round={}",
+                request.file_hash,
+                pre_filter_source_count,
+                skipped_low_id_sources,
+                post_filter_source_count,
+                source_requery_round
+            );
+            if skipped_low_id_sources != 0 {
                 info!(
-                    "native ED2K download requesting server callback file_hash={} client_id={} tcp_port={} source_server={}",
-                    request.file_hash,
-                    source.client_id,
-                    source.tcp_port,
-                    source
-                        .source_server
-                        .map_or_else(|| "-".to_string(), |endpoint| endpoint.to_string())
+                    "native ED2K download filtered callback-only sources file_hash={} skipped_low_id_sources={} requery_round={}",
+                    request.file_hash, skipped_low_id_sources, source_requery_round
                 );
-                let callback_result = if let Some(source_server) = source.source_server {
-                    request_callback_on_server(
-                        runtime.bind_ip,
-                        &config.p2p.ed2k,
-                        hello_identity,
-                        &shared_catalog,
-                        source_server,
-                        source.client_id,
-                        callback_timeout,
-                        &cancel,
-                    )
-                    .await
-                } else {
-                    request_callback_via_background_session(
-                        &runtime.ed2k_server_search,
-                        source.client_id,
-                        callback_timeout,
-                        &cancel,
-                    )
-                    .await
-                };
-                match callback_result {
-                    Ok(()) => {}
-                    Err(error) => warn!(
-                        "native ED2K server callback request failed file_hash={} client_id={} source_server={}: {error}",
+            }
+
+            if !callback_only_sources.is_empty() {
+                let cancel = CancellationToken::new();
+                for source in &callback_only_sources {
+                    let source_key = ed2k_source_attempt_key(source);
+                    if !requested_callback_sources.insert(source_key) {
+                        continue;
+                    }
+                    runtime
+                        .ed2k_transfer
+                        .register_callback_intent(Ed2kCallbackIntent {
+                            client_id: source.client_id,
+                            file_hash: request.file_hash.clone(),
+                            canonical_name: canonical_name.clone(),
+                            file_size,
+                            source: Ed2kSourceHint {
+                                ip: source.ip.to_string(),
+                                tcp_port: source.tcp_port,
+                                user_hash: source.user_hash.map(hex::encode),
+                            },
+                        })
+                        .await;
+                    info!(
+                        "native ED2K download requesting server callback file_hash={} client_id={} tcp_port={} source_server={} requery_round={}",
                         request.file_hash,
                         source.client_id,
+                        source.tcp_port,
                         source
                             .source_server
-                            .map_or_else(|| "-".to_string(), |endpoint| endpoint.to_string())
-                    ),
+                            .map_or_else(|| "-".to_string(), |endpoint| endpoint.to_string()),
+                        source_requery_round
+                    );
+                    let callback_result = if let Some(source_server) = source.source_server {
+                        request_callback_on_server(
+                            runtime.bind_ip,
+                            &config.p2p.ed2k,
+                            hello_identity,
+                            &shared_catalog,
+                            source_server,
+                            source.client_id,
+                            callback_timeout,
+                            &cancel,
+                        )
+                        .await
+                    } else {
+                        request_callback_via_background_session(
+                            &runtime.ed2k_server_search,
+                            source.client_id,
+                            callback_timeout,
+                            &cancel,
+                        )
+                        .await
+                    };
+                    match callback_result {
+                        Ok(()) => {}
+                        Err(error) => warn!(
+                            "native ED2K server callback request failed file_hash={} client_id={} source_server={}: {error}",
+                            request.file_hash,
+                            source.client_id,
+                            source
+                                .source_server
+                                .map_or_else(|| "-".to_string(), |endpoint| endpoint.to_string())
+                        ),
+                    }
                 }
             }
-        }
-        sources.retain(Ed2kFoundSource::is_direct_dialable);
-        let had_direct_sources = !sources.is_empty();
-        if !had_direct_sources {
-            info!(
-                "native ED2K download source filtering left no direct-dialable sources file_hash={} callback_only_source_count={}",
-                request.file_hash, skipped_low_id_sources
-            );
-        }
-        for source in &sources {
-            dump_ed2k_tcp_download_meta(
-                SocketAddr::new(IpAddr::V4(source.ip), source.tcp_port),
-                None,
-                "source_candidate",
-                format!(
-                    "file_hash={} client_id={} low_id={} obfuscated={} has_user_hash={}",
-                    request.file_hash,
-                    source.client_id,
-                    source.low_id,
-                    source.obfuscated,
-                    source.user_hash.is_some()
-                ),
-            );
-        }
-        if had_direct_sources {
-            let outcome = Self::run_native_ed2k_direct_downloads(
-                runtime.bind_ip,
-                hello_identity,
-                Arc::clone(&runtime.ed2k_secure_ident),
-                Arc::clone(&runtime.ed2k_transfer),
-                request.file_hash.clone(),
-                canonical_name.clone(),
-                file_size,
-                sources,
-                Duration::from_secs(config.p2p.ed2k.connect_timeout_secs.max(10)),
-                config.p2p.ed2k.max_parallel_download_peers,
-                |bind_ip,
-                 source,
-                 hello_identity,
-                 secure_ident,
-                 transfer_runtime,
-                 file_name,
-                 file_size,
-                 connect_timeout| async move {
-                    download_file_from_peer(
-                        bind_ip,
-                        &source,
-                        hello_identity,
-                        &secure_ident,
-                        transfer_runtime.as_ref(),
-                        file_name,
-                        file_size,
-                        connect_timeout,
-                    )
-                    .await
-                },
-            )
-            .await?;
 
-            if outcome.completed {
-                let manifest = runtime.ed2k_transfer.manifest(&request.file_hash).await?;
-                dump_ed2k_tcp_download_meta(
-                    SocketAddr::new(IpAddr::V4(runtime.bind_ip), config.p2p.ed2k.listen_port),
-                    None,
-                    "download_completed",
-                    format!(
-                        "file_hash={} file_name={} expected_size={} manifest_size={} verified_ranges={} completed={}",
-                        request.file_hash,
-                        manifest.canonical_name,
-                        file_size,
-                        manifest.file_size,
-                        manifest.verified_ranges.len(),
-                        manifest.completed
-                    ),
-                );
+            let direct_sources: Vec<_> = sources
+                .iter()
+                .filter(|source| {
+                    source.is_direct_dialable()
+                        && !attempted_direct_sources.contains(&ed2k_source_attempt_key(source))
+                })
+                .cloned()
+                .collect();
+            had_direct_sources |= !direct_sources.is_empty();
+            if direct_sources.is_empty() && requested_callback_sources.is_empty() {
                 info!(
-                    "native ED2K download completed file_hash={} file_name={} size={}",
-                    request.file_hash, manifest.canonical_name, manifest.file_size
+                    "native ED2K download source filtering left no direct-dialable sources file_hash={} callback_only_source_count={} requery_round={}",
+                    request.file_hash, skipped_low_id_sources, source_requery_round
                 );
-                return Ok(());
             }
-            let last_error = outcome.last_error;
-            if outcome.accepted_incomplete_peers != 0 {
+            for source in &direct_sources {
                 dump_ed2k_tcp_download_meta(
-                    SocketAddr::new(IpAddr::V4(runtime.bind_ip), config.p2p.ed2k.listen_port),
+                    SocketAddr::new(IpAddr::V4(source.ip), source.tcp_port),
                     None,
-                    "download_accepted_incomplete_peers",
+                    "source_candidate",
                     format!(
-                        "file_hash={} accepted_incomplete_peers={}",
-                        request.file_hash, outcome.accepted_incomplete_peers
+                        "file_hash={} client_id={} low_id={} obfuscated={} has_user_hash={} requery_round={}",
+                        request.file_hash,
+                        source.client_id,
+                        source.low_id,
+                        source.obfuscated,
+                        source.user_hash.is_some(),
+                        source_requery_round
                     ),
                 );
+                attempted_direct_sources.insert(ed2k_source_attempt_key(source));
             }
-            if !callback_only_sources.is_empty() {
-                tokio::time::sleep(callback_timeout).await;
-                let manifest = Self::await_callback_transfer_completion(
-                    runtime.ed2k_transfer.as_ref(),
-                    &request.file_hash,
-                    &runtime.ed2k_transfer.manifest(&request.file_hash).await?,
-                    Duration::from_secs(callback_timeout.as_secs().max(90)),
+            if !direct_sources.is_empty() {
+                let outcome = Self::run_native_ed2k_direct_downloads(
+                    runtime.bind_ip,
+                    hello_identity,
+                    Arc::clone(&runtime.ed2k_secure_ident),
+                    Arc::clone(&runtime.ed2k_transfer),
+                    request.file_hash.clone(),
+                    canonical_name.clone(),
+                    file_size,
+                    direct_sources,
+                    Duration::from_secs(config.p2p.ed2k.connect_timeout_secs.max(10)),
+                    config.p2p.ed2k.max_parallel_download_peers,
+                    |bind_ip,
+                     source,
+                     hello_identity,
+                     secure_ident,
+                     transfer_runtime,
+                     file_name,
+                     file_size,
+                     connect_timeout| async move {
+                        download_file_from_peer(
+                            bind_ip,
+                            &source,
+                            hello_identity,
+                            &secure_ident,
+                            transfer_runtime.as_ref(),
+                            file_name,
+                            file_size,
+                            connect_timeout,
+                        )
+                        .await
+                    },
                 )
                 .await?;
-                if manifest.completed {
-                    return Ok(());
-                }
-                if manifest_has_ed2k_transfer_progress(&manifest) {
+
+                if outcome.completed {
+                    let manifest = runtime.ed2k_transfer.manifest(&request.file_hash).await?;
+                    dump_ed2k_tcp_download_meta(
+                        SocketAddr::new(IpAddr::V4(runtime.bind_ip), config.p2p.ed2k.listen_port),
+                        None,
+                        "download_completed",
+                        format!(
+                            "file_hash={} file_name={} expected_size={} manifest_size={} verified_ranges={} completed={}",
+                            request.file_hash,
+                            manifest.canonical_name,
+                            file_size,
+                            manifest.file_size,
+                            manifest.verified_ranges.len(),
+                            manifest.completed
+                        ),
+                    );
                     info!(
-                        "native ED2K callback transfer remains in progress after grace window file_hash={} bytes_written={} md4_hashset_acquired={}",
-                        request.file_hash,
-                        manifest
-                            .pieces
-                            .iter()
-                            .map(|piece| piece.bytes_written)
-                            .sum::<u64>(),
-                        manifest.md4_hashset_acquired
+                        "native ED2K download completed file_hash={} file_name={} size={}",
+                        request.file_hash, manifest.canonical_name, manifest.file_size
                     );
                     return Ok(());
                 }
+                if outcome.accepted_incomplete_peers != 0 {
+                    accepted_incomplete_peers =
+                        accepted_incomplete_peers.saturating_add(outcome.accepted_incomplete_peers);
+                    dump_ed2k_tcp_download_meta(
+                        SocketAddr::new(IpAddr::V4(runtime.bind_ip), config.p2p.ed2k.listen_port),
+                        None,
+                        "download_accepted_incomplete_peers",
+                        format!(
+                            "file_hash={} accepted_incomplete_peers={} total_accepted_incomplete_peers={}",
+                            request.file_hash,
+                            outcome.accepted_incomplete_peers,
+                            accepted_incomplete_peers
+                        ),
+                    );
+                }
+                if let Some(error) = outcome.last_error {
+                    last_direct_error = Some(error);
+                }
             }
-            if let Some(error) = last_error {
-                return Err(error).with_context(|| {
-                    format!(
-                        "native ED2K download did not complete for {} after trying discovered sources",
-                        request.file_hash
-                    )
-                });
+
+            if auto_acquire_sources
+                && file_size != 0
+                && source_requery_round < ED2K_DOWNLOAD_SOURCE_REQUERY_ROUNDS
+            {
+                source_requery_round += 1;
+                info!(
+                    "native ED2K download refreshing sources file_hash={} requery_round={} attempted_direct_sources={}",
+                    request.file_hash,
+                    source_requery_round,
+                    attempted_direct_sources.len()
+                );
+                if source_requery_round > 1 {
+                    tokio::time::sleep(Duration::from_secs(
+                        ED2K_DOWNLOAD_SOURCE_REQUERY_DELAY_SECS,
+                    ))
+                    .await;
+                }
+                match Self::native_ed2k_download_sources(
+                    &runtime,
+                    &config,
+                    file_hash,
+                    file_size,
+                    ed2k_user_hash,
+                )
+                .await
+                {
+                    Ok(refreshed_sources) => {
+                        let refreshed_source_count = refreshed_sources.len();
+                        let previous_source_count = sources.len();
+                        merge_download_sources(&mut sources, refreshed_sources);
+                        let added_source_count =
+                            sources.len().saturating_sub(previous_source_count);
+                        let new_direct_source_count =
+                            new_direct_ed2k_source_count(&sources, &attempted_direct_sources);
+                        info!(
+                            "native ED2K download source refresh completed file_hash={} requery_round={} refreshed_source_count={} added_source_count={} aggregated_source_count={} new_direct_source_count={}",
+                            request.file_hash,
+                            source_requery_round,
+                            refreshed_source_count,
+                            added_source_count,
+                            sources.len(),
+                            new_direct_source_count
+                        );
+                        if new_direct_source_count != 0
+                            || source_requery_round < ED2K_DOWNLOAD_SOURCE_REQUERY_ROUNDS
+                        {
+                            continue;
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            "native ED2K download source refresh failed file_hash={} requery_round={}: {error}",
+                            request.file_hash, source_requery_round
+                        );
+                        if source_requery_round < ED2K_DOWNLOAD_SOURCE_REQUERY_ROUNDS {
+                            continue;
+                        }
+                    }
+                }
             }
+            break;
         }
 
-        if !callback_only_sources.is_empty() {
+        if !requested_callback_sources.is_empty() {
             tokio::time::sleep(callback_timeout).await;
             let manifest = Self::await_callback_transfer_completion(
                 runtime.ed2k_transfer.as_ref(),
@@ -6901,6 +6993,21 @@ impl OverlordAgentEmule {
             return Ok(());
         }
         if had_direct_sources {
+            if let Some(error) = last_direct_error {
+                return Err(error).with_context(|| {
+                    format!(
+                        "native ED2K download did not complete for {} after trying discovered sources",
+                        request.file_hash
+                    )
+                });
+            }
+            if accepted_incomplete_peers != 0 {
+                anyhow::bail!(
+                    "native ED2K download for {} did not complete after {} accepted incomplete peer sessions",
+                    request.file_hash,
+                    accepted_incomplete_peers
+                );
+            }
             anyhow::bail!(
                 "native ED2K download for {} did not complete and no peer reported a concrete error",
                 request.file_hash
