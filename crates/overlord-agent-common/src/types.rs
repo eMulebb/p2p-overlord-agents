@@ -223,9 +223,13 @@ pub struct KadPublishObservability {
     pub latest_keyword_batch: Option<PublishBatchSummary>,
     pub latest_source_batch: Option<PublishBatchSummary>,
     #[serde(default)]
+    pub latest_notes_batch: Option<PublishBatchSummary>,
+    #[serde(default)]
     pub keyword_counters: PublishCounters,
     #[serde(default)]
     pub source_counters: PublishCounters,
+    #[serde(default)]
+    pub notes_counters: PublishCounters,
     pub synthetic_drip_interval_secs: Option<u64>,
     pub synthetic_drip_batch_items: Option<u32>,
     pub synthetic_drip_queue_depth: Option<u32>,

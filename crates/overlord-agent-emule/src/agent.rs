@@ -479,23 +479,34 @@ async fn record_publish_summaries(
     published_items: usize,
     keyword_stats: PublishAttemptStats,
     source_stats: PublishAttemptStats,
+    notes_stats: Option<PublishAttemptStats>,
     completed_at: DateTime<Utc>,
 ) {
     let keyword_summary =
         build_publish_batch_summary(seed_source, published_items, keyword_stats, completed_at);
     let source_summary =
         build_publish_batch_summary(seed_source, published_items, source_stats, completed_at);
+    let notes_summary = notes_stats.map(|stats| {
+        build_publish_batch_summary(seed_source, published_items, stats, completed_at)
+    });
 
     log_publish_summary("keyword", &keyword_summary);
     log_publish_summary("source", &source_summary);
+    if let Some(summary) = notes_summary.as_ref() {
+        log_publish_summary("notes", summary);
+    }
 
     let mut observability = publish_observability.lock().await;
     observability.last_seed_source = Some(seed_source);
     observability.last_seed_at = Some(completed_at);
     observability.latest_keyword_batch = Some(keyword_summary.clone());
     observability.latest_source_batch = Some(source_summary.clone());
+    observability.latest_notes_batch = notes_summary.clone();
     apply_publish_summary(&mut observability.keyword_counters, &keyword_summary);
     apply_publish_summary(&mut observability.source_counters, &source_summary);
+    if let Some(summary) = notes_summary.as_ref() {
+        apply_publish_summary(&mut observability.notes_counters, summary);
+    }
 }
 
 /// Refreshes the live publish snapshot while a long seed batch is still running.
@@ -509,6 +520,7 @@ async fn update_publish_progress(
     processed_items: usize,
     keyword_stats: PublishAttemptStats,
     source_stats: PublishAttemptStats,
+    notes_stats: Option<PublishAttemptStats>,
     observed_at: DateTime<Utc>,
 ) {
     let mut observability = publish_observability.lock().await;
@@ -526,6 +538,14 @@ async fn update_publish_progress(
         source_stats,
         observed_at,
     ));
+    if let Some(stats) = notes_stats {
+        observability.latest_notes_batch = Some(build_publish_batch_summary(
+            seed_source,
+            processed_items,
+            stats,
+            observed_at,
+        ));
+    }
 }
 
 async fn set_synthetic_publish_queue_depth(
@@ -3728,6 +3748,7 @@ async fn seed_popular_impl(
         0,
         keyword_totals,
         source_totals,
+        context.notes_publish_enabled.then_some(notes_totals),
         Utc::now(),
     )
     .await;
@@ -3891,6 +3912,7 @@ async fn seed_popular_impl(
             item_no,
             keyword_totals,
             source_totals,
+            context.notes_publish_enabled.then_some(notes_totals),
             observed_at,
         )
         .await;
@@ -3924,6 +3946,7 @@ async fn seed_popular_impl(
         published_items,
         keyword_totals,
         source_totals,
+        context.notes_publish_enabled.then_some(notes_totals),
         Utc::now(),
     )
     .await;
@@ -5865,6 +5888,11 @@ impl IndexerService for OverlordAgentEmule {
         publish_observability.source_counters = effective_publish_counters(
             &publish_observability.source_counters,
             publish_observability.latest_source_batch.as_ref(),
+            publish_observability.last_seed_at,
+        );
+        publish_observability.notes_counters = effective_publish_counters(
+            &publish_observability.notes_counters,
+            publish_observability.latest_notes_batch.as_ref(),
             publish_observability.last_seed_at,
         );
         publish_observability.synthetic_drip_interval_secs =
@@ -8444,10 +8472,10 @@ mod tests {
         normalize_ed2k_user_hash_markers, parse_kad_hello_metadata, record_passive_replay_complete,
         record_passive_replay_enqueue_wait, record_passive_replay_idle,
         record_passive_replay_post_failure, record_passive_replay_post_latency,
-        record_passive_replay_start, restore_snoop_queue, select_ed2k_keyword_metadata,
-        should_request_hello_response_ack, significant_keyword_words, source_publish_client_hash,
-        synthetic_file_hash, synthetic_popular_hash, synthetic_popular_hashes,
-        synthetic_publish_aich_hash, synthetic_publish_queue_depth,
+        record_passive_replay_start, record_publish_summaries, restore_snoop_queue,
+        select_ed2k_keyword_metadata, should_request_hello_response_ack, significant_keyword_words,
+        source_publish_client_hash, synthetic_file_hash, synthetic_popular_hash,
+        synthetic_popular_hashes, synthetic_publish_aich_hash, synthetic_publish_queue_depth,
         try_acquire_passive_replay_gate,
     };
     use crate::{
@@ -8471,8 +8499,8 @@ mod tests {
     use overlord_agent_common::{
         AgentInterfacesView, ConfigUpdate, CoordinatorClient, HarvestFamily, HashType,
         IndexerRegistration, IndexerService, KadHarvestObservability, KadPassiveReplayTierSummary,
-        Protocol, PublishCounters, PublishSeedSource, RegisterRequest, RegistrationResponse,
-        SnoopEntry,
+        KadPublishObservability, Protocol, PublishCounters, PublishSeedSource, RegisterRequest,
+        RegistrationResponse, SnoopEntry,
     };
     use overlord_agent_nat::{UPNP_MINIUPNPC_BACKEND, UPNP_RUPNP_BACKEND};
     use overlord_kad_dht::{DhtConfig, DhtNode, PublishAttemptStats, SearchResult, SourceResult};
@@ -9437,6 +9465,52 @@ mod tests {
         let effective = effective_publish_counters(&counters, Some(&summary), Some(completed_at));
 
         assert_eq!(effective, counters);
+    }
+
+    #[tokio::test]
+    async fn record_publish_summaries_tracks_notes_family_when_enabled() {
+        let completed_at = Utc.with_ymd_and_hms(2026, 4, 25, 10, 0, 0).unwrap();
+        let observability = Arc::new(Mutex::new(KadPublishObservability::default()));
+
+        record_publish_summaries(
+            &observability,
+            PublishSeedSource::ManualApi,
+            2,
+            PublishAttemptStats {
+                closest_contacts_considered: 3,
+                attempted_contacts: 3,
+                acked_contacts: 2,
+                timed_out_contacts: 0,
+            },
+            PublishAttemptStats {
+                closest_contacts_considered: 4,
+                attempted_contacts: 4,
+                acked_contacts: 3,
+                timed_out_contacts: 1,
+            },
+            Some(PublishAttemptStats {
+                closest_contacts_considered: 5,
+                attempted_contacts: 5,
+                acked_contacts: 4,
+                timed_out_contacts: 1,
+            }),
+            completed_at,
+        )
+        .await;
+
+        let snapshot = observability.lock().await;
+        let latest_notes = snapshot
+            .latest_notes_batch
+            .as_ref()
+            .expect("notes publish batch summary");
+        assert_eq!(latest_notes.seed_source, PublishSeedSource::ManualApi);
+        assert_eq!(latest_notes.published_items, 2);
+        assert_eq!(latest_notes.attempted_contacts, 5);
+        assert_eq!(latest_notes.acked_contacts, 4);
+        assert_eq!(snapshot.notes_counters.batches, 1);
+        assert_eq!(snapshot.notes_counters.published_items, 2);
+        assert_eq!(snapshot.notes_counters.attempted_contacts, 5);
+        assert_eq!(snapshot.notes_counters.last_success_at, Some(completed_at));
     }
 
     #[test]
