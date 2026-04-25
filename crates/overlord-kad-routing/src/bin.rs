@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 
-use overlord_kad_proto::{K, NodeId};
+use overlord_kad_proto::{K, KadUdpKey, NodeId};
 
 use crate::contact::{Contact, ContactType, is_lan};
 use crate::error::{RoutingError, RoutingSubnetLimitScope};
@@ -80,7 +80,10 @@ impl RoutingBin {
             existing.ip = contact.ip;
             existing.udp_port = contact.udp_port;
             existing.tcp_port = contact.tcp_port;
-            existing.kad_version = contact.kad_version;
+            existing.kad_version = existing.kad_version.max(contact.kad_version);
+            if contact.udp_key != KadUdpKey::ZERO {
+                existing.udp_key = contact.udp_key;
+            }
             existing.last_seen = contact.last_seen;
             // Move to back (most recently seen)
             let c = self.contacts.remove(pos).expect("position valid");
@@ -184,6 +187,33 @@ mod tests {
         assert!(!bin.try_add(c2).unwrap()); // updated, not new
         assert_eq!(bin.len(), 1);
         assert_eq!(bin.contacts[0].ip, "1.2.3.5".parse::<Ipv4Addr>().unwrap());
+    }
+
+    #[test]
+    fn test_update_existing_keeps_highest_version_and_learned_udp_key() {
+        let mut bin = RoutingBin::new();
+        let mut seeded = make_contact(1, "1.2.3.4".parse().unwrap());
+        seeded.kad_version = 10;
+        seeded.udp_key = KadUdpKey::new(0xAABB_CCDD);
+        assert!(bin.try_add(seeded).unwrap());
+
+        let mut thin_bootstrap_entry = make_contact(1, "1.2.3.5".parse().unwrap());
+        thin_bootstrap_entry.kad_version = 2;
+        thin_bootstrap_entry.udp_key = KadUdpKey::ZERO;
+        assert!(!bin.try_add(thin_bootstrap_entry).unwrap());
+
+        assert_eq!(bin.contacts[0].ip, "1.2.3.5".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(bin.contacts[0].kad_version, 10);
+        assert_eq!(bin.contacts[0].udp_key, KadUdpKey::new(0xAABB_CCDD));
+
+        let mut refreshed = make_contact(1, "1.2.3.6".parse().unwrap());
+        refreshed.kad_version = 11;
+        refreshed.udp_key = KadUdpKey::new(0x1122_3344);
+        assert!(!bin.try_add(refreshed).unwrap());
+
+        assert_eq!(bin.contacts[0].ip, "1.2.3.6".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(bin.contacts[0].kad_version, 11);
+        assert_eq!(bin.contacts[0].udp_key, KadUdpKey::new(0x1122_3344));
     }
 
     #[test]
