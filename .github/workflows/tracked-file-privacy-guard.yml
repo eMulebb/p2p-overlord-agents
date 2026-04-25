@@ -6,8 +6,7 @@ on:
       - ".github/workflows/tracked-file-privacy-guard.yml"
       - "AGENTS.md"
       - "docs/**"
-      - "scripts/windows/tracked_file_privacy_guard.ps1"
-      - "scripts/windows/tracked_file_privacy_guard_policy.v1.json"
+      - "schemas/privacy-guard/**"
       - "crates/**"
       - "*.toml"
       - "*.md"
@@ -16,8 +15,7 @@ on:
       - ".github/workflows/tracked-file-privacy-guard.yml"
       - "AGENTS.md"
       - "docs/**"
-      - "scripts/windows/tracked_file_privacy_guard.ps1"
-      - "scripts/windows/tracked_file_privacy_guard_policy.v1.json"
+      - "schemas/privacy-guard/**"
       - "crates/**"
       - "*.toml"
       - "*.md"
@@ -30,6 +28,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Checkout tooling
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/p2p-overlord-tooling
+          path: .ci/p2p-overlord-tooling
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Run tracked-file privacy guard
         shell: pwsh
-        run: ./scripts/windows/tracked_file_privacy_guard.ps1
+        working-directory: .ci/p2p-overlord-tooling
+        run: python -m overlord_tooling guard-tracked-files --repo-root ../..
