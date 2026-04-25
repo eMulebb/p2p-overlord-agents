@@ -168,6 +168,10 @@ const EMULE_TCP_CRYPT_MAGIC_SERVER: u8 = 203;
 const EMULE_TCP_CRYPT_MAGIC_SYNC: u32 = 0x835E_6FC4;
 const EMULE_TCP_CRYPT_DISCARD_LEN: usize = 1024;
 const EMULE_ENCRYPTION_METHOD_OBFUSCATION: u8 = 0x00;
+const EMULE_UDP_CRYPT_HEADER_LEN: usize = 8;
+const EMULE_UDP_CRYPT_MAGIC_SYNC_SERVER: u32 = 0x13EF_24D5;
+const EMULE_UDP_CRYPT_MAGIC_CLIENT_SERVER: u8 = 0x6B;
+const EMULE_UDP_CRYPT_MAGIC_SERVER_CLIENT: u8 = 0xA5;
 const SERVER_OBFUSCATION_PUBLIC_KEY_LEN: usize = 96;
 const SERVER_OBFUSCATION_RANDOM_EXPONENT_LEN: usize = 16;
 const SERVER_OBFUSCATION_MAX_PADDING_LEN: usize = 15;
@@ -189,6 +193,14 @@ struct Rc4KeyStream {
 
 impl Rc4KeyStream {
     fn new(key: &[u8]) -> Self {
+        Self::new_with_discard(key, EMULE_TCP_CRYPT_DISCARD_LEN)
+    }
+
+    fn new_without_discard(key: &[u8]) -> Self {
+        Self::new_with_discard(key, 0)
+    }
+
+    fn new_with_discard(key: &[u8], discard_len: usize) -> Self {
         let mut s = [0u8; 256];
         for (index, value) in s.iter_mut().enumerate() {
             *value = index as u8;
@@ -199,8 +211,10 @@ impl Rc4KeyStream {
             s.swap(i, j);
         }
         let mut stream = Self { s, i: 0, j: 0 };
-        let mut discard = [0u8; EMULE_TCP_CRYPT_DISCARD_LEN];
-        stream.apply(&mut discard);
+        for _ in 0..discard_len {
+            let mut discard = [0u8; 1];
+            stream.apply(&mut discard);
+        }
         stream
     }
 
@@ -371,6 +385,10 @@ impl ConfiguredServerEntry {
         self.obfuscation_port_tcp != 0
             && (self.udp_flags & (SERVER_UDP_FLAG_UDPOBFUSCATION | SERVER_UDP_FLAG_TCPOBFUSCATION))
                 != 0
+    }
+
+    fn supports_obfuscation_udp(&self) -> bool {
+        self.udp_flags & SERVER_UDP_FLAG_UDPOBFUSCATION != 0
     }
 }
 
@@ -1614,7 +1632,7 @@ async fn run_one_server_session(
             }
             udp_packet = async {
                 if let Some(socket) = server_udp_socket.as_ref() {
-                    read_server_udp_packet(socket).await
+                    read_server_udp_packet(socket, server).await
                 } else {
                     std::future::pending::<Result<Option<ServerUdpPacket>>>().await
                 }
@@ -1877,6 +1895,146 @@ pub async fn search_source_servers(
 
     if !aggregated_results.is_empty() {
         return Ok(aggregated_results);
+    }
+
+    if let Some(error) = last_error {
+        return Err(error);
+    }
+    Ok(Vec::new())
+}
+
+/// Executes ED2K server UDP source searches for one file hash and size.
+///
+/// LowID live sessions can receive a server warning and disconnect before a
+/// fresh TCP source-search login reaches `OP_IDCHANGE`. eMule can still use the
+/// server UDP `GlobGetSources` family, so keep that path available as a
+/// first-class source acquisition fallback.
+pub async fn search_source_udp_servers(
+    bind_ip: Ipv4Addr,
+    config: &Ed2kConfig,
+    preferred_endpoint: Option<SocketAddr>,
+    excluded_endpoint: Option<SocketAddr>,
+    max_attempts: usize,
+    file_hash: Ed2kHash,
+    file_size: u64,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<Vec<Ed2kFoundSource>> {
+    let mut configured_servers = configured_server_entries(config)?;
+    if configured_servers.is_empty() {
+        anyhow::bail!("ED2K UDP source search requires at least one configured server");
+    }
+    if let Some(preferred_endpoint) = preferred_endpoint
+        && let Some(index) = configured_servers.iter().position(|entry| {
+            entry.host == preferred_endpoint.ip().to_string()
+                && entry.port == preferred_endpoint.port()
+        })
+    {
+        let preferred = configured_servers.remove(index);
+        configured_servers.insert(0, preferred);
+    }
+    if let Some(excluded_endpoint) = excluded_endpoint {
+        configured_servers.retain(|entry| {
+            entry.host != excluded_endpoint.ip().to_string()
+                || entry.port != excluded_endpoint.port()
+        });
+    }
+    if configured_servers.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(bind_ip), 0))
+        .await
+        .with_context(|| format!("failed to bind ED2K UDP source-search socket on {bind_ip}"))?;
+    let mut aggregated_results = Vec::new();
+    let mut last_error = None;
+    let per_server_timeout = timeout.max(Duration::from_secs(5));
+
+    for (attempt_index, configured_server) in configured_servers
+        .into_iter()
+        .take(max_attempts.max(1))
+        .enumerate()
+    {
+        if cancel.is_cancelled() {
+            return Ok(Vec::new());
+        }
+        let resolved_server = match resolve_server_entry(&configured_server).await {
+            Ok(server) => server,
+            Err(error) => {
+                warn!(
+                    "failed to resolve ED2K UDP source-search server {} name={}: {error}",
+                    configured_server.base_endpoint_text(),
+                    configured_server.display_name()
+                );
+                last_error = Some(error);
+                continue;
+            }
+        };
+        info!(
+            "ED2K UDP source search attempt={}/{} endpoint={} name={} file_hash={}",
+            attempt_index + 1,
+            max_attempts.max(1),
+            resolved_server.base_endpoint(),
+            resolved_server.entry.display_name(),
+            file_hash
+        );
+        if let Err(error) =
+            send_udp_source_search(&socket, &resolved_server, file_hash, file_size).await
+        {
+            warn!(
+                "failed to send ED2K UDP source search file_hash={} endpoint={}: {error}",
+                file_hash,
+                resolved_server.base_endpoint()
+            );
+            last_error = Some(error);
+            continue;
+        }
+
+        let deadline = TokioInstant::now() + per_server_timeout;
+        loop {
+            if cancel.is_cancelled() {
+                return Ok(Vec::new());
+            }
+            let Some(remaining) = deadline.checked_duration_since(TokioInstant::now()) else {
+                break;
+            };
+            match tokio::time::timeout(remaining, read_server_udp_packet(&socket, &resolved_server))
+                .await
+            {
+                Ok(Ok(Some(packet))) => {
+                    if packet.from.ip() != IpAddr::V4(resolved_server.ip) {
+                        continue;
+                    }
+                    if packet.opcode != OP_GLOBFOUNDSOURCES {
+                        continue;
+                    }
+                    for results in decode_udp_found_source_sets(&packet.payload)? {
+                        let results =
+                            annotate_found_sources_server(results, resolved_server.base_endpoint());
+                        validate_found_sources(&results, file_hash)?;
+                        merge_found_sources(&mut aggregated_results, results);
+                    }
+                    info!(
+                        "completed ED2K UDP source search file_hash={} endpoint={} source_count={} aggregated_source_count={}",
+                        file_hash,
+                        resolved_server.base_endpoint(),
+                        aggregated_results.len(),
+                        aggregated_results.len()
+                    );
+                    break;
+                }
+                Ok(Ok(None)) => continue,
+                Ok(Err(error)) => {
+                    last_error = Some(error);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+
+        if !aggregated_results.is_empty() {
+            return Ok(aggregated_results);
+        }
     }
 
     if let Some(error) = last_error {
@@ -2757,14 +2915,20 @@ async fn bind_server_udp_socket(bind_ip: Ipv4Addr) -> Result<UdpSocket> {
 }
 
 fn server_udp_endpoint(server: &ResolvedServerEntry) -> SocketAddr {
-    SocketAddr::new(
-        IpAddr::V4(server.ip),
-        if server.entry.port <= u16::MAX - 4 {
-            server.entry.port + 4
+    let port = if should_obfuscate_server_udp(server) {
+        if server.entry.obfuscation_port_udp != 0 {
+            server.entry.obfuscation_port_udp
+        } else if server.entry.port <= u16::MAX - 12 {
+            server.entry.port + 12
         } else {
             server.entry.port
-        },
-    )
+        }
+    } else if server.entry.port <= u16::MAX - 4 {
+        server.entry.port + 4
+    } else {
+        server.entry.port
+    };
+    SocketAddr::new(IpAddr::V4(server.ip), port)
 }
 
 async fn send_server_udp_packet(
@@ -2773,19 +2937,13 @@ async fn send_server_udp_packet(
     opcode: u8,
     payload: &[u8],
 ) -> Result<()> {
-    let mut packet = Vec::with_capacity(2 + payload.len());
-    packet.push(OP_EDONKEYPROT);
-    packet.push(opcode);
-    packet.extend_from_slice(payload);
-    socket
-        .send_to(&packet, server_udp_endpoint(server))
-        .await
-        .with_context(|| {
-            format!(
-                "failed to send ED2K server UDP opcode=0x{opcode:02X} to {}",
-                server_udp_endpoint(server)
-            )
-        })?;
+    let (endpoint, packet) = encode_server_udp_datagram(server, opcode, payload);
+    socket.send_to(&packet, endpoint).await.with_context(|| {
+        format!(
+            "failed to send ED2K server UDP opcode=0x{opcode:02X} to {}",
+            endpoint
+        )
+    })?;
     Ok(())
 }
 
@@ -2815,23 +2973,107 @@ async fn send_udp_source_search(
     send_server_udp_packet(socket, server, opcode, &payload).await
 }
 
-async fn read_server_udp_packet(socket: &UdpSocket) -> Result<Option<ServerUdpPacket>> {
+async fn read_server_udp_packet(
+    socket: &UdpSocket,
+    server: &ResolvedServerEntry,
+) -> Result<Option<ServerUdpPacket>> {
     let mut buffer = vec![0u8; 65_535];
     let (len, from) = socket
         .recv_from(&mut buffer)
         .await
         .context("failed to receive ED2K server UDP datagram")?;
-    if len < 2 {
+    let Some(packet) = decode_server_udp_datagram(server, &buffer[..len]) else {
         return Ok(None);
-    }
-    if buffer[0] != OP_EDONKEYPROT {
+    };
+    if packet.len() < 2 || packet[0] != OP_EDONKEYPROT {
         return Ok(None);
     }
     Ok(Some(ServerUdpPacket {
-        opcode: buffer[1],
-        payload: buffer[2..len].to_vec(),
+        opcode: packet[1],
+        payload: packet[2..].to_vec(),
         from,
     }))
+}
+
+fn should_obfuscate_server_udp(server: &ResolvedServerEntry) -> bool {
+    server.entry.udp_key != 0 && server.entry.supports_obfuscation_udp()
+}
+
+fn encode_server_udp_datagram(
+    server: &ResolvedServerEntry,
+    opcode: u8,
+    payload: &[u8],
+) -> (SocketAddr, Vec<u8>) {
+    let mut plain = Vec::with_capacity(2 + payload.len());
+    plain.push(OP_EDONKEYPROT);
+    plain.push(opcode);
+    plain.extend_from_slice(payload);
+    if !should_obfuscate_server_udp(server) {
+        return (server_udp_endpoint(server), plain);
+    }
+
+    let random_key_part = rand::thread_rng().r#gen::<u16>();
+    let mut packet = Vec::with_capacity(EMULE_UDP_CRYPT_HEADER_LEN + plain.len());
+    packet.push(random_non_ed2k_udp_marker());
+    packet.extend_from_slice(&random_key_part.to_le_bytes());
+    packet.extend_from_slice(&EMULE_UDP_CRYPT_MAGIC_SYNC_SERVER.to_le_bytes());
+    packet.push(0);
+    packet.extend_from_slice(&plain);
+    let mut cipher = derive_server_udp_cipher(
+        server.entry.udp_key,
+        random_key_part,
+        EMULE_UDP_CRYPT_MAGIC_CLIENT_SERVER,
+    );
+    cipher.apply(&mut packet[3..]);
+    (server_udp_endpoint(server), packet)
+}
+
+fn decode_server_udp_datagram(server: &ResolvedServerEntry, packet: &[u8]) -> Option<Vec<u8>> {
+    if packet.first().copied() == Some(OP_EDONKEYPROT) {
+        return Some(packet.to_vec());
+    }
+    if !should_obfuscate_server_udp(server) || packet.len() <= EMULE_UDP_CRYPT_HEADER_LEN {
+        return None;
+    }
+
+    let random_key_part = u16::from_le_bytes([packet[1], packet[2]]);
+    let mut decrypted = packet[3..].to_vec();
+    let mut cipher = derive_server_udp_cipher(
+        server.entry.udp_key,
+        random_key_part,
+        EMULE_UDP_CRYPT_MAGIC_SERVER_CLIENT,
+    );
+    cipher.apply(&mut decrypted);
+    if decrypted.len() < 5 {
+        return None;
+    }
+    let magic = u32::from_le_bytes(decrypted[..4].try_into().ok()?);
+    if magic != EMULE_UDP_CRYPT_MAGIC_SYNC_SERVER {
+        return None;
+    }
+    let padding_len = usize::from(decrypted[4] & 0x0F);
+    let payload_offset = 5usize.checked_add(padding_len)?;
+    if decrypted.len() <= payload_offset {
+        return None;
+    }
+    Some(decrypted[payload_offset..].to_vec())
+}
+
+fn derive_server_udp_cipher(server_udp_key: u32, random_key_part: u16, magic: u8) -> Rc4KeyStream {
+    let mut key_material = Vec::with_capacity(7);
+    key_material.extend_from_slice(&server_udp_key.to_le_bytes());
+    key_material.push(magic);
+    key_material.extend_from_slice(&random_key_part.to_le_bytes());
+    Rc4KeyStream::new_without_discard(&md5_compute(key_material).0)
+}
+
+fn random_non_ed2k_udp_marker() -> u8 {
+    loop {
+        let marker = rand::thread_rng().r#gen::<u8>();
+        if marker != OP_EDONKEYPROT {
+            return marker;
+        }
+    }
 }
 
 fn encode_login_request(identity: Ed2kHelloIdentity) -> Vec<u8> {
@@ -3921,23 +4163,26 @@ mod tests {
         BackgroundServerSearchRequest, CT_EMULE_VERSION, CT_NAME, CT_SERVER_FLAGS, CT_VERSION,
         ConfiguredServerEntry, EDONKEY_VERSION, EMULE_ENCRYPTION_METHOD_OBFUSCATION,
         EMULE_TCP_CRYPT_MAGIC_REQUESTER, EMULE_TCP_CRYPT_MAGIC_SERVER, EMULE_TCP_CRYPT_MAGIC_SYNC,
+        EMULE_UDP_CRYPT_MAGIC_SERVER_CLIENT, EMULE_UDP_CRYPT_MAGIC_SYNC_SERVER,
         EMULE_VERSION_MAJOR, EMULE_VERSION_MINOR, EMULE_VERSION_UPDATE, Ed2kFoundSource, Ed2kHash,
         Ed2kSearchFile, Ed2kServerState, FT_FILENAME, FT_FILESIZE, FT_FILETYPE, FT_SOURCES,
         HELLO_NICKNAME, OFFER_FILE_SAMPLE_HASH, OFFER_FILE_SAMPLE_NAME, OFFER_FILE_SAMPLE_SIZE,
-        OP_EDONKEYPROT, OP_GETSERVERLIST, OP_GETSOURCES, OP_GETSOURCES_OBFU, OP_LOGINREQUEST,
-        OP_OFFERFILES, OP_PACKEDPROT, ResolvedServerEntry, SERVER_OBFUSCATION_PRIME_BYTES,
-        SERVER_OBFUSCATION_PUBLIC_KEY_LEN, SERVER_TCP_FLAG_COMPRESSION, SERVER_TCP_FLAG_LARGEFILES,
-        SERVER_TCP_FLAG_TCPOBFUSCATION, SERVER_UDP_FLAG_UDPOBFUSCATION,
+        OP_EDONKEYPROT, OP_GETSERVERLIST, OP_GETSOURCES, OP_GETSOURCES_OBFU, OP_GLOBGETSOURCES2,
+        OP_LOGINREQUEST, OP_OFFERFILES, OP_PACKEDPROT, ResolvedServerEntry,
+        SERVER_OBFUSCATION_PRIME_BYTES, SERVER_OBFUSCATION_PUBLIC_KEY_LEN,
+        SERVER_TCP_FLAG_COMPRESSION, SERVER_TCP_FLAG_LARGEFILES, SERVER_TCP_FLAG_TCPOBFUSCATION,
+        SERVER_UDP_FLAG_EXT_GETSOURCES2, SERVER_UDP_FLAG_UDPOBFUSCATION,
         SOURCE_OBFUSCATION_USER_HASH_PRESENT, ST_DESCRIPTION, ST_SERVERNAME, ServerSession,
         TAG_SHORT_NAME_MASK, TAGTYPE_UINT32, biguint_to_fixed_be, decode_found_sources,
         decode_search_result_page, decode_search_results, decode_server_ident,
-        decode_server_payload, derive_server_cipher, ed2k_string_tag_type, encode_login_request,
-        encode_offer_files_payload, encode_packet, encode_search_request, encode_source_request,
-        format_server_flags, ipv4_from_client_id, login_identity_for_server_transport,
-        new_ed2k_server_search_channel, offer_files_catalog_fingerprint,
-        search_keyword_via_background_session, search_source_via_background_session,
-        server_capabilities, should_use_server_obfuscation, source_request_opcode,
-        validate_found_sources,
+        decode_server_payload, decode_server_udp_datagram, derive_server_cipher,
+        derive_server_udp_cipher, ed2k_string_tag_type, encode_login_request,
+        encode_offer_files_payload, encode_packet, encode_search_request,
+        encode_server_udp_datagram, encode_source_request, format_server_flags,
+        ipv4_from_client_id, login_identity_for_server_transport, new_ed2k_server_search_channel,
+        offer_files_catalog_fingerprint, search_keyword_via_background_session,
+        search_source_via_background_session, server_capabilities, server_udp_endpoint,
+        should_use_server_obfuscation, source_request_opcode, validate_found_sources,
     };
     use crate::{
         ed2k_tcp::{Ed2kHelloIdentity, emule_connect_options},
@@ -3969,6 +4214,60 @@ mod tests {
             },
             ip: Ipv4Addr::LOCALHOST,
         }
+    }
+
+    fn test_udp_obfuscated_server() -> ResolvedServerEntry {
+        ResolvedServerEntry {
+            entry: ConfiguredServerEntry {
+                host: "127.0.0.1".to_string(),
+                port: 4661,
+                name: Some("test".to_string()),
+                description: None,
+                udp_flags: SERVER_UDP_FLAG_UDPOBFUSCATION | SERVER_UDP_FLAG_EXT_GETSOURCES2,
+                udp_key: 0x1122_3344,
+                udp_key_ip: 0x5566_7788,
+                obfuscation_port_tcp: 4661,
+                obfuscation_port_udp: 4675,
+            },
+            ip: Ipv4Addr::LOCALHOST,
+        }
+    }
+
+    #[test]
+    fn server_udp_endpoint_uses_obfuscation_port_when_keyed() {
+        let server = test_udp_obfuscated_server();
+        assert_eq!(server_udp_endpoint(&server).port(), 4675);
+
+        let plain_server = test_server(0, SERVER_UDP_FLAG_EXT_GETSOURCES2);
+        assert_eq!(server_udp_endpoint(&plain_server).port(), 4665);
+    }
+
+    #[test]
+    fn server_udp_obfuscation_round_trips_plain_payload() {
+        let server = test_udp_obfuscated_server();
+        let (endpoint, packet) = encode_server_udp_datagram(&server, OP_GLOBGETSOURCES2, b"abc");
+
+        assert_eq!(endpoint.port(), 4675);
+        assert_ne!(packet[0], OP_EDONKEYPROT);
+
+        let random_key_part = 0x7788u16;
+        let mut response = vec![0x01];
+        response.extend_from_slice(&random_key_part.to_le_bytes());
+        response.extend_from_slice(&EMULE_UDP_CRYPT_MAGIC_SYNC_SERVER.to_le_bytes());
+        response.push(0);
+        response.extend_from_slice(&[OP_EDONKEYPROT, OP_GLOBGETSOURCES2, b'a', b'b', b'c']);
+        let mut cipher = derive_server_udp_cipher(
+            server.entry.udp_key,
+            random_key_part,
+            EMULE_UDP_CRYPT_MAGIC_SERVER_CLIENT,
+        );
+        cipher.apply(&mut response[3..]);
+
+        let decoded = decode_server_udp_datagram(&server, &response).expect("decrypt packet");
+        assert_eq!(
+            decoded,
+            [OP_EDONKEYPROT, OP_GLOBGETSOURCES2, b'a', b'b', b'c']
+        );
     }
 
     #[test]

@@ -69,7 +69,7 @@ use crate::ed2k_server::{
     Ed2kFoundSource, Ed2kSearchFile, Ed2kServerSearchHandle, Ed2kServerState,
     new_ed2k_server_search_channel, request_callback_on_server,
     request_callback_via_background_session, run_ed2k_server_loop, search_keyword_servers,
-    search_keyword_via_background_session, search_source_servers,
+    search_keyword_via_background_session, search_source_servers, search_source_udp_servers,
     search_source_via_background_session,
 };
 use crate::ed2k_tcp::{
@@ -6414,6 +6414,39 @@ impl OverlordAgentEmule {
                 warn!(
                     "native ED2K download active server source search failed for file_hash={file_hash}: {error}"
                 );
+            }
+        }
+        if sources.is_empty() {
+            match search_source_udp_servers(
+                runtime.bind_ip,
+                &config.p2p.ed2k,
+                preferred_endpoint,
+                has_background_search
+                    .then_some(preferred_endpoint)
+                    .flatten(),
+                active_source_attempts,
+                file_hash,
+                file_size,
+                source_search_timeout,
+                &cancel,
+            )
+            .await
+            {
+                Ok(udp_results) => {
+                    let source_count = udp_results.len();
+                    merge_download_sources(&mut sources, udp_results);
+                    info!(
+                        "native ED2K download UDP source acquisition completed file_hash={} source_count={} aggregated_source_count={}",
+                        file_hash,
+                        source_count,
+                        sources.len()
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        "native ED2K download UDP source search failed for file_hash={file_hash}: {error}"
+                    );
+                }
             }
         }
         if file_size != 0 {
