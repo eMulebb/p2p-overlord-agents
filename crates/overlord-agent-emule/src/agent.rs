@@ -7100,28 +7100,6 @@ impl OverlordAgentEmule {
 
         self.reconcile_p2p_runtime_if_interface_moved().await?;
         let normalized_file_hash = request.file_hash.to_lowercase();
-        if let Some(runtime) = self.runtime.lock().await.clone()
-            && let Ok(manifest) = runtime.ed2k_transfer.manifest(&normalized_file_hash).await
-        {
-            let persisted_bytes = manifest
-                .pieces
-                .iter()
-                .map(|piece| piece.bytes_written)
-                .sum::<u64>();
-            if manifest.completed {
-                info!(
-                    "native ED2K download already completed file_hash={} bytes_written={} md4_hashset_acquired={}",
-                    normalized_file_hash, persisted_bytes, manifest.md4_hashset_acquired
-                );
-                return Ok(());
-            }
-            if manifest_has_ed2k_transfer_progress(&manifest) {
-                info!(
-                    "native ED2K download resuming persisted progress file_hash={} bytes_written={} md4_hashset_acquired={}",
-                    normalized_file_hash, persisted_bytes, manifest.md4_hashset_acquired
-                );
-            }
-        }
         {
             let mut active = self.active_ed2k_downloads.lock().await;
             if !active.insert(normalized_file_hash.clone()) {
@@ -7167,6 +7145,33 @@ impl OverlordAgentEmule {
             activity_snapshot.query_or_target =
                 Some(format!("{} ({})", activity_name, normalized_file_hash));
             begin_agent_activity(&agent_activity, activity_key.clone(), activity_snapshot).await;
+
+            if let Some(runtime) = runtime_handle.lock().await.clone()
+                && let Ok(manifest) = runtime.ed2k_transfer.manifest(&normalized_file_hash).await
+            {
+                let persisted_bytes = manifest
+                    .pieces
+                    .iter()
+                    .map(|piece| piece.bytes_written)
+                    .sum::<u64>();
+                if manifest.completed {
+                    info!(
+                        "native ED2K download already completed file_hash={} bytes_written={} md4_hashset_acquired={}",
+                        normalized_file_hash, persisted_bytes, manifest.md4_hashset_acquired
+                    );
+                    finish_agent_activity(&agent_activity, &activity_key, Utc::now()).await;
+                    clear_agent_degraded_activity(&agent_activity).await;
+                    active_downloads.lock().await.remove(&normalized_file_hash);
+                    drop(download_permit);
+                    return;
+                }
+                if manifest_has_ed2k_transfer_progress(&manifest) {
+                    info!(
+                        "native ED2K download resuming persisted progress file_hash={} bytes_written={} md4_hashset_acquired={}",
+                        normalized_file_hash, persisted_bytes, manifest.md4_hashset_acquired
+                    );
+                }
+            }
 
             let outcome = Self::start_native_ed2k_download(
                 runtime_handle,
