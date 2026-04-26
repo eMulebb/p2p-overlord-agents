@@ -3158,6 +3158,14 @@ fn new_direct_ed2k_source_count(
     direct_download_candidate_sources(sources, attempted_direct_endpoints).len()
 }
 
+fn should_skip_no_progress_source_requery(
+    had_direct_sources: bool,
+    manifest_has_progress: bool,
+    new_direct_source_count: usize,
+) -> bool {
+    had_direct_sources && !manifest_has_progress && new_direct_source_count == 0
+}
+
 /// Collects Kad-advertised ED2K sources for a bounded window so downloads can
 /// proceed even when server-assisted source discovery is flaky.
 async fn collect_kad_ed2k_sources(
@@ -6998,6 +7006,24 @@ impl OverlordAgentEmule {
                 && file_size != 0
                 && source_requery_round < ED2K_DOWNLOAD_SOURCE_REQUERY_ROUNDS
             {
+                let manifest = runtime.ed2k_transfer.manifest(&request.file_hash).await?;
+                let known_new_direct_source_count =
+                    new_direct_ed2k_source_count(&sources, &attempted_direct_endpoints);
+                if should_skip_no_progress_source_requery(
+                    had_direct_sources,
+                    manifest_has_ed2k_transfer_progress(&manifest),
+                    known_new_direct_source_count,
+                ) {
+                    info!(
+                        "native ED2K download skipping source refresh file_hash={} reason=no_progress_repeated_endpoints attempted_direct_endpoints={} known_new_direct_source_count={} md4_hashset_acquired={} verified_ranges={}",
+                        request.file_hash,
+                        attempted_direct_endpoints.len(),
+                        known_new_direct_source_count,
+                        manifest.md4_hashset_acquired,
+                        manifest.verified_ranges.len()
+                    );
+                    break;
+                }
                 source_requery_round += 1;
                 info!(
                     "native ED2K download refreshing sources file_hash={} requery_round={} attempted_direct_endpoints={}",
@@ -7038,7 +7064,8 @@ impl OverlordAgentEmule {
                             new_direct_source_count
                         );
                         let manifest = runtime.ed2k_transfer.manifest(&request.file_hash).await?;
-                        if manifest_has_ed2k_transfer_progress(&manifest) {
+                        let manifest_has_progress = manifest_has_ed2k_transfer_progress(&manifest);
+                        if manifest_has_progress {
                             info!(
                                 "native ED2K download source refresh preserving in-progress transfer file_hash={} requery_round={} md4_hashset_acquired={} verified_ranges={}",
                                 request.file_hash,
@@ -8788,7 +8815,8 @@ mod tests {
         record_passive_replay_enqueue_wait, record_passive_replay_idle,
         record_passive_replay_post_failure, record_passive_replay_post_latency,
         record_passive_replay_start, record_publish_summaries, restore_snoop_queue,
-        select_ed2k_keyword_metadata, should_request_hello_response_ack, significant_keyword_words,
+        select_ed2k_keyword_metadata, should_request_hello_response_ack,
+        should_skip_no_progress_source_requery, significant_keyword_words,
         source_publish_client_hash, synthetic_file_hash, synthetic_popular_hash,
         synthetic_popular_hashes, synthetic_publish_aich_hash, synthetic_publish_queue_depth,
         try_acquire_passive_replay_gate,
@@ -9371,6 +9399,14 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert!(candidates[0].obfuscated);
         assert!(candidates[0].user_hash.is_some());
+    }
+
+    #[test]
+    fn no_progress_source_requery_skips_exhausted_direct_endpoints() {
+        assert!(should_skip_no_progress_source_requery(true, false, 0));
+        assert!(!should_skip_no_progress_source_requery(true, true, 0));
+        assert!(!should_skip_no_progress_source_requery(true, false, 1));
+        assert!(!should_skip_no_progress_source_requery(false, false, 0));
     }
 
     #[tokio::test]
