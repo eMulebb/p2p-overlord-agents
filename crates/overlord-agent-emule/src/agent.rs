@@ -836,6 +836,7 @@ struct NativeDirectDownloadOutcome {
 }
 
 type Ed2kSourceAttemptKey = (Ipv4Addr, u16, Option<[u8; 16]>, Option<u8>);
+type Ed2kSourceEndpointKey = (Ipv4Addr, u16);
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3116,6 +3117,10 @@ fn ed2k_source_attempt_key(source: &Ed2kFoundSource) -> Ed2kSourceAttemptKey {
     )
 }
 
+fn ed2k_source_endpoint_key(source: &Ed2kFoundSource) -> Ed2kSourceEndpointKey {
+    (source.ip, source.tcp_port)
+}
+
 fn sort_native_ed2k_download_sources(sources: &mut [Ed2kFoundSource]) {
     // Prefer direct, obfuscation-ready sources first, matching eMule's bias
     // toward peers that can complete the initial secure handshake.
@@ -3128,17 +3133,29 @@ fn sort_native_ed2k_download_sources(sources: &mut [Ed2kFoundSource]) {
     });
 }
 
-fn new_direct_ed2k_source_count(
+fn direct_download_candidate_sources(
     sources: &[Ed2kFoundSource],
-    attempted_direct_sources: &HashSet<Ed2kSourceAttemptKey>,
-) -> usize {
+    attempted_direct_endpoints: &HashSet<Ed2kSourceEndpointKey>,
+) -> Vec<Ed2kFoundSource> {
+    let mut seen_endpoints = HashSet::new();
     sources
         .iter()
         .filter(|source| {
-            source.is_direct_dialable()
-                && !attempted_direct_sources.contains(&ed2k_source_attempt_key(source))
+            if !source.is_direct_dialable() {
+                return false;
+            }
+            let endpoint = ed2k_source_endpoint_key(source);
+            !attempted_direct_endpoints.contains(&endpoint) && seen_endpoints.insert(endpoint)
         })
-        .count()
+        .cloned()
+        .collect()
+}
+
+fn new_direct_ed2k_source_count(
+    sources: &[Ed2kFoundSource],
+    attempted_direct_endpoints: &HashSet<Ed2kSourceEndpointKey>,
+) -> usize {
+    direct_download_candidate_sources(sources, attempted_direct_endpoints).len()
 }
 
 /// Collects Kad-advertised ED2K sources for a bounded window so downloads can
@@ -6773,7 +6790,7 @@ impl OverlordAgentEmule {
         // Low-ID peers often arrive noticeably later than direct ED2K connects
         // because the server-mediated callback has to propagate first.
         let callback_timeout = Duration::from_secs(config.p2p.ed2k.connect_timeout_secs.max(30));
-        let mut attempted_direct_sources = HashSet::new();
+        let mut attempted_direct_endpoints: HashSet<Ed2kSourceEndpointKey> = HashSet::new();
         let mut requested_callback_sources = HashSet::new();
         let mut had_direct_sources = false;
         let mut accepted_incomplete_peers = 0u32;
@@ -6874,14 +6891,8 @@ impl OverlordAgentEmule {
                 }
             }
 
-            let direct_sources: Vec<_> = sources
-                .iter()
-                .filter(|source| {
-                    source.is_direct_dialable()
-                        && !attempted_direct_sources.contains(&ed2k_source_attempt_key(source))
-                })
-                .cloned()
-                .collect();
+            let direct_sources =
+                direct_download_candidate_sources(&sources, &attempted_direct_endpoints);
             had_direct_sources |= !direct_sources.is_empty();
             if direct_sources.is_empty() && requested_callback_sources.is_empty() {
                 info!(
@@ -6904,7 +6915,7 @@ impl OverlordAgentEmule {
                         source_requery_round
                     ),
                 );
-                attempted_direct_sources.insert(ed2k_source_attempt_key(source));
+                attempted_direct_endpoints.insert(ed2k_source_endpoint_key(source));
             }
             if !direct_sources.is_empty() {
                 let outcome = Self::run_native_ed2k_direct_downloads(
@@ -6989,10 +7000,10 @@ impl OverlordAgentEmule {
             {
                 source_requery_round += 1;
                 info!(
-                    "native ED2K download refreshing sources file_hash={} requery_round={} attempted_direct_sources={}",
+                    "native ED2K download refreshing sources file_hash={} requery_round={} attempted_direct_endpoints={}",
                     request.file_hash,
                     source_requery_round,
-                    attempted_direct_sources.len()
+                    attempted_direct_endpoints.len()
                 );
                 if source_requery_round > 1 {
                     tokio::time::sleep(Duration::from_secs(
@@ -7016,7 +7027,7 @@ impl OverlordAgentEmule {
                         let added_source_count =
                             sources.len().saturating_sub(previous_source_count);
                         let new_direct_source_count =
-                            new_direct_ed2k_source_count(&sources, &attempted_direct_sources);
+                            new_direct_ed2k_source_count(&sources, &attempted_direct_endpoints);
                         info!(
                             "native ED2K download source refresh completed file_hash={} requery_round={} refreshed_source_count={} added_source_count={} aggregated_source_count={} new_direct_source_count={}",
                             request.file_hash,
@@ -7026,8 +7037,22 @@ impl OverlordAgentEmule {
                             sources.len(),
                             new_direct_source_count
                         );
-                        if new_direct_source_count != 0
-                            || source_requery_round < ED2K_DOWNLOAD_SOURCE_REQUERY_ROUNDS
+                        let manifest = runtime.ed2k_transfer.manifest(&request.file_hash).await?;
+                        if manifest_has_ed2k_transfer_progress(&manifest) {
+                            info!(
+                                "native ED2K download source refresh preserving in-progress transfer file_hash={} requery_round={} md4_hashset_acquired={} verified_ranges={}",
+                                request.file_hash,
+                                source_requery_round,
+                                manifest.md4_hashset_acquired,
+                                manifest.verified_ranges.len()
+                            );
+                            continue;
+                        }
+                        if new_direct_source_count != 0 {
+                            continue;
+                        }
+                        if !had_direct_sources
+                            && source_requery_round < ED2K_DOWNLOAD_SOURCE_REQUERY_ROUNDS
                         {
                             continue;
                         }
@@ -8751,10 +8776,11 @@ mod tests {
         build_hello_response, build_kad_hello_request_tags, build_kad_hello_response_tags,
         build_keyword_snoop_entry, build_notes_publish_tags, build_notes_snoop_entry,
         build_publish_batch_summary, build_source_publish_tags, build_source_snoop_entry,
-        current_tcp_firewalled, ed2k_download_source_server_attempt_budget,
-        ed2k_file_type_search_term, ed2k_keyword_server_attempt_budget, effective_publish_counters,
-        empty_networking_config, emule_high_id_source_type, exact_ed2k_hash_query_token,
-        flush_snoop_queue, kad_source_result_to_ed2k_found_source, keyword_target,
+        current_tcp_firewalled, direct_download_candidate_sources,
+        ed2k_download_source_server_attempt_budget, ed2k_file_type_search_term,
+        ed2k_keyword_server_attempt_budget, effective_publish_counters, empty_networking_config,
+        emule_high_id_source_type, exact_ed2k_hash_query_token, flush_snoop_queue,
+        kad_source_result_to_ed2k_found_source, keyword_target,
         manifest_has_ed2k_transfer_progress, next_passive_replay_request,
         next_passive_replay_request_for_family, next_synthetic_publish_batch,
         normalize_ed2k_user_hash_markers, p2p_interface_reconcile_target, parse_kad_hello_metadata,
@@ -9263,6 +9289,88 @@ mod tests {
         };
 
         assert!(plaintext_fallback_for_obfuscated_source(&source).is_none());
+    }
+
+    #[test]
+    fn direct_download_candidates_exhaust_endpoint_family_after_attempt() {
+        let file_hash = Ed2kHash::from_bytes([0x44; 16]);
+        let mut attempted_endpoints = HashSet::new();
+        attempted_endpoints.insert((Ipv4Addr::new(10, 0, 0, 1), 41001));
+        let sources = vec![
+            Ed2kFoundSource {
+                file_hash,
+                ip: Ipv4Addr::new(10, 0, 0, 1),
+                tcp_port: 41001,
+                client_id: 1,
+                low_id: false,
+                obfuscated: true,
+                obfuscation_options: Some(0x83),
+                user_hash: Some([0x11; 16]),
+                source_server: None,
+            },
+            Ed2kFoundSource {
+                file_hash,
+                ip: Ipv4Addr::new(10, 0, 0, 1),
+                tcp_port: 41001,
+                client_id: 2,
+                low_id: false,
+                obfuscated: false,
+                obfuscation_options: None,
+                user_hash: None,
+                source_server: None,
+            },
+            Ed2kFoundSource {
+                file_hash,
+                ip: Ipv4Addr::new(10, 0, 0, 2),
+                tcp_port: 41001,
+                client_id: 3,
+                low_id: false,
+                obfuscated: true,
+                obfuscation_options: Some(0x83),
+                user_hash: Some([0x22; 16]),
+                source_server: None,
+            },
+        ];
+
+        let candidates = direct_download_candidate_sources(&sources, &attempted_endpoints);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].ip, Ipv4Addr::new(10, 0, 0, 2));
+    }
+
+    #[test]
+    fn direct_download_candidates_deduplicate_same_endpoint_in_one_round() {
+        let file_hash = Ed2kHash::from_bytes([0x45; 16]);
+        let sources = vec![
+            Ed2kFoundSource {
+                file_hash,
+                ip: Ipv4Addr::new(10, 0, 0, 1),
+                tcp_port: 41001,
+                client_id: 1,
+                low_id: false,
+                obfuscated: true,
+                obfuscation_options: Some(0x83),
+                user_hash: Some([0x11; 16]),
+                source_server: None,
+            },
+            Ed2kFoundSource {
+                file_hash,
+                ip: Ipv4Addr::new(10, 0, 0, 1),
+                tcp_port: 41001,
+                client_id: 2,
+                low_id: false,
+                obfuscated: false,
+                obfuscation_options: None,
+                user_hash: None,
+                source_server: None,
+            },
+        ];
+
+        let candidates = direct_download_candidate_sources(&sources, &HashSet::new());
+
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].obfuscated);
+        assert!(candidates[0].user_hash.is_some());
     }
 
     #[tokio::test]
