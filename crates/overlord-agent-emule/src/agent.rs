@@ -1799,6 +1799,52 @@ impl OverlordAgentEmule {
         Ok(())
     }
 
+    async fn reconcile_p2p_runtime_if_interface_moved(&self) -> Result<()> {
+        let config = self.config.read().await.clone();
+        if !config.p2p.selection_confirmed {
+            return Ok(());
+        }
+        if config
+            .p2p
+            .bind_ip
+            .as_deref()
+            .is_some_and(|bind_ip| !bind_ip.trim().is_empty())
+        {
+            return Ok(());
+        }
+
+        let Some(bind_iface) = config
+            .p2p
+            .bind_iface
+            .as_deref()
+            .filter(|bind_iface| !bind_iface.trim().is_empty())
+        else {
+            return Ok(());
+        };
+        let Some(runtime_bind_ip) = self
+            .runtime
+            .lock()
+            .await
+            .as_ref()
+            .map(|runtime| runtime.bind_ip)
+        else {
+            return Ok(());
+        };
+
+        let interfaces = detect_interfaces().unwrap_or_default();
+        let Some(next_bind_ip) =
+            p2p_interface_reconcile_target(&config, &interfaces, runtime_bind_ip)
+        else {
+            return Ok(());
+        };
+
+        info!(
+            "p2p bind interface resolved to a new IPv4 address; reconciling runtime bind_iface={} old_bind_ip={} new_bind_ip={}",
+            bind_iface, runtime_bind_ip, next_bind_ip
+        );
+        self.reconcile_runtime().await
+    }
+
     async fn stop_runtime(&self) -> Result<()> {
         self.cancel_active_searches().await;
         if let Some(runtime) = self.runtime.lock().await.take() {
@@ -5668,6 +5714,32 @@ fn apply_networking_config(config: &mut EmuleAgentConfig, desired: &AgentNetwork
     config.nat.p2p.external_ip_override = desired.nat.p2p.external_ip_override.clone();
 }
 
+fn p2p_interface_reconcile_target(
+    config: &EmuleAgentConfig,
+    interfaces: &[AgentInterface],
+    runtime_bind_ip: Ipv4Addr,
+) -> Option<Ipv4Addr> {
+    if !config.p2p.selection_confirmed {
+        return None;
+    }
+    if config
+        .p2p
+        .bind_ip
+        .as_deref()
+        .is_some_and(|bind_ip| !bind_ip.trim().is_empty())
+    {
+        return None;
+    }
+    let bind_iface = config
+        .p2p
+        .bind_iface
+        .as_deref()
+        .filter(|bind_iface| !bind_iface.trim().is_empty())?;
+    let next_bind_ip = resolve_bind_ip(interfaces, Some(bind_iface), None)?;
+    let next_bind_ip = next_bind_ip.parse::<Ipv4Addr>().ok()?;
+    (next_bind_ip != runtime_bind_ip).then_some(next_bind_ip)
+}
+
 fn persist_networking_config(
     state_paths: &AgentStatePaths,
     desired: &AgentNetworkingConfig,
@@ -5760,6 +5832,7 @@ impl IndexerService for OverlordAgentEmule {
     }
 
     async fn search(&self, job: SearchJob) -> Result<()> {
+        self.reconcile_p2p_runtime_if_interface_moved().await?;
         let runtime = self.runtime.lock().await.clone();
         let Some(runtime) = runtime else {
             anyhow::bail!("agent networking is waiting for interface selection");
@@ -6080,6 +6153,7 @@ impl IndexerService for OverlordAgentEmule {
     }
 
     async fn seed_popular(&self, hashes: Vec<PopularHash>) -> Result<()> {
+        self.reconcile_p2p_runtime_if_interface_moved().await?;
         let runtime = self.runtime.lock().await.clone();
         let Some(runtime) = runtime else {
             anyhow::bail!("agent networking is waiting for interface selection");
@@ -7024,6 +7098,7 @@ impl OverlordAgentEmule {
             anyhow::bail!("unsupported enrich kind {}", request.kind);
         }
 
+        self.reconcile_p2p_runtime_if_interface_moved().await?;
         let normalized_file_hash = request.file_hash.to_lowercase();
         if let Some(runtime) = self.runtime.lock().await.clone()
             && let Ok(manifest) = runtime.ed2k_transfer.manifest(&normalized_file_hash).await
@@ -8654,14 +8729,14 @@ mod tests {
         flush_snoop_queue, kad_source_result_to_ed2k_found_source, keyword_target,
         manifest_has_ed2k_transfer_progress, next_passive_replay_request,
         next_passive_replay_request_for_family, next_synthetic_publish_batch,
-        normalize_ed2k_user_hash_markers, parse_kad_hello_metadata, record_passive_replay_complete,
-        record_passive_replay_enqueue_wait, record_passive_replay_idle,
-        record_passive_replay_post_failure, record_passive_replay_post_latency,
-        record_passive_replay_start, record_publish_summaries, restore_snoop_queue,
-        select_ed2k_keyword_metadata, should_request_hello_response_ack, significant_keyword_words,
-        source_publish_client_hash, synthetic_file_hash, synthetic_popular_hash,
-        synthetic_popular_hashes, synthetic_publish_aich_hash, synthetic_publish_queue_depth,
-        try_acquire_passive_replay_gate,
+        normalize_ed2k_user_hash_markers, p2p_interface_reconcile_target, parse_kad_hello_metadata,
+        record_passive_replay_complete, record_passive_replay_enqueue_wait,
+        record_passive_replay_idle, record_passive_replay_post_failure,
+        record_passive_replay_post_latency, record_passive_replay_start, record_publish_summaries,
+        restore_snoop_queue, select_ed2k_keyword_metadata, should_request_hello_response_ack,
+        significant_keyword_words, source_publish_client_hash, synthetic_file_hash,
+        synthetic_popular_hash, synthetic_popular_hashes, synthetic_publish_aich_hash,
+        synthetic_publish_queue_depth, try_acquire_passive_replay_gate,
     };
     use crate::{
         config::SnoopQueueConfig,
@@ -8687,7 +8762,9 @@ mod tests {
         KadPublishObservability, Protocol, PublishCounters, PublishSeedSource, RegisterRequest,
         RegistrationResponse, SnoopEntry,
     };
-    use overlord_agent_nat::{UPNP_MINIUPNPC_BACKEND, UPNP_RUPNP_BACKEND};
+    use overlord_agent_nat::{
+        AgentInterface, InterfaceAddressFamily, UPNP_MINIUPNPC_BACKEND, UPNP_RUPNP_BACKEND,
+    };
     use overlord_kad_dht::{DhtConfig, DhtNode, PublishAttemptStats, SearchResult, SourceResult};
     use overlord_kad_proto::{
         Ed2kHash, NodeId, SearchKeyReq, SearchNotesReq, SearchSourceReq, Tag, TagName, TagValue,
@@ -9450,6 +9527,58 @@ mod tests {
         assert!(!OverlordAgentEmule::restart_required_for_networking_change(
             &old, &p2p_port
         ));
+    }
+
+    #[test]
+    fn p2p_interface_reconcile_target_tracks_interface_ip_changes() {
+        let mut config = EmuleAgentConfig::default();
+        config.p2p.selection_confirmed = true;
+        config.p2p.bind_iface = Some("hide.me".to_string());
+        config.p2p.bind_ip = None;
+        let interfaces = vec![AgentInterface {
+            name: "hide.me".to_string(),
+            description: None,
+            is_loopback: false,
+            is_vpn_candidate: true,
+            has_default_route: false,
+            addresses: vec![overlord_agent_nat::AgentInterfaceAddress {
+                family: InterfaceAddressFamily::Ipv4,
+                address: "10.46.87.221".to_string(),
+            }],
+        }];
+
+        assert_eq!(
+            p2p_interface_reconcile_target(&config, &interfaces, "10.46.102.186".parse().unwrap()),
+            Some("10.46.87.221".parse().unwrap())
+        );
+        assert_eq!(
+            p2p_interface_reconcile_target(&config, &interfaces, "10.46.87.221".parse().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn p2p_interface_reconcile_target_respects_explicit_bind_ip() {
+        let mut config = EmuleAgentConfig::default();
+        config.p2p.selection_confirmed = true;
+        config.p2p.bind_iface = Some("hide.me".to_string());
+        config.p2p.bind_ip = Some("10.46.102.186".to_string());
+        let interfaces = vec![AgentInterface {
+            name: "hide.me".to_string(),
+            description: None,
+            is_loopback: false,
+            is_vpn_candidate: true,
+            has_default_route: false,
+            addresses: vec![overlord_agent_nat::AgentInterfaceAddress {
+                family: InterfaceAddressFamily::Ipv4,
+                address: "10.46.87.221".to_string(),
+            }],
+        }];
+
+        assert_eq!(
+            p2p_interface_reconcile_target(&config, &interfaces, "10.46.102.186".parse().unwrap()),
+            None
+        );
     }
 
     #[test]
