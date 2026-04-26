@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -127,6 +127,7 @@ const ED2K_DOWNLOAD_KAD_SOURCE_TIMEOUT_FLOOR_SECS: u64 = 45;
 const ED2K_DOWNLOAD_KAD_SOURCE_RETRY_DELAY_MS: u64 = 500;
 const ED2K_DOWNLOAD_SOURCE_REQUERY_ROUNDS: usize = 2;
 const ED2K_DOWNLOAD_SOURCE_REQUERY_DELAY_SECS: u64 = 5;
+const ED2K_SOURCE_OBFUSCATION_REQUIRES_CRYPT: u8 = 0x04;
 const ED2K_HASH_ONLY_QUERY_PREFIX: &str = "ed2k::";
 const ACTIVITY_KEY_STARTING: &str = "starting";
 const ACTIVITY_KEY_BOOTSTRAPPING: &str = "bootstrapping";
@@ -6276,11 +6277,11 @@ impl OverlordAgentEmule {
         loop {
             let mut accepted_incomplete_peers = 0u32;
             let mut retryable_error_seen = false;
-            let mut source_iter = retry_sources.clone().into_iter();
+            let mut pending_sources = VecDeque::from(retry_sources.clone());
             let mut active_downloads = JoinSet::new();
 
             while active_downloads.len() < max_parallel_download_peers {
-                let Some(source) = source_iter.next() else {
+                let Some(source) = pending_sources.pop_front() else {
                     break;
                 };
                 let transfer_runtime = Arc::clone(&transfer_runtime);
@@ -6314,7 +6315,7 @@ impl OverlordAgentEmule {
                 active_downloads.spawn(async move {
                     let result = download_peer(
                         bind_ip,
-                        source,
+                        source.clone(),
                         hello_identity,
                         secure_ident,
                         transfer_runtime,
@@ -6323,12 +6324,13 @@ impl OverlordAgentEmule {
                         connect_timeout,
                     )
                     .await;
-                    (peer_addr, result)
+                    (peer_addr, source, result)
                 });
             }
 
             while let Some(joined) = active_downloads.join_next().await {
-                let (peer_addr, result) = joined.context("native ED2K download worker panicked")?;
+                let (peer_addr, source, result) =
+                    joined.context("native ED2K download worker panicked")?;
                 match result {
                     Ok(Ed2kPeerDownloadOutcome::Completed) => {
                         let manifest = transfer_runtime.manifest(&file_hash_hex).await?;
@@ -6382,11 +6384,20 @@ impl OverlordAgentEmule {
                             file_hash_hex, peer_addr
                         );
                         last_error = Some(error);
+                        if let Some(fallback_source) =
+                            plaintext_fallback_for_obfuscated_source(&source)
+                        {
+                            info!(
+                                "native ED2K download scheduling plaintext fallback file_hash={} peer={}:{}",
+                                file_hash_hex, source.ip, source.tcp_port
+                            );
+                            pending_sources.push_front(fallback_source);
+                        }
                     }
                 }
 
                 while active_downloads.len() < max_parallel_download_peers {
-                    let Some(source) = source_iter.next() else {
+                    let Some(source) = pending_sources.pop_front() else {
                         break;
                     };
                     let transfer_runtime = Arc::clone(&transfer_runtime);
@@ -6420,7 +6431,7 @@ impl OverlordAgentEmule {
                     active_downloads.spawn(async move {
                         let result = download_peer(
                             bind_ip,
-                            source,
+                            source.clone(),
                             hello_identity,
                             secure_ident,
                             transfer_runtime,
@@ -6429,7 +6440,7 @@ impl OverlordAgentEmule {
                             connect_timeout,
                         )
                         .await;
-                        (peer_addr, result)
+                        (peer_addr, source, result)
                     });
                 }
             }
@@ -8717,6 +8728,18 @@ fn merge_download_sources(
     }
 }
 
+fn plaintext_fallback_for_obfuscated_source(source: &Ed2kFoundSource) -> Option<Ed2kFoundSource> {
+    let options = source.obfuscation_options?;
+    if options & ED2K_SOURCE_OBFUSCATION_REQUIRES_CRYPT != 0 {
+        return None;
+    }
+    let mut fallback = source.clone();
+    fallback.obfuscated = false;
+    fallback.obfuscation_options = None;
+    fallback.user_hash = None;
+    Some(fallback)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -8735,13 +8758,14 @@ mod tests {
         manifest_has_ed2k_transfer_progress, next_passive_replay_request,
         next_passive_replay_request_for_family, next_synthetic_publish_batch,
         normalize_ed2k_user_hash_markers, p2p_interface_reconcile_target, parse_kad_hello_metadata,
-        record_passive_replay_complete, record_passive_replay_enqueue_wait,
-        record_passive_replay_idle, record_passive_replay_post_failure,
-        record_passive_replay_post_latency, record_passive_replay_start, record_publish_summaries,
-        restore_snoop_queue, select_ed2k_keyword_metadata, should_request_hello_response_ack,
-        significant_keyword_words, source_publish_client_hash, synthetic_file_hash,
-        synthetic_popular_hash, synthetic_popular_hashes, synthetic_publish_aich_hash,
-        synthetic_publish_queue_depth, try_acquire_passive_replay_gate,
+        plaintext_fallback_for_obfuscated_source, record_passive_replay_complete,
+        record_passive_replay_enqueue_wait, record_passive_replay_idle,
+        record_passive_replay_post_failure, record_passive_replay_post_latency,
+        record_passive_replay_start, record_publish_summaries, restore_snoop_queue,
+        select_ed2k_keyword_metadata, should_request_hello_response_ack, significant_keyword_words,
+        source_publish_client_hash, synthetic_file_hash, synthetic_popular_hash,
+        synthetic_popular_hashes, synthetic_publish_aich_hash, synthetic_publish_queue_depth,
+        try_acquire_passive_replay_gate,
     };
     use crate::{
         config::SnoopQueueConfig,
@@ -9126,6 +9150,119 @@ mod tests {
         assert_eq!(*attempts.lock().await, vec![41001, 41001, 41001]);
         let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
         assert!(manifest.completed);
+    }
+
+    #[tokio::test]
+    async fn native_direct_download_tries_plaintext_after_optional_obfuscated_failure() {
+        let temp_root = unique_test_dir("overlord-agent-emule-obfuscated-plaintext-fallback");
+        let transfer_runtime = Arc::new(Ed2kTransferRuntime::load_or_create(&temp_root).unwrap());
+        let payload = b"captured small file payload".repeat(32);
+        let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
+        let file_hash_hex = file_hash.to_string();
+        transfer_runtime
+            .ensure_job(&new_transfer_job(
+                file_hash,
+                "captured.epub".to_string(),
+                payload.len() as u64,
+            ))
+            .await
+            .unwrap();
+        let secure_ident =
+            Arc::new(Ed2kSecureIdent::load_or_create(&temp_root.join("secure-ident.der")).unwrap());
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let payload = Arc::new(payload);
+        let file_hash_hex_for_download = file_hash_hex.clone();
+        let outcome = OverlordAgentEmule::run_native_ed2k_direct_downloads(
+            Ipv4Addr::LOCALHOST,
+            Ed2kHelloIdentity {
+                user_hash: [0x11; 16],
+                client_id: 0,
+                tcp_port: 41001,
+                udp_port: 41000,
+                server_ip: 0,
+                server_port: 0,
+                connect_options: emule_connect_options(true),
+                direct_udp_callback: false,
+            },
+            secure_ident,
+            Arc::clone(&transfer_runtime),
+            file_hash_hex.clone(),
+            "captured.epub".to_string(),
+            payload.len() as u64,
+            vec![Ed2kFoundSource {
+                file_hash,
+                ip: Ipv4Addr::LOCALHOST,
+                tcp_port: 41001,
+                client_id: 1,
+                low_id: false,
+                obfuscated: true,
+                obfuscation_options: Some(0x83),
+                user_hash: Some([0x22; 16]),
+                source_server: None,
+            }],
+            Duration::from_secs(1),
+            1,
+            {
+                let attempts = Arc::clone(&attempts);
+                move |_bind_ip,
+                      source,
+                      _hello_identity,
+                      _secure_ident,
+                      transfer_runtime,
+                      _file_name,
+                      _file_size,
+                      _connect_timeout| {
+                    let attempts = Arc::clone(&attempts);
+                    let payload = Arc::clone(&payload);
+                    let file_hash_hex = file_hash_hex_for_download.clone();
+                    async move {
+                        attempts.lock().await.push((
+                            source.tcp_port,
+                            source.obfuscated,
+                            source.user_hash.is_some(),
+                        ));
+                        if source.obfuscated {
+                            anyhow::bail!("simulated obfuscated peer close");
+                        }
+                        transfer_runtime
+                            .store_md4_hashset(&file_hash_hex, Vec::new())
+                            .await?;
+                        transfer_runtime
+                            .store_piece_data(&file_hash_hex, 0, payload.as_slice())
+                            .await?;
+                        Ok(Ed2kPeerDownloadOutcome::Completed)
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.completed);
+        assert_eq!(
+            *attempts.lock().await,
+            vec![(41001, true, true), (41001, false, false)]
+        );
+        let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
+        assert!(manifest.completed);
+    }
+
+    #[test]
+    fn plaintext_fallback_preserves_crypt_required_sources() {
+        let file_hash = Ed2kHash::from_bytes([0x33; 16]);
+        let source = Ed2kFoundSource {
+            file_hash,
+            ip: Ipv4Addr::LOCALHOST,
+            tcp_port: 41001,
+            client_id: 1,
+            low_id: false,
+            obfuscated: true,
+            obfuscation_options: Some(0x87),
+            user_hash: Some([0x22; 16]),
+            source_server: None,
+        };
+
+        assert!(plaintext_fallback_for_obfuscated_source(&source).is_none());
     }
 
     #[tokio::test]
