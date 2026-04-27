@@ -707,17 +707,29 @@ pub async fn request_callback_via_background_session(
 ///
 /// This keeps callback routing aligned with the server that reported the
 /// callback-only source whenever that provenance is available.
-#[allow(clippy::too_many_arguments)]
-pub async fn request_callback_on_server(
-    bind_ip: Ipv4Addr,
-    config: &Ed2kConfig,
-    hello_identity: Ed2kHelloIdentity,
-    shared_catalog: &[Ed2kSharedEntry],
-    server_endpoint: SocketAddr,
-    client_id: u32,
-    timeout: Duration,
-    cancel: &CancellationToken,
-) -> Result<()> {
+/// Inputs for a focused ED2K server callback request.
+pub struct Ed2kCallbackRequestOptions<'a> {
+    pub bind_ip: Ipv4Addr,
+    pub config: &'a Ed2kConfig,
+    pub hello_identity: Ed2kHelloIdentity,
+    pub shared_catalog: &'a [Ed2kSharedEntry],
+    pub server_endpoint: SocketAddr,
+    pub client_id: u32,
+    pub timeout: Duration,
+    pub cancel: &'a CancellationToken,
+}
+
+pub async fn request_callback_on_server(options: Ed2kCallbackRequestOptions<'_>) -> Result<()> {
+    let Ed2kCallbackRequestOptions {
+        bind_ip,
+        config,
+        hello_identity,
+        shared_catalog,
+        server_endpoint,
+        client_id,
+        timeout,
+        cancel,
+    } = options;
     let resolved_server = resolve_callback_server_entry(config, server_endpoint).await?;
     let use_server_obfuscation =
         should_use_server_obfuscation(hello_identity.connect_options, &resolved_server);
@@ -1234,19 +1246,32 @@ impl ServerSession {
     }
 }
 
+/// Inputs for the long-lived ED2K server session loop.
+pub struct Ed2kServerLoopOptions {
+    pub bind_ip: Ipv4Addr,
+    pub nat: Arc<NatManager>,
+    pub config: Ed2kConfig,
+    pub hello_identity: Ed2kHelloIdentity,
+    pub shared_catalog: Ed2kSharedCatalog,
+    pub state: Arc<RwLock<Ed2kServerState>>,
+    pub search_inbox: Ed2kServerSearchInbox,
+    pub kad_firewall: Arc<Mutex<KadFirewallState>>,
+    pub shutdown: Arc<AtomicBool>,
+}
+
 /// Runs the minimal oracle-shaped ED2K server session loop for the configured endpoints.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_ed2k_server_loop(
-    bind_ip: Ipv4Addr,
-    nat: Arc<NatManager>,
-    config: Ed2kConfig,
-    hello_identity: Ed2kHelloIdentity,
-    shared_catalog: Ed2kSharedCatalog,
-    state: Arc<RwLock<Ed2kServerState>>,
-    mut search_inbox: Ed2kServerSearchInbox,
-    kad_firewall: Arc<Mutex<KadFirewallState>>,
-    shutdown: Arc<AtomicBool>,
-) {
+pub async fn run_ed2k_server_loop(options: Ed2kServerLoopOptions) {
+    let Ed2kServerLoopOptions {
+        bind_ip,
+        nat,
+        config,
+        hello_identity,
+        shared_catalog,
+        state,
+        mut search_inbox,
+        kad_firewall,
+        shutdown,
+    } = options;
     let reconnect_delay = Duration::from_secs(config.reconnect_interval_secs.max(1));
     let session_context = ServerSessionContext {
         bind_ip,
@@ -1687,17 +1712,31 @@ async fn run_one_server_session(
 /// server connection pool exists. The function prefers the currently connected
 /// background server when one is available, caps how many configured servers it
 /// will probe, and returns the first non-empty result page it receives.
-#[allow(clippy::too_many_arguments)]
+/// Inputs for a one-shot ED2K keyword search across configured servers.
+pub struct Ed2kKeywordSearchOptions<'a> {
+    pub bind_ip: Ipv4Addr,
+    pub config: &'a Ed2kConfig,
+    pub hello_identity: Ed2kHelloIdentity,
+    pub shared_catalog: &'a [Ed2kSharedEntry],
+    pub preferred_endpoint: Option<SocketAddr>,
+    pub max_attempts: usize,
+    pub query: &'a str,
+    pub cancel: &'a CancellationToken,
+}
+
 pub async fn search_keyword_servers(
-    bind_ip: Ipv4Addr,
-    config: &Ed2kConfig,
-    hello_identity: Ed2kHelloIdentity,
-    shared_catalog: &[Ed2kSharedEntry],
-    preferred_endpoint: Option<SocketAddr>,
-    max_attempts: usize,
-    query: &str,
-    cancel: &CancellationToken,
+    options: Ed2kKeywordSearchOptions<'_>,
 ) -> Result<Vec<Ed2kSearchFile>> {
+    let Ed2kKeywordSearchOptions {
+        bind_ip,
+        config,
+        hello_identity,
+        shared_catalog,
+        preferred_endpoint,
+        max_attempts,
+        query,
+        cancel,
+    } = options;
     let mut configured_servers = configured_server_entries(config)?;
     if configured_servers.is_empty() {
         anyhow::bail!("ED2K keyword search requires at least one configured server");
@@ -1788,19 +1827,35 @@ pub async fn search_keyword_servers(
 /// The ED2K server protocol uses `OP_GETSOURCES`/`OP_FOUNDSOURCES` rather than
 /// the generic search-query tree used for keyword searches, so this path stays
 /// separate from `search_keyword_servers`.
-#[allow(clippy::too_many_arguments)]
+/// Inputs for a one-shot ED2K source search across configured servers.
+pub struct Ed2kSourceSearchOptions<'a> {
+    pub bind_ip: Ipv4Addr,
+    pub config: &'a Ed2kConfig,
+    pub hello_identity: Ed2kHelloIdentity,
+    pub shared_catalog: &'a [Ed2kSharedEntry],
+    pub preferred_endpoint: Option<SocketAddr>,
+    pub excluded_endpoint: Option<SocketAddr>,
+    pub max_attempts: usize,
+    pub file_hash: Ed2kHash,
+    pub file_size: u64,
+    pub cancel: &'a CancellationToken,
+}
+
 pub async fn search_source_servers(
-    bind_ip: Ipv4Addr,
-    config: &Ed2kConfig,
-    hello_identity: Ed2kHelloIdentity,
-    shared_catalog: &[Ed2kSharedEntry],
-    preferred_endpoint: Option<SocketAddr>,
-    excluded_endpoint: Option<SocketAddr>,
-    max_attempts: usize,
-    file_hash: Ed2kHash,
-    _file_size: u64,
-    cancel: &CancellationToken,
+    options: Ed2kSourceSearchOptions<'_>,
 ) -> Result<Vec<Ed2kFoundSource>> {
+    let Ed2kSourceSearchOptions {
+        bind_ip,
+        config,
+        hello_identity,
+        shared_catalog,
+        preferred_endpoint,
+        excluded_endpoint,
+        max_attempts,
+        file_hash,
+        file_size: _file_size,
+        cancel,
+    } = options;
     let mut configured_servers = configured_server_entries(config)?;
     if configured_servers.is_empty() {
         anyhow::bail!("ED2K source search requires at least one configured server");
@@ -1866,16 +1921,16 @@ pub async fn search_source_servers(
             resolved_server.entry.display_name(),
             file_hash
         );
-        match search_sources_on_server(
+        match search_sources_on_server(SourceSearchServerOptions {
             bind_ip,
-            &resolved_server,
+            server: &resolved_server,
             hello_identity,
             shared_catalog,
             file_hash,
-            _file_size,
+            file_size: _file_size,
             idle_timeout,
             cancel,
-        )
+        })
         .await
         {
             Ok(results) if !results.is_empty() => {
@@ -1903,6 +1958,28 @@ pub async fn search_source_servers(
     Ok(Vec::new())
 }
 
+/// Inputs for an ED2K server UDP source search.
+pub struct Ed2kUdpSourceSearchOptions<'a> {
+    /// Local IPv4 address to bind for outbound server UDP traffic.
+    pub bind_ip: Ipv4Addr,
+    /// ED2K server configuration and search limits.
+    pub config: &'a Ed2kConfig,
+    /// Server endpoint to try first when it is present in the configured list.
+    pub preferred_endpoint: Option<SocketAddr>,
+    /// Server endpoint to skip, usually because another source-search path is already using it.
+    pub excluded_endpoint: Option<SocketAddr>,
+    /// Maximum number of configured servers to try.
+    pub max_attempts: usize,
+    /// Target ED2K file hash.
+    pub file_hash: Ed2kHash,
+    /// Target file size in bytes.
+    pub file_size: u64,
+    /// Per-server response wait budget.
+    pub timeout: Duration,
+    /// Cancellation signal for the owning search/download job.
+    pub cancel: &'a CancellationToken,
+}
+
 /// Executes ED2K server UDP source searches for one file hash and size.
 ///
 /// LowID live sessions can receive a server warning and disconnect before a
@@ -1910,16 +1987,19 @@ pub async fn search_source_servers(
 /// server UDP `GlobGetSources` family, so keep that path available as a
 /// first-class source acquisition fallback.
 pub async fn search_source_udp_servers(
-    bind_ip: Ipv4Addr,
-    config: &Ed2kConfig,
-    preferred_endpoint: Option<SocketAddr>,
-    excluded_endpoint: Option<SocketAddr>,
-    max_attempts: usize,
-    file_hash: Ed2kHash,
-    file_size: u64,
-    timeout: Duration,
-    cancel: &CancellationToken,
+    options: Ed2kUdpSourceSearchOptions<'_>,
 ) -> Result<Vec<Ed2kFoundSource>> {
+    let Ed2kUdpSourceSearchOptions {
+        bind_ip,
+        config,
+        preferred_endpoint,
+        excluded_endpoint,
+        max_attempts,
+        file_hash,
+        file_size,
+        timeout,
+        cancel,
+    } = options;
     let mut configured_servers = configured_server_entries(config)?;
     if configured_servers.is_empty() {
         anyhow::bail!("ED2K UDP source search requires at least one configured server");
@@ -2184,17 +2264,30 @@ async fn search_keyword_on_server(
     Ok(results)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn search_sources_on_server(
+struct SourceSearchServerOptions<'a> {
     bind_ip: Ipv4Addr,
-    server: &ResolvedServerEntry,
+    server: &'a ResolvedServerEntry,
     hello_identity: Ed2kHelloIdentity,
-    shared_catalog: &[Ed2kSharedEntry],
+    shared_catalog: &'a [Ed2kSharedEntry],
     file_hash: Ed2kHash,
     file_size: u64,
     idle_timeout: Duration,
-    cancel: &CancellationToken,
+    cancel: &'a CancellationToken,
+}
+
+async fn search_sources_on_server(
+    options: SourceSearchServerOptions<'_>,
 ) -> Result<Vec<Ed2kFoundSource>> {
+    let SourceSearchServerOptions {
+        bind_ip,
+        server,
+        hello_identity,
+        shared_catalog,
+        file_hash,
+        file_size,
+        idle_timeout,
+        cancel,
+    } = options;
     let use_server_obfuscation =
         should_use_server_obfuscation(hello_identity.connect_options, server);
     let login_identity =

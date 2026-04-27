@@ -66,16 +66,17 @@ use overlord_kad_routing::{Contact, ContactType};
 
 use crate::config::{Ed2kConfig, Ed2kUploadQueuePolicyConfig, EmuleAgentConfig};
 use crate::ed2k_server::{
-    Ed2kFoundSource, Ed2kSearchFile, Ed2kServerSearchHandle, Ed2kServerState,
-    new_ed2k_server_search_channel, request_callback_on_server,
+    Ed2kCallbackRequestOptions, Ed2kFoundSource, Ed2kKeywordSearchOptions, Ed2kSearchFile,
+    Ed2kServerLoopOptions, Ed2kServerSearchHandle, Ed2kServerState, Ed2kSourceSearchOptions,
+    Ed2kUdpSourceSearchOptions, new_ed2k_server_search_channel, request_callback_on_server,
     request_callback_via_background_session, run_ed2k_server_loop, search_keyword_servers,
     search_keyword_via_background_session, search_source_servers, search_source_udp_servers,
     search_source_via_background_session,
 };
 use crate::ed2k_tcp::{
-    Ed2kHelloIdentity, Ed2kPeerDownloadOutcome, Ed2kSecureIdent, FirewallCheckUdpRequest,
-    download_file_from_peer, dump_ed2k_tcp_download_meta, emule_connect_options,
-    enrich_hello_identity, request_udp_firewall_check, run_ed2k_listener,
+    Ed2kHelloIdentity, Ed2kListenerOptions, Ed2kPeerDownloadOptions, Ed2kPeerDownloadOutcome,
+    Ed2kSecureIdent, FirewallCheckUdpRequest, download_file_from_peer, dump_ed2k_tcp_download_meta,
+    emule_connect_options, enrich_hello_identity, request_udp_firewall_check, run_ed2k_listener,
 };
 use crate::ed2k_transfer::{
     Ed2kCallbackIntent, Ed2kLocalIngestSummary, Ed2kResumeManifest, Ed2kSharedCatalog,
@@ -1196,6 +1197,19 @@ async fn record_agent_degraded_activity(
 
 async fn clear_agent_degraded_activity(tracker: &Arc<Mutex<AgentActivityTracker>>) {
     tracker.lock().await.clear_degraded();
+}
+
+struct NativeDirectDownloadOptions {
+    bind_ip: Ipv4Addr,
+    hello_identity: Ed2kHelloIdentity,
+    secure_ident: Arc<Ed2kSecureIdent>,
+    transfer_runtime: Arc<Ed2kTransferRuntime>,
+    file_hash_hex: String,
+    file_name: String,
+    file_size: u64,
+    sources: Vec<Ed2kFoundSource>,
+    connect_timeout: Duration,
+    max_parallel_download_peers: usize,
 }
 
 impl OverlordAgentEmule {
@@ -3016,18 +3030,18 @@ async fn resolve_hash_only_ed2k_metadata(
     if !learned.is_complete() {
         let active_server_attempts =
             ed2k_keyword_server_attempt_budget(&config.p2p.ed2k, &keyword_query);
-        match search_keyword_servers(
-            runtime.bind_ip,
-            &config.p2p.ed2k,
+        match search_keyword_servers(Ed2kKeywordSearchOptions {
+            bind_ip: runtime.bind_ip,
+            config: &config.p2p.ed2k,
             hello_identity,
-            &shared_catalog,
-            (!background_search_available)
+            shared_catalog: &shared_catalog,
+            preferred_endpoint: (!background_search_available)
                 .then_some(preferred_endpoint)
                 .flatten(),
-            active_server_attempts,
-            &keyword_query,
-            &cancel,
-        )
+            max_attempts: active_server_attempts,
+            query: &keyword_query,
+            cancel: &cancel,
+        })
         .await
         {
             Ok(results) => {
@@ -3248,18 +3262,32 @@ async fn collect_kad_ed2k_sources(
     sources
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn do_active_ed2k_keyword_search(
+struct ActiveEd2kSearchContext<'a> {
     bind_ip: Ipv4Addr,
     indexer_id: Uuid,
     ed2k_user_hash: [u8; 16],
-    shared_catalog: &[Ed2kSharedEntry],
-    job: &SearchJob,
-    config: &EmuleAgentConfig,
+    shared_catalog: &'a [Ed2kSharedEntry],
+    job: &'a SearchJob,
+    config: &'a EmuleAgentConfig,
     background_search: Option<Ed2kServerSearchHandle>,
     preferred_endpoint: Option<SocketAddr>,
     cancel: CancellationToken,
+}
+
+async fn do_active_ed2k_keyword_search(
+    context: ActiveEd2kSearchContext<'_>,
 ) -> Result<SearchRunStats> {
+    let ActiveEd2kSearchContext {
+        bind_ip,
+        indexer_id,
+        ed2k_user_hash,
+        shared_catalog,
+        job,
+        config,
+        background_search,
+        preferred_endpoint,
+        cancel,
+    } = context;
     let callback_client = CoordinatorClient::new(&job.callback_url)?;
     let hello_identity = Ed2kHelloIdentity {
         user_hash: ed2k_user_hash,
@@ -3301,16 +3329,16 @@ async fn do_active_ed2k_keyword_search(
                 warn!(
                     "ED2K background session search returned no results for query={query:?}; falling back to one-shot search"
                 );
-                search_keyword_servers(
+                search_keyword_servers(Ed2kKeywordSearchOptions {
                     bind_ip,
-                    &config.p2p.ed2k,
+                    config: &config.p2p.ed2k,
                     hello_identity,
                     shared_catalog,
                     preferred_endpoint,
-                    active_server_attempts,
+                    max_attempts: active_server_attempts,
                     query,
-                    &cancel,
-                )
+                    cancel: &cancel,
+                })
                 .await?
                 .into_iter()
                 .map(|result| map_ed2k_keyword_result(&result))
@@ -3320,16 +3348,16 @@ async fn do_active_ed2k_keyword_search(
                 warn!(
                     "ED2K background session search failed for query={query:?}; falling back to one-shot search: {error}"
                 );
-                search_keyword_servers(
+                search_keyword_servers(Ed2kKeywordSearchOptions {
                     bind_ip,
-                    &config.p2p.ed2k,
+                    config: &config.p2p.ed2k,
                     hello_identity,
                     shared_catalog,
                     preferred_endpoint,
-                    active_server_attempts,
+                    max_attempts: active_server_attempts,
                     query,
-                    &cancel,
-                )
+                    cancel: &cancel,
+                })
                 .await?
                 .into_iter()
                 .map(|result| map_ed2k_keyword_result(&result))
@@ -3337,16 +3365,16 @@ async fn do_active_ed2k_keyword_search(
             }
         }
     } else {
-        search_keyword_servers(
+        search_keyword_servers(Ed2kKeywordSearchOptions {
             bind_ip,
-            &config.p2p.ed2k,
+            config: &config.p2p.ed2k,
             hello_identity,
             shared_catalog,
             preferred_endpoint,
-            active_server_attempts,
+            max_attempts: active_server_attempts,
             query,
-            &cancel,
-        )
+            cancel: &cancel,
+        })
         .await?
         .into_iter()
         .map(|result| map_ed2k_keyword_result(&result))
@@ -3365,18 +3393,20 @@ async fn do_active_ed2k_keyword_search(
     Ok(stats)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn do_active_ed2k_source_search(
-    bind_ip: Ipv4Addr,
-    indexer_id: Uuid,
-    ed2k_user_hash: [u8; 16],
-    shared_catalog: &[Ed2kSharedEntry],
-    job: &SearchJob,
-    config: &EmuleAgentConfig,
-    background_search: Option<Ed2kServerSearchHandle>,
-    preferred_endpoint: Option<SocketAddr>,
-    cancel: CancellationToken,
+    context: ActiveEd2kSearchContext<'_>,
 ) -> Result<SearchRunStats> {
+    let ActiveEd2kSearchContext {
+        bind_ip,
+        indexer_id,
+        ed2k_user_hash,
+        shared_catalog,
+        job,
+        config,
+        background_search,
+        preferred_endpoint,
+        cancel,
+    } = context;
     let callback_client = CoordinatorClient::new(&job.callback_url)?;
     let hello_identity = Ed2kHelloIdentity {
         user_hash: ed2k_user_hash,
@@ -3424,18 +3454,18 @@ async fn do_active_ed2k_source_search(
                 warn!(
                     "ED2K background session source search returned no sources for file_hash={file_hash}; falling back to one-shot search"
                 );
-                search_source_servers(
+                search_source_servers(Ed2kSourceSearchOptions {
                     bind_ip,
-                    &config.p2p.ed2k,
+                    config: &config.p2p.ed2k,
                     hello_identity,
                     shared_catalog,
                     preferred_endpoint,
-                    fallback_excluded_endpoint,
-                    ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
+                    excluded_endpoint: fallback_excluded_endpoint,
+                    max_attempts: ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
                     file_hash,
                     file_size,
-                    &cancel,
-                )
+                    cancel: &cancel,
+                })
                 .await?
                 .into_iter()
                 .map(|result| map_ed2k_source_result(&result, file_size))
@@ -3445,18 +3475,18 @@ async fn do_active_ed2k_source_search(
                 warn!(
                     "ED2K background session source search failed for file_hash={file_hash}; falling back to one-shot search: {error}"
                 );
-                search_source_servers(
+                search_source_servers(Ed2kSourceSearchOptions {
                     bind_ip,
-                    &config.p2p.ed2k,
+                    config: &config.p2p.ed2k,
                     hello_identity,
                     shared_catalog,
                     preferred_endpoint,
-                    fallback_excluded_endpoint,
-                    ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
+                    excluded_endpoint: fallback_excluded_endpoint,
+                    max_attempts: ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
                     file_hash,
                     file_size,
-                    &cancel,
-                )
+                    cancel: &cancel,
+                })
                 .await?
                 .into_iter()
                 .map(|result| map_ed2k_source_result(&result, file_size))
@@ -3464,18 +3494,18 @@ async fn do_active_ed2k_source_search(
             }
         }
     } else {
-        search_source_servers(
+        search_source_servers(Ed2kSourceSearchOptions {
             bind_ip,
-            &config.p2p.ed2k,
+            config: &config.p2p.ed2k,
             hello_identity,
             shared_catalog,
             preferred_endpoint,
-            None,
-            ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
+            excluded_endpoint: None,
+            max_attempts: ED2K_ACTIVE_SEARCH_MAX_SERVER_ATTEMPTS,
             file_hash,
             file_size,
-            &cancel,
-        )
+            cancel: &cancel,
+        })
         .await?
         .into_iter()
         .map(|result| map_ed2k_source_result(&result, file_size))
@@ -5944,17 +5974,17 @@ impl IndexerService for OverlordAgentEmule {
                             (None, None)
                         }
                     };
-                    do_active_ed2k_keyword_search(
+                    do_active_ed2k_keyword_search(ActiveEd2kSearchContext {
                         bind_ip,
                         indexer_id,
                         ed2k_user_hash,
-                        &ed2k_shared_catalog,
-                        &job,
-                        &config_snapshot,
+                        shared_catalog: &ed2k_shared_catalog,
+                        job: &job,
+                        config: &config_snapshot,
                         background_search,
                         preferred_endpoint,
-                        cancel.clone(),
-                    )
+                        cancel: cancel.clone(),
+                    })
                     .await
                 }
                 (Protocol::Ed2k, SearchKind::Source) => {
@@ -5966,17 +5996,17 @@ impl IndexerService for OverlordAgentEmule {
                             (None, None)
                         }
                     };
-                    do_active_ed2k_source_search(
+                    do_active_ed2k_source_search(ActiveEd2kSearchContext {
                         bind_ip,
                         indexer_id,
                         ed2k_user_hash,
-                        &ed2k_shared_catalog,
-                        &job,
-                        &config_snapshot,
+                        shared_catalog: &ed2k_shared_catalog,
+                        job: &job,
+                        config: &config_snapshot,
                         background_search,
                         preferred_endpoint,
-                        cancel.clone(),
-                    )
+                        cancel: cancel.clone(),
+                    })
                     .await
                 }
                 (Protocol::Ed2k, SearchKind::Notes) => {
@@ -6257,18 +6287,8 @@ impl OverlordAgentEmule {
     /// The native download path keeps several peers in flight concurrently so a
     /// single dead or non-serving source does not block completion when another
     /// discovered peer can provide the file.
-    #[allow(clippy::too_many_arguments)]
     async fn run_native_ed2k_direct_downloads<DownloadFn, DownloadFuture>(
-        bind_ip: Ipv4Addr,
-        hello_identity: Ed2kHelloIdentity,
-        secure_ident: Arc<Ed2kSecureIdent>,
-        transfer_runtime: Arc<Ed2kTransferRuntime>,
-        file_hash_hex: String,
-        file_name: String,
-        file_size: u64,
-        sources: Vec<Ed2kFoundSource>,
-        connect_timeout: Duration,
-        max_parallel_download_peers: usize,
+        options: NativeDirectDownloadOptions,
         download_peer: DownloadFn,
     ) -> Result<NativeDirectDownloadOutcome>
     where
@@ -6288,6 +6308,18 @@ impl OverlordAgentEmule {
             + 'static,
         DownloadFuture: Future<Output = Result<Ed2kPeerDownloadOutcome>> + Send + 'static,
     {
+        let NativeDirectDownloadOptions {
+            bind_ip,
+            hello_identity,
+            secure_ident,
+            transfer_runtime,
+            file_hash_hex,
+            file_name,
+            file_size,
+            sources,
+            connect_timeout,
+            max_parallel_download_peers,
+        } = options;
         let max_parallel_download_peers = max_parallel_download_peers.max(1);
         let retry_deadline =
             if !sources.is_empty() && sources.iter().all(|source| source.ip.is_loopback()) {
@@ -6575,20 +6607,20 @@ impl OverlordAgentEmule {
         }
 
         let active_source_attempts = ed2k_download_source_server_attempt_budget(&config.p2p.ed2k);
-        match search_source_servers(
-            runtime.bind_ip,
-            &config.p2p.ed2k,
+        match search_source_servers(Ed2kSourceSearchOptions {
+            bind_ip: runtime.bind_ip,
+            config: &config.p2p.ed2k,
             hello_identity,
-            &shared_catalog,
+            shared_catalog: &shared_catalog,
             preferred_endpoint,
-            has_background_search
+            excluded_endpoint: has_background_search
                 .then_some(preferred_endpoint)
                 .flatten(),
-            active_source_attempts,
+            max_attempts: active_source_attempts,
             file_hash,
             file_size,
-            &cancel,
-        )
+            cancel: &cancel,
+        })
         .await
         {
             Ok(server_results) => {
@@ -6608,19 +6640,19 @@ impl OverlordAgentEmule {
             }
         }
         if sources.is_empty() {
-            match search_source_udp_servers(
-                runtime.bind_ip,
-                &config.p2p.ed2k,
+            match search_source_udp_servers(Ed2kUdpSourceSearchOptions {
+                bind_ip: runtime.bind_ip,
+                config: &config.p2p.ed2k,
                 preferred_endpoint,
-                has_background_search
+                excluded_endpoint: has_background_search
                     .then_some(preferred_endpoint)
                     .flatten(),
-                active_source_attempts,
+                max_attempts: active_source_attempts,
                 file_hash,
                 file_size,
-                source_search_timeout,
-                &cancel,
-            )
+                timeout: source_search_timeout,
+                cancel: &cancel,
+            })
             .await
             {
                 Ok(udp_results) => {
@@ -6865,16 +6897,16 @@ impl OverlordAgentEmule {
                         source_requery_round
                     );
                     let callback_result = if let Some(source_server) = source.source_server {
-                        request_callback_on_server(
-                            runtime.bind_ip,
-                            &config.p2p.ed2k,
+                        request_callback_on_server(Ed2kCallbackRequestOptions {
+                            bind_ip: runtime.bind_ip,
+                            config: &config.p2p.ed2k,
                             hello_identity,
-                            &shared_catalog,
-                            source_server,
-                            source.client_id,
-                            callback_timeout,
-                            &cancel,
-                        )
+                            shared_catalog: &shared_catalog,
+                            server_endpoint: source_server,
+                            client_id: source.client_id,
+                            timeout: callback_timeout,
+                            cancel: &cancel,
+                        })
                         .await
                     } else {
                         request_callback_via_background_session(
@@ -6927,16 +6959,20 @@ impl OverlordAgentEmule {
             }
             if !direct_sources.is_empty() {
                 let outcome = Self::run_native_ed2k_direct_downloads(
-                    runtime.bind_ip,
-                    hello_identity,
-                    Arc::clone(&runtime.ed2k_secure_ident),
-                    Arc::clone(&runtime.ed2k_transfer),
-                    request.file_hash.clone(),
-                    canonical_name.clone(),
-                    file_size,
-                    direct_sources,
-                    Duration::from_secs(config.p2p.ed2k.connect_timeout_secs.max(10)),
-                    config.p2p.ed2k.max_parallel_download_peers,
+                    NativeDirectDownloadOptions {
+                        bind_ip: runtime.bind_ip,
+                        hello_identity,
+                        secure_ident: Arc::clone(&runtime.ed2k_secure_ident),
+                        transfer_runtime: Arc::clone(&runtime.ed2k_transfer),
+                        file_hash_hex: request.file_hash.clone(),
+                        file_name: canonical_name.clone(),
+                        file_size,
+                        sources: direct_sources,
+                        connect_timeout: Duration::from_secs(
+                            config.p2p.ed2k.connect_timeout_secs.max(10),
+                        ),
+                        max_parallel_download_peers: config.p2p.ed2k.max_parallel_download_peers,
+                    },
                     |bind_ip,
                      source,
                      hello_identity,
@@ -6945,16 +6981,16 @@ impl OverlordAgentEmule {
                      file_name,
                      file_size,
                      connect_timeout| async move {
-                        download_file_from_peer(
+                        download_file_from_peer(Ed2kPeerDownloadOptions {
                             bind_ip,
-                            &source,
+                            peer: &source,
                             hello_identity,
-                            &secure_ident,
-                            transfer_runtime.as_ref(),
-                            file_name,
+                            secure_ident: &secure_ident,
+                            transfer_runtime: transfer_runtime.as_ref(),
+                            canonical_name: file_name,
                             file_size,
-                            connect_timeout,
-                        )
+                            timeout: connect_timeout,
+                        })
                         .await
                     },
                 )
@@ -7506,16 +7542,16 @@ impl OverlordAgentEmule {
             direct_udp_callback: false,
         };
         runtime.tasks.lock().await.push(tokio::spawn(async move {
-            run_ed2k_listener(
-                ed2k_listener,
+            run_ed2k_listener(Ed2kListenerOptions {
+                listener: ed2k_listener,
                 dht,
-                ed2k_server_state,
+                server_state: ed2k_server_state,
                 kad_firewall,
-                ed2k_secure_ident,
-                ed2k_transfer,
-                ed2k_hello_identity,
+                secure_ident: ed2k_secure_ident,
+                transfer_runtime: ed2k_transfer,
+                hello_identity: ed2k_hello_identity,
                 shutdown,
-            )
+            })
             .await;
         }));
 
@@ -7540,17 +7576,17 @@ impl OverlordAgentEmule {
         };
         if let Some(ed2k_server_search_inbox) = ed2k_server_search_inbox {
             runtime.tasks.lock().await.push(tokio::spawn(async move {
-                run_ed2k_server_loop(
+                run_ed2k_server_loop(Ed2kServerLoopOptions {
                     bind_ip,
                     nat,
-                    ed2k_server_config,
-                    ed2k_hello_identity,
-                    ed2k_shared_catalog,
-                    ed2k_server_state,
-                    ed2k_server_search_inbox,
+                    config: ed2k_server_config,
+                    hello_identity: ed2k_hello_identity,
+                    shared_catalog: ed2k_shared_catalog,
+                    state: ed2k_server_state,
+                    search_inbox: ed2k_server_search_inbox,
                     kad_firewall,
                     shutdown,
-                )
+                })
                 .await;
             }));
         } else {
@@ -8796,14 +8832,14 @@ fn plaintext_fallback_for_obfuscated_source(source: &Ed2kFoundSource) -> Option<
 mod tests {
     use super::{
         COORDINATOR_RECONNECT_SECS, EMULE_LARGE_FILE_SIZE_THRESHOLD, EmuleAgentConfig,
-        EnrichEd2kDownloadRequest, EnrichEd2kDownloadSource, OverlordAgentEmule,
-        PASSIVE_REPLAY_CONCURRENCY, PassiveReplaySelection, SYNTHETIC_POPULAR_SEEDS,
-        SourcePublishSettings, apply_harvest_record, apply_networking_config,
-        apply_publish_summary, apply_queue_family_counts, build_hello_request,
-        build_hello_response, build_kad_hello_request_tags, build_kad_hello_response_tags,
-        build_keyword_snoop_entry, build_notes_publish_tags, build_notes_snoop_entry,
-        build_publish_batch_summary, build_source_publish_tags, build_source_snoop_entry,
-        current_tcp_firewalled, direct_download_candidate_sources,
+        EnrichEd2kDownloadRequest, EnrichEd2kDownloadSource, NativeDirectDownloadOptions,
+        OverlordAgentEmule, PASSIVE_REPLAY_CONCURRENCY, PassiveReplaySelection,
+        SYNTHETIC_POPULAR_SEEDS, SourcePublishSettings, apply_harvest_record,
+        apply_networking_config, apply_publish_summary, apply_queue_family_counts,
+        build_hello_request, build_hello_response, build_kad_hello_request_tags,
+        build_kad_hello_response_tags, build_keyword_snoop_entry, build_notes_publish_tags,
+        build_notes_snoop_entry, build_publish_batch_summary, build_source_publish_tags,
+        build_source_snoop_entry, current_tcp_firewalled, direct_download_candidate_sources,
         ed2k_download_source_server_attempt_budget, ed2k_file_type_search_term,
         ed2k_keyword_server_attempt_budget, effective_publish_counters, empty_networking_config,
         emule_high_id_source_type, exact_ed2k_hash_query_token, flush_snoop_queue,
@@ -9030,48 +9066,50 @@ mod tests {
         let payload = Arc::new(payload);
         let file_hash_hex_for_download = file_hash_hex.clone();
         let outcome = OverlordAgentEmule::run_native_ed2k_direct_downloads(
-            Ipv4Addr::LOCALHOST,
-            Ed2kHelloIdentity {
-                user_hash: [0x11; 16],
-                client_id: 0,
-                tcp_port: 41001,
-                udp_port: 41000,
-                server_ip: 0,
-                server_port: 0,
-                connect_options: emule_connect_options(false),
-                direct_udp_callback: false,
-            },
-            secure_ident,
-            Arc::clone(&transfer_runtime),
-            file_hash_hex.clone(),
-            "captured.epub".to_string(),
-            payload.len() as u64,
-            vec![
-                Ed2kFoundSource {
-                    file_hash,
-                    ip: Ipv4Addr::LOCALHOST,
+            NativeDirectDownloadOptions {
+                bind_ip: Ipv4Addr::LOCALHOST,
+                hello_identity: Ed2kHelloIdentity {
+                    user_hash: [0x11; 16],
+                    client_id: 0,
                     tcp_port: 41001,
-                    client_id: 1,
-                    low_id: false,
-                    obfuscated: false,
-                    obfuscation_options: None,
-                    user_hash: None,
-                    source_server: None,
+                    udp_port: 41000,
+                    server_ip: 0,
+                    server_port: 0,
+                    connect_options: emule_connect_options(false),
+                    direct_udp_callback: false,
                 },
-                Ed2kFoundSource {
-                    file_hash,
-                    ip: Ipv4Addr::LOCALHOST,
-                    tcp_port: 41002,
-                    client_id: 2,
-                    low_id: false,
-                    obfuscated: false,
-                    obfuscation_options: None,
-                    user_hash: None,
-                    source_server: None,
-                },
-            ],
-            Duration::from_secs(1),
-            2,
+                secure_ident,
+                transfer_runtime: Arc::clone(&transfer_runtime),
+                file_hash_hex: file_hash_hex.clone(),
+                file_name: "captured.epub".to_string(),
+                file_size: payload.len() as u64,
+                sources: vec![
+                    Ed2kFoundSource {
+                        file_hash,
+                        ip: Ipv4Addr::LOCALHOST,
+                        tcp_port: 41001,
+                        client_id: 1,
+                        low_id: false,
+                        obfuscated: false,
+                        obfuscation_options: None,
+                        user_hash: None,
+                        source_server: None,
+                    },
+                    Ed2kFoundSource {
+                        file_hash,
+                        ip: Ipv4Addr::LOCALHOST,
+                        tcp_port: 41002,
+                        client_id: 2,
+                        low_id: false,
+                        obfuscated: false,
+                        obfuscation_options: None,
+                        user_hash: None,
+                        source_server: None,
+                    },
+                ],
+                connect_timeout: Duration::from_secs(1),
+                max_parallel_download_peers: 2,
+            },
             {
                 let attempts = Arc::clone(&attempts);
                 move |_bind_ip,
@@ -9134,35 +9172,37 @@ mod tests {
         let file_hash_hex_for_download = file_hash_hex.clone();
         let success_after_attempt = 3usize;
         let outcome = OverlordAgentEmule::run_native_ed2k_direct_downloads(
-            Ipv4Addr::LOCALHOST,
-            Ed2kHelloIdentity {
-                user_hash: [0x11; 16],
-                client_id: 0,
-                tcp_port: 41001,
-                udp_port: 41000,
-                server_ip: 0,
-                server_port: 0,
-                connect_options: emule_connect_options(false),
-                direct_udp_callback: false,
+            NativeDirectDownloadOptions {
+                bind_ip: Ipv4Addr::LOCALHOST,
+                hello_identity: Ed2kHelloIdentity {
+                    user_hash: [0x11; 16],
+                    client_id: 0,
+                    tcp_port: 41001,
+                    udp_port: 41000,
+                    server_ip: 0,
+                    server_port: 0,
+                    connect_options: emule_connect_options(false),
+                    direct_udp_callback: false,
+                },
+                secure_ident,
+                transfer_runtime: Arc::clone(&transfer_runtime),
+                file_hash_hex: file_hash_hex.clone(),
+                file_name: "captured.epub".to_string(),
+                file_size: payload.len() as u64,
+                sources: vec![Ed2kFoundSource {
+                    file_hash,
+                    ip: Ipv4Addr::LOCALHOST,
+                    tcp_port: 41001,
+                    client_id: 1,
+                    low_id: false,
+                    obfuscated: false,
+                    obfuscation_options: None,
+                    user_hash: None,
+                    source_server: None,
+                }],
+                connect_timeout: Duration::from_secs(1),
+                max_parallel_download_peers: 1,
             },
-            secure_ident,
-            Arc::clone(&transfer_runtime),
-            file_hash_hex.clone(),
-            "captured.epub".to_string(),
-            payload.len() as u64,
-            vec![Ed2kFoundSource {
-                file_hash,
-                ip: Ipv4Addr::LOCALHOST,
-                tcp_port: 41001,
-                client_id: 1,
-                low_id: false,
-                obfuscated: false,
-                obfuscation_options: None,
-                user_hash: None,
-                source_server: None,
-            }],
-            Duration::from_secs(1),
-            1,
             {
                 let attempts = Arc::clone(&attempts);
                 move |_bind_ip,
@@ -9227,35 +9267,37 @@ mod tests {
         let payload = Arc::new(payload);
         let file_hash_hex_for_download = file_hash_hex.clone();
         let outcome = OverlordAgentEmule::run_native_ed2k_direct_downloads(
-            Ipv4Addr::LOCALHOST,
-            Ed2kHelloIdentity {
-                user_hash: [0x11; 16],
-                client_id: 0,
-                tcp_port: 41001,
-                udp_port: 41000,
-                server_ip: 0,
-                server_port: 0,
-                connect_options: emule_connect_options(true),
-                direct_udp_callback: false,
+            NativeDirectDownloadOptions {
+                bind_ip: Ipv4Addr::LOCALHOST,
+                hello_identity: Ed2kHelloIdentity {
+                    user_hash: [0x11; 16],
+                    client_id: 0,
+                    tcp_port: 41001,
+                    udp_port: 41000,
+                    server_ip: 0,
+                    server_port: 0,
+                    connect_options: emule_connect_options(true),
+                    direct_udp_callback: false,
+                },
+                secure_ident,
+                transfer_runtime: Arc::clone(&transfer_runtime),
+                file_hash_hex: file_hash_hex.clone(),
+                file_name: "captured.epub".to_string(),
+                file_size: payload.len() as u64,
+                sources: vec![Ed2kFoundSource {
+                    file_hash,
+                    ip: Ipv4Addr::LOCALHOST,
+                    tcp_port: 41001,
+                    client_id: 1,
+                    low_id: false,
+                    obfuscated: true,
+                    obfuscation_options: Some(0x83),
+                    user_hash: Some([0x22; 16]),
+                    source_server: None,
+                }],
+                connect_timeout: Duration::from_secs(1),
+                max_parallel_download_peers: 1,
             },
-            secure_ident,
-            Arc::clone(&transfer_runtime),
-            file_hash_hex.clone(),
-            "captured.epub".to_string(),
-            payload.len() as u64,
-            vec![Ed2kFoundSource {
-                file_hash,
-                ip: Ipv4Addr::LOCALHOST,
-                tcp_port: 41001,
-                client_id: 1,
-                low_id: false,
-                obfuscated: true,
-                obfuscation_options: Some(0x83),
-                user_hash: Some([0x22; 16]),
-                source_server: None,
-            }],
-            Duration::from_secs(1),
-            1,
             {
                 let attempts = Arc::clone(&attempts);
                 move |_bind_ip,
@@ -9430,48 +9472,50 @@ mod tests {
         let payload = Arc::new(payload);
         let file_hash_hex_for_download = file_hash_hex.clone();
         let outcome = OverlordAgentEmule::run_native_ed2k_direct_downloads(
-            Ipv4Addr::LOCALHOST,
-            Ed2kHelloIdentity {
-                user_hash: [0x11; 16],
-                client_id: 0,
-                tcp_port: 41001,
-                udp_port: 41000,
-                server_ip: 0,
-                server_port: 0,
-                connect_options: emule_connect_options(false),
-                direct_udp_callback: false,
-            },
-            secure_ident,
-            Arc::clone(&transfer_runtime),
-            file_hash_hex.clone(),
-            "captured.epub".to_string(),
-            payload.len() as u64,
-            vec![
-                Ed2kFoundSource {
-                    file_hash,
-                    ip: Ipv4Addr::LOCALHOST,
+            NativeDirectDownloadOptions {
+                bind_ip: Ipv4Addr::LOCALHOST,
+                hello_identity: Ed2kHelloIdentity {
+                    user_hash: [0x11; 16],
+                    client_id: 0,
                     tcp_port: 41001,
-                    client_id: 1,
-                    low_id: false,
-                    obfuscated: false,
-                    obfuscation_options: None,
-                    user_hash: None,
-                    source_server: None,
+                    udp_port: 41000,
+                    server_ip: 0,
+                    server_port: 0,
+                    connect_options: emule_connect_options(false),
+                    direct_udp_callback: false,
                 },
-                Ed2kFoundSource {
-                    file_hash,
-                    ip: Ipv4Addr::LOCALHOST,
-                    tcp_port: 41002,
-                    client_id: 2,
-                    low_id: false,
-                    obfuscated: false,
-                    obfuscation_options: None,
-                    user_hash: None,
-                    source_server: None,
-                },
-            ],
-            Duration::from_secs(1),
-            2,
+                secure_ident,
+                transfer_runtime: Arc::clone(&transfer_runtime),
+                file_hash_hex: file_hash_hex.clone(),
+                file_name: "captured.epub".to_string(),
+                file_size: payload.len() as u64,
+                sources: vec![
+                    Ed2kFoundSource {
+                        file_hash,
+                        ip: Ipv4Addr::LOCALHOST,
+                        tcp_port: 41001,
+                        client_id: 1,
+                        low_id: false,
+                        obfuscated: false,
+                        obfuscation_options: None,
+                        user_hash: None,
+                        source_server: None,
+                    },
+                    Ed2kFoundSource {
+                        file_hash,
+                        ip: Ipv4Addr::LOCALHOST,
+                        tcp_port: 41002,
+                        client_id: 2,
+                        low_id: false,
+                        obfuscated: false,
+                        obfuscation_options: None,
+                        user_hash: None,
+                        source_server: None,
+                    },
+                ],
+                connect_timeout: Duration::from_secs(1),
+                max_parallel_download_peers: 2,
+            },
             {
                 let attempts = Arc::clone(&attempts);
                 move |_bind_ip,

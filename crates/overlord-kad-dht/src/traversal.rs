@@ -466,16 +466,16 @@ async fn run_search_phase(
         } else {
             next_emit_at.min(phase_deadline)
         };
-        collect_search_results_until(
-            &mut unsolicited,
+        collect_search_results_until(SearchResultDrain {
+            unsolicited: &mut unsolicited,
             cancel,
             receive_until,
             target,
-            &queried_addrs,
-            &result_tx,
-            should_collect_search_entries,
-            &mut search_entries,
-        )
+            queried_addrs: &queried_addrs,
+            result_tx: &result_tx,
+            collect_search_entries: should_collect_search_entries,
+            search_entries: &mut search_entries,
+        })
         .await;
 
         let now = Instant::now();
@@ -533,18 +533,29 @@ fn compute_initial_jumpstart_emit_at(
     stalled_at.max(now)
 }
 
-/// Drain unsolicited packets until the next jump-start emit slot or overall deadline.
-#[allow(clippy::too_many_arguments)]
-async fn collect_search_results_until(
-    unsolicited: &mut tokio::sync::broadcast::Receiver<overlord_kad_net::ReceivedKadPacket>,
-    cancel: &CancellationToken,
+struct SearchResultDrain<'a> {
+    unsolicited: &'a mut tokio::sync::broadcast::Receiver<overlord_kad_net::ReceivedKadPacket>,
+    cancel: &'a CancellationToken,
     receive_until: Instant,
     target: NodeId,
-    queried_addrs: &HashSet<SocketAddr>,
-    result_tx: &Option<mpsc::Sender<(Ed2kHash, Vec<Tag>)>>,
+    queried_addrs: &'a HashSet<SocketAddr>,
+    result_tx: &'a Option<mpsc::Sender<(Ed2kHash, Vec<Tag>)>>,
     collect_search_entries: bool,
-    search_entries: &mut Vec<(Ed2kHash, Vec<Tag>)>,
-) {
+    search_entries: &'a mut Vec<(Ed2kHash, Vec<Tag>)>,
+}
+
+/// Drain unsolicited packets until the next jump-start emit slot or overall deadline.
+async fn collect_search_results_until(drain: SearchResultDrain<'_>) {
+    let SearchResultDrain {
+        unsolicited,
+        cancel,
+        receive_until,
+        target,
+        queried_addrs,
+        result_tx,
+        collect_search_entries,
+        search_entries,
+    } = drain;
     loop {
         if cancel.is_cancelled() {
             break;

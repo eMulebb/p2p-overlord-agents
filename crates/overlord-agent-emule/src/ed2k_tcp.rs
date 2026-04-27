@@ -1511,17 +1511,31 @@ pub(crate) async fn connect_callback_peer(
 /// hashset. The downloader keeps the captured hashset-first path as the
 /// default, but falls back to `OP_STARTUPLOADREQ` after a short stall so
 /// queue-oriented peers are not discarded prematurely.
-#[allow(clippy::too_many_arguments)]
+/// Inputs for one outbound native ED2K peer download attempt.
+pub(crate) struct Ed2kPeerDownloadOptions<'a> {
+    pub bind_ip: Ipv4Addr,
+    pub peer: &'a Ed2kFoundSource,
+    pub hello_identity: Ed2kHelloIdentity,
+    pub secure_ident: &'a Arc<Ed2kSecureIdent>,
+    pub transfer_runtime: &'a Ed2kTransferRuntime,
+    pub canonical_name: String,
+    pub file_size: u64,
+    pub timeout: Duration,
+}
+
 pub(crate) async fn download_file_from_peer(
-    bind_ip: Ipv4Addr,
-    peer: &Ed2kFoundSource,
-    hello_identity: Ed2kHelloIdentity,
-    secure_ident: &Arc<Ed2kSecureIdent>,
-    transfer_runtime: &Ed2kTransferRuntime,
-    canonical_name: String,
-    file_size: u64,
-    timeout: Duration,
+    options: Ed2kPeerDownloadOptions<'_>,
 ) -> Result<Ed2kPeerDownloadOutcome> {
+    let Ed2kPeerDownloadOptions {
+        bind_ip,
+        peer,
+        hello_identity,
+        secure_ident,
+        transfer_runtime,
+        canonical_name,
+        file_size,
+        timeout,
+    } = options;
     let file_hash = peer.file_hash;
     let file_hash_hex = file_hash.to_string();
     let job = new_transfer_job(file_hash, canonical_name, file_size);
@@ -1571,19 +1585,19 @@ pub(crate) async fn download_file_from_peer(
             .write_all(&hello)
             .await
             .with_context(|| format!("failed to send OP_HELLO to {peer_addr}"))?;
-        let session_result = drive_download_session(
-            &mut transport,
+        let session_result = drive_download_session(DownloadSessionOptions {
+            transport: &mut transport,
             peer_addr,
             hello_identity,
-            secure_ident.as_ref(),
+            secure_ident: secure_ident.as_ref(),
             transfer_runtime,
             file_hash,
-            &file_hash_hex,
+            file_hash_hex: &file_hash_hex,
             timeout,
-            true,
-            false,
-            false,
-        )
+            send_initial_requests: true,
+            initial_hello_complete: false,
+            initial_secure_ident_started: false,
+        })
         .await;
         match &session_result {
             Ok(Ed2kPeerDownloadOutcome::Completed) => dump_ed2k_tcp_download_meta(
@@ -1610,20 +1624,36 @@ pub(crate) async fn download_file_from_peer(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn drive_download_session(
-    transport: &mut Ed2kTransport,
+struct DownloadSessionOptions<'a> {
+    transport: &'a mut Ed2kTransport,
     peer_addr: SocketAddr,
     hello_identity: Ed2kHelloIdentity,
-    secure_ident: &Ed2kSecureIdent,
-    transfer_runtime: &Ed2kTransferRuntime,
+    secure_ident: &'a Ed2kSecureIdent,
+    transfer_runtime: &'a Ed2kTransferRuntime,
     file_hash: Ed2kHash,
-    file_hash_hex: &str,
+    file_hash_hex: &'a str,
     timeout: Duration,
     send_initial_requests: bool,
     initial_hello_complete: bool,
     initial_secure_ident_started: bool,
+}
+
+async fn drive_download_session(
+    options: DownloadSessionOptions<'_>,
 ) -> Result<Ed2kPeerDownloadOutcome> {
+    let DownloadSessionOptions {
+        transport,
+        peer_addr,
+        hello_identity,
+        secure_ident,
+        transfer_runtime,
+        file_hash,
+        file_hash_hex,
+        timeout,
+        send_initial_requests,
+        initial_hello_complete,
+        initial_secure_ident_started,
+    } = options;
     const HASHSET_STALL_UPLOAD_FALLBACK: Duration = Duration::from_millis(500);
     const QUEUE_RANK_GRACE: Duration = Duration::from_secs(20);
     const PART_RESPONSE_GRACE: Duration = Duration::from_secs(20);
@@ -2374,18 +2404,18 @@ async fn drive_download_session(
                         if pending.uncompressed_written == piece_len {
                             pending_compressed_parts.remove(compressed_index);
                         }
-                        flush_ready_download_blocks(
+                        flush_ready_download_blocks(ReadyDownloadBlocks {
                             transfer_runtime,
                             file_hash_hex,
-                            &mut pending_part_requests,
-                            &mut active_piece_request,
-                            &mut manifest,
+                            pending_part_requests: &mut pending_part_requests,
+                            active_piece_request: &mut active_piece_request,
+                            manifest: &mut manifest,
                             peer_addr,
-                            transport.mode,
-                            &mut completed_block_count,
-                            &mut session_payload_down,
-                            &mut part_response_deadline,
-                        )
+                            transport_mode: transport.mode,
+                            completed_block_count: &mut completed_block_count,
+                            session_payload_down: &mut session_payload_down,
+                            part_response_deadline: &mut part_response_deadline,
+                        })
                         .await?;
                     } else {
                         let (returned_hash, start, end, bytes) =
@@ -2440,18 +2470,18 @@ async fn drive_download_session(
                         }
                         pending_part_requests[pending_index]
                             .buffer_response_bytes(start, end, &bytes)?;
-                        flush_ready_download_blocks(
+                        flush_ready_download_blocks(ReadyDownloadBlocks {
                             transfer_runtime,
                             file_hash_hex,
-                            &mut pending_part_requests,
-                            &mut active_piece_request,
-                            &mut manifest,
+                            pending_part_requests: &mut pending_part_requests,
+                            active_piece_request: &mut active_piece_request,
+                            manifest: &mut manifest,
                             peer_addr,
-                            transport.mode,
-                            &mut completed_block_count,
-                            &mut session_payload_down,
-                            &mut part_response_deadline,
-                        )
+                            transport_mode: transport.mode,
+                            completed_block_count: &mut completed_block_count,
+                            session_payload_down: &mut session_payload_down,
+                            part_response_deadline: &mut part_response_deadline,
+                        })
                         .await?;
                     }
                 }
@@ -3377,18 +3407,30 @@ pub(crate) async fn enrich_hello_identity(
     identity
 }
 
+/// Inputs for the long-lived ED2K TCP listener task.
+pub struct Ed2kListenerOptions {
+    pub listener: Arc<TcpListener>,
+    pub dht: DhtNode,
+    pub server_state: Arc<RwLock<Ed2kServerState>>,
+    pub kad_firewall: Arc<Mutex<KadFirewallState>>,
+    pub secure_ident: Arc<Ed2kSecureIdent>,
+    pub transfer_runtime: Arc<Ed2kTransferRuntime>,
+    pub hello_identity: Ed2kHelloIdentity,
+    pub shutdown: Arc<AtomicBool>,
+}
+
 /// Run the minimal eD2k TCP listener needed for inbound hello parity and firewall checks.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_ed2k_listener(
-    listener: Arc<TcpListener>,
-    dht: DhtNode,
-    server_state: Arc<RwLock<Ed2kServerState>>,
-    kad_firewall: Arc<Mutex<KadFirewallState>>,
-    secure_ident: Arc<Ed2kSecureIdent>,
-    transfer_runtime: Arc<Ed2kTransferRuntime>,
-    hello_identity: Ed2kHelloIdentity,
-    shutdown: Arc<AtomicBool>,
-) {
+pub async fn run_ed2k_listener(options: Ed2kListenerOptions) {
+    let Ed2kListenerOptions {
+        listener,
+        dht,
+        server_state,
+        kad_firewall,
+        secure_ident,
+        transfer_runtime,
+        hello_identity,
+        shutdown,
+    } = options;
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
@@ -3401,12 +3443,14 @@ pub async fn run_ed2k_listener(
                     if let Err(error) = handle_connection(
                         stream,
                         peer_addr,
-                        &dht,
-                        &server_state,
-                        &kad_firewall,
-                        &secure_ident,
-                        &transfer_runtime,
-                        hello_identity,
+                        Ed2kConnectionContext {
+                            dht: &dht,
+                            server_state: &server_state,
+                            kad_firewall: &kad_firewall,
+                            secure_ident: &secure_ident,
+                            transfer_runtime: &transfer_runtime,
+                            hello_identity,
+                        },
                     )
                     .await
                     {
@@ -3425,17 +3469,28 @@ pub async fn run_ed2k_listener(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+struct Ed2kConnectionContext<'a> {
+    dht: &'a DhtNode,
+    server_state: &'a Arc<RwLock<Ed2kServerState>>,
+    kad_firewall: &'a Arc<Mutex<KadFirewallState>>,
+    secure_ident: &'a Arc<Ed2kSecureIdent>,
+    transfer_runtime: &'a Arc<Ed2kTransferRuntime>,
+    hello_identity: Ed2kHelloIdentity,
+}
+
 async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
-    dht: &DhtNode,
-    server_state: &Arc<RwLock<Ed2kServerState>>,
-    kad_firewall: &Arc<Mutex<KadFirewallState>>,
-    secure_ident: &Arc<Ed2kSecureIdent>,
-    transfer_runtime: &Arc<Ed2kTransferRuntime>,
-    hello_identity: Ed2kHelloIdentity,
+    context: Ed2kConnectionContext<'_>,
 ) -> Result<()> {
+    let Ed2kConnectionContext {
+        dht,
+        server_state,
+        kad_firewall,
+        secure_ident,
+        transfer_runtime,
+        hello_identity,
+    } = context;
     let local_addr = stream.local_addr().with_context(|| {
         format!("failed to resolve local eD2k listener address for {peer_addr}")
     })?;
@@ -3620,19 +3675,19 @@ async fn handle_connection(
                         "claimed inbound ED2K callback download file_hash={} client_id={} peer={peer_addr}",
                         callback_intent.file_hash, callback_intent.client_id
                     );
-                    match drive_download_session(
-                        &mut transport,
+                    match drive_download_session(DownloadSessionOptions {
+                        transport: &mut transport,
                         peer_addr,
-                        response_identity,
-                        secure_ident.as_ref(),
+                        hello_identity: response_identity,
+                        secure_ident: secure_ident.as_ref(),
                         transfer_runtime,
                         file_hash,
-                        &callback_intent.file_hash,
-                        ED2K_CONNECTION_IDLE_TIMEOUT,
-                        true,
-                        true,
-                        true,
-                    )
+                        file_hash_hex: &callback_intent.file_hash,
+                        timeout: ED2K_CONNECTION_IDLE_TIMEOUT,
+                        send_initial_requests: true,
+                        initial_hello_complete: true,
+                        initial_secure_ident_started: true,
+                    })
                     .await?
                     {
                         Ed2kPeerDownloadOutcome::Completed => break Ok(()),
@@ -5041,19 +5096,32 @@ fn inflate_compressed_part_fragment(
     Ok((bytes, finished))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn flush_ready_download_blocks(
-    transfer_runtime: &Ed2kTransferRuntime,
-    file_hash_hex: &str,
-    pending_part_requests: &mut Vec<PendingPartRequest>,
-    active_piece_request: &mut Option<ActiveDownloadPiece>,
-    manifest: &mut Ed2kResumeManifest,
+struct ReadyDownloadBlocks<'a> {
+    transfer_runtime: &'a Ed2kTransferRuntime,
+    file_hash_hex: &'a str,
+    pending_part_requests: &'a mut Vec<PendingPartRequest>,
+    active_piece_request: &'a mut Option<ActiveDownloadPiece>,
+    manifest: &'a mut Ed2kResumeManifest,
     peer_addr: SocketAddr,
     transport_mode: Ed2kTransportMode,
-    completed_block_count: &mut usize,
-    session_payload_down: &mut u64,
-    part_response_deadline: &mut Option<tokio::time::Instant>,
-) -> Result<()> {
+    completed_block_count: &'a mut usize,
+    session_payload_down: &'a mut u64,
+    part_response_deadline: &'a mut Option<tokio::time::Instant>,
+}
+
+async fn flush_ready_download_blocks(blocks: ReadyDownloadBlocks<'_>) -> Result<()> {
+    let ReadyDownloadBlocks {
+        transfer_runtime,
+        file_hash_hex,
+        pending_part_requests,
+        active_piece_request,
+        manifest,
+        peer_addr,
+        transport_mode,
+        completed_block_count,
+        session_payload_down,
+        part_response_deadline,
+    } = blocks;
     while pending_part_requests
         .first()
         .is_some_and(|request| request.queued && request.is_ready())
@@ -5554,15 +5622,15 @@ fn is_connection_shutdown_error(error: &anyhow::Error) -> bool {
 mod tests {
     use super::{
         CT_EMULE_MISCOPTIONS1, CT_EMULE_MISCOPTIONS2, CT_EMULE_UDPPORTS, CT_EMULE_VERSION, CT_NAME,
-        CT_VERSION, DownloadWindowLimits, ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED,
-        EDONKEY_VERSION, EMULE_CRYPT_REQUESTS, EMULE_CRYPT_SUPPORTS,
-        EMULE_ENCRYPTION_METHOD_OBFUSCATION, EMULE_PROTOCOL_VERSION,
+        CT_VERSION, DownloadSessionOptions, DownloadWindowLimits,
+        ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, EDONKEY_VERSION, EMULE_CRYPT_REQUESTS,
+        EMULE_CRYPT_SUPPORTS, EMULE_ENCRYPTION_METHOD_OBFUSCATION, EMULE_PROTOCOL_VERSION,
         EMULE_TCP_CRYPT_MAGIC_REQUESTER, EMULE_TCP_CRYPT_MAGIC_SERVER, EMULE_TCP_CRYPT_MAGIC_SYNC,
-        EMULE_VERSION_SHORT, Ed2kHelloIdentity, Ed2kPeerConnectMode, Ed2kPeerDownloadOutcome,
-        Ed2kPeerSecureIdentState, Ed2kSecureIdent, Ed2kTransport, Ed2kTransportMode,
-        FirewallCheckUdpRequest, HELLO_NICKNAME, OP_EDONKEYPROT, OP_EMULEINFO, OP_EMULEINFOANSWER,
-        OP_EMULEPROT, OP_FILESTATUS, OP_FWCHECKUDPREQ, OP_HELLO, OP_HELLOANSWER,
-        OP_REQFILENAMEANSWER, OP_REQUESTPARTS, OP_SECIDENTSTATE, TAGTYPE_UINT32,
+        EMULE_VERSION_SHORT, Ed2kHelloIdentity, Ed2kPeerConnectMode, Ed2kPeerDownloadOptions,
+        Ed2kPeerDownloadOutcome, Ed2kPeerSecureIdentState, Ed2kSecureIdent, Ed2kTransport,
+        Ed2kTransportMode, FirewallCheckUdpRequest, HELLO_NICKNAME, OP_EDONKEYPROT, OP_EMULEINFO,
+        OP_EMULEINFOANSWER, OP_EMULEPROT, OP_FILESTATUS, OP_FWCHECKUDPREQ, OP_HELLO,
+        OP_HELLOANSWER, OP_REQFILENAMEANSWER, OP_REQUESTPARTS, OP_SECIDENTSTATE, TAGTYPE_UINT32,
         begin_secure_ident_probe, build_hello_responses, connect_callback_peer,
         decode_incoming_obfuscation_header, decode_peer_payload, decode_public_key_payload,
         decode_request_parts_payload, decode_secident_state, derive_obfuscation_key,
@@ -5608,6 +5676,56 @@ mod tests {
         net::{TcpListener, TcpStream},
         sync::{Mutex, RwLock},
     };
+
+    macro_rules! download_file_from_peer_test {
+        (
+            $bind_ip:expr,
+            $peer:expr,
+            $hello_identity:expr,
+            $secure_ident:expr,
+            $transfer_runtime:expr,
+            $canonical_name:expr,
+            $file_size:expr,
+            $timeout:expr $(,)?
+        ) => {
+            download_file_from_peer(Ed2kPeerDownloadOptions {
+                bind_ip: $bind_ip,
+                peer: $peer,
+                hello_identity: $hello_identity,
+                secure_ident: $secure_ident,
+                transfer_runtime: $transfer_runtime,
+                canonical_name: $canonical_name,
+                file_size: $file_size,
+                timeout: $timeout,
+            })
+        };
+    }
+
+    macro_rules! handle_connection_test {
+        (
+            $stream:expr,
+            $peer_addr:expr,
+            $dht:expr,
+            $server_state:expr,
+            $kad_firewall:expr,
+            $secure_ident:expr,
+            $transfer_runtime:expr,
+            $hello_identity:expr $(,)?
+        ) => {
+            super::handle_connection(
+                $stream,
+                $peer_addr,
+                super::Ed2kConnectionContext {
+                    dht: $dht,
+                    server_state: $server_state,
+                    kad_firewall: $kad_firewall,
+                    secure_ident: $secure_ident,
+                    transfer_runtime: $transfer_runtime,
+                    hello_identity: $hello_identity,
+                },
+            )
+        };
+    }
 
     #[test]
     fn firewall_check_udp_request_roundtrip() {
@@ -6744,7 +6862,7 @@ mod tests {
             stream.write_all(&filename_answer).await.unwrap();
         });
 
-        let result = download_file_from_peer(
+        let result = download_file_from_peer_test!(
             Ipv4Addr::LOCALHOST,
             &Ed2kFoundSource {
                 file_hash,
@@ -6912,7 +7030,7 @@ mod tests {
             stream.write_all(&second_fragment).await.unwrap();
         });
 
-        let result = download_file_from_peer(
+        let result = download_file_from_peer_test!(
             Ipv4Addr::LOCALHOST,
             &Ed2kFoundSource {
                 file_hash,
@@ -7060,7 +7178,7 @@ mod tests {
             stream.write_all(&packet).await.unwrap();
         });
 
-        let result = download_file_from_peer(
+        let result = download_file_from_peer_test!(
             Ipv4Addr::LOCALHOST,
             &Ed2kFoundSource {
                 file_hash,
@@ -7232,7 +7350,7 @@ mod tests {
             stream.write_all(&second_fragment).await.unwrap();
         });
 
-        let result = download_file_from_peer(
+        let result = download_file_from_peer_test!(
             Ipv4Addr::LOCALHOST,
             &Ed2kFoundSource {
                 file_hash,
@@ -7406,7 +7524,7 @@ mod tests {
             transport.write_all(&second_fragment).await.unwrap();
         });
 
-        let result = download_file_from_peer(
+        let result = download_file_from_peer_test!(
             Ipv4Addr::LOCALHOST,
             &Ed2kFoundSource {
                 file_hash,
@@ -7573,7 +7691,7 @@ mod tests {
             stream.write_all(&sending_part).await.unwrap();
         });
 
-        let result = download_file_from_peer(
+        let result = download_file_from_peer_test!(
             Ipv4Addr::LOCALHOST,
             &Ed2kFoundSource {
                 file_hash,
@@ -7850,7 +7968,7 @@ mod tests {
             }
         });
 
-        let result = download_file_from_peer(
+        let result = download_file_from_peer_test!(
             Ipv4Addr::LOCALHOST,
             &Ed2kFoundSource {
                 file_hash,
@@ -7968,7 +8086,7 @@ mod tests {
             drop(stream);
         });
 
-        let result = download_file_from_peer(
+        let result = download_file_from_peer_test!(
             Ipv4Addr::LOCALHOST,
             &Ed2kFoundSource {
                 file_hash,
@@ -8143,7 +8261,7 @@ mod tests {
             stream.write_all(&sending_part).await.unwrap();
         });
 
-        let result = download_file_from_peer(
+        let result = download_file_from_peer_test!(
             Ipv4Addr::LOCALHOST,
             &Ed2kFoundSource {
                 file_hash,
@@ -8399,10 +8517,10 @@ mod tests {
                 .unwrap(),
         );
 
-        let result = drive_download_session(
-            &mut transport,
-            remote_addr,
-            Ed2kHelloIdentity {
+        let result = drive_download_session(DownloadSessionOptions {
+            transport: &mut transport,
+            peer_addr: remote_addr,
+            hello_identity: Ed2kHelloIdentity {
                 user_hash: [0x11; 16],
                 client_id: 0,
                 tcp_port: 41001,
@@ -8412,15 +8530,15 @@ mod tests {
                 connect_options: emule_connect_options(false),
                 direct_udp_callback: false,
             },
-            secure_ident.as_ref(),
-            &transfer_runtime,
+            secure_ident: secure_ident.as_ref(),
+            transfer_runtime: &transfer_runtime,
             file_hash,
-            &file_hash_hex,
-            Duration::from_secs(3),
-            true,
-            true,
-            true,
-        )
+            file_hash_hex: &file_hash_hex,
+            timeout: Duration::from_secs(3),
+            send_initial_requests: true,
+            initial_hello_complete: true,
+            initial_secure_ident_started: true,
+        })
         .await
         .unwrap();
 
@@ -8602,7 +8720,7 @@ mod tests {
             stream.write_all(&sending_part).await.unwrap();
         });
 
-        let result = download_file_from_peer(
+        let result = download_file_from_peer_test!(
             Ipv4Addr::LOCALHOST,
             &Ed2kFoundSource {
                 file_hash,
@@ -8766,7 +8884,7 @@ mod tests {
             let secure_ident = Arc::clone(&secure_ident);
             async move {
                 let (stream, remote_addr) = listener.accept().await.unwrap();
-                super::handle_connection(
+                handle_connection_test!(
                     stream,
                     remote_addr,
                     &dht,
@@ -8939,7 +9057,7 @@ mod tests {
             let secure_ident = Arc::clone(&secure_ident);
             async move {
                 let (stream, remote_addr) = listener.accept().await.unwrap();
-                super::handle_connection(
+                handle_connection_test!(
                     stream,
                     remote_addr,
                     &dht,
@@ -9119,7 +9237,7 @@ mod tests {
             let secure_ident = Arc::clone(&secure_ident);
             async move {
                 let (stream, remote_addr) = listener.accept().await.unwrap();
-                super::handle_connection(
+                handle_connection_test!(
                     stream,
                     remote_addr,
                     &dht,
@@ -9270,7 +9388,7 @@ mod tests {
                     let kad_firewall = Arc::clone(&kad_firewall);
                     let secure_ident = Arc::clone(&secure_ident);
                     async move {
-                        super::handle_connection(
+                        handle_connection_test!(
                             first_stream,
                             first_addr,
                             &dht,
@@ -9291,7 +9409,7 @@ mod tests {
                     let kad_firewall = Arc::clone(&kad_firewall);
                     let secure_ident = Arc::clone(&secure_ident);
                     async move {
-                        super::handle_connection(
+                        handle_connection_test!(
                             second_stream,
                             second_addr,
                             &dht,
@@ -9463,7 +9581,7 @@ mod tests {
                     let kad_firewall = Arc::clone(&kad_firewall);
                     let secure_ident = Arc::clone(&secure_ident);
                     async move {
-                        super::handle_connection(
+                        handle_connection_test!(
                             first_stream,
                             first_addr,
                             &dht,
@@ -9484,7 +9602,7 @@ mod tests {
                     let kad_firewall = Arc::clone(&kad_firewall);
                     let secure_ident = Arc::clone(&secure_ident);
                     async move {
-                        super::handle_connection(
+                        handle_connection_test!(
                             second_stream,
                             second_addr,
                             &dht,
@@ -9664,7 +9782,7 @@ mod tests {
                     let kad_firewall = Arc::clone(&kad_firewall);
                     let secure_ident = Arc::clone(&secure_ident);
                     async move {
-                        super::handle_connection(
+                        handle_connection_test!(
                             first_stream,
                             first_addr,
                             &dht,
@@ -9685,7 +9803,7 @@ mod tests {
                     let kad_firewall = Arc::clone(&kad_firewall);
                     let secure_ident = Arc::clone(&secure_ident);
                     async move {
-                        super::handle_connection(
+                        handle_connection_test!(
                             second_stream,
                             second_addr,
                             &dht,
@@ -9873,7 +9991,7 @@ mod tests {
                     let kad_firewall = Arc::clone(&kad_firewall);
                     let secure_ident = Arc::clone(&secure_ident);
                     tokio::spawn(async move {
-                        let _ = super::handle_connection(
+                        let _ = handle_connection_test!(
                             stream,
                             addr,
                             &dht,
@@ -10095,7 +10213,7 @@ mod tests {
                     let kad_firewall = Arc::clone(&kad_firewall);
                     let secure_ident = Arc::clone(&secure_ident);
                     tokio::spawn(async move {
-                        let _ = super::handle_connection(
+                        let _ = handle_connection_test!(
                             stream,
                             addr,
                             &dht,
@@ -10377,7 +10495,7 @@ mod tests {
                     let kad_firewall = Arc::clone(&kad_firewall);
                     let secure_ident = Arc::clone(&secure_ident);
                     tokio::spawn(async move {
-                        let _ = super::handle_connection(
+                        let _ = handle_connection_test!(
                             stream,
                             addr,
                             &dht,
@@ -10729,7 +10847,7 @@ mod tests {
             direct_udp_callback: false,
         };
 
-        let first_result = download_file_from_peer(
+        let first_result = download_file_from_peer_test!(
             Ipv4Addr::LOCALHOST,
             &source,
             hello_identity,
@@ -10751,7 +10869,7 @@ mod tests {
         );
         assert_eq!(partial_manifest.pieces[0].bytes_written, split as u64);
 
-        let resumed_result = download_file_from_peer(
+        let resumed_result = download_file_from_peer_test!(
             Ipv4Addr::LOCALHOST,
             &source,
             hello_identity,
@@ -10878,7 +10996,7 @@ mod tests {
             stream.write_all(&sending_part).await.unwrap();
         });
 
-        let result = download_file_from_peer(
+        let result = download_file_from_peer_test!(
             Ipv4Addr::LOCALHOST,
             &Ed2kFoundSource {
                 file_hash,
@@ -11083,7 +11201,7 @@ mod tests {
             stream.write_all(&late_fragment).await.unwrap();
         });
 
-        let result = download_file_from_peer(
+        let result = download_file_from_peer_test!(
             Ipv4Addr::LOCALHOST,
             &Ed2kFoundSource {
                 file_hash,
@@ -11299,7 +11417,7 @@ mod tests {
             stream.write_all(&early_fragment).await.unwrap();
         });
 
-        let result = download_file_from_peer(
+        let result = download_file_from_peer_test!(
             Ipv4Addr::LOCALHOST,
             &Ed2kFoundSource {
                 file_hash,
@@ -11527,7 +11645,7 @@ mod tests {
             stream.write_all(&early_fragment).await.unwrap();
         });
 
-        let result = download_file_from_peer(
+        let result = download_file_from_peer_test!(
             Ipv4Addr::LOCALHOST,
             &Ed2kFoundSource {
                 file_hash,
