@@ -399,537 +399,112 @@ async fn listener_hashset_request2_returns_aich_when_available() {
 
 #[tokio::test]
 async fn listener_upload_queue_promotes_waiter_after_disconnect() {
-    let payload = vec![0x51; 4096];
-    let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
-    let file_hash_hex = file_hash.to_string();
-    let root = unique_test_dir("ed2k-upload-listener-queue-disconnect");
-    let transfer_runtime = Arc::new(Ed2kTransferRuntime::load_or_create(&root).unwrap());
-    transfer_runtime
-        .configure_upload_queue(Ed2kUploadQueueConfig {
-            active_slots: 1,
-            waiting_capacity: 8,
-            waiting_timeout: Duration::from_secs(30),
-            granted_timeout: Duration::from_secs(30),
-            upload_timeout: Duration::from_secs(30),
-        })
+    let mut runtime = ListenerTestRuntime::new(
+        "ed2k-upload-listener-queue-disconnect",
+        listener_test_identity(0x22, 0x1234_5678, 41001, 41000),
+        [0x3D; 16],
+        0x1122_3344,
+    )
+    .await;
+    runtime.use_one_slot_upload_queue().await;
+    let file = runtime
+        .seed_verified_upload_file("queued.txt", vec![0x51; 4096])
         .await;
-    let job = new_transfer_job(file_hash, "queued.txt".to_string(), payload.len() as u64);
-    transfer_runtime.ensure_job(&job).await.unwrap();
-    transfer_runtime
-        .store_md4_hashset(&file_hash_hex, Vec::new())
-        .await
-        .unwrap();
-    transfer_runtime
-        .store_piece_data(&file_hash_hex, 0, &payload)
-        .await
-        .unwrap();
+    let server = runtime.spawn_listener_connections(2);
 
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-    let peer_addr = listener.local_addr().unwrap();
-    let dht = DhtNode::new(DhtConfig {
-        bind_addr: "127.0.0.1:0".parse().unwrap(),
-        node_id: NodeId::from_bytes([0x3D; 16]),
-        udp_key: 0x1122_3344,
-        ..DhtConfig::default()
-    })
-    .await
-    .unwrap();
-    let server_state = Arc::new(RwLock::new(Ed2kServerState::default()));
-    let kad_firewall = Arc::new(Mutex::new(KadFirewallState::default()));
-    let secure_ident = Arc::new(
-        Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap()).unwrap(),
-    );
-    let hello_identity = Ed2kHelloIdentity {
-        user_hash: [0x22; 16],
-        client_id: 0x1234_5678,
-        tcp_port: 41001,
-        udp_port: 41000,
-        server_ip: 0,
-        server_port: 0,
-        connect_options: emule_connect_options(false),
-        direct_udp_callback: false,
-    };
-
-    let server = tokio::spawn({
-        let dht = dht.clone();
-        let transfer_runtime = Arc::clone(&transfer_runtime);
-        let server_state = Arc::clone(&server_state);
-        let kad_firewall = Arc::clone(&kad_firewall);
-        let secure_ident = Arc::clone(&secure_ident);
-        async move {
-            let (first_stream, first_addr) = listener.accept().await.unwrap();
-            let first = tokio::spawn({
-                let dht = dht.clone();
-                let transfer_runtime = Arc::clone(&transfer_runtime);
-                let server_state = Arc::clone(&server_state);
-                let kad_firewall = Arc::clone(&kad_firewall);
-                let secure_ident = Arc::clone(&secure_ident);
-                async move {
-                    handle_connection_test!(
-                        first_stream,
-                        first_addr,
-                        &dht,
-                        &server_state,
-                        &kad_firewall,
-                        &secure_ident,
-                        &transfer_runtime,
-                        hello_identity,
-                    )
-                    .await
-                }
-            });
-
-            let (second_stream, second_addr) = listener.accept().await.unwrap();
-            let second = tokio::spawn({
-                let transfer_runtime = Arc::clone(&transfer_runtime);
-                let server_state = Arc::clone(&server_state);
-                let kad_firewall = Arc::clone(&kad_firewall);
-                let secure_ident = Arc::clone(&secure_ident);
-                async move {
-                    handle_connection_test!(
-                        second_stream,
-                        second_addr,
-                        &dht,
-                        &server_state,
-                        &kad_firewall,
-                        &secure_ident,
-                        &transfer_runtime,
-                        hello_identity,
-                    )
-                    .await
-                }
-            });
-
-            first.await.unwrap().unwrap();
-            second.await.unwrap().unwrap();
-        }
-    });
-
-    let first_identity = Ed2kHelloIdentity {
-        user_hash: [0x31; 16],
-        client_id: 0x0102_0304,
-        tcp_port: 4661,
-        udp_port: 4665,
-        server_ip: 0,
-        server_port: 0,
-        connect_options: emule_connect_options(false),
-        direct_udp_callback: false,
-    };
-    let mut first_stream = TcpStream::connect(peer_addr).await.unwrap();
-    first_stream
-        .write_all(&encode_hello_request(first_identity))
-        .await
-        .unwrap();
-    let _ = read_until_opcode(&mut first_stream, OP_EDONKEYPROT, OP_HELLOANSWER).await;
-    first_stream
-        .write_all(&super::encode_start_upload_req(&file_hash))
-        .await
-        .unwrap();
-    let _ = read_until_opcode(&mut first_stream, OP_EDONKEYPROT, super::OP_ACCEPTUPLOADREQ).await;
-
-    let second_identity = Ed2kHelloIdentity {
-        user_hash: [0x32; 16],
-        client_id: 0x0506_0708,
-        tcp_port: 4662,
-        udp_port: 4666,
-        server_ip: 0,
-        server_port: 0,
-        connect_options: emule_connect_options(false),
-        direct_udp_callback: false,
-    };
-    let mut second_stream = TcpStream::connect(peer_addr).await.unwrap();
-    second_stream
-        .write_all(&encode_hello_request(second_identity))
-        .await
-        .unwrap();
-    let _ = read_until_opcode(&mut second_stream, OP_EDONKEYPROT, OP_HELLOANSWER).await;
-    second_stream
-        .write_all(&super::encode_start_upload_req(&file_hash))
-        .await
-        .unwrap();
-    let queue_ranking =
-        read_until_opcode(&mut second_stream, OP_EMULEPROT, super::OP_QUEUERANKING).await;
-    assert_eq!(u16::from_le_bytes([queue_ranking[6], queue_ranking[7]]), 1);
+    let first_stream = connect_peer_until_upload_accepted(
+        runtime.peer_addr,
+        listener_test_identity(0x31, 0x0102_0304, 4661, 4665),
+        &file.file_hash,
+    )
+    .await;
+    let mut second_stream = connect_peer_until_queue_rank(
+        runtime.peer_addr,
+        listener_test_identity(0x32, 0x0506_0708, 4662, 4666),
+        &file.file_hash,
+        1,
+    )
+    .await;
 
     drop(first_stream);
 
-    let promoted = tokio::time::timeout(
-        Duration::from_secs(3),
-        read_until_opcode(
-            &mut second_stream,
-            OP_EDONKEYPROT,
-            super::OP_ACCEPTUPLOADREQ,
-        ),
-    )
-    .await
-    .unwrap();
-    assert_eq!(promoted.len(), 6);
+    wait_for_upload_accept_timeout(&mut second_stream).await;
     drop(second_stream);
     server.await.unwrap();
 }
 
 #[tokio::test]
 async fn listener_upload_queue_promotes_waiter_after_cancel_transfer() {
-    let payload = vec![0x61; 4096];
-    let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
-    let file_hash_hex = file_hash.to_string();
-    let root = unique_test_dir("ed2k-upload-listener-queue-cancel");
-    let transfer_runtime = Arc::new(Ed2kTransferRuntime::load_or_create(&root).unwrap());
-    transfer_runtime
-        .configure_upload_queue(Ed2kUploadQueueConfig {
-            active_slots: 1,
-            waiting_capacity: 8,
-            waiting_timeout: Duration::from_secs(30),
-            granted_timeout: Duration::from_secs(30),
-            upload_timeout: Duration::from_secs(30),
-        })
+    let mut runtime = ListenerTestRuntime::new(
+        "ed2k-upload-listener-queue-cancel",
+        listener_test_identity(0x23, 0x2233_4455, 41002, 41003),
+        [0x3E; 16],
+        0x5566_7788,
+    )
+    .await;
+    runtime.use_one_slot_upload_queue().await;
+    let file = runtime
+        .seed_verified_upload_file("queued.txt", vec![0x61; 4096])
         .await;
-    let job = new_transfer_job(file_hash, "queued.txt".to_string(), payload.len() as u64);
-    transfer_runtime.ensure_job(&job).await.unwrap();
-    transfer_runtime
-        .store_md4_hashset(&file_hash_hex, Vec::new())
-        .await
-        .unwrap();
-    transfer_runtime
-        .store_piece_data(&file_hash_hex, 0, &payload)
-        .await
-        .unwrap();
+    let server = runtime.spawn_listener_connections(2);
 
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-    let peer_addr = listener.local_addr().unwrap();
-    let dht = DhtNode::new(DhtConfig {
-        bind_addr: "127.0.0.1:0".parse().unwrap(),
-        node_id: NodeId::from_bytes([0x3E; 16]),
-        udp_key: 0x5566_7788,
-        ..DhtConfig::default()
-    })
-    .await
-    .unwrap();
-    let server_state = Arc::new(RwLock::new(Ed2kServerState::default()));
-    let kad_firewall = Arc::new(Mutex::new(KadFirewallState::default()));
-    let secure_ident = Arc::new(
-        Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap()).unwrap(),
-    );
-    let hello_identity = Ed2kHelloIdentity {
-        user_hash: [0x23; 16],
-        client_id: 0x2233_4455,
-        tcp_port: 41002,
-        udp_port: 41003,
-        server_ip: 0,
-        server_port: 0,
-        connect_options: emule_connect_options(false),
-        direct_udp_callback: false,
-    };
+    let mut first_stream = connect_peer_until_upload_accepted(
+        runtime.peer_addr,
+        listener_test_identity(0x41, 0x1111_1111, 4661, 4665),
+        &file.file_hash,
+    )
+    .await;
+    let mut second_stream = connect_peer_until_queue_rank(
+        runtime.peer_addr,
+        listener_test_identity(0x42, 0x2222_2222, 4662, 4666),
+        &file.file_hash,
+        1,
+    )
+    .await;
 
-    let server = tokio::spawn({
-        let dht = dht.clone();
-        let transfer_runtime = Arc::clone(&transfer_runtime);
-        let server_state = Arc::clone(&server_state);
-        let kad_firewall = Arc::clone(&kad_firewall);
-        let secure_ident = Arc::clone(&secure_ident);
-        async move {
-            let (first_stream, first_addr) = listener.accept().await.unwrap();
-            let first = tokio::spawn({
-                let dht = dht.clone();
-                let transfer_runtime = Arc::clone(&transfer_runtime);
-                let server_state = Arc::clone(&server_state);
-                let kad_firewall = Arc::clone(&kad_firewall);
-                let secure_ident = Arc::clone(&secure_ident);
-                async move {
-                    handle_connection_test!(
-                        first_stream,
-                        first_addr,
-                        &dht,
-                        &server_state,
-                        &kad_firewall,
-                        &secure_ident,
-                        &transfer_runtime,
-                        hello_identity,
-                    )
-                    .await
-                }
-            });
-
-            let (second_stream, second_addr) = listener.accept().await.unwrap();
-            let second = tokio::spawn({
-                let transfer_runtime = Arc::clone(&transfer_runtime);
-                let server_state = Arc::clone(&server_state);
-                let kad_firewall = Arc::clone(&kad_firewall);
-                let secure_ident = Arc::clone(&secure_ident);
-                async move {
-                    handle_connection_test!(
-                        second_stream,
-                        second_addr,
-                        &dht,
-                        &server_state,
-                        &kad_firewall,
-                        &secure_ident,
-                        &transfer_runtime,
-                        hello_identity,
-                    )
-                    .await
-                }
-            });
-
-            first.await.unwrap().unwrap();
-            second.await.unwrap().unwrap();
-        }
-    });
-
-    let first_identity = Ed2kHelloIdentity {
-        user_hash: [0x41; 16],
-        client_id: 0x1111_1111,
-        tcp_port: 4661,
-        udp_port: 4665,
-        server_ip: 0,
-        server_port: 0,
-        connect_options: emule_connect_options(false),
-        direct_udp_callback: false,
-    };
-    let mut first_stream = TcpStream::connect(peer_addr).await.unwrap();
-    first_stream
-        .write_all(&encode_hello_request(first_identity))
-        .await
-        .unwrap();
-    let _ = read_until_opcode(&mut first_stream, OP_EDONKEYPROT, OP_HELLOANSWER).await;
-    first_stream
-        .write_all(&super::encode_start_upload_req(&file_hash))
-        .await
-        .unwrap();
-    let _ = read_until_opcode(&mut first_stream, OP_EDONKEYPROT, super::OP_ACCEPTUPLOADREQ).await;
-
-    let second_identity = Ed2kHelloIdentity {
-        user_hash: [0x42; 16],
-        client_id: 0x2222_2222,
-        tcp_port: 4662,
-        udp_port: 4666,
-        server_ip: 0,
-        server_port: 0,
-        connect_options: emule_connect_options(false),
-        direct_udp_callback: false,
-    };
-    let mut second_stream = TcpStream::connect(peer_addr).await.unwrap();
-    second_stream
-        .write_all(&encode_hello_request(second_identity))
-        .await
-        .unwrap();
-    let _ = read_until_opcode(&mut second_stream, OP_EDONKEYPROT, OP_HELLOANSWER).await;
-    second_stream
-        .write_all(&super::encode_start_upload_req(&file_hash))
-        .await
-        .unwrap();
-    let queue_ranking =
-        read_until_opcode(&mut second_stream, OP_EMULEPROT, super::OP_QUEUERANKING).await;
-    assert_eq!(u16::from_le_bytes([queue_ranking[6], queue_ranking[7]]), 1);
-
-    first_stream
-        .write_all(&encode_packet(
-            OP_EDONKEYPROT,
-            super::OP_CANCELTRANSFER,
-            &[],
-        ))
-        .await
-        .unwrap();
+    send_cancel_transfer(&mut first_stream).await;
     drop(first_stream);
 
-    let promoted = tokio::time::timeout(
-        Duration::from_secs(3),
-        read_until_opcode(
-            &mut second_stream,
-            OP_EDONKEYPROT,
-            super::OP_ACCEPTUPLOADREQ,
-        ),
-    )
-    .await
-    .unwrap();
-    assert_eq!(promoted.len(), 6);
+    wait_for_upload_accept_timeout(&mut second_stream).await;
     drop(second_stream);
     server.await.unwrap();
 }
 
 #[tokio::test]
 async fn listener_upload_queue_refreshes_waiting_rank_before_promotion() {
-    let payload = vec![0x71; 4096];
-    let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
-    let file_hash_hex = file_hash.to_string();
-    let root = unique_test_dir("ed2k-upload-listener-queue-refresh");
-    let transfer_runtime = Arc::new(Ed2kTransferRuntime::load_or_create(&root).unwrap());
-    transfer_runtime
-        .configure_upload_queue(Ed2kUploadQueueConfig {
-            active_slots: 1,
-            waiting_capacity: 8,
-            waiting_timeout: Duration::from_secs(30),
-            granted_timeout: Duration::from_secs(30),
-            upload_timeout: Duration::from_secs(30),
-        })
-        .await;
-    let job = new_transfer_job(file_hash, "queued.txt".to_string(), payload.len() as u64);
-    transfer_runtime.ensure_job(&job).await.unwrap();
-    transfer_runtime
-        .store_md4_hashset(&file_hash_hex, Vec::new())
-        .await
-        .unwrap();
-    transfer_runtime
-        .store_piece_data(&file_hash_hex, 0, &payload)
-        .await
-        .unwrap();
-
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-    let peer_addr = listener.local_addr().unwrap();
-    let dht = DhtNode::new(DhtConfig {
-        bind_addr: "127.0.0.1:0".parse().unwrap(),
-        node_id: NodeId::from_bytes([0x4E; 16]),
-        udp_key: 0x2233_4455,
-        ..DhtConfig::default()
-    })
-    .await
-    .unwrap();
-    let server_state = Arc::new(RwLock::new(Ed2kServerState::default()));
-    let kad_firewall = Arc::new(Mutex::new(KadFirewallState::default()));
-    let secure_ident = Arc::new(
-        Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap()).unwrap(),
-    );
-    let hello_identity = Ed2kHelloIdentity {
-        user_hash: [0x51; 16],
-        client_id: 0x3141_5926,
-        tcp_port: 41002,
-        udp_port: 41003,
-        server_ip: 0,
-        server_port: 0,
-        connect_options: emule_connect_options(false),
-        direct_udp_callback: false,
-    };
-
-    let server = tokio::spawn({
-        let dht = dht.clone();
-        let transfer_runtime = Arc::clone(&transfer_runtime);
-        let server_state = Arc::clone(&server_state);
-        let kad_firewall = Arc::clone(&kad_firewall);
-        let secure_ident = Arc::clone(&secure_ident);
-        async move {
-            let (first_stream, first_addr) = listener.accept().await.unwrap();
-            let first = tokio::spawn({
-                let dht = dht.clone();
-                let transfer_runtime = Arc::clone(&transfer_runtime);
-                let server_state = Arc::clone(&server_state);
-                let kad_firewall = Arc::clone(&kad_firewall);
-                let secure_ident = Arc::clone(&secure_ident);
-                async move {
-                    handle_connection_test!(
-                        first_stream,
-                        first_addr,
-                        &dht,
-                        &server_state,
-                        &kad_firewall,
-                        &secure_ident,
-                        &transfer_runtime,
-                        hello_identity,
-                    )
-                    .await
-                }
-            });
-
-            let (second_stream, second_addr) = listener.accept().await.unwrap();
-            let second = tokio::spawn({
-                let transfer_runtime = Arc::clone(&transfer_runtime);
-                let server_state = Arc::clone(&server_state);
-                let kad_firewall = Arc::clone(&kad_firewall);
-                let secure_ident = Arc::clone(&secure_ident);
-                async move {
-                    handle_connection_test!(
-                        second_stream,
-                        second_addr,
-                        &dht,
-                        &server_state,
-                        &kad_firewall,
-                        &secure_ident,
-                        &transfer_runtime,
-                        hello_identity,
-                    )
-                    .await
-                }
-            });
-
-            first.await.unwrap().unwrap();
-            second.await.unwrap().unwrap();
-        }
-    });
-
-    let first_identity = Ed2kHelloIdentity {
-        user_hash: [0x61; 16],
-        client_id: 0x1111_2222,
-        tcp_port: 4661,
-        udp_port: 4665,
-        server_ip: 0,
-        server_port: 0,
-        connect_options: emule_connect_options(false),
-        direct_udp_callback: false,
-    };
-    let mut first_stream = TcpStream::connect(peer_addr).await.unwrap();
-    first_stream
-        .write_all(&encode_hello_request(first_identity))
-        .await
-        .unwrap();
-    let _ = read_until_opcode(&mut first_stream, OP_EDONKEYPROT, OP_HELLOANSWER).await;
-    first_stream
-        .write_all(&super::encode_start_upload_req(&file_hash))
-        .await
-        .unwrap();
-    let _ = read_until_opcode(&mut first_stream, OP_EDONKEYPROT, super::OP_ACCEPTUPLOADREQ).await;
-
-    let second_identity = Ed2kHelloIdentity {
-        user_hash: [0x62; 16],
-        client_id: 0x2222_3333,
-        tcp_port: 4662,
-        udp_port: 4666,
-        server_ip: 0,
-        server_port: 0,
-        connect_options: emule_connect_options(false),
-        direct_udp_callback: false,
-    };
-    let mut second_stream = TcpStream::connect(peer_addr).await.unwrap();
-    second_stream
-        .write_all(&encode_hello_request(second_identity))
-        .await
-        .unwrap();
-    let _ = read_until_opcode(&mut second_stream, OP_EDONKEYPROT, OP_HELLOANSWER).await;
-    second_stream
-        .write_all(&super::encode_start_upload_req(&file_hash))
-        .await
-        .unwrap();
-    let first_rank =
-        read_until_opcode(&mut second_stream, OP_EMULEPROT, super::OP_QUEUERANKING).await;
-    assert_eq!(u16::from_le_bytes([first_rank[6], first_rank[7]]), 1);
-
-    let refreshed = tokio::time::timeout(
-        Duration::from_secs(2),
-        read_until_opcode(&mut second_stream, OP_EMULEPROT, super::OP_QUEUERANKING),
+    let mut runtime = ListenerTestRuntime::new(
+        "ed2k-upload-listener-queue-refresh",
+        listener_test_identity(0x51, 0x3141_5926, 41002, 41003),
+        [0x4E; 16],
+        0x2233_4455,
     )
-    .await
-    .unwrap();
-    assert_eq!(u16::from_le_bytes([refreshed[6], refreshed[7]]), 1);
+    .await;
+    runtime.use_one_slot_upload_queue().await;
+    let file = runtime
+        .seed_verified_upload_file("queued.txt", vec![0x71; 4096])
+        .await;
+    let server = runtime.spawn_listener_connections(2);
 
-    first_stream
-        .write_all(&encode_packet(
-            OP_EDONKEYPROT,
-            super::OP_CANCELTRANSFER,
-            &[],
-        ))
-        .await
-        .unwrap();
+    let mut first_stream = connect_peer_until_upload_accepted(
+        runtime.peer_addr,
+        listener_test_identity(0x61, 0x1111_2222, 4661, 4665),
+        &file.file_hash,
+    )
+    .await;
+    let mut second_stream = connect_peer_until_queue_rank(
+        runtime.peer_addr,
+        listener_test_identity(0x62, 0x2222_3333, 4662, 4666),
+        &file.file_hash,
+        1,
+    )
+    .await;
+
+    wait_for_queue_rank_timeout(&mut second_stream, 1).await;
+
+    send_cancel_transfer(&mut first_stream).await;
     drop(first_stream);
 
-    let promoted = tokio::time::timeout(
-        Duration::from_secs(3),
-        read_until_opcode(
-            &mut second_stream,
-            OP_EDONKEYPROT,
-            super::OP_ACCEPTUPLOADREQ,
-        ),
-    )
-    .await
-    .unwrap();
-    assert_eq!(promoted.len(), 6);
+    wait_for_upload_accept_timeout(&mut second_stream).await;
     drop(second_stream);
     server.await.unwrap();
 }
