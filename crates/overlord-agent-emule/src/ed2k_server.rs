@@ -47,6 +47,7 @@ use crate::{
     kad_firewall::KadFirewallState,
 };
 
+mod active_callback;
 mod active_keyword;
 mod active_source;
 mod diagnostics;
@@ -58,6 +59,7 @@ mod search_expr;
 mod server_entry;
 mod tag_codec;
 mod udp;
+pub use active_callback::{Ed2kCallbackRequestOptions, request_callback_on_server};
 pub use active_keyword::{Ed2kKeywordSearchOptions, search_keyword_servers};
 pub use active_source::{
     Ed2kSourceSearchOptions, Ed2kUdpSourceSearchOptions, search_source_servers,
@@ -541,159 +543,6 @@ pub async fn request_callback_via_background_session(
                 .with_context(|| format!("timed out waiting for ED2K background callback response after {timeout:?}"))?
                 .context("ED2K background callback responder dropped")?;
             response.map_err(anyhow::Error::msg)
-        }
-    }
-}
-
-/// Requests an ED2K server callback for a LowID peer on one explicit server.
-///
-/// This keeps callback routing aligned with the server that reported the
-/// callback-only source whenever that provenance is available.
-/// Inputs for a focused ED2K server callback request.
-pub struct Ed2kCallbackRequestOptions<'a> {
-    pub bind_ip: Ipv4Addr,
-    pub config: &'a Ed2kConfig,
-    pub hello_identity: Ed2kHelloIdentity,
-    pub shared_catalog: &'a [Ed2kSharedEntry],
-    pub server_endpoint: SocketAddr,
-    pub client_id: u32,
-    pub timeout: Duration,
-    pub cancel: &'a CancellationToken,
-}
-
-pub async fn request_callback_on_server(options: Ed2kCallbackRequestOptions<'_>) -> Result<()> {
-    let Ed2kCallbackRequestOptions {
-        bind_ip,
-        config,
-        hello_identity,
-        shared_catalog,
-        server_endpoint,
-        client_id,
-        timeout,
-        cancel,
-    } = options;
-    let resolved_server = resolve_callback_server_entry(config, server_endpoint).await?;
-    let use_server_obfuscation =
-        should_use_server_obfuscation(hello_identity.connect_options, &resolved_server);
-    let login_identity =
-        login_identity_for_server_transport(hello_identity, use_server_obfuscation);
-    let transport_endpoint = resolved_server.transport_endpoint(use_server_obfuscation);
-    let mut session = ServerSession::connect(
-        bind_ip,
-        transport_endpoint,
-        Arc::new(RwLock::new(Ed2kServerState::default())),
-        "active_callback",
-        timeout,
-    )
-    .await?;
-    let login_payload = encode_login_request(login_identity);
-    if use_server_obfuscation {
-        let login_request = encode_packet(OP_LOGINREQUEST, &login_payload, false)?;
-        session
-            .negotiate_obfuscation_and_send(&login_request)
-            .await?;
-    } else {
-        session.send_packet(OP_LOGINREQUEST, &login_payload).await?;
-    }
-    session.set_phase(
-        ServerSessionPhase::AwaitingIdChange,
-        "login request sent; awaiting OP_IDCHANGE for callback request",
-    );
-    loop {
-        if cancel.is_cancelled() {
-            return Ok(());
-        }
-        let packet = tokio::time::timeout(timeout, session.read_packet())
-            .await
-            .with_context(|| {
-                format!("timed out waiting for ED2K callback-ready login on {transport_endpoint}")
-            })??;
-        let Some(packet) = packet else {
-            anyhow::bail!("ED2K server {transport_endpoint} closed before callback dispatch");
-        };
-        match packet.opcode {
-            OP_IDCHANGE => {
-                if packet.payload.len() < 4 {
-                    anyhow::bail!("short OP_IDCHANGE payload from {transport_endpoint}");
-                }
-                session.assigned_client_id =
-                    Some(u32::from_le_bytes(packet.payload[..4].try_into().unwrap()));
-                session.server_flags = (packet.payload.len() >= 8)
-                    .then(|| u32::from_le_bytes(packet.payload[4..8].try_into().unwrap()));
-                send_connected_server_startup(
-                    &mut session,
-                    &Arc::new(RwLock::new(shared_catalog.to_vec())),
-                    hello_identity.tcp_port,
-                )
-                .await?;
-                wait_for_offer_files_settle(&session).await;
-                session.set_phase(
-                    ServerSessionPhase::SearchActive,
-                    format!("dispatching callback request client_id={client_id}"),
-                );
-                session
-                    .send_packet(OP_CALLBACKREQUEST, &client_id.to_le_bytes())
-                    .await?;
-                info!(
-                    "sent ED2K targeted callback request client_id={} endpoint={} trace_id={} transport={}",
-                    client_id,
-                    session.endpoint,
-                    session.trace_id,
-                    if use_server_obfuscation {
-                        "obfuscated"
-                    } else {
-                        "plaintext"
-                    }
-                );
-                let callback_response_deadline =
-                    TokioInstant::now() + timeout.min(Duration::from_secs(5));
-                loop {
-                    if cancel.is_cancelled() {
-                        return Ok(());
-                    }
-                    let remaining = callback_response_deadline
-                        .checked_duration_since(TokioInstant::now())
-                        .unwrap_or_default();
-                    if remaining.is_zero() {
-                        session.set_phase(
-                            ServerSessionPhase::Completed,
-                            format!(
-                                "completed callback request client_id={client_id} without explicit failure"
-                            ),
-                        );
-                        return Ok(());
-                    }
-                    let packet = tokio::time::timeout(remaining, session.read_packet())
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "timed out waiting for ED2K callback response from {transport_endpoint}"
-                            )
-                        })??;
-                    let Some(packet) = packet else {
-                        anyhow::bail!(
-                            "ED2K server {transport_endpoint} closed after callback dispatch"
-                        );
-                    };
-                    match packet.opcode {
-                        OP_CALLBACK_FAIL => {
-                            anyhow::bail!(
-                                "ED2K server {transport_endpoint} reported callback failure for client_id={client_id}"
-                            );
-                        }
-                        OP_REJECT => {
-                            anyhow::bail!(
-                                "ED2K server {transport_endpoint} rejected the callback request"
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            OP_REJECT => {
-                anyhow::bail!("ED2K server {transport_endpoint} rejected the callback request");
-            }
-            _ => {}
         }
     }
 }
