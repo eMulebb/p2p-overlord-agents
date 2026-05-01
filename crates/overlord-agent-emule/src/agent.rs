@@ -48,10 +48,7 @@ use crate::config::EmuleAgentConfig;
 use crate::ed2k_server::{Ed2kFoundSource, Ed2kServerSearchHandle, Ed2kServerState};
 #[cfg(test)]
 use crate::ed2k_tcp::Ed2kPeerDownloadOutcome;
-use crate::ed2k_tcp::{
-    Ed2kHelloIdentity, Ed2kSecureIdent, FirewallCheckUdpRequest, emule_connect_options,
-    enrich_hello_identity, request_udp_firewall_check,
-};
+use crate::ed2k_tcp::{Ed2kHelloIdentity, Ed2kSecureIdent};
 use crate::ed2k_transfer::{Ed2kLocalIngestSummary, Ed2kSharedCatalog, Ed2kTransferRuntime};
 use crate::kad_firewall::KadFirewallState;
 use crate::kad_store::{KadLocalStore, KadLocalStoreConfig};
@@ -60,6 +57,7 @@ use crate::snoop_queue::SnoopQueue;
 
 mod activity;
 mod background_ed2k;
+mod background_firewall;
 mod background_routing;
 mod background_tasks;
 mod control_runtime;
@@ -104,7 +102,6 @@ use self::ed2k_search::{
     kad_source_result_to_ed2k_found_source, select_ed2k_keyword_metadata,
     select_kad_keyword_metadata,
 };
-use self::kad_firewall_runtime::{active_udp_firewall_ports, select_udp_firewall_helpers};
 use self::kad_runtime::build_hello_request;
 #[cfg(test)]
 use self::kad_runtime::current_tcp_firewalled;
