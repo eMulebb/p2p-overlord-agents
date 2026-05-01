@@ -32,6 +32,8 @@ mod result_decoder;
 mod search_expr;
 mod server_entry;
 mod session;
+mod session_driver;
+mod source_utils;
 mod startup;
 mod tag_codec;
 mod types;
@@ -56,9 +58,6 @@ pub use background::{
 use diagnostics::{dump_ed2k_server_meta, dump_ed2k_server_packet};
 use flags::{format_connect_options, format_server_flags, is_low_id};
 pub use loop_runtime::run_ed2k_server_loop;
-use loop_runtime::{
-    annotate_found_sources_server, ipv4_from_client_id, merge_found_sources, validate_found_sources,
-};
 use obfuscation::{
     Rc4KeyStream, biguint_to_fixed_be, derive_server_cipher, random_non_protocol_marker,
     random_nonzero_biguint, should_use_server_obfuscation,
@@ -77,6 +76,10 @@ use server_entry::{
     resolve_server_entry,
 };
 use session::{Ed2kPacket, ServerSession, ServerSessionPhase};
+use session_driver::{clear_server_connection_state, run_one_server_session};
+use source_utils::{
+    annotate_found_sources_server, ipv4_from_client_id, merge_found_sources, validate_found_sources,
+};
 use startup::{
     encode_login_request, encode_source_request, encode_udp_search_request,
     encode_udp_source_request, login_identity_for_server_transport, send_connected_server_startup,
