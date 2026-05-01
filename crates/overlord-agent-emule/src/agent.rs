@@ -3,7 +3,7 @@ use std::future::Future;
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{Ipv4Addr, SocketAddr},
     path::Path,
     sync::{
         Arc,
@@ -20,7 +20,6 @@ use overlord_agent_nat::{
     AgentNetworkReport, AgentNetworkingConfig, NatManager, ResolvedInterfaceBindingReport,
     detect_interfaces,
 };
-use rand::seq::SliceRandom;
 use serde::Deserialize;
 use serde_json::Value;
 use sha1::Sha1;
@@ -30,7 +29,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use overlord_agent_common::{
@@ -41,7 +40,7 @@ use overlord_agent_common::{
     RunningIndexerServer, SearchEventStatus, SearchJob, SearchKind, SnoopEntry, SnoopObservation,
 };
 use overlord_kad_dht::{DhtNode, RpcObservabilitySnapshot, RpcWorkClass};
-use overlord_kad_proto::{Ed2kHash, KadPacket, NodeId};
+use overlord_kad_proto::{Ed2kHash, NodeId};
 
 use crate::config::EmuleAgentConfig;
 use crate::ed2k_server::{Ed2kFoundSource, Ed2kServerSearchHandle, Ed2kServerState};
@@ -57,9 +56,11 @@ use crate::snoop_queue::SnoopQueue;
 mod activity;
 mod background_ed2k;
 mod background_firewall;
+mod background_kad;
 mod background_passive;
 mod background_publish;
 mod background_routing;
+mod background_snoop;
 mod background_tasks;
 mod control_runtime;
 mod ed2k_download;
@@ -79,11 +80,11 @@ mod search;
 mod snoop;
 
 use self::activity::{
-    ACTIVITY_KEY_FLUSHING_SNOOPS, ACTIVITY_KEY_RECONFIGURING, ACTIVITY_KEY_STARTING,
-    AgentActivityTracker, active_ed2k_download_key, active_search_key, begin_agent_activity,
+    ACTIVITY_KEY_RECONFIGURING, ACTIVITY_KEY_STARTING, AgentActivityTracker,
+    active_ed2k_download_key, active_search_key, begin_agent_activity,
     clear_agent_degraded_activity, finish_agent_activity, new_activity_snapshot,
     publish_activity_key, record_agent_degraded_activity, runtime_activity_error,
-    search_activity_context, update_agent_activity_error,
+    search_activity_context,
 };
 use self::ed2k_runtime::manifest_has_ed2k_transfer_progress;
 #[cfg(test)]
@@ -102,6 +103,7 @@ use self::ed2k_search::{
     kad_source_result_to_ed2k_found_source, select_ed2k_keyword_metadata,
     select_kad_keyword_metadata,
 };
+#[cfg(test)]
 use self::kad_runtime::build_hello_request;
 #[cfg(test)]
 use self::kad_runtime::current_tcp_firewalled;
@@ -111,7 +113,6 @@ use self::kad_runtime::{build_hello_response, should_request_hello_response_ack}
 use self::kad_runtime::{
     build_kad_hello_request_tags, build_kad_hello_response_tags, parse_kad_hello_metadata,
 };
-use self::kad_unsolicited::{UnsolicitedPacketContext, handle_unsolicited_packet};
 use self::lifecycle::{AgentStatePaths, ensure_parent_dir, load_or_create_indexer_id};
 #[cfg(test)]
 use self::networking::apply_networking_config;
