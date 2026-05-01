@@ -35,6 +35,7 @@ mod startup;
 mod tag_codec;
 mod types;
 mod udp;
+mod udp_runtime;
 pub use active_callback::{Ed2kCallbackRequestOptions, request_callback_on_server};
 pub use active_keyword::{Ed2kKeywordSearchOptions, search_keyword_servers};
 pub use active_source::{
@@ -57,9 +58,7 @@ use flags::{format_connect_options, format_server_flags, is_low_id};
 use loop_runtime::decode_server_ident;
 pub use loop_runtime::run_ed2k_server_loop;
 use loop_runtime::{
-    annotate_found_sources_server, ipv4_from_client_id, merge_found_sources,
-    read_server_udp_packet, send_udp_keyword_search, send_udp_source_search,
-    validate_found_sources,
+    annotate_found_sources_server, ipv4_from_client_id, merge_found_sources, validate_found_sources,
 };
 use obfuscation::{
     Rc4KeyStream, biguint_to_fixed_be, derive_server_cipher, random_non_protocol_marker,
@@ -87,6 +86,7 @@ use tag_codec::{decode_ed2k_string, decode_tag};
 use types::ServerUdpPacket;
 pub use types::{Ed2kFoundSource, Ed2kSearchFile, Ed2kServerLoopOptions, Ed2kServerState};
 use udp::{decode_server_udp_datagram, encode_server_udp_datagram, server_udp_endpoint};
+use udp_runtime::{read_server_udp_packet, send_udp_keyword_search, send_udp_source_search};
 
 #[cfg(test)]
 use server_entry::ConfiguredServerEntry;

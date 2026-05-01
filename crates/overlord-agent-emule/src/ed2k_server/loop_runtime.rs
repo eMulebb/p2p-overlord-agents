@@ -4,8 +4,8 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
-use tokio::{net::UdpSocket, sync::RwLock, time::Instant as TokioInstant};
+use anyhow::Result;
+use tokio::{sync::RwLock, time::Instant as TokioInstant};
 use tracing::{debug, info, warn};
 
 use overlord_kad_proto::Ed2kHash;
@@ -13,19 +13,20 @@ use overlord_kad_proto::Ed2kHash;
 use crate::ed2k_tcp::{connect_callback_peer, enrich_hello_identity};
 
 use super::types::{CallbackRequest, ServerSessionContext, ServerUdpPacket};
+use super::udp_runtime::{
+    bind_server_udp_socket, read_server_udp_packet, send_server_udp_status_request,
+};
 use super::{
     BackgroundServerSearchRequest, Ed2kFoundSource, Ed2kPacket, Ed2kServerLoopOptions,
-    Ed2kServerSearchInbox, Ed2kServerState, OP_CALLBACK_FAIL, OP_CALLBACKREQUESTED, OP_EDONKEYPROT,
-    OP_FOUNDSOURCES, OP_FOUNDSOURCES_OBFU, OP_GLOBSERVSTATREQ, OP_IDCHANGE, OP_LOGINREQUEST,
-    OP_OFFERFILES, OP_QUERY_MORE_RESULT, OP_REJECT, OP_SEARCHREQUEST, OP_SEARCHRESULT,
-    OP_SERVERIDENT, OP_SERVERLIST, OP_SERVERMESSAGE, OP_SERVERSTATUS,
-    PendingBackgroundServerSearch, ResolvedServerEntry, ST_DESCRIPTION, ST_SERVERNAME,
-    ServerSession, ServerSessionPhase, configured_server_entries, decode_ed2k_string,
-    decode_found_sources, decode_search_result_page, decode_server_udp_datagram, decode_tag,
-    encode_login_request, encode_packet, encode_search_request, encode_server_udp_datagram,
-    encode_udp_search_request, encode_udp_source_request, fail_background_search_request,
-    fail_pending_background_search, format_connect_options, format_server_flags,
-    handle_background_udp_packet, is_low_id, log_search_result_page,
+    Ed2kServerSearchInbox, Ed2kServerState, OP_CALLBACK_FAIL, OP_CALLBACKREQUESTED,
+    OP_FOUNDSOURCES, OP_FOUNDSOURCES_OBFU, OP_IDCHANGE, OP_LOGINREQUEST, OP_OFFERFILES,
+    OP_QUERY_MORE_RESULT, OP_REJECT, OP_SEARCHREQUEST, OP_SEARCHRESULT, OP_SERVERIDENT,
+    OP_SERVERLIST, OP_SERVERMESSAGE, OP_SERVERSTATUS, PendingBackgroundServerSearch,
+    ResolvedServerEntry, ST_DESCRIPTION, ST_SERVERNAME, ServerSession, ServerSessionPhase,
+    configured_server_entries, decode_ed2k_string, decode_found_sources, decode_search_result_page,
+    decode_tag, encode_login_request, encode_packet, encode_search_request,
+    fail_background_search_request, fail_pending_background_search, format_connect_options,
+    format_server_flags, handle_background_udp_packet, is_low_id, log_search_result_page,
     login_identity_for_server_transport, resolve_server_entry, send_connected_server_startup,
     send_offer_files_advertisement, server_udp_endpoint, should_use_server_obfuscation,
     start_background_server_search, wait_for_offer_files_settle,
@@ -767,76 +768,6 @@ async fn clear_server_connection_state(state: &Arc<RwLock<Ed2kServerState>>) {
     guard.endpoint = None;
     guard.client_id = None;
     guard.server_flags = None;
-}
-
-async fn bind_server_udp_socket(bind_ip: Ipv4Addr) -> Result<UdpSocket> {
-    UdpSocket::bind(SocketAddr::new(IpAddr::V4(bind_ip), 0))
-        .await
-        .with_context(|| format!("failed to bind ED2K server UDP helper on {bind_ip}:0"))
-}
-
-async fn send_server_udp_packet(
-    socket: &UdpSocket,
-    server: &ResolvedServerEntry,
-    opcode: u8,
-    payload: &[u8],
-) -> Result<()> {
-    let (endpoint, packet) = encode_server_udp_datagram(server, opcode, payload);
-    socket.send_to(&packet, endpoint).await.with_context(|| {
-        format!(
-            "failed to send ED2K server UDP opcode=0x{opcode:02X} to {}",
-            endpoint
-        )
-    })?;
-    Ok(())
-}
-
-async fn send_server_udp_status_request(
-    socket: &UdpSocket,
-    server: &ResolvedServerEntry,
-) -> Result<()> {
-    send_server_udp_packet(socket, server, OP_GLOBSERVSTATREQ, &[]).await
-}
-
-pub(super) async fn send_udp_keyword_search(
-    socket: &UdpSocket,
-    server: &ResolvedServerEntry,
-    search_payload: &[u8],
-) -> Result<()> {
-    let (opcode, payload) = encode_udp_search_request(server, search_payload);
-    send_server_udp_packet(socket, server, opcode, &payload).await
-}
-
-pub(super) async fn send_udp_source_search(
-    socket: &UdpSocket,
-    server: &ResolvedServerEntry,
-    file_hash: Ed2kHash,
-    file_size: u64,
-) -> Result<()> {
-    let (opcode, payload) = encode_udp_source_request(server, file_hash, file_size);
-    send_server_udp_packet(socket, server, opcode, &payload).await
-}
-
-pub(super) async fn read_server_udp_packet(
-    socket: &UdpSocket,
-    server: &ResolvedServerEntry,
-) -> Result<Option<ServerUdpPacket>> {
-    let mut buffer = vec![0u8; 65_535];
-    let (len, from) = socket
-        .recv_from(&mut buffer)
-        .await
-        .context("failed to receive ED2K server UDP datagram")?;
-    let Some(packet) = decode_server_udp_datagram(server, &buffer[..len]) else {
-        return Ok(None);
-    };
-    if packet.len() < 2 || packet[0] != OP_EDONKEYPROT {
-        return Ok(None);
-    }
-    Ok(Some(ServerUdpPacket {
-        opcode: packet[1],
-        payload: packet[2..].to_vec(),
-        from,
-    }))
 }
 
 pub(super) fn decode_server_ident(payload: &[u8]) -> Result<(Option<String>, Option<String>)> {
