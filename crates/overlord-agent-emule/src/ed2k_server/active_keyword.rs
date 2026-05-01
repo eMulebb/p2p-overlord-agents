@@ -1,11 +1,11 @@
 use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
-use tokio::{io::AsyncWriteExt, sync::RwLock};
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -185,14 +185,12 @@ async fn search_keyword_on_server(
             })?;
     } else {
         session
-            .stream
-            .write_all(&login_request)
-            .await
-            .with_context(|| {
-                format!("failed to send ED2K server login request to {transport_endpoint}")
-            })?;
+            .send_encoded_packet(
+                &login_request,
+                format!("failed to send ED2K server login request to {transport_endpoint}"),
+            )
+            .await?;
     }
-    session.last_tx = Instant::now();
     session.set_phase(
         ServerSessionPhase::AwaitingIdChange,
         "login request sent; awaiting OP_IDCHANGE",
