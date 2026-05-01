@@ -35,8 +35,8 @@ use super::{
 use crate::{
     config::EmuleAgentConfig,
     ed2k_server::{
-        Ed2kCallbackRequestOptions, Ed2kFoundSource, Ed2kSourceSearchOptions,
-        Ed2kUdpSourceSearchOptions, request_callback_on_server,
+        Ed2kCallbackRequestOptions, Ed2kFoundSource, Ed2kServerSearchHandle,
+        Ed2kSourceSearchOptions, Ed2kUdpSourceSearchOptions, request_callback_on_server,
         request_callback_via_background_session, search_source_servers, search_source_udp_servers,
         search_source_via_background_session,
     },
@@ -45,8 +45,8 @@ use crate::{
         download_file_from_peer, dump_ed2k_tcp_download_meta, emule_connect_options,
     },
     ed2k_transfer::{
-        Ed2kCallbackIntent, Ed2kResumeManifest, Ed2kSourceHint, Ed2kTransferRuntime,
-        new_transfer_job,
+        Ed2kCallbackIntent, Ed2kResumeManifest, Ed2kSharedEntry, Ed2kSourceHint,
+        Ed2kTransferRuntime, new_transfer_job,
     },
 };
 use overlord_kad_proto::Ed2kHash;
@@ -68,6 +68,18 @@ pub(super) struct NativeDirectDownloadOptions {
     pub(super) sources: Vec<Ed2kFoundSource>,
     pub(super) connect_timeout: Duration,
     pub(super) max_parallel_download_peers: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ServerSourceSearchContext<'a> {
+    runtime: &'a AgentNetworkRuntime,
+    config: &'a EmuleAgentConfig,
+    preferred_endpoint: Option<SocketAddr>,
+    has_background_search: bool,
+    active_source_attempts: usize,
+    file_hash: Ed2kHash,
+    file_size: u64,
+    cancel: &'a CancellationToken,
 }
 
 /// Attempts direct-dial ED2K peer downloads until the transfer manifest
@@ -356,165 +368,46 @@ pub(super) async fn native_ed2k_download_sources(
     };
 
     let has_background_search = background_search.is_some();
-    if let Some(background_search) = background_search {
-        match search_source_via_background_session(
-            &background_search,
-            file_hash,
-            file_size,
-            source_search_timeout,
-            &cancel,
-        )
-        .await
-        {
-            Ok(results) if !results.is_empty() => {
-                let source_count = results.len();
-                merge_download_sources(&mut sources, results);
-                info!(
-                    "native ED2K download background source acquisition completed file_hash={} source_count={} aggregated_source_count={}",
-                    file_hash,
-                    source_count,
-                    sources.len()
-                );
-            }
-            Ok(_) => {
-                info!(
-                    "native ED2K download background source acquisition completed file_hash={} source_count=0 aggregated_source_count={}",
-                    file_hash,
-                    sources.len()
-                );
-                warn!(
-                    "native ED2K download background source search returned no sources for file_hash={file_hash}"
-                );
-            }
-            Err(error) => {
-                warn!(
-                    "native ED2K download background source search failed for file_hash={file_hash}: {error}"
-                );
-            }
-        }
-    }
-
+    collect_background_session_sources(
+        &mut sources,
+        background_search,
+        file_hash,
+        file_size,
+        source_search_timeout,
+        &cancel,
+    )
+    .await;
     let active_source_attempts = ed2k_download_source_server_attempt_budget(&config.p2p.ed2k);
-    match search_source_servers(Ed2kSourceSearchOptions {
-        bind_ip: runtime.bind_ip,
-        config: &config.p2p.ed2k,
-        hello_identity,
-        shared_catalog: &shared_catalog,
+    let server_source_context = ServerSourceSearchContext {
+        runtime,
+        config,
         preferred_endpoint,
-        excluded_endpoint: has_background_search
-            .then_some(preferred_endpoint)
-            .flatten(),
-        max_attempts: active_source_attempts,
+        has_background_search,
+        active_source_attempts,
         file_hash,
         file_size,
         cancel: &cancel,
-    })
-    .await
-    {
-        Ok(server_results) => {
-            let source_count = server_results.len();
-            merge_download_sources(&mut sources, server_results);
-            info!(
-                "native ED2K download active source acquisition completed file_hash={} source_count={} aggregated_source_count={}",
-                file_hash,
-                source_count,
-                sources.len()
-            );
-        }
-        Err(error) => {
-            warn!(
-                "native ED2K download active server source search failed for file_hash={file_hash}: {error}"
-            );
-        }
-    }
+    };
+    collect_active_server_sources(
+        &mut sources,
+        server_source_context,
+        hello_identity,
+        &shared_catalog,
+    )
+    .await;
     if sources.is_empty() {
-        match search_source_udp_servers(Ed2kUdpSourceSearchOptions {
-            bind_ip: runtime.bind_ip,
-            config: &config.p2p.ed2k,
-            preferred_endpoint,
-            excluded_endpoint: has_background_search
-                .then_some(preferred_endpoint)
-                .flatten(),
-            max_attempts: active_source_attempts,
-            file_hash,
-            file_size,
-            timeout: source_search_timeout,
-            cancel: &cancel,
-        })
-        .await
-        {
-            Ok(udp_results) => {
-                let source_count = udp_results.len();
-                merge_download_sources(&mut sources, udp_results);
-                info!(
-                    "native ED2K download UDP source acquisition completed file_hash={} source_count={} aggregated_source_count={}",
-                    file_hash,
-                    source_count,
-                    sources.len()
-                );
-            }
-            Err(error) => {
-                warn!(
-                    "native ED2K download UDP source search failed for file_hash={file_hash}: {error}"
-                );
-            }
-        }
-    }
-    if file_size != 0 {
-        let existing_source_count = sources.len();
-        let kad_supplement_threshold = config.p2p.ed2k.kad_source_supplement_max_existing_sources;
-        let should_query_kad =
-            existing_source_count == 0 || existing_source_count <= kad_supplement_threshold;
-        if should_query_kad {
-            let kad_sources = collect_kad_ed2k_sources(
-                &runtime.dht,
-                file_hash,
-                file_size,
-                source_search_timeout.max(Duration::from_secs(
-                    ED2K_DOWNLOAD_KAD_SOURCE_TIMEOUT_FLOOR_SECS,
-                )),
-            )
+        collect_udp_server_sources(&mut sources, server_source_context, source_search_timeout)
             .await;
-            let kad_source_count = kad_sources.len();
-            if kad_source_count != 0 {
-                merge_download_sources(&mut sources, kad_sources);
-                let added_source_count = sources.len().saturating_sub(existing_source_count);
-                info!(
-                    "native ED2K download Kad source {} produced file_hash={} source_count={} added_source_count={} aggregated_source_count={}",
-                    if existing_source_count == 0 {
-                        "fallback"
-                    } else {
-                        "supplement"
-                    },
-                    file_hash,
-                    kad_source_count,
-                    added_source_count,
-                    sources.len()
-                );
-            } else {
-                info!(
-                    "native ED2K download Kad source {} returned no sources for file_hash={} aggregated_source_count={}",
-                    if existing_source_count == 0 {
-                        "fallback"
-                    } else {
-                        "supplement"
-                    },
-                    file_hash,
-                    sources.len()
-                );
-            }
-        } else {
-            info!(
-                "native ED2K download Kad source supplement skipped file_hash={} existing_source_count={} threshold={}",
-                file_hash, existing_source_count, kad_supplement_threshold
-            );
-        }
-    } else if sources.is_empty() {
-        info!(
-            "native ED2K download skipped Kad source fallback for file_hash={} because file_size is unknown",
-            file_hash
-        );
     }
+    collect_kad_source_supplement(
+        &mut sources,
+        runtime,
+        config,
+        file_hash,
+        file_size,
+        source_search_timeout,
+    )
+    .await;
     info!(
         "native ED2K download source acquisition completed file_hash={} aggregated_source_count={} background_search_enabled={}",
         file_hash,
@@ -522,6 +415,202 @@ pub(super) async fn native_ed2k_download_sources(
         has_background_search
     );
     Ok(sources)
+}
+
+async fn collect_background_session_sources(
+    sources: &mut Vec<Ed2kFoundSource>,
+    background_search: Option<Ed2kServerSearchHandle>,
+    file_hash: Ed2kHash,
+    file_size: u64,
+    source_search_timeout: Duration,
+    cancel: &CancellationToken,
+) {
+    let Some(background_search) = background_search else {
+        return;
+    };
+    match search_source_via_background_session(
+        &background_search,
+        file_hash,
+        file_size,
+        source_search_timeout,
+        cancel,
+    )
+    .await
+    {
+        Ok(results) if !results.is_empty() => {
+            let source_count = results.len();
+            merge_download_sources(sources, results);
+            info!(
+                "native ED2K download background source acquisition completed file_hash={} source_count={} aggregated_source_count={}",
+                file_hash,
+                source_count,
+                sources.len()
+            );
+        }
+        Ok(_) => {
+            info!(
+                "native ED2K download background source acquisition completed file_hash={} source_count=0 aggregated_source_count={}",
+                file_hash,
+                sources.len()
+            );
+            warn!(
+                "native ED2K download background source search returned no sources for file_hash={file_hash}"
+            );
+        }
+        Err(error) => {
+            warn!(
+                "native ED2K download background source search failed for file_hash={file_hash}: {error}"
+            );
+        }
+    }
+}
+
+async fn collect_active_server_sources(
+    sources: &mut Vec<Ed2kFoundSource>,
+    context: ServerSourceSearchContext<'_>,
+    hello_identity: Ed2kHelloIdentity,
+    shared_catalog: &[Ed2kSharedEntry],
+) {
+    match search_source_servers(Ed2kSourceSearchOptions {
+        bind_ip: context.runtime.bind_ip,
+        config: &context.config.p2p.ed2k,
+        hello_identity,
+        shared_catalog,
+        preferred_endpoint: context.preferred_endpoint,
+        excluded_endpoint: context
+            .has_background_search
+            .then_some(context.preferred_endpoint)
+            .flatten(),
+        max_attempts: context.active_source_attempts,
+        file_hash: context.file_hash,
+        file_size: context.file_size,
+        cancel: context.cancel,
+    })
+    .await
+    {
+        Ok(server_results) => {
+            let source_count = server_results.len();
+            merge_download_sources(sources, server_results);
+            info!(
+                "native ED2K download active source acquisition completed file_hash={} source_count={} aggregated_source_count={}",
+                context.file_hash,
+                source_count,
+                sources.len()
+            );
+        }
+        Err(error) => {
+            warn!(
+                "native ED2K download active server source search failed for file_hash={}: {error}",
+                context.file_hash
+            );
+        }
+    }
+}
+
+async fn collect_udp_server_sources(
+    sources: &mut Vec<Ed2kFoundSource>,
+    context: ServerSourceSearchContext<'_>,
+    source_search_timeout: Duration,
+) {
+    match search_source_udp_servers(Ed2kUdpSourceSearchOptions {
+        bind_ip: context.runtime.bind_ip,
+        config: &context.config.p2p.ed2k,
+        preferred_endpoint: context.preferred_endpoint,
+        excluded_endpoint: context
+            .has_background_search
+            .then_some(context.preferred_endpoint)
+            .flatten(),
+        max_attempts: context.active_source_attempts,
+        file_hash: context.file_hash,
+        file_size: context.file_size,
+        timeout: source_search_timeout,
+        cancel: context.cancel,
+    })
+    .await
+    {
+        Ok(udp_results) => {
+            let source_count = udp_results.len();
+            merge_download_sources(sources, udp_results);
+            info!(
+                "native ED2K download UDP source acquisition completed file_hash={} source_count={} aggregated_source_count={}",
+                context.file_hash,
+                source_count,
+                sources.len()
+            );
+        }
+        Err(error) => {
+            warn!(
+                "native ED2K download UDP source search failed for file_hash={}: {error}",
+                context.file_hash
+            );
+        }
+    }
+}
+
+async fn collect_kad_source_supplement(
+    sources: &mut Vec<Ed2kFoundSource>,
+    runtime: &AgentNetworkRuntime,
+    config: &EmuleAgentConfig,
+    file_hash: Ed2kHash,
+    file_size: u64,
+    source_search_timeout: Duration,
+) {
+    if file_size == 0 {
+        if sources.is_empty() {
+            info!(
+                "native ED2K download skipped Kad source fallback for file_hash={} because file_size is unknown",
+                file_hash
+            );
+        }
+        return;
+    }
+
+    let existing_source_count = sources.len();
+    let kad_supplement_threshold = config.p2p.ed2k.kad_source_supplement_max_existing_sources;
+    let should_query_kad =
+        existing_source_count == 0 || existing_source_count <= kad_supplement_threshold;
+    if !should_query_kad {
+        info!(
+            "native ED2K download Kad source supplement skipped file_hash={} existing_source_count={} threshold={}",
+            file_hash, existing_source_count, kad_supplement_threshold
+        );
+        return;
+    }
+
+    let kad_sources = collect_kad_ed2k_sources(
+        &runtime.dht,
+        file_hash,
+        file_size,
+        source_search_timeout.max(Duration::from_secs(
+            ED2K_DOWNLOAD_KAD_SOURCE_TIMEOUT_FLOOR_SECS,
+        )),
+    )
+    .await;
+    let kad_source_count = kad_sources.len();
+    let kad_mode = if existing_source_count == 0 {
+        "fallback"
+    } else {
+        "supplement"
+    };
+    if kad_source_count != 0 {
+        merge_download_sources(sources, kad_sources);
+        let added_source_count = sources.len().saturating_sub(existing_source_count);
+        info!(
+            "native ED2K download Kad source {} produced file_hash={} source_count={} added_source_count={} aggregated_source_count={}",
+            kad_mode,
+            file_hash,
+            kad_source_count,
+            added_source_count,
+            sources.len()
+        );
+    } else {
+        info!(
+            "native ED2K download Kad source {} returned no sources for file_hash={} aggregated_source_count={}",
+            kad_mode,
+            file_hash,
+            sources.len()
+        );
+    }
 }
 
 pub(super) async fn start_native_ed2k_download(
