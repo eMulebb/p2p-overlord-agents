@@ -56,8 +56,13 @@ use crate::{
 
 mod flags;
 mod search_expr;
+mod udp;
 use flags::{format_connect_options, format_server_flags, is_low_id};
 use search_expr::encode_search_request;
+use udp::{decode_server_udp_datagram, encode_server_udp_datagram, server_udp_endpoint};
+
+#[cfg(test)]
+use udp::derive_server_udp_cipher;
 
 const OP_EDONKEYPROT: u8 = 0xE3;
 const OP_EMULEPROT: u8 = 0xC5;
@@ -2994,23 +2999,6 @@ async fn bind_server_udp_socket(bind_ip: Ipv4Addr) -> Result<UdpSocket> {
         .with_context(|| format!("failed to bind ED2K server UDP helper on {bind_ip}:0"))
 }
 
-fn server_udp_endpoint(server: &ResolvedServerEntry) -> SocketAddr {
-    let port = if should_obfuscate_server_udp(server) {
-        if server.entry.obfuscation_port_udp != 0 {
-            server.entry.obfuscation_port_udp
-        } else if server.entry.port <= u16::MAX - 12 {
-            server.entry.port + 12
-        } else {
-            server.entry.port
-        }
-    } else if server.entry.port <= u16::MAX - 4 {
-        server.entry.port + 4
-    } else {
-        server.entry.port
-    };
-    SocketAddr::new(IpAddr::V4(server.ip), port)
-}
-
 async fn send_server_udp_packet(
     socket: &UdpSocket,
     server: &ResolvedServerEntry,
@@ -3073,87 +3061,6 @@ async fn read_server_udp_packet(
         payload: packet[2..].to_vec(),
         from,
     }))
-}
-
-fn should_obfuscate_server_udp(server: &ResolvedServerEntry) -> bool {
-    server.entry.udp_key != 0 && server.entry.supports_obfuscation_udp()
-}
-
-fn encode_server_udp_datagram(
-    server: &ResolvedServerEntry,
-    opcode: u8,
-    payload: &[u8],
-) -> (SocketAddr, Vec<u8>) {
-    let mut plain = Vec::with_capacity(2 + payload.len());
-    plain.push(OP_EDONKEYPROT);
-    plain.push(opcode);
-    plain.extend_from_slice(payload);
-    if !should_obfuscate_server_udp(server) {
-        return (server_udp_endpoint(server), plain);
-    }
-
-    let random_key_part = rand::thread_rng().r#gen::<u16>();
-    let mut packet = Vec::with_capacity(EMULE_UDP_CRYPT_HEADER_LEN + plain.len());
-    packet.push(random_non_ed2k_udp_marker());
-    packet.extend_from_slice(&random_key_part.to_le_bytes());
-    packet.extend_from_slice(&EMULE_UDP_CRYPT_MAGIC_SYNC_SERVER.to_le_bytes());
-    packet.push(0);
-    packet.extend_from_slice(&plain);
-    let mut cipher = derive_server_udp_cipher(
-        server.entry.udp_key,
-        random_key_part,
-        EMULE_UDP_CRYPT_MAGIC_CLIENT_SERVER,
-    );
-    cipher.apply(&mut packet[3..]);
-    (server_udp_endpoint(server), packet)
-}
-
-fn decode_server_udp_datagram(server: &ResolvedServerEntry, packet: &[u8]) -> Option<Vec<u8>> {
-    if packet.first().copied() == Some(OP_EDONKEYPROT) {
-        return Some(packet.to_vec());
-    }
-    if !should_obfuscate_server_udp(server) || packet.len() <= EMULE_UDP_CRYPT_HEADER_LEN {
-        return None;
-    }
-
-    let random_key_part = u16::from_le_bytes([packet[1], packet[2]]);
-    let mut decrypted = packet[3..].to_vec();
-    let mut cipher = derive_server_udp_cipher(
-        server.entry.udp_key,
-        random_key_part,
-        EMULE_UDP_CRYPT_MAGIC_SERVER_CLIENT,
-    );
-    cipher.apply(&mut decrypted);
-    if decrypted.len() < 5 {
-        return None;
-    }
-    let magic = u32::from_le_bytes(decrypted[..4].try_into().ok()?);
-    if magic != EMULE_UDP_CRYPT_MAGIC_SYNC_SERVER {
-        return None;
-    }
-    let padding_len = usize::from(decrypted[4] & 0x0F);
-    let payload_offset = 5usize.checked_add(padding_len)?;
-    if decrypted.len() <= payload_offset {
-        return None;
-    }
-    Some(decrypted[payload_offset..].to_vec())
-}
-
-fn derive_server_udp_cipher(server_udp_key: u32, random_key_part: u16, magic: u8) -> Rc4KeyStream {
-    let mut key_material = Vec::with_capacity(7);
-    key_material.extend_from_slice(&server_udp_key.to_le_bytes());
-    key_material.push(magic);
-    key_material.extend_from_slice(&random_key_part.to_le_bytes());
-    Rc4KeyStream::new_without_discard(&md5_compute(key_material).0)
-}
-
-fn random_non_ed2k_udp_marker() -> u8 {
-    loop {
-        let marker = rand::thread_rng().r#gen::<u8>();
-        if marker != OP_EDONKEYPROT {
-            return marker;
-        }
-    }
 }
 
 fn encode_login_request(identity: Ed2kHelloIdentity) -> Vec<u8> {
