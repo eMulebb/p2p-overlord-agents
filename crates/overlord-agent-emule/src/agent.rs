@@ -24,7 +24,7 @@ use overlord_agent_nat::{
     build_interface_binding_report, built_in_upnp_port_mapping_providers,
     default_upnp_backend_order, detect_interfaces, recommend_interface, resolve_bind_ip,
 };
-use rand::{RngCore, seq::SliceRandom};
+use rand::seq::SliceRandom;
 use serde::Deserialize;
 use serde_json::Value;
 use sha1::Sha1;
@@ -119,9 +119,12 @@ use self::passive_replay::{
 #[cfg(test)]
 use self::publish::{apply_publish_summary, build_publish_batch_summary};
 use self::publish::{
-    effective_publish_counters, record_publish_summaries, set_synthetic_publish_queue_depth,
-    update_publish_progress,
+    build_notes_publish_tags, build_source_publish_tags, effective_publish_counters,
+    load_or_create_ed2k_user_hash, record_publish_summaries, set_synthetic_publish_queue_depth,
+    source_publish_client_hash, update_publish_progress,
 };
+#[cfg(test)]
+use self::publish::{emule_high_id_source_type, normalize_ed2k_user_hash_markers};
 
 const ACTIVE_BATCH_SIZE: usize = 25;
 /// Large passive harvest floods should be posted in bigger coordinator batches
@@ -3205,146 +3208,6 @@ async fn seed_coordinator_popular_if_available(
         context,
     )
     .await
-}
-
-/// Returns the eMule high-ID source type used for source publishes in the non-firewalled case.
-fn emule_high_id_source_type(file_size: u64) -> u32 {
-    if file_size > EMULE_LARGE_FILE_SIZE_THRESHOLD {
-        4
-    } else {
-        1
-    }
-}
-
-/// eMule Kad carries 128-bit search/source entry IDs in 32-bit little-endian
-/// chunk order rather than raw MD4 byte order.
-fn emule_kad_chunk_order(bytes: [u8; 16]) -> [u8; 16] {
-    let mut ordered = [0u8; 16];
-    for (dst, src) in ordered.chunks_exact_mut(4).zip(bytes.chunks_exact(4)) {
-        dst.copy_from_slice(&[src[3], src[2], src[1], src[0]]);
-    }
-    ordered
-}
-
-/// Reuse the persisted eD2k user hash as the Kad source-publish identity.
-///
-/// The oracle source-publish path sends the eMule client hash rather than the
-/// Kad node ID in the second `KADEMLIA2_PUBLISH_SOURCE_REQ` field.
-fn source_publish_client_hash(ed2k_user_hash: [u8; 16]) -> NodeId {
-    NodeId::from_bytes(emule_kad_chunk_order(ed2k_user_hash))
-}
-
-/// Applies the classic eMule client marker bytes to an ED2K user hash.
-fn normalize_ed2k_user_hash_markers(mut user_hash: [u8; 16]) -> [u8; 16] {
-    user_hash[5] = 0x0E;
-    user_hash[14] = 0x6F;
-    user_hash
-}
-
-/// Mirrors the oracle `isbadhash` check for persisted ED2K user hashes.
-fn ed2k_user_hash_is_bad(user_hash: &[u8; 16]) -> bool {
-    let lo = u64::from_le_bytes(user_hash[..8].try_into().expect("slice has 8 bytes"));
-    let hi = u64::from_le_bytes(user_hash[8..].try_into().expect("slice has 8 bytes"));
-    (lo & 0xffff_00ff_ffff_ffff) == 0 && (hi & 0xff00_ffff_ffff_ffff) == 0
-}
-
-/// Creates a fresh eMule-style ED2K user hash.
-fn create_ed2k_user_hash() -> [u8; 16] {
-    loop {
-        let mut user_hash = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut user_hash);
-        let user_hash = normalize_ed2k_user_hash_markers(user_hash);
-        if !ed2k_user_hash_is_bad(&user_hash) {
-            return user_hash;
-        }
-    }
-}
-
-/// Loads the persisted ED2K user hash, or creates one that mirrors eMule semantics.
-fn load_or_create_ed2k_user_hash(path: &Path) -> Result<[u8; 16]> {
-    if path.exists() {
-        let bytes = fs::read(path)
-            .with_context(|| format!("failed to read ED2K user hash from {}", path.display()))?;
-        if bytes.len() == 16 {
-            let mut user_hash = [0u8; 16];
-            user_hash.copy_from_slice(&bytes);
-            let normalized = normalize_ed2k_user_hash_markers(user_hash);
-            if !ed2k_user_hash_is_bad(&normalized) {
-                if normalized != user_hash {
-                    fs::write(path, normalized).with_context(|| {
-                        format!("failed to normalize ED2K user hash at {}", path.display())
-                    })?;
-                }
-                return Ok(normalized);
-            }
-        }
-    }
-
-    let user_hash = create_ed2k_user_hash();
-    fs::write(path, user_hash)
-        .with_context(|| format!("failed to persist ED2K user hash to {}", path.display()))?;
-    Ok(user_hash)
-}
-
-/// Return the eMule-style `TAG_ENCRYPTION` bits for the current non-firewalled agent.
-///
-/// This mirrors the oracle `GetMyConnectOptions(true, false)` shape we also expose over TCP hello.
-fn emule_source_encryption_options(obfuscation_enabled: bool) -> u8 {
-    emule_connect_options(obfuscation_enabled)
-}
-
-/// Builds the oracle-style source publish tag set for one file announcement.
-fn build_source_publish_tags(
-    bind_addr: SocketAddr,
-    source_publish_settings: SourcePublishSettings,
-    file_size: u64,
-) -> Vec<Tag> {
-    let mut tags = vec![
-        Tag::new_short(
-            tag_name::SOURCETYPE,
-            TagValue::UInt(u64::from(emule_high_id_source_type(file_size))),
-        ),
-        // Mirror the oracle: SOURCEPORT carries the ED2K TCP listener while
-        // SOURCEUPORT carries the Kad UDP listener.
-        Tag::new_short(
-            tag_name::SOURCEPORT,
-            TagValue::UInt(u64::from(source_publish_settings.tcp_port)),
-        ),
-    ];
-    if let SocketAddr::V4(addr) = bind_addr {
-        tags.push(Tag::new_short(
-            tag_name::SOURCEIP,
-            TagValue::U32(u32::from_be_bytes(addr.ip().octets())),
-        ));
-    }
-    tags.push(Tag::new_short(
-        tag_name::SOURCEUPORT,
-        TagValue::U16(bind_addr.port()),
-    ));
-    tags.push(Tag::filesize(file_size));
-    tags.push(Tag::new_short(
-        tag_name::ENCRYPTION,
-        TagValue::U8(emule_source_encryption_options(
-            source_publish_settings.obfuscation_enabled,
-        )),
-    ));
-    tags
-}
-
-/// Builds a deterministic notes-publish payload for controlled live validation.
-///
-/// The notes-seeding path remains opt-in so the runtime can exercise notes
-/// publish parity without making synthetic notes part of the default behavior.
-fn build_notes_publish_tags(canonical_name: &str, file_size: u64) -> Vec<Tag> {
-    vec![
-        Tag::filename(canonical_name.to_string()),
-        Tag::filesize(file_size),
-        Tag::new_short(tag_name::FILERATING, TagValue::U8(4)),
-        Tag::new_short(
-            tag_name::DESCRIPTION,
-            TagValue::String(format!("overlord validation note for {canonical_name}")),
-        ),
-    ]
 }
 
 /// Executes one complete keyword/source/(optional) notes seeding pass.
