@@ -192,7 +192,9 @@ fn encode_startup_multipacket_ext2_answer(
 
 mod common;
 mod download;
+mod download_fixture;
 mod listener;
 mod protocol;
 
 use common::*;
+use download_fixture::*;

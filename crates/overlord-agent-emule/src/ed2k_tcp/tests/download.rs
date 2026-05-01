@@ -156,76 +156,22 @@ async fn small_file_download_accepts_split_sending_part_frames() {
 
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let peer_addr = listener.local_addr().unwrap();
-    let peer_public_key = Arc::new(
-        Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap()).unwrap(),
-    );
+    let peer_public_key = test_peer_secure_ident();
     let payload_for_server = payload.clone();
-    let peer_public_key_for_server = Arc::clone(&peer_public_key);
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
 
-        let hello = read_packet(&mut stream).await;
-        assert_eq!(hello[5], OP_HELLO);
-
-        let hello_answer = encode_hello_answer(Ed2kHelloIdentity {
-            user_hash: [0x42; 16],
-            client_id: 0x5912_0559,
-            tcp_port: peer_addr.port(),
-            udp_port: 0,
-            server_ip: 0,
-            server_port: 0,
-            connect_options: emule_connect_options(false),
-            direct_udp_callback: false,
-        });
-        stream.write_all(&hello_answer).await.unwrap();
-
-        let secure_ident_probe = read_packet(&mut stream).await;
-        assert_eq!(secure_ident_probe[5], OP_SECIDENTSTATE);
-        let peer_challenge =
-            encode_secident_state(ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, 0x4436_EEAC);
-        stream.write_all(&peer_challenge).await.unwrap();
-
-        let public_key = read_packet(&mut stream).await;
-        assert_eq!(public_key[5], super::OP_PUBLICKEY);
-        let peer_public_key_packet = encode_packet(
-            OP_EMULEPROT,
-            super::OP_PUBLICKEY,
-            &peer_public_key_for_server.public_key_payload().unwrap(),
-        );
-        stream.write_all(&peer_public_key_packet).await.unwrap();
-
-        let signature = read_packet(&mut stream).await;
-        assert_eq!(signature[5], super::OP_SIGNATURE);
-        let peer_signature = encode_packet(OP_EMULEPROT, super::OP_SIGNATURE, &[0xAA; 49]);
-        stream.write_all(&peer_signature).await.unwrap();
-
-        let startup_request = read_packet(&mut stream).await;
-        assert_startup_multipacket_ext2(
-            startup_request[0],
-            startup_request[5],
-            &startup_request[6..],
-            &file_hash,
-            payload.len() as u64,
-            false,
-        );
-
-        let filename_answer = encode_startup_multipacket_ext2_answer(
+        complete_plain_secure_ident_exchange(&mut stream, peer_addr, &peer_public_key).await;
+        answer_startup_metadata(
+            &mut stream,
             &file_hash,
             payload.len() as u64,
             "captured.epub",
             false,
-        );
-        stream.write_all(&filename_answer).await.unwrap();
-
-        let start_upload = read_packet(&mut stream).await;
-        assert_eq!(start_upload[5], super::OP_STARTUPLOADREQ);
-        let accept = encode_accept_upload_req();
-        stream.write_all(&accept).await.unwrap();
-
-        let request_parts = read_packet(&mut stream).await;
-        assert_eq!(request_parts[5], super::OP_REQUESTPARTS);
+        )
+        .await;
         let (requested_hash, ranges) =
-            decode_request_parts_payload(&request_parts[6..], false).unwrap();
+            accept_upload_and_read_parts_request(&mut stream, false).await;
         assert_eq!(requested_hash, file_hash);
         let (start, end) = ranges[0];
         let midpoint = start + ((end - start) / 2);
@@ -304,76 +250,23 @@ async fn hash_only_small_file_download_learns_metadata_from_startup_answer() {
 
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let peer_addr = listener.local_addr().unwrap();
-    let peer_public_key = Arc::new(
-        Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap()).unwrap(),
-    );
+    let peer_public_key = test_peer_secure_ident();
     let payload_for_server = payload.clone();
-    let peer_public_key_for_server = Arc::clone(&peer_public_key);
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
 
-        let hello = read_packet(&mut stream).await;
-        assert_eq!(hello[5], OP_HELLO);
-
-        let hello_answer = encode_hello_answer(Ed2kHelloIdentity {
-            user_hash: [0x42; 16],
-            client_id: 0x5912_0559,
-            tcp_port: peer_addr.port(),
-            udp_port: 0,
-            server_ip: 0,
-            server_port: 0,
-            connect_options: emule_connect_options(false),
-            direct_udp_callback: false,
-        });
-        stream.write_all(&hello_answer).await.unwrap();
-
-        let secure_ident_probe = read_packet(&mut stream).await;
-        assert_eq!(secure_ident_probe[5], OP_SECIDENTSTATE);
-        let peer_challenge =
-            encode_secident_state(ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, 0x4436_EEAC);
-        stream.write_all(&peer_challenge).await.unwrap();
-
-        let public_key = read_packet(&mut stream).await;
-        assert_eq!(public_key[5], super::OP_PUBLICKEY);
-        let peer_public_key_packet = encode_packet(
-            OP_EMULEPROT,
-            super::OP_PUBLICKEY,
-            &peer_public_key_for_server.public_key_payload().unwrap(),
-        );
-        stream.write_all(&peer_public_key_packet).await.unwrap();
-
-        let signature = read_packet(&mut stream).await;
-        assert_eq!(signature[5], super::OP_SIGNATURE);
-        let peer_signature = encode_packet(OP_EMULEPROT, super::OP_SIGNATURE, &[0xAA; 49]);
-        stream.write_all(&peer_signature).await.unwrap();
-
-        let startup_request = read_packet(&mut stream).await;
-        assert_startup_multipacket_ext2(
-            startup_request[0],
-            startup_request[5],
-            &startup_request[6..],
+        complete_plain_secure_ident_exchange(&mut stream, peer_addr, &peer_public_key).await;
+        answer_startup_metadata_with_expected_size(
+            &mut stream,
             &file_hash,
             0,
-            false,
-        );
-
-        let filename_answer = encode_startup_multipacket_ext2_answer(
-            &file_hash,
             payload_for_server.len() as u64,
             "captured.epub",
             false,
-        );
-        stream.write_all(&filename_answer).await.unwrap();
-
-        let start_upload = read_packet(&mut stream).await;
-        assert_eq!(start_upload[5], super::OP_STARTUPLOADREQ);
-        let accept = encode_accept_upload_req();
-        stream.write_all(&accept).await.unwrap();
-
-        let request_parts = read_packet(&mut stream).await;
-        assert_eq!(request_parts[5], super::OP_REQUESTPARTS);
+        )
+        .await;
         let (requested_hash, ranges) =
-            decode_request_parts_payload(&request_parts[6..], false).unwrap();
+            accept_upload_and_read_parts_request(&mut stream, false).await;
         assert_eq!(requested_hash, file_hash);
         let (start, end) = ranges[0];
 
@@ -449,75 +342,22 @@ async fn small_file_download_accepts_split_compressed_part_frames() {
 
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let peer_addr = listener.local_addr().unwrap();
-    let peer_public_key = Arc::new(
-        Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap()).unwrap(),
-    );
-    let peer_public_key_for_server = Arc::clone(&peer_public_key);
+    let peer_public_key = test_peer_secure_ident();
     let payload_for_server = payload.clone();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
 
-        let hello = read_packet(&mut stream).await;
-        assert_eq!(hello[5], OP_HELLO);
-
-        let hello_answer = encode_hello_answer(Ed2kHelloIdentity {
-            user_hash: [0x42; 16],
-            client_id: 0x5912_0559,
-            tcp_port: peer_addr.port(),
-            udp_port: 0,
-            server_ip: 0,
-            server_port: 0,
-            connect_options: emule_connect_options(false),
-            direct_udp_callback: false,
-        });
-        stream.write_all(&hello_answer).await.unwrap();
-
-        let secure_ident_probe = read_packet(&mut stream).await;
-        assert_eq!(secure_ident_probe[5], OP_SECIDENTSTATE);
-        let peer_challenge =
-            encode_secident_state(ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, 0x4436_EEAC);
-        stream.write_all(&peer_challenge).await.unwrap();
-
-        let public_key = read_packet(&mut stream).await;
-        assert_eq!(public_key[5], super::OP_PUBLICKEY);
-        let peer_public_key_packet = encode_packet(
-            OP_EMULEPROT,
-            super::OP_PUBLICKEY,
-            &peer_public_key_for_server.public_key_payload().unwrap(),
-        );
-        stream.write_all(&peer_public_key_packet).await.unwrap();
-
-        let signature = read_packet(&mut stream).await;
-        assert_eq!(signature[5], super::OP_SIGNATURE);
-        let peer_signature = encode_packet(OP_EMULEPROT, super::OP_SIGNATURE, &[0xAA; 49]);
-        stream.write_all(&peer_signature).await.unwrap();
-
-        let startup_request = read_packet(&mut stream).await;
-        assert_startup_multipacket_ext2(
-            startup_request[0],
-            startup_request[5],
-            &startup_request[6..],
-            &file_hash,
-            payload_for_server.len() as u64,
-            false,
-        );
-
-        let filename_answer = encode_startup_multipacket_ext2_answer(
+        complete_plain_secure_ident_exchange(&mut stream, peer_addr, &peer_public_key).await;
+        answer_startup_metadata(
+            &mut stream,
             &file_hash,
             payload_for_server.len() as u64,
             "captured.epub",
             false,
-        );
-        stream.write_all(&filename_answer).await.unwrap();
-
-        let start_upload = read_packet(&mut stream).await;
-        assert_eq!(start_upload[5], super::OP_STARTUPLOADREQ);
-        stream.write_all(&encode_accept_upload_req()).await.unwrap();
-
-        let request_parts = read_packet(&mut stream).await;
-        assert_eq!(request_parts[5], super::OP_REQUESTPARTS);
+        )
+        .await;
         let (requested_hash, ranges) =
-            decode_request_parts_payload(&request_parts[6..], false).unwrap();
+            accept_upload_and_read_parts_request(&mut stream, false).await;
         assert_eq!(requested_hash, file_hash);
         assert_eq!(ranges, vec![(0, payload_for_server.len() as u64)]);
 
