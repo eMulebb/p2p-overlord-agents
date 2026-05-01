@@ -66,68 +66,23 @@ async fn listener_upload_session_serves_verified_file_via_compressed_parts() {
 
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let peer_addr = listener.local_addr().unwrap();
-    let dht = DhtNode::new(DhtConfig {
-        bind_addr: "127.0.0.1:0".parse().unwrap(),
-        node_id: NodeId::from_bytes([0x3C; 16]),
-        udp_key: 0x1122_3344,
-        ..DhtConfig::default()
-    })
-    .await
-    .unwrap();
+    let dht = test_dht().await;
     let server_state = Arc::new(RwLock::new(Ed2kServerState::default()));
     let kad_firewall = Arc::new(Mutex::new(KadFirewallState::default()));
-    let secure_ident = Arc::new(
-        Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap()).unwrap(),
+    let secure_ident = listener_secure_ident();
+    let hello_identity = listener_hello_identity();
+
+    let server = spawn_single_listener_connection(
+        listener,
+        dht,
+        server_state,
+        kad_firewall,
+        secure_ident,
+        Arc::clone(&transfer_runtime),
+        hello_identity,
     );
-    let hello_identity = Ed2kHelloIdentity {
-        user_hash: [0x22; 16],
-        client_id: 0x1234_5678,
-        tcp_port: 41001,
-        udp_port: 41000,
-        server_ip: 0,
-        server_port: 0,
-        connect_options: emule_connect_options(false),
-        direct_udp_callback: false,
-    };
 
-    let server = tokio::spawn({
-        let transfer_runtime = Arc::clone(&transfer_runtime);
-        let server_state = Arc::clone(&server_state);
-        let kad_firewall = Arc::clone(&kad_firewall);
-        let secure_ident = Arc::clone(&secure_ident);
-        async move {
-            let (stream, remote_addr) = listener.accept().await.unwrap();
-            handle_connection_test!(
-                stream,
-                remote_addr,
-                &dht,
-                &server_state,
-                &kad_firewall,
-                &secure_ident,
-                &transfer_runtime,
-                hello_identity,
-            )
-            .await
-            .unwrap();
-        }
-    });
-
-    let mut stream = TcpStream::connect(peer_addr).await.unwrap();
-    let peer_identity = Ed2kHelloIdentity {
-        user_hash: [0x77; 16],
-        client_id: 0x8765_4321,
-        tcp_port: 46671,
-        udp_port: 46672,
-        server_ip: 0,
-        server_port: 0,
-        connect_options: emule_connect_options(false),
-        direct_udp_callback: false,
-    };
-    stream
-        .write_all(&encode_hello_request(peer_identity))
-        .await
-        .unwrap();
-    let _hello_answer = read_until_opcode(&mut stream, OP_EDONKEYPROT, OP_HELLOANSWER).await;
+    let mut stream = connect_peer_and_exchange_hello(peer_addr, peer_hello_identity()).await;
 
     let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
     stream
@@ -216,19 +171,10 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
 
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let peer_addr = listener.local_addr().unwrap();
-    let dht = DhtNode::new(DhtConfig {
-        bind_addr: "127.0.0.1:0".parse().unwrap(),
-        node_id: NodeId::from_bytes([0x4D; 16]),
-        udp_key: 0x5566_7788,
-        ..DhtConfig::default()
-    })
-    .await
-    .unwrap();
+    let dht = test_dht().await;
     let server_state = Arc::new(RwLock::new(Ed2kServerState::default()));
     let kad_firewall = Arc::new(Mutex::new(KadFirewallState::default()));
-    let secure_ident = Arc::new(
-        Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap()).unwrap(),
-    );
+    let secure_ident = listener_secure_ident();
     let hello_identity = Ed2kHelloIdentity {
         user_hash: [0x31; 16],
         client_id: 0x1357_2468,
@@ -240,29 +186,16 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
         direct_udp_callback: false,
     };
 
-    let server = tokio::spawn({
-        let transfer_runtime = Arc::clone(&transfer_runtime);
-        let server_state = Arc::clone(&server_state);
-        let kad_firewall = Arc::clone(&kad_firewall);
-        let secure_ident = Arc::clone(&secure_ident);
-        async move {
-            let (stream, remote_addr) = listener.accept().await.unwrap();
-            handle_connection_test!(
-                stream,
-                remote_addr,
-                &dht,
-                &server_state,
-                &kad_firewall,
-                &secure_ident,
-                &transfer_runtime,
-                hello_identity,
-            )
-            .await
-            .unwrap();
-        }
-    });
+    let server = spawn_single_listener_connection(
+        listener,
+        dht,
+        server_state,
+        kad_firewall,
+        secure_ident,
+        Arc::clone(&transfer_runtime),
+        hello_identity,
+    );
 
-    let mut stream = TcpStream::connect(peer_addr).await.unwrap();
     let peer_identity = Ed2kHelloIdentity {
         user_hash: [0x41; 16],
         client_id: 0x2468_1357,
@@ -273,11 +206,7 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
         connect_options: emule_connect_options(false),
         direct_udp_callback: false,
     };
-    stream
-        .write_all(&encode_hello_request(peer_identity))
-        .await
-        .unwrap();
-    let _ = read_until_opcode(&mut stream, OP_EDONKEYPROT, OP_HELLOANSWER).await;
+    let mut stream = connect_peer_and_exchange_hello(peer_addr, peer_identity).await;
 
     let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
     stream

@@ -194,7 +194,9 @@ mod common;
 mod download;
 mod download_fixture;
 mod listener;
+mod listener_fixture;
 mod protocol;
 
 use common::*;
 use download_fixture::*;
+use listener_fixture::*;
