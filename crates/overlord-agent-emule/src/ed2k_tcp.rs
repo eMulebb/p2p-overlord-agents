@@ -37,16 +37,19 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::ed2k_server::{Ed2kFoundSource, Ed2kServerState};
+#[cfg(test)]
+use crate::ed2k_transfer::ED2K_EMBLOCK_SIZE;
 use crate::ed2k_transfer::{
-    ED2K_EMBLOCK_SIZE, ED2K_PART_SIZE, Ed2kAichHashset, Ed2kResumeManifest, Ed2kSharedEntry,
-    Ed2kSourceHint, Ed2kTransferRuntime, Ed2kUploadPeerIdentity, Ed2kUploadSessionHandle,
-    Ed2kUploadSessionStatus, decode_aich_hash_hex, expected_piece_length, new_transfer_job,
+    ED2K_PART_SIZE, Ed2kAichHashset, Ed2kResumeManifest, Ed2kSharedEntry, Ed2kSourceHint,
+    Ed2kTransferRuntime, Ed2kUploadPeerIdentity, Ed2kUploadSessionHandle, Ed2kUploadSessionStatus,
+    decode_aich_hash_hex, new_transfer_job,
 };
 use crate::kad_firewall::KadFirewallState;
 use overlord_kad_dht::DhtNode;
 use overlord_kad_proto::{Ed2kHash, FirewallUdp, KadPacket};
 
 mod codec;
+mod download;
 mod dump;
 mod hello;
 mod identity;
@@ -72,6 +75,13 @@ use codec::{
     encode_compressed_part_fragment, encode_packed_packet, encode_request_sources2_subpayload,
     encode_sending_part,
 };
+use download::{
+    ActiveDownloadPiece, DownloadRequestWindowState, PendingCompressedPart, PendingPartRequest,
+    ReadyDownloadBlocks, flush_buffered_download_prefixes, flush_ready_download_blocks,
+    next_download_read_timeout, pump_download_request_window, reconcile_download_manifest_metadata,
+};
+#[cfg(test)]
+use download::{DownloadWindowLimits, select_download_window_limits};
 pub(crate) use dump::dump_ed2k_tcp_download_meta;
 use dump::{
     dump_ed2k_tcp_download_recv, dump_ed2k_tcp_download_send, dump_ed2k_tcp_helper_meta,
@@ -434,96 +444,6 @@ struct Ed2kHashsetAnswer2 {
     file_identifier: Ed2kFileIdentifier,
     md4_hashset: Option<Ed2kMd4Hashset>,
     aich_hashset: Option<Ed2kAichHashset>,
-}
-
-/// Incremental inflate state for one pending compressed part stream.
-///
-/// Real eMule peers can split one compressed block across multiple
-/// `OP_COMPRESSEDPART` frames. The per-packet header repeats the block start
-/// and the total compressed stream length, while the payload only carries one
-/// fragment of the zlib stream.
-struct PendingCompressedPart {
-    piece_index: u32,
-    start: u64,
-    end: u64,
-    advertised_compressed_len: usize,
-    compressed_received: usize,
-    uncompressed_written: u64,
-    inflater: Decompress,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ActiveDownloadPiece {
-    piece_index: u32,
-    next_offset: u64,
-    piece_end: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PendingPartRequest {
-    piece_index: u32,
-    start: u64,
-    end: u64,
-    queued: bool,
-    received_end: u64,
-    response_bytes: Vec<u8>,
-}
-
-impl PendingPartRequest {
-    fn new(piece_index: u32, start: u64, end: u64) -> Self {
-        Self {
-            piece_index,
-            start,
-            end,
-            queued: false,
-            received_end: start,
-            response_bytes: Vec::new(),
-        }
-    }
-
-    fn matches_uncompressed_fragment(&self, start: u64, end: u64) -> bool {
-        self.queued && self.received_end == start && end >= start && end <= self.end
-    }
-
-    fn buffer_response_bytes(&mut self, start: u64, end: u64, bytes: &[u8]) -> Result<()> {
-        let data_len = u64::try_from(bytes.len()).context("response block exceeds u64 length")?;
-        let expected_end = start.saturating_add(data_len);
-        if start != self.received_end || end != expected_end || end > self.end {
-            anyhow::bail!(
-                "unexpected response range {start}..{end} for pending block {}..{} received_end={}",
-                self.start,
-                self.end,
-                self.received_end
-            );
-        }
-        self.response_bytes.extend_from_slice(bytes);
-        self.received_end = end;
-        Ok(())
-    }
-
-    fn is_ready(&self) -> bool {
-        self.received_end == self.end
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DownloadWindowLimits {
-    max_pending_blocks: usize,
-    min_pending_blocks: usize,
-}
-
-struct DownloadRequestWindowState<'a> {
-    transfer_runtime: &'a Ed2kTransferRuntime,
-    file_hash: &'a Ed2kHash,
-    file_hash_hex: &'a str,
-    file_size: u64,
-    manifest: &'a Ed2kResumeManifest,
-    active_piece_request: &'a mut Option<ActiveDownloadPiece>,
-    pending_part_requests: &'a mut Vec<PendingPartRequest>,
-    upload_accepted_at: tokio::time::Instant,
-    completed_block_count: usize,
-    session_payload_down: u64,
-    part_response_grace: Duration,
 }
 
 struct EncodedUploadPartPacket {
@@ -2009,179 +1929,6 @@ async fn drive_download_session(
     session_result
 }
 
-async fn pump_download_request_window(
-    transport: &mut Ed2kTransport,
-    peer_addr: SocketAddr,
-    state: DownloadRequestWindowState<'_>,
-) -> Result<Option<tokio::time::Instant>> {
-    let DownloadRequestWindowState {
-        transfer_runtime,
-        file_hash,
-        file_hash_hex,
-        file_size,
-        manifest,
-        active_piece_request,
-        pending_part_requests,
-        upload_accepted_at,
-        completed_block_count,
-        session_payload_down,
-        part_response_grace,
-    } = state;
-    let window = select_download_window_limits(
-        manifest,
-        completed_block_count,
-        session_payload_down,
-        upload_accepted_at,
-    );
-    if pending_part_requests.len() < window.min_pending_blocks {
-        while pending_part_requests.len() < window.max_pending_blocks {
-            if active_piece_request.is_none() {
-                let Some(next_part) = transfer_runtime
-                    .claim_next_missing_part(file_hash_hex)
-                    .await?
-                else {
-                    break;
-                };
-                let piece_start = u64::from(next_part.piece_index) * ED2K_PART_SIZE;
-                let piece_end = (piece_start + ED2K_PART_SIZE).min(file_size);
-                *active_piece_request = Some(ActiveDownloadPiece {
-                    piece_index: next_part.piece_index,
-                    next_offset: piece_start + next_part.bytes_written,
-                    piece_end,
-                });
-            }
-            let Some(active_piece) = active_piece_request.as_mut() else {
-                break;
-            };
-            if active_piece.next_offset >= active_piece.piece_end {
-                break;
-            }
-            let end = (active_piece.next_offset + ED2K_EMBLOCK_SIZE).min(active_piece.piece_end);
-            pending_part_requests.push(PendingPartRequest::new(
-                active_piece.piece_index,
-                active_piece.next_offset,
-                end,
-            ));
-            active_piece.next_offset = end;
-        }
-    }
-
-    let mut request_indices = Vec::with_capacity(3);
-    let mut requested_ranges = Vec::with_capacity(3);
-    for (index, request) in pending_part_requests.iter().enumerate() {
-        if request.queued {
-            continue;
-        }
-        request_indices.push(index);
-        requested_ranges.push((request.start, request.end));
-        if request_indices.len() >= 3 {
-            break;
-        }
-    }
-    if requested_ranges.is_empty() {
-        return Ok(None);
-    }
-
-    let request_parts = encode_request_parts_batch(file_hash, &requested_ranges)?;
-    dump_ed2k_tcp_download_send(peer_addr, transport.mode, "request_parts", &request_parts);
-    transport
-        .write_all(&request_parts)
-        .await
-        .with_context(|| format!("failed to send OP_REQUESTPARTS to {peer_addr}"))?;
-    for index in request_indices {
-        pending_part_requests[index].queued = true;
-    }
-    dump_ed2k_tcp_download_meta(
-        peer_addr,
-        Some(transport.mode),
-        "request_window",
-        format!(
-            "file_hash={file_hash_hex} queued={} total_pending={} max_pending={} min_pending={}",
-            requested_ranges.len(),
-            pending_part_requests.len(),
-            window.max_pending_blocks,
-            window.min_pending_blocks
-        ),
-    );
-    Ok(Some(tokio::time::Instant::now() + part_response_grace))
-}
-
-#[must_use]
-fn select_download_window_limits(
-    manifest: &Ed2kResumeManifest,
-    completed_block_count: usize,
-    session_payload_down: u64,
-    upload_accepted_at: tokio::time::Instant,
-) -> DownloadWindowLimits {
-    if completed_block_count == 0 || session_payload_down == 0 {
-        return DownloadWindowLimits {
-            max_pending_blocks: 1,
-            min_pending_blocks: 1,
-        };
-    }
-
-    let remaining_bytes = remaining_unverified_bytes(manifest);
-    let elapsed_secs = upload_accepted_at.elapsed().as_secs_f64().max(0.001);
-    let download_rate = session_payload_down as f64 / elapsed_secs;
-
-    let (max_pending_blocks, block_delta) = if remaining_bytes <= ED2K_PART_SIZE * 4 {
-        if completed_block_count < 2 || download_rate < 600.0 || session_payload_down < 40 * 1024 {
-            (1usize, 0usize)
-        } else if download_rate < 1200.0 {
-            (2usize, 0usize)
-        } else {
-            (3usize, 1usize)
-        }
-    } else if completed_block_count >= 3 && download_rate > 75.0 * 1024.0 {
-        (6usize, 2usize)
-    } else {
-        (3usize, 1usize)
-    };
-
-    DownloadWindowLimits {
-        max_pending_blocks,
-        min_pending_blocks: max_pending_blocks.saturating_sub(block_delta).max(1),
-    }
-}
-
-#[must_use]
-fn remaining_unverified_bytes(manifest: &Ed2kResumeManifest) -> u64 {
-    manifest
-        .pieces
-        .iter()
-        .map(|piece| {
-            let piece_len = expected_piece_length(
-                manifest.file_size,
-                manifest.piece_size,
-                u64::from(piece.piece_index),
-            );
-            piece_len.saturating_sub(piece.bytes_written)
-        })
-        .sum()
-}
-
-/// Pick the next ED2K download read wait so queue and part-response grace
-/// windows are enforced even when the caller configured a much larger session
-/// timeout.
-#[must_use]
-fn next_download_read_timeout(
-    now: tokio::time::Instant,
-    base_timeout: Duration,
-    fallback_poll_delay: Option<Duration>,
-    queued_until: Option<tokio::time::Instant>,
-    part_response_deadline: Option<tokio::time::Instant>,
-) -> Duration {
-    let mut read_timeout =
-        fallback_poll_delay.map_or(base_timeout, |delay| base_timeout.min(delay));
-    if let Some(deadline) = queued_until {
-        read_timeout = read_timeout.min(deadline.saturating_duration_since(now));
-    }
-    if let Some(deadline) = part_response_deadline {
-        read_timeout = read_timeout.min(deadline.saturating_duration_since(now));
-    }
-    read_timeout
-}
-
 /// Return the eMule TCP/Kad connect-option bits mirrored from the oracle
 /// `GetMyConnectOptions(true, false)` path, minus the direct-callback flag.
 #[must_use]
@@ -3140,154 +2887,6 @@ async fn reply_with_firewall_udp(
         .await
         .with_context(|| format!("failed to send KADEMLIA2_FIREWALLUDP to {target}"))?;
     }
-    Ok(())
-}
-
-struct ReadyDownloadBlocks<'a> {
-    transfer_runtime: &'a Ed2kTransferRuntime,
-    file_hash_hex: &'a str,
-    pending_part_requests: &'a mut Vec<PendingPartRequest>,
-    active_piece_request: &'a mut Option<ActiveDownloadPiece>,
-    manifest: &'a mut Ed2kResumeManifest,
-    peer_addr: SocketAddr,
-    transport_mode: Ed2kTransportMode,
-    completed_block_count: &'a mut usize,
-    session_payload_down: &'a mut u64,
-    part_response_deadline: &'a mut Option<tokio::time::Instant>,
-}
-
-async fn flush_ready_download_blocks(blocks: ReadyDownloadBlocks<'_>) -> Result<()> {
-    let ReadyDownloadBlocks {
-        transfer_runtime,
-        file_hash_hex,
-        pending_part_requests,
-        active_piece_request,
-        manifest,
-        peer_addr,
-        transport_mode,
-        completed_block_count,
-        session_payload_down,
-        part_response_deadline,
-    } = blocks;
-    while pending_part_requests
-        .first()
-        .is_some_and(|request| request.queued && request.is_ready())
-    {
-        let request = pending_part_requests.remove(0);
-        let piece_completed = transfer_runtime
-            .append_piece_block(
-                file_hash_hex,
-                request.piece_index,
-                request.start,
-                request.end,
-                &request.response_bytes,
-            )
-            .await?;
-        *manifest = transfer_runtime.manifest(file_hash_hex).await?;
-        if piece_completed {
-            *active_piece_request = None;
-        }
-        dump_ed2k_tcp_download_meta(
-            peer_addr,
-            Some(transport_mode),
-            "piece_block_flushed",
-            format!(
-                "file_hash={file_hash_hex} piece_index={} start={} end={} completed={}",
-                request.piece_index, request.start, request.end, manifest.completed
-            ),
-        );
-        *completed_block_count = completed_block_count.saturating_add(1);
-        *session_payload_down =
-            session_payload_down.saturating_add(request.end.saturating_sub(request.start));
-    }
-    if !pending_part_requests.iter().any(|request| request.queued) {
-        *part_response_deadline = None;
-    }
-    Ok(())
-}
-
-async fn flush_buffered_download_prefixes(
-    transfer_runtime: &Ed2kTransferRuntime,
-    file_hash_hex: &str,
-    pending_part_requests: &mut Vec<PendingPartRequest>,
-    active_piece_request: &mut Option<ActiveDownloadPiece>,
-    manifest: &mut Ed2kResumeManifest,
-    peer_addr: SocketAddr,
-    transport_mode: Ed2kTransportMode,
-) -> Result<()> {
-    loop {
-        let Some(first_request) = pending_part_requests.first() else {
-            break;
-        };
-        if !first_request.queued || first_request.response_bytes.is_empty() {
-            break;
-        }
-
-        let (piece_index, start, end, bytes, request_complete) = {
-            let request = &mut pending_part_requests[0];
-            let bytes = std::mem::take(&mut request.response_bytes);
-            let start = request.start;
-            let end = request.received_end;
-            request.start = end;
-            (
-                request.piece_index,
-                start,
-                end,
-                bytes,
-                request.start == request.end,
-            )
-        };
-
-        let piece_completed = transfer_runtime
-            .append_piece_block(file_hash_hex, piece_index, start, end, &bytes)
-            .await?;
-        *manifest = transfer_runtime.manifest(file_hash_hex).await?;
-        if piece_completed {
-            *active_piece_request = None;
-        }
-        dump_ed2k_tcp_download_meta(
-            peer_addr,
-            Some(transport_mode),
-            "piece_prefix_flushed",
-            format!(
-                "file_hash={file_hash_hex} piece_index={piece_index} start={start} end={end} completed={}",
-                manifest.completed
-            ),
-        );
-
-        if request_complete {
-            pending_part_requests.remove(0);
-            continue;
-        }
-        break;
-    }
-    Ok(())
-}
-
-async fn reconcile_download_manifest_metadata(
-    transfer_runtime: &Ed2kTransferRuntime,
-    file_hash_hex: &str,
-    manifest: &mut Ed2kResumeManifest,
-    request_file_identifier: &mut Ed2kFileIdentifier,
-    peer_file_identifier: &Ed2kFileIdentifier,
-    peer_file_name: Option<&str>,
-) -> Result<()> {
-    let learned_size = peer_file_identifier.file_size;
-    let learned_name = peer_file_name
-        .map(str::trim)
-        .filter(|name| !name.is_empty());
-    if learned_size.is_none() && learned_name.is_none() && peer_file_identifier.aich_root.is_none()
-    {
-        return Ok(());
-    }
-
-    *manifest = transfer_runtime
-        .reconcile_job_metadata(file_hash_hex, learned_name, learned_size)
-        .await?;
-    *manifest = transfer_runtime
-        .reconcile_aich_root(file_hash_hex, peer_file_identifier.aich_root)
-        .await?;
-    *request_file_identifier = Ed2kFileIdentifier::from_manifest(manifest)?;
     Ok(())
 }
 
