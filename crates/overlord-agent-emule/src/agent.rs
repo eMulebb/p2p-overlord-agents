@@ -92,6 +92,7 @@ mod networking;
 mod passive_replay;
 mod publish;
 mod search;
+mod snoop;
 
 use self::activity::{
     ACTIVITY_KEY_BOOTSTRAPPING, ACTIVITY_KEY_FLUSHING_SNOOPS, ACTIVITY_KEY_RECONFIGURING,
@@ -121,17 +122,17 @@ use self::networking::empty_networking_config;
 use self::networking::{
     apply_networking_config, p2p_interface_reconcile_target, persist_networking_config,
 };
-#[cfg(test)]
-use self::passive_replay::record_passive_replay_idle;
 use self::passive_replay::{
-    PassiveReplaySelection, apply_harvest_record, apply_queue_family_counts,
-    next_passive_replay_request, next_passive_replay_request_for_family,
-    passive_replay_thin_result_threshold, passive_replay_tier_contact_limits,
-    record_passive_replay_complete, record_passive_replay_enqueue_wait,
-    record_passive_replay_idle_for_worker, record_passive_replay_outcome,
-    record_passive_replay_post_failure, record_passive_replay_post_latency,
-    record_passive_replay_start, try_acquire_passive_replay_gate,
+    PassiveReplaySelection, apply_queue_family_counts, next_passive_replay_request,
+    next_passive_replay_request_for_family, passive_replay_thin_result_threshold,
+    passive_replay_tier_contact_limits, record_passive_replay_complete,
+    record_passive_replay_enqueue_wait, record_passive_replay_idle_for_worker,
+    record_passive_replay_outcome, record_passive_replay_post_failure,
+    record_passive_replay_post_latency, record_passive_replay_start,
+    try_acquire_passive_replay_gate,
 };
+#[cfg(test)]
+use self::passive_replay::{apply_harvest_record, record_passive_replay_idle};
 #[cfg(test)]
 use self::publish::{apply_publish_summary, build_publish_batch_summary};
 use self::publish::{
@@ -145,6 +146,10 @@ use self::search::{
     SearchRunStats, do_active_keyword_search, do_active_notes_search, do_active_source_search,
     emit_search_event, map_note_result, map_search_result_for, map_source_result,
     post_search_batch, search_file_hash, search_file_size, search_query,
+};
+use self::snoop::{
+    build_keyword_snoop_entry, build_notes_snoop_entry, build_source_snoop_entry,
+    flush_snoop_queue, record_snoop_entry, restore_snoop_queue,
 };
 
 const ACTIVE_BATCH_SIZE: usize = 25;
@@ -3120,66 +3125,6 @@ async fn seed_popular_impl(
     Ok(())
 }
 
-async fn restore_snoop_queue(
-    coordinator: &CoordinatorClient,
-    indexer_id: Uuid,
-    snoop_queue: &Arc<Mutex<SnoopQueue>>,
-) {
-    match coordinator.restore_snoop(indexer_id).await {
-        Ok(entries) => {
-            let mut queue = snoop_queue.lock().await;
-            queue.merge_snapshot(entries);
-            let counts = queue.family_counts();
-            info!(
-                "kad snoop restore keyword={} source={} notes={} total={}",
-                counts.keyword,
-                counts.source,
-                counts.notes,
-                queue.len()
-            );
-        }
-        Err(error) => warn!("failed to restore snoop queue: {error}"),
-    }
-}
-
-async fn flush_snoop_queue(
-    coordinator: &CoordinatorClient,
-    indexer_id: Uuid,
-    snoop_queue: &Arc<Mutex<SnoopQueue>>,
-    observed_snoop_events: &Arc<Mutex<Vec<SnoopObservation>>>,
-) -> Result<()> {
-    let (entries, counts) = {
-        let queue = snoop_queue.lock().await;
-        (queue.snapshot(), queue.family_counts())
-    };
-    let observations = {
-        let mut observed = observed_snoop_events.lock().await;
-        std::mem::take(&mut *observed)
-    };
-    info!(
-        "kad snoop flush keyword={} source={} notes={} total={} observations={}",
-        counts.keyword,
-        counts.source,
-        counts.notes,
-        entries.len(),
-        observations.len()
-    );
-    match coordinator
-        .flush_snoop(indexer_id, &entries, &observations)
-        .await
-    {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let mut observed = observed_snoop_events.lock().await;
-            observations
-                .into_iter()
-                .rev()
-                .for_each(|event| observed.insert(0, event));
-            Err(error)
-        }
-    }
-}
-
 fn ensure_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -3284,184 +3229,6 @@ fn keyword_target(query: &str) -> NodeId {
     hasher.update(first_word.as_bytes());
     let digest: [u8; 16] = hasher.finalize().into();
     NodeId::from_be_bytes(digest)
-}
-
-fn keyword_logical_key(req: &SearchKeyReq) -> String {
-    let payload_hex = if req.restrictive_payload.is_empty() {
-        None
-    } else {
-        Some(hex::encode(&req.restrictive_payload))
-    };
-    format!(
-        "keyword:{}:{:04x}:{}",
-        req.target,
-        req.start_position,
-        payload_hex.as_deref().unwrap_or_default()
-    )
-}
-
-fn source_logical_key(req: &SearchSourceReq) -> String {
-    format!(
-        "source:{}:{:04x}:{}",
-        req.target, req.start_position, req.size
-    )
-}
-
-fn notes_logical_key(req: &SearchNotesReq) -> String {
-    format!("notes:{}:{}", req.target, req.size)
-}
-
-fn build_keyword_snoop_entry(req: &SearchKeyReq, now: chrono::DateTime<Utc>) -> SnoopEntry {
-    let payload_hex = if req.restrictive_payload.is_empty() {
-        None
-    } else {
-        Some(hex::encode(&req.restrictive_payload))
-    };
-    SnoopEntry::Keyword {
-        logical_key: keyword_logical_key(req),
-        target: req.target.to_string(),
-        start_position: req.start_position,
-        restrictive_payload_hex: payload_hex,
-        hit_count: 1,
-        first_seen: now,
-        last_seen: now,
-        last_drained_at: None,
-    }
-}
-
-fn build_source_snoop_entry(req: &SearchSourceReq, now: chrono::DateTime<Utc>) -> SnoopEntry {
-    SnoopEntry::Source {
-        logical_key: source_logical_key(req),
-        target: req.target.to_string(),
-        start_position: req.start_position,
-        size: req.size,
-        hit_count: 1,
-        first_seen: now,
-        last_seen: now,
-        last_drained_at: None,
-    }
-}
-
-fn build_notes_snoop_entry(req: &SearchNotesReq, now: chrono::DateTime<Utc>) -> SnoopEntry {
-    SnoopEntry::Notes {
-        logical_key: notes_logical_key(req),
-        target: req.target.to_string(),
-        size: req.size,
-        hit_count: 1,
-        first_seen: now,
-        last_seen: now,
-        last_drained_at: None,
-    }
-}
-
-async fn record_snoop_entry(
-    snoop_queue: &Arc<Mutex<SnoopQueue>>,
-    observed_snoop_events: &Arc<Mutex<Vec<SnoopObservation>>>,
-    harvest_observability: &Arc<Mutex<KadHarvestObservability>>,
-    from: SocketAddr,
-    entry: SnoopEntry,
-) {
-    let (family, target, detail) = match &entry {
-        SnoopEntry::Keyword {
-            target,
-            start_position,
-            restrictive_payload_hex,
-            ..
-        } => (
-            "keyword",
-            target.clone(),
-            format!(
-                "start_position={start_position} restrictive_bytes={}",
-                restrictive_payload_hex
-                    .as_ref()
-                    .map(|payload| payload.len() / 2)
-                    .unwrap_or(0)
-            ),
-        ),
-        SnoopEntry::Source {
-            target,
-            start_position,
-            size,
-            ..
-        } => (
-            "source",
-            target.clone(),
-            format!("start_position={start_position} size={size}"),
-        ),
-        SnoopEntry::Notes { target, size, .. } => ("notes", target.clone(), format!("size={size}")),
-    };
-    let observed_at = entry.last_seen();
-    let outcome = {
-        let mut queue = snoop_queue.lock().await;
-        queue.record(entry.clone())
-    };
-    {
-        let mut observability = harvest_observability.lock().await;
-        apply_harvest_record(&mut observability, from, &entry, outcome.is_new);
-    }
-    if outcome.is_new || outcome.hit_count <= 3 || outcome.hit_count % 10 == 0 {
-        debug!(
-            "kad snoop family={} from={} target={} {} queue_depth={} family_queue_depth={} hit_count={} state={} seen_at={}",
-            family,
-            from,
-            target,
-            detail,
-            outcome.queue_depth,
-            outcome.family_queue_depth,
-            outcome.hit_count,
-            if outcome.is_new { "new" } else { "repeat" },
-            observed_at
-        );
-    }
-    observed_snoop_events.lock().await.push(match entry {
-        SnoopEntry::Keyword {
-            logical_key,
-            target,
-            start_position,
-            restrictive_payload_hex,
-            last_seen,
-            ..
-        } => SnoopObservation {
-            family: HarvestFamily::Keyword,
-            logical_key,
-            target,
-            start_position: Some(start_position),
-            size: None,
-            restrictive_payload_hex,
-            observed_at: last_seen,
-        },
-        SnoopEntry::Source {
-            logical_key,
-            target,
-            start_position,
-            size,
-            last_seen,
-            ..
-        } => SnoopObservation {
-            family: HarvestFamily::Source,
-            logical_key,
-            target,
-            start_position: Some(start_position),
-            size: Some(size),
-            restrictive_payload_hex: None,
-            observed_at: last_seen,
-        },
-        SnoopEntry::Notes {
-            logical_key,
-            target,
-            size,
-            last_seen,
-            ..
-        } => SnoopObservation {
-            family: HarvestFamily::Notes,
-            logical_key,
-            target,
-            start_position: None,
-            size: Some(size),
-            restrictive_payload_hex: None,
-            observed_at: last_seen,
-        },
-    });
 }
 
 async fn persist_nodes_dat_for(dht: &DhtNode, state_paths: &AgentStatePaths) -> Result<()> {
