@@ -18,7 +18,6 @@
 //! - range serving with eMule-style part fragmentation and optional compression
 
 use std::{
-    collections::VecDeque,
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     str::FromStr,
@@ -35,7 +34,7 @@ use md5::compute as md5_compute;
 use rand::Rng;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpSocket, TcpStream},
+    net::{TcpListener, TcpStream},
     sync::{Mutex, RwLock},
 };
 use tracing::{debug, info, warn};
@@ -54,6 +53,7 @@ mod codec;
 mod dump;
 mod hello;
 mod identity;
+mod transport;
 use codec::{
     build_upload_part_packets, decode_aich_file_hash_answer, decode_compressed_part_fragment,
     decode_file_hash_payload, decode_file_status_payload, decode_hashset_answer,
@@ -95,6 +95,8 @@ use identity::{
     decode_secident_state, encode_secident_state, random_nonzero_u32,
     try_send_secure_ident_signature,
 };
+pub use transport::EmuleTcpPacket;
+use transport::{Ed2kTransport, Ed2kTransportMode};
 
 const OP_EMULEPROT: u8 = 0xC5;
 const OP_EDONKEYPROT: u8 = 0xE3;
@@ -201,17 +203,6 @@ const ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED: u8 = 2;
 // operator-configurable nick surface, keep a neutral stock-like default
 // instead of the earlier project URL identity.
 const HELLO_NICKNAME: &str = "eMule";
-
-/// One decoded eD2k TCP packet.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EmuleTcpPacket {
-    /// Protocol marker byte.
-    pub protocol: u8,
-    /// Packet opcode.
-    pub opcode: u8,
-    /// Packet payload without the framing header.
-    pub payload: Vec<u8>,
-}
 
 /// Payload of `OP_FWCHECKUDPREQ`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -573,30 +564,6 @@ impl Rc4KeyStream {
             self.j = (self.j + self.s[self.i] as usize) & 0xFF;
             self.s.swap(self.i, self.j);
             *byte ^= self.s[(self.s[self.i] as usize + self.s[self.j] as usize) & 0xFF];
-        }
-    }
-}
-
-#[derive(Debug)]
-struct Ed2kTransport {
-    stream: TcpStream,
-    prefetched: VecDeque<u8>,
-    receive_cipher: Option<Rc4KeyStream>,
-    send_cipher: Option<Rc4KeyStream>,
-    mode: Ed2kTransportMode,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Ed2kTransportMode {
-    Plaintext,
-    Obfuscated,
-}
-
-impl Ed2kTransportMode {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Plaintext => "plaintext",
-            Self::Obfuscated => "obfuscated",
         }
     }
 }
@@ -2240,182 +2207,6 @@ fn next_download_read_timeout(
         read_timeout = read_timeout.min(deadline.saturating_duration_since(now));
     }
     read_timeout
-}
-
-impl Ed2kTransport {
-    async fn connect_outgoing(
-        bind_ip: Ipv4Addr,
-        peer_addr: SocketAddr,
-        local_connect_options: u8,
-        peer_user_hash: Option<[u8; 16]>,
-        peer_connect_options: Option<u8>,
-        timeout: Duration,
-    ) -> Result<Self> {
-        let socket = match peer_addr {
-            SocketAddr::V4(_) => {
-                TcpSocket::new_v4().context("failed to create outgoing eD2k TCP socket")?
-            }
-            SocketAddr::V6(_) => {
-                anyhow::bail!("IPv6 callback peer connections are not supported yet: {peer_addr}")
-            }
-        };
-        socket
-            .bind(SocketAddr::new(IpAddr::V4(bind_ip), 0))
-            .with_context(|| format!("failed to bind outgoing eD2k socket to {bind_ip}"))?;
-        let mut stream = tokio::time::timeout(timeout, socket.connect(peer_addr))
-            .await
-            .with_context(|| format!("timed out connecting to eD2k peer {peer_addr}"))??;
-        stream
-            .set_nodelay(true)
-            .with_context(|| format!("failed to enable TCP_NODELAY for peer {peer_addr}"))?;
-
-        if should_enable_outgoing_obfuscation(
-            local_connect_options,
-            peer_user_hash,
-            peer_connect_options,
-        )? {
-            let peer_user_hash = peer_user_hash.expect("validated above");
-            let (receive_cipher, send_cipher) = tokio::time::timeout(
-                timeout,
-                negotiate_outgoing_obfuscation_handshake(&mut stream, peer_user_hash),
-            )
-            .await
-            .with_context(|| {
-                format!("timed out negotiating eD2k obfuscation with peer {peer_addr}")
-            })??;
-            return Ok(Self {
-                stream,
-                prefetched: VecDeque::new(),
-                receive_cipher: Some(receive_cipher),
-                send_cipher: Some(send_cipher),
-                mode: Ed2kTransportMode::Obfuscated,
-            });
-        }
-
-        Ok(Self {
-            stream,
-            prefetched: VecDeque::new(),
-            receive_cipher: None,
-            send_cipher: None,
-            mode: Ed2kTransportMode::Plaintext,
-        })
-    }
-
-    async fn accept(mut stream: TcpStream, local_user_hash: [u8; 16]) -> Result<Self> {
-        let mut first_byte = [0u8; 1];
-        match stream.read_exact(&mut first_byte).await {
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-                return Ok(Self {
-                    stream,
-                    prefetched: VecDeque::new(),
-                    receive_cipher: None,
-                    send_cipher: None,
-                    mode: Ed2kTransportMode::Plaintext,
-                });
-            }
-            Err(error) => return Err(error.into()),
-        }
-
-        if is_plain_ed2k_protocol_marker(first_byte[0]) {
-            let mut prefetched = VecDeque::with_capacity(1);
-            prefetched.push_back(first_byte[0]);
-            return Ok(Self {
-                stream,
-                prefetched,
-                receive_cipher: None,
-                send_cipher: None,
-                mode: Ed2kTransportMode::Plaintext,
-            });
-        }
-
-        let (receive_cipher, send_cipher) =
-            accept_incoming_obfuscation_handshake(&mut stream, local_user_hash, first_byte[0])
-                .await?;
-        Ok(Self {
-            stream,
-            prefetched: VecDeque::new(),
-            receive_cipher: Some(receive_cipher),
-            send_cipher: Some(send_cipher),
-            mode: Ed2kTransportMode::Obfuscated,
-        })
-    }
-
-    async fn read_packet(&mut self) -> Result<Option<EmuleTcpPacket>> {
-        let Some(protocol) = self.read_u8().await? else {
-            return Ok(None);
-        };
-
-        let mut header_rest = [0u8; TCP_PACKET_HEADER_LEN - 1];
-        self.read_exact(&mut header_rest).await?;
-        let packet_length = u32::from_le_bytes([
-            header_rest[0],
-            header_rest[1],
-            header_rest[2],
-            header_rest[3],
-        ]);
-        let opcode = header_rest[4];
-        if packet_length == 0 {
-            anyhow::bail!("invalid eD2k packet length 0");
-        }
-
-        let payload_len = usize::try_from(packet_length - 1).context("packet length overflow")?;
-        let mut payload = vec![0u8; payload_len];
-        self.read_exact(&mut payload).await?;
-        let (protocol, payload) = decode_peer_payload(protocol, payload)?;
-        Ok(Some(EmuleTcpPacket {
-            protocol,
-            opcode,
-            payload,
-        }))
-    }
-
-    async fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
-        if let Some(cipher) = self.send_cipher.as_mut() {
-            let mut encrypted = bytes.to_vec();
-            cipher.apply(&mut encrypted);
-            self.stream.write_all(&encrypted).await?;
-        } else {
-            self.stream.write_all(bytes).await?;
-        }
-        Ok(())
-    }
-
-    async fn read_u8(&mut self) -> Result<Option<u8>> {
-        if let Some(byte) = self.prefetched.pop_front() {
-            return Ok(Some(byte));
-        }
-        let mut byte = [0u8; 1];
-        match self.stream.read_exact(&mut byte).await {
-            Ok(_) => {
-                if let Some(cipher) = self.receive_cipher.as_mut() {
-                    cipher.apply(&mut byte);
-                }
-                Ok(Some(byte[0]))
-            }
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    async fn read_exact(&mut self, bytes: &mut [u8]) -> Result<()> {
-        let mut offset = 0usize;
-        while offset < bytes.len() {
-            if let Some(byte) = self.prefetched.pop_front() {
-                bytes[offset] = byte;
-                offset += 1;
-            } else {
-                break;
-            }
-        }
-        if offset < bytes.len() {
-            self.stream.read_exact(&mut bytes[offset..]).await?;
-            if let Some(cipher) = self.receive_cipher.as_mut() {
-                cipher.apply(&mut bytes[offset..]);
-            }
-        }
-        Ok(())
-    }
 }
 
 /// Decode one peer TCP payload exactly like the oracle socket path: packed
