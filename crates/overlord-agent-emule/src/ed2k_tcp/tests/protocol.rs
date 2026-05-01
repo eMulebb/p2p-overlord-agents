@@ -958,17 +958,6 @@ async fn udp_firewall_check_request_completes_hello_exchange_before_request() {
     let helper_addr = listener.local_addr().unwrap();
 
     let server = tokio::spawn(async move {
-        async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-            let mut header = [0u8; 6];
-            stream.read_exact(&mut header).await.unwrap();
-            let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-            let mut packet = header.to_vec();
-            let mut payload = vec![0u8; packet_len - 1];
-            stream.read_exact(&mut payload).await.unwrap();
-            packet.extend_from_slice(&payload);
-            packet
-        }
-
         let (mut stream, peer_addr) = listener.accept().await.unwrap();
         assert_eq!(peer_addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
 
