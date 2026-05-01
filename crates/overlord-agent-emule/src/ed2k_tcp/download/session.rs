@@ -1,7 +1,6 @@
 use std::{net::SocketAddr, time::Duration};
 
 use anyhow::{Context, Result};
-use flate2::Decompress;
 use overlord_kad_proto::Ed2kHash;
 
 use crate::ed2k_transfer::Ed2kTransferRuntime;
@@ -15,22 +14,23 @@ use super::super::{
     OP_HELLOANSWER, OP_MULTIPACKETANSWER_EXT2, OP_PUBLICKEY, OP_QUEUERANKING, OP_REQFILENAMEANSWER,
     OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64, OP_SETREQFILEID, OP_SIGNATURE,
     begin_secure_ident_probe, build_hello_responses, decode_aich_file_hash_answer,
-    decode_compressed_part_fragment, decode_file_status_payload, decode_hashset_answer,
-    decode_hashset_answer2, decode_hello_profile, decode_public_key_payload,
-    decode_request_filename_answer, decode_request_filename_answer_body, decode_secident_state,
-    decode_sending_part_payload, dump_ed2k_tcp_download_meta, dump_ed2k_tcp_download_recv,
-    dump_ed2k_tcp_download_send, encode_emule_info_answer, encode_packet,
-    inflate_compressed_part_fragment, is_connection_shutdown_error, skip_file_status_body,
+    decode_file_status_payload, decode_hashset_answer, decode_hashset_answer2,
+    decode_hello_profile, decode_public_key_payload, decode_request_filename_answer,
+    decode_request_filename_answer_body, decode_secident_state, dump_ed2k_tcp_download_meta,
+    dump_ed2k_tcp_download_recv, dump_ed2k_tcp_download_send, encode_emule_info_answer,
+    encode_packet, is_connection_shutdown_error, skip_file_status_body,
     try_send_secure_ident_signature,
 };
 use super::{
     ActiveDownloadPiece, DownloadRequestWindowState, PendingCompressedPart, PendingPartRequest,
-    ReadyDownloadBlocks, flush_buffered_download_prefixes, flush_ready_download_blocks,
-    next_download_read_timeout, pump_download_request_window, reconcile_download_manifest_metadata,
+    flush_buffered_download_prefixes, next_download_read_timeout, pump_download_request_window,
+    reconcile_download_manifest_metadata,
 };
+mod parts;
 mod startup;
 mod state;
 
+use parts::{DownloadPartPacket, handle_download_part_packet};
 use startup::{DownloadStartupStep, HASHSET_STALL_UPLOAD_FALLBACK, advance_download_startup};
 use state::DownloadSessionState;
 /// Outcome of one outbound ED2K peer download attempt.
@@ -492,212 +492,21 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                 | (OP_EMULEPROT, OP_SENDINGPART_I64)
                 | (OP_EMULEPROT, OP_COMPRESSEDPART)
                 | (OP_EMULEPROT, OP_COMPRESSEDPART_I64) => {
-                    let use_i64 = packet.opcode == OP_SENDINGPART_I64
-                        || packet.opcode == OP_COMPRESSEDPART_I64;
-                    if packet.opcode == OP_COMPRESSEDPART || packet.opcode == OP_COMPRESSEDPART_I64 {
-                        let (returned_hash, start, advertised_compressed_len, compressed_fragment) =
-                            decode_compressed_part_fragment(&packet.payload, use_i64)?;
-                        if returned_hash != file_hash {
-                            dump_ed2k_tcp_download_meta(
-                                peer_addr,
-                                Some(transport.mode),
-                                "unexpected_part_hash",
-                                format!(
-                                    "expected_file_hash={file_hash_hex} returned_file_hash={returned_hash} start={start} compressed_len={advertised_compressed_len}"
-                                ),
-                            );
-                            continue;
-                        }
-                        if !pending_part_requests.iter().any(|request| request.queued) {
-                            dump_ed2k_tcp_download_meta(
-                                peer_addr,
-                                Some(transport.mode),
-                                "unexpected_compressed_part_without_queued_request",
-                                format!(
-                                    "file_hash={file_hash_hex} start={start} compressed_len={advertised_compressed_len}"
-                                ),
-                            );
-                            return Ok(Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
-                        }
-                        let Some(pending_index) = pending_part_requests.iter().position(
-                            |request| request.queued && request.start == start && request.end > request.start,
-                        ) else {
-                            dump_ed2k_tcp_download_meta(
-                                peer_addr,
-                                Some(transport.mode),
-                                "unexpected_compressed_part_range",
-                                format!(
-                                    "file_hash={file_hash_hex} start={start} compressed_len={advertised_compressed_len} pending={:?}",
-                                    pending_part_requests
-                                ),
-                            );
-                            return Ok(Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
-                        };
-                        let expected_request = pending_part_requests[pending_index].clone();
-                        let expected_part = expected_request.piece_index;
-                        let expected_start = expected_request.start;
-                        let expected_end = expected_request.end;
-                        let compressed_index = if let Some(index) = pending_compressed_parts
-                            .iter()
-                            .position(|pending| {
-                                pending.piece_index == expected_part
-                                    && pending.start == expected_start
-                                    && pending.end == expected_end
-                            })
-                        {
-                            let pending = &pending_compressed_parts[index];
-                            if pending.advertised_compressed_len != advertised_compressed_len {
-                                anyhow::bail!(
-                                    "peer {peer_addr} changed compressed-part framing for piece {expected_part} start={}..{} advertised={} expected={}..{} advertised={}",
-                                    pending.start,
-                                    pending.end,
-                                    pending.advertised_compressed_len,
-                                    expected_start,
-                                    expected_end,
-                                    advertised_compressed_len
-                                );
-                            }
-                            index
-                        } else {
-                            pending_compressed_parts.push(PendingCompressedPart {
-                                piece_index: expected_part,
-                                start: expected_start,
-                                end: expected_end,
-                                advertised_compressed_len,
-                                compressed_received: 0,
-                                uncompressed_written: 0,
-                                inflater: Decompress::new(true),
-                            });
-                            pending_compressed_parts.len() - 1
-                        };
-                        let (bytes, finished) = {
-                            let pending = &mut pending_compressed_parts[compressed_index];
-                            inflate_compressed_part_fragment(pending, compressed_fragment)?
-                        };
-                        let stream_end = {
-                            let pending = &pending_compressed_parts[compressed_index];
-                            pending.start + pending.uncompressed_written
-                        };
-                        if !bytes.is_empty() {
-                            let stream_start = stream_end
-                                .checked_sub(u64::try_from(bytes.len()).unwrap_or(0))
-                                .unwrap_or(start);
-                            let expected_received_start =
-                                pending_part_requests[pending_index].received_end;
-                            if stream_start != expected_received_start {
-                                dump_ed2k_tcp_download_meta(
-                                    peer_addr,
-                                    Some(transport.mode),
-                                    "out_of_order_compressed_part_range",
-                                    format!(
-                                        "file_hash={file_hash_hex} piece_index={expected_part} expected_start={} start={stream_start} end={stream_end} pending={:?}",
-                                        expected_received_start,
-                                        pending_part_requests
-                                    ),
-                                );
-                                return Ok(Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
-                            }
-                            pending_part_requests[pending_index]
-                                .buffer_response_bytes(stream_start, stream_end, &bytes)?;
-                        }
-                        let piece_len = expected_end - expected_start;
-                        let pending = &pending_compressed_parts[compressed_index];
-                        if pending.uncompressed_written > piece_len {
-                            anyhow::bail!(
-                                "peer {peer_addr} decompressed beyond requested piece boundary for piece {expected_part}: wrote {} expected {}",
-                                pending.uncompressed_written,
-                                piece_len
-                            );
-                        }
-                        if finished && pending.uncompressed_written != piece_len {
-                            anyhow::bail!(
-                                "peer {peer_addr} ended compressed stream early for piece {expected_part}: wrote {} expected {}",
-                                pending.uncompressed_written,
-                                piece_len
-                            );
-                        }
-                        if pending.uncompressed_written == piece_len {
-                            pending_compressed_parts.remove(compressed_index);
-                        }
-                        flush_ready_download_blocks(ReadyDownloadBlocks {
+                    if let Some(outcome) = handle_download_part_packet(DownloadPartPacket {
                             transfer_runtime,
+                            file_hash: &file_hash,
                             file_hash_hex,
                             pending_part_requests: &mut pending_part_requests,
-                            active_piece_request: &mut session_state.active_piece_request,
+                            pending_compressed_parts: &mut pending_compressed_parts,
                             manifest: &mut manifest,
+                            session_state: &mut session_state,
                             peer_addr,
                             transport_mode: transport.mode,
-                            completed_block_count: &mut session_state.completed_block_count,
-                            session_payload_down: &mut session_state.session_payload_down,
-                            part_response_deadline: &mut session_state.part_response_deadline,
+                            packet: &packet,
                         })
-                        .await?;
-                    } else {
-                        let (returned_hash, start, end, bytes) =
-                            decode_sending_part_payload(&packet.payload, use_i64)?;
-                        if returned_hash != file_hash {
-                            dump_ed2k_tcp_download_meta(
-                                peer_addr,
-                                Some(transport.mode),
-                                "unexpected_part_hash",
-                                format!(
-                                    "expected_file_hash={file_hash_hex} returned_file_hash={returned_hash} start={start} end={end}"
-                                ),
-                            );
-                            continue;
-                        }
-                        if !pending_part_requests.iter().any(|request| request.queued) {
-                            dump_ed2k_tcp_download_meta(
-                                peer_addr,
-                                Some(transport.mode),
-                                "unexpected_part_without_queued_request",
-                                format!("file_hash={file_hash_hex} start={start} end={end}"),
-                            );
-                            return Ok(Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
-                        }
-                        let Some(pending_index) = pending_part_requests.iter().position(
-                            |request| request.matches_uncompressed_fragment(start, end),
-                        ) else {
-                            dump_ed2k_tcp_download_meta(
-                                peer_addr,
-                                Some(transport.mode),
-                                "unexpected_part_range",
-                                format!(
-                                    "file_hash={file_hash_hex} start={start} end={end} pending={:?}",
-                                    pending_part_requests
-                                ),
-                            );
-                            return Ok(Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
-                        };
-                        let expected_request = pending_part_requests[pending_index].clone();
-                        let expected_start = expected_request.start;
-                        if start < expected_start {
-                            dump_ed2k_tcp_download_meta(
-                                peer_addr,
-                                Some(transport.mode),
-                                "unexpected_part_fragment_start",
-                                format!(
-                                    "file_hash={file_hash_hex} expected_start={expected_start} start={start} end={end} pending={:?}",
-                                    pending_part_requests
-                                ),
-                            );
-                            return Ok(Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
-                        }
-                        pending_part_requests[pending_index]
-                            .buffer_response_bytes(start, end, &bytes)?;
-                        flush_ready_download_blocks(ReadyDownloadBlocks {
-                            transfer_runtime,
-                            file_hash_hex,
-                            pending_part_requests: &mut pending_part_requests,
-                            active_piece_request: &mut session_state.active_piece_request,
-                            manifest: &mut manifest,
-                            peer_addr,
-                            transport_mode: transport.mode,
-                            completed_block_count: &mut session_state.completed_block_count,
-                            session_payload_down: &mut session_state.session_payload_down,
-                            part_response_deadline: &mut session_state.part_response_deadline,
-                        })
-                        .await?;
+                        .await?
+                    {
+                        return Ok(outcome);
                     }
                 }
                 _ => {}
