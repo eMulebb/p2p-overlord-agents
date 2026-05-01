@@ -7,9 +7,10 @@ use std::{
 
 use anyhow::{Context, Result};
 
+use super::manifest::{manifest_progress_bytes, quarantine_corrupt_manifest};
 use super::{
     ED2K_EMBLOCK_SIZE, Ed2kManifestCheckpointState, Ed2kResumeManifest, Ed2kTransferJob,
-    Ed2kTransferRuntime, MANIFEST_FILE_NAME, manifest_progress_bytes, quarantine_corrupt_manifest,
+    Ed2kTransferRuntime, MANIFEST_FILE_NAME,
 };
 
 const ED2K_RESUME_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
