@@ -12,6 +12,7 @@ use overlord_kad_dht::DhtNode;
 use super::dump::{
     dump_ed2k_tcp_helper_meta, dump_ed2k_tcp_helper_recv, dump_ed2k_tcp_helper_send,
 };
+use super::hello::{encode_hello_answer, is_mule_hello, is_mule_hello_answer};
 use super::{
     ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, ED2K_SECURE_IDENT_SIGNATURE_NEEDED,
     EMULE_CRYPT_REQUESTS, EMULE_CRYPT_SUPPORTS, Ed2kHelloIdentity, Ed2kPeerConnectMode,
@@ -20,9 +21,8 @@ use super::{
     OP_EMULEINFO, OP_EMULEINFOANSWER, OP_EMULEPROT, OP_FWCHECKUDPREQ, OP_HELLO, OP_HELLOANSWER,
     OP_PUBLICKEY, OP_SECIDENTSTATE, OP_SIGNATURE, begin_secure_ident_probe, build_hello_responses,
     decode_public_key_payload, decode_secident_state, encode_emule_info_answer,
-    encode_hello_answer, encode_hello_request, encode_packet, encode_secident_state, is_mule_hello,
-    is_mule_hello_answer, random_nonzero_u32, reply_with_firewall_udp,
-    try_send_secure_ident_signature,
+    encode_hello_request, encode_packet, encode_secident_state, random_nonzero_u32,
+    reply_with_firewall_udp, try_send_secure_ident_signature,
 };
 
 /// Immutable session metadata shared by one outgoing TCP helper exchange.
