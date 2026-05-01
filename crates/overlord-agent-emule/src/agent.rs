@@ -20,7 +20,6 @@ use overlord_agent_nat::{
     AgentNetworkReport, AgentNetworkingConfig, NatManager, ResolvedInterfaceBindingReport,
     detect_interfaces,
 };
-use serde::Deserialize;
 use serde_json::Value;
 use tokio::{
     net::TcpListener,
@@ -39,7 +38,7 @@ use overlord_agent_common::{
     RunningIndexerServer, SearchEventStatus, SearchJob, SearchKind, SnoopEntry, SnoopObservation,
 };
 use overlord_kad_dht::{DhtNode, RpcObservabilitySnapshot, RpcWorkClass};
-use overlord_kad_proto::{Ed2kHash, NodeId};
+use overlord_kad_proto::NodeId;
 
 use crate::config::EmuleAgentConfig;
 use crate::ed2k_server::{Ed2kFoundSource, Ed2kServerSearchHandle, Ed2kServerState};
@@ -63,6 +62,7 @@ mod background_snoop;
 mod background_tasks;
 mod control_runtime;
 mod ed2k_download;
+mod ed2k_enrich;
 mod ed2k_runtime;
 mod ed2k_search;
 mod kad_firewall_runtime;
@@ -85,6 +85,9 @@ use self::activity::{
     publish_activity_key, record_agent_degraded_activity, runtime_activity_error,
     search_activity_context,
 };
+#[cfg(test)]
+use self::ed2k_enrich::EnrichEd2kDownloadSource;
+use self::ed2k_enrich::{EnrichEd2kDownloadRequest, IngestLocalFileRequest};
 use self::ed2k_runtime::manifest_has_ed2k_transfer_progress;
 #[cfg(test)]
 use self::ed2k_runtime::plaintext_fallback_for_obfuscated_source;
@@ -310,106 +313,6 @@ struct NativeDirectDownloadOutcome {
     completed: bool,
     accepted_incomplete_peers: u32,
     last_error: Option<anyhow::Error>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct EnrichEd2kDownloadSource {
-    ip: Ipv4Addr,
-    #[serde(alias = "tcp_port")]
-    tcp_port: u16,
-    #[serde(default, alias = "client_id")]
-    client_id: Option<u32>,
-    #[serde(default, alias = "low_id")]
-    low_id: Option<bool>,
-    #[serde(default, alias = "obfuscation_options")]
-    obfuscation_options: Option<u8>,
-    #[serde(default, alias = "user_hash")]
-    user_hash: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct EnrichEd2kDownloadRequest {
-    kind: String,
-    #[serde(alias = "file_hash")]
-    file_hash: String,
-    #[serde(default, alias = "file_name", alias = "canonical_name")]
-    file_name: Option<String>,
-    #[serde(default, alias = "file_size")]
-    file_size: Option<u64>,
-    #[serde(default)]
-    sources: Vec<EnrichEd2kDownloadSource>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct IngestLocalFileRequest {
-    #[serde(alias = "source_path", alias = "file_path")]
-    source_path: String,
-    #[serde(default, alias = "canonical_name", alias = "file_name")]
-    canonical_name: Option<String>,
-}
-
-impl EnrichEd2kDownloadSource {
-    fn into_found_source(self, file_hash: Ed2kHash) -> Result<Ed2kFoundSource> {
-        let user_hash = self
-            .user_hash
-            .map(|value| -> Result<[u8; 16]> {
-                let bytes = hex::decode(&value)
-                    .with_context(|| format!("invalid source user hash {value}"))?;
-                let bytes: [u8; 16] = bytes
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("source user hash must be 16 bytes"))?;
-                Ok(bytes)
-            })
-            .transpose()?;
-        Ok(Ed2kFoundSource {
-            file_hash,
-            ip: self.ip,
-            tcp_port: self.tcp_port,
-            client_id: self.client_id.unwrap_or_else(|| u32::from(self.ip)),
-            low_id: self.low_id.unwrap_or(false),
-            obfuscated: self.obfuscation_options.is_some(),
-            obfuscation_options: self.obfuscation_options,
-            user_hash,
-            source_server: None,
-        })
-    }
-}
-
-impl EnrichEd2kDownloadRequest {
-    fn canonical_name(&self) -> String {
-        self.file_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| hash_only_ed2k_placeholder_name(&self.file_hash))
-    }
-
-    fn file_size_or_unknown(&self) -> u64 {
-        self.file_size.unwrap_or(0)
-    }
-}
-
-impl IngestLocalFileRequest {
-    fn canonical_name(&self) -> Result<String> {
-        self.canonical_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_string())
-            .ok_or_else(|| anyhow::anyhow!("local ingest payload requires canonicalName"))
-    }
-}
-
-fn hash_only_ed2k_placeholder_name(file_hash: &str) -> String {
-    format!("ed2k-{file_hash}.bin")
-}
-
-fn is_hash_only_ed2k_placeholder_name(name: &str, file_hash: &str) -> bool {
-    name.eq_ignore_ascii_case(&hash_only_ed2k_placeholder_name(file_hash))
 }
 
 pub struct OverlordAgentEmule {

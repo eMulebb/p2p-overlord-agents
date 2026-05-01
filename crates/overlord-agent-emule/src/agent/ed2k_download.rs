@@ -18,7 +18,8 @@ use tracing::{info, warn};
 use super::{
     AgentNetworkRuntime, ED2K_DOWNLOAD_KAD_SOURCE_TIMEOUT_FLOOR_SECS,
     ED2K_DOWNLOAD_SOURCE_REQUERY_DELAY_SECS, ED2K_DOWNLOAD_SOURCE_REQUERY_ROUNDS,
-    EnrichEd2kDownloadRequest, NativeDirectDownloadOptions, NativeDirectDownloadOutcome,
+    NativeDirectDownloadOptions, NativeDirectDownloadOutcome,
+    ed2k_enrich::{EnrichEd2kDownloadRequest, is_hash_only_ed2k_placeholder_name},
     ed2k_runtime::{
         Ed2kSourceEndpointKey, direct_download_candidate_sources, ed2k_source_attempt_key,
         ed2k_source_endpoint_key, is_retryable_direct_download_error,
@@ -30,7 +31,7 @@ use super::{
         collect_kad_ed2k_sources, ed2k_download_source_server_attempt_budget,
         ed2k_source_search_timeout, resolve_hash_only_ed2k_metadata,
     },
-    is_hash_only_ed2k_placeholder_name, merge_download_sources,
+    merge_download_sources,
 };
 use crate::{
     config::EmuleAgentConfig,
