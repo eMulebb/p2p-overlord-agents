@@ -18,7 +18,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use anyhow::{Context, Result};
@@ -32,6 +32,7 @@ mod catalog;
 mod hashset;
 mod manifest;
 mod model;
+mod store;
 mod upload_queue;
 
 pub use catalog::{Ed2kSharedCatalog, Ed2kSharedEntry, Ed2kSharedRange};
@@ -63,8 +64,6 @@ pub(crate) const ED2K_PART_SIZE: u64 = 9_728_000;
 pub(crate) const ED2K_EMBLOCK_SIZE: u64 = 184_320;
 const MANIFEST_FILE_NAME: &str = "resume-manifest.json";
 const PAYLOAD_FILE_NAME: &str = "pieces.bin";
-const ED2K_RESUME_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
-const ED2K_RESUME_CHECKPOINT_BYTES: u64 = ED2K_EMBLOCK_SIZE * 16;
 
 /// Runtime owner for ED2K transfer manifests, piece-store payloads, and the
 /// transfer-backed shared catalog.
@@ -843,26 +842,6 @@ impl Ed2kTransferRuntime {
             .release_session(handle, Instant::now());
     }
 
-    async fn load_manifest_or_rebuild_unlocked(
-        &self,
-        job: &Ed2kTransferJob,
-    ) -> Result<Ed2kResumeManifest> {
-        match self.load_manifest_unlocked(&job.file_hash).await {
-            Ok(manifest) => Ok(manifest),
-            Err(error) => {
-                let manifest_path = self.transfer_dir(&job.file_hash).join(MANIFEST_FILE_NAME);
-                quarantine_corrupt_manifest(&manifest_path).await?;
-                let manifest = Ed2kResumeManifest::new(job);
-                self.store_manifest_unlocked(&manifest).await?;
-                tracing::warn!(
-                    "rebuilt ED2K manifest after corrupt state for {}: {error}",
-                    job.file_hash
-                );
-                Ok(manifest)
-            }
-        }
-    }
-
     async fn upsert_verified_catalog_entry(&self, manifest: &Ed2kResumeManifest) {
         let mut entries = self.shared_catalog.write().await;
         entries.retain(|entry| entry.file_hash != manifest.file_hash || entry.compatibility_hint);
@@ -870,76 +849,6 @@ impl Ed2kTransferRuntime {
             entries.push(Ed2kSharedEntry::from_manifest(manifest));
         }
         *entries = dedupe_entries(entries.clone());
-    }
-
-    async fn load_manifest_unlocked(&self, file_hash: &str) -> Result<Ed2kResumeManifest> {
-        if let Some(manifest) = self.manifest_cache.lock().await.get(file_hash).cloned() {
-            return Ok(manifest);
-        }
-        let path = self.transfer_dir(file_hash).join(MANIFEST_FILE_NAME);
-        let bytes = tokio::fs::read(&path)
-            .await
-            .with_context(|| format!("failed to read ED2K manifest {}", path.display()))?;
-        let manifest = serde_json::from_slice(&bytes)
-            .with_context(|| format!("failed to decode ED2K manifest {}", path.display()))?;
-        self.mark_manifest_persisted_unlocked(&manifest).await;
-        Ok(manifest)
-    }
-
-    async fn store_manifest_unlocked(&self, manifest: &Ed2kResumeManifest) -> Result<()> {
-        let transfer_dir = self.transfer_dir(&manifest.file_hash);
-        tokio::fs::create_dir_all(&transfer_dir)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to create ED2K transfer directory {}",
-                    transfer_dir.display()
-                )
-            })?;
-        let path = transfer_dir.join(MANIFEST_FILE_NAME);
-        let encoded = serde_json::to_vec_pretty(manifest)?;
-        tokio::fs::write(&path, encoded)
-            .await
-            .with_context(|| format!("failed to write ED2K manifest {}", path.display()))?;
-        self.mark_manifest_persisted_unlocked(manifest).await;
-        Ok(())
-    }
-
-    async fn cache_manifest_unlocked(&self, manifest: &Ed2kResumeManifest) {
-        self.manifest_cache
-            .lock()
-            .await
-            .insert(manifest.file_hash.clone(), manifest.clone());
-    }
-
-    async fn mark_manifest_persisted_unlocked(&self, manifest: &Ed2kResumeManifest) {
-        self.cache_manifest_unlocked(manifest).await;
-        self.manifest_checkpoint_state.lock().await.insert(
-            manifest.file_hash.clone(),
-            Ed2kManifestCheckpointState {
-                persisted_bytes_written: manifest_progress_bytes(manifest),
-                last_persisted_at: Instant::now(),
-            },
-        );
-    }
-
-    async fn should_checkpoint_manifest_unlocked(&self, manifest: &Ed2kResumeManifest) -> bool {
-        let current_progress = manifest_progress_bytes(manifest);
-        let mut states = self.manifest_checkpoint_state.lock().await;
-        let state = states.entry(manifest.file_hash.clone()).or_insert_with(|| {
-            Ed2kManifestCheckpointState {
-                persisted_bytes_written: current_progress,
-                last_persisted_at: Instant::now(),
-            }
-        });
-        let dirty_bytes = current_progress.saturating_sub(state.persisted_bytes_written);
-        dirty_bytes >= ED2K_RESUME_CHECKPOINT_BYTES
-            || (dirty_bytes != 0
-                && state.last_persisted_at.elapsed() >= ED2K_RESUME_CHECKPOINT_INTERVAL)
-    }
-
-    fn transfer_dir(&self, file_hash: &str) -> PathBuf {
-        self.root_dir.join(file_hash)
     }
 }
 
