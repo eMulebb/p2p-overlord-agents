@@ -1,19 +1,15 @@
 use std::{
-    io,
     net::{IpAddr, SocketAddr},
     str::FromStr,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
 };
 
 use anyhow::{Context, Result};
 use tokio::{
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     sync::{Mutex, RwLock},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use overlord_kad_dht::DhtNode;
 use overlord_kad_proto::{Ed2kHash, FirewallUdp, KadPacket};
@@ -27,7 +23,7 @@ use crate::{
     kad_firewall::KadFirewallState,
 };
 
-use super::codec::{
+use super::super::codec::{
     build_upload_part_packets, decode_file_hash_payload, decode_hashset_request2,
     decode_request_parts_payload, decode_request_sources_payload, encode_accept_upload_req,
     encode_answer_sources_empty, encode_answer_sources2_empty, encode_file_req_ans_nofil,
@@ -35,19 +31,21 @@ use super::codec::{
     encode_multipacket_ext2_answer, encode_packet, encode_queue_ranking,
     encode_request_filename_answer, skip_request_filename_ext_info,
 };
-use super::download::{DownloadSessionOptions, Ed2kPeerDownloadOutcome, drive_download_session};
-use super::dump::{
+use super::super::download::{
+    DownloadSessionOptions, Ed2kPeerDownloadOutcome, drive_download_session,
+};
+use super::super::dump::{
     dump_ed2k_tcp_listener_meta, dump_ed2k_tcp_listener_recv, dump_ed2k_tcp_listener_send,
 };
-use super::hello::{
+use super::super::hello::{
     DecodedHelloIdentity, build_hello_responses, decode_hello_profile, encode_emule_info_answer,
 };
-use super::identity::{
+use super::super::identity::{
     Ed2kPeerSecureIdentState, begin_secure_ident_probe, decode_public_key_payload,
     decode_secident_state, encode_secident_state, random_nonzero_u32,
     try_send_secure_ident_signature,
 };
-use super::{
+use super::super::{
     ED2K_CONNECTION_IDLE_TIMEOUT, ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED,
     ED2K_SECURE_IDENT_SIGNATURE_NEEDED, ED2K_SOURCE_EXCHANGE2_VERSION,
     ED2K_UPLOAD_QUEUE_POLL_INTERVAL, ED2K_UPLOAD_QUEUE_REFRESH_INTERVAL, Ed2kFileIdentifier,
@@ -59,78 +57,16 @@ use super::{
     OP_STARTUPLOADREQ, apply_server_state,
 };
 
-/// Inputs for the long-lived ED2K TCP listener task.
-pub struct Ed2kListenerOptions {
-    pub listener: Arc<TcpListener>,
-    pub dht: DhtNode,
-    pub server_state: Arc<RwLock<Ed2kServerState>>,
-    pub kad_firewall: Arc<Mutex<KadFirewallState>>,
-    pub secure_ident: Arc<Ed2kSecureIdent>,
-    pub transfer_runtime: Arc<Ed2kTransferRuntime>,
-    pub hello_identity: Ed2kHelloIdentity,
-    pub shutdown: Arc<AtomicBool>,
+pub(in crate::ed2k_tcp) struct Ed2kConnectionContext<'a> {
+    pub(in crate::ed2k_tcp) dht: &'a DhtNode,
+    pub(in crate::ed2k_tcp) server_state: &'a Arc<RwLock<Ed2kServerState>>,
+    pub(in crate::ed2k_tcp) kad_firewall: &'a Arc<Mutex<KadFirewallState>>,
+    pub(in crate::ed2k_tcp) secure_ident: &'a Arc<Ed2kSecureIdent>,
+    pub(in crate::ed2k_tcp) transfer_runtime: &'a Arc<Ed2kTransferRuntime>,
+    pub(in crate::ed2k_tcp) hello_identity: Ed2kHelloIdentity,
 }
 
-/// Run the minimal eD2k TCP listener needed for inbound hello parity and firewall checks.
-pub async fn run_ed2k_listener(options: Ed2kListenerOptions) {
-    let Ed2kListenerOptions {
-        listener,
-        dht,
-        server_state,
-        kad_firewall,
-        secure_ident,
-        transfer_runtime,
-        hello_identity,
-        shutdown,
-    } = options;
-    while !shutdown.load(Ordering::Relaxed) {
-        match listener.accept().await {
-            Ok((stream, peer_addr)) => {
-                let dht = dht.clone();
-                let server_state = Arc::clone(&server_state);
-                let kad_firewall = Arc::clone(&kad_firewall);
-                let secure_ident = Arc::clone(&secure_ident);
-                let transfer_runtime = Arc::clone(&transfer_runtime);
-                tokio::spawn(async move {
-                    if let Err(error) = handle_connection(
-                        stream,
-                        peer_addr,
-                        Ed2kConnectionContext {
-                            dht: &dht,
-                            server_state: &server_state,
-                            kad_firewall: &kad_firewall,
-                            secure_ident: &secure_ident,
-                            transfer_runtime: &transfer_runtime,
-                            hello_identity,
-                        },
-                    )
-                    .await
-                    {
-                        debug!("eD2k connection handling failed from {peer_addr}: {error}");
-                    }
-                });
-            }
-            Err(error) if is_transient_accept_error(&error) => {
-                debug!("ignoring transient eD2k accept failure: {error}");
-            }
-            Err(error) => {
-                warn!("eD2k listener accept failed: {error}");
-                break;
-            }
-        }
-    }
-}
-
-pub(super) struct Ed2kConnectionContext<'a> {
-    pub(super) dht: &'a DhtNode,
-    pub(super) server_state: &'a Arc<RwLock<Ed2kServerState>>,
-    pub(super) kad_firewall: &'a Arc<Mutex<KadFirewallState>>,
-    pub(super) secure_ident: &'a Arc<Ed2kSecureIdent>,
-    pub(super) transfer_runtime: &'a Arc<Ed2kTransferRuntime>,
-    pub(super) hello_identity: Ed2kHelloIdentity,
-}
-
-pub(super) async fn handle_connection(
+pub(in crate::ed2k_tcp) async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
     context: Ed2kConnectionContext<'_>,
@@ -991,11 +927,4 @@ async fn enrich_hello_identity(
         && firewall.udp_verified
         && firewall.udp_open;
     identity
-}
-
-fn is_transient_accept_error(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset | io::ErrorKind::TimedOut
-    )
 }
