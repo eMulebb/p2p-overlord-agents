@@ -8,21 +8,20 @@ use crate::ed2k_transfer::{ED2K_PART_SIZE, Ed2kTransferRuntime};
 
 use super::super::{
     ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, ED2K_SECURE_IDENT_SIGNATURE_NEEDED,
-    Ed2kFileIdentifier, Ed2kHashsetRequestOptions, Ed2kHelloIdentity, Ed2kPeerSecureIdentState,
-    Ed2kSecureIdent, Ed2kTransport, OP_ACCEPTUPLOADREQ, OP_AICHFILEHASHANS, OP_ANSWERSOURCES,
-    OP_ANSWERSOURCES2, OP_COMPRESSEDPART, OP_COMPRESSEDPART_I64, OP_EDONKEYPROT, OP_EMULEINFO,
-    OP_EMULEINFOANSWER, OP_EMULEPROT, OP_FILEDESC, OP_FILEREQANSNOFIL, OP_FILESTATUS,
-    OP_HASHSETANSWER, OP_HASHSETANSWER2, OP_HELLO, OP_HELLOANSWER, OP_MULTIPACKETANSWER_EXT2,
-    OP_PUBLICKEY, OP_QUEUERANKING, OP_REQFILENAMEANSWER, OP_SECIDENTSTATE, OP_SENDINGPART,
-    OP_SENDINGPART_I64, OP_SETREQFILEID, OP_SIGNATURE, begin_secure_ident_probe,
-    build_hello_responses, decode_aich_file_hash_answer, decode_compressed_part_fragment,
-    decode_file_status_payload, decode_hashset_answer, decode_hashset_answer2,
-    decode_hello_profile, decode_public_key_payload, decode_request_filename_answer,
-    decode_request_filename_answer_body, decode_secident_state, decode_sending_part_payload,
-    dump_ed2k_tcp_download_meta, dump_ed2k_tcp_download_recv, dump_ed2k_tcp_download_send,
-    encode_aich_file_hash_request, encode_emule_info_answer, encode_hashset_request,
-    encode_hashset_request2, encode_multipacket_ext2_request, encode_packet,
-    encode_request_filename, encode_request_sources2, encode_set_req_file_id,
+    Ed2kFileIdentifier, Ed2kHashsetRequestOptions, Ed2kHelloIdentity, Ed2kSecureIdent,
+    Ed2kTransport, OP_ACCEPTUPLOADREQ, OP_AICHFILEHASHANS, OP_ANSWERSOURCES, OP_ANSWERSOURCES2,
+    OP_COMPRESSEDPART, OP_COMPRESSEDPART_I64, OP_EDONKEYPROT, OP_EMULEINFO, OP_EMULEINFOANSWER,
+    OP_EMULEPROT, OP_FILEDESC, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_HASHSETANSWER,
+    OP_HASHSETANSWER2, OP_HELLO, OP_HELLOANSWER, OP_MULTIPACKETANSWER_EXT2, OP_PUBLICKEY,
+    OP_QUEUERANKING, OP_REQFILENAMEANSWER, OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64,
+    OP_SETREQFILEID, OP_SIGNATURE, begin_secure_ident_probe, build_hello_responses,
+    decode_aich_file_hash_answer, decode_compressed_part_fragment, decode_file_status_payload,
+    decode_hashset_answer, decode_hashset_answer2, decode_hello_profile, decode_public_key_payload,
+    decode_request_filename_answer, decode_request_filename_answer_body, decode_secident_state,
+    decode_sending_part_payload, dump_ed2k_tcp_download_meta, dump_ed2k_tcp_download_recv,
+    dump_ed2k_tcp_download_send, encode_aich_file_hash_request, encode_emule_info_answer,
+    encode_hashset_request, encode_hashset_request2, encode_multipacket_ext2_request,
+    encode_packet, encode_request_filename, encode_request_sources2, encode_set_req_file_id,
     encode_start_upload_req, inflate_compressed_part_fragment, is_connection_shutdown_error,
     skip_file_status_body, try_send_secure_ident_signature,
 };
@@ -31,6 +30,9 @@ use super::{
     ReadyDownloadBlocks, flush_buffered_download_prefixes, flush_ready_download_blocks,
     next_download_read_timeout, pump_download_request_window, reconcile_download_manifest_metadata,
 };
+mod state;
+
+use state::DownloadSessionState;
 /// Outcome of one outbound ED2K peer download attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Ed2kPeerDownloadOutcome {
@@ -81,24 +83,8 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
     let mut pending_compressed_parts: Vec<PendingCompressedPart> = Vec::new();
     let mut manifest = transfer_runtime.manifest(file_hash_hex).await?;
     let mut request_file_identifier = Ed2kFileIdentifier::from_manifest(&manifest)?;
-    let mut peer_secure_ident = Ed2kPeerSecureIdentState::default();
-    let mut hello_complete = initial_hello_complete;
-    let mut secure_ident_started = initial_secure_ident_started;
-    let mut remote_supports_file_identifiers = false;
-    let mut startup_file_requests_sent = false;
-    let mut startup_file_response_received = false;
-    let mut source_request_sent = false;
-    let mut aich_file_hash_requested = false;
-    let mut hashset_requested = false;
-    let mut hashset_requested_at = None;
-    let mut upload_requested = false;
-    let mut upload_accepted = false;
-    let mut upload_accepted_at = None;
-    let mut part_response_deadline = None;
-    let mut queued_until = None;
-    let mut active_piece_request: Option<ActiveDownloadPiece> = None;
-    let mut completed_block_count = 0usize;
-    let mut session_payload_down = 0u64;
+    let mut session_state =
+        DownloadSessionState::new(initial_hello_complete, initial_secure_ident_started);
 
     let session_result = async {
         loop {
@@ -106,16 +92,16 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                 return Ok(Ed2kPeerDownloadOutcome::Completed);
             }
 
-            let waiting_for_peer_secure_ident = secure_ident_started
-                && (peer_secure_ident.peer_challenge_from.is_none()
-                    || peer_secure_ident.pending_signature
-                    || (peer_secure_ident.requested_peer_key
-                        && peer_secure_ident.peer_public_key.is_none())
-                    || (peer_secure_ident.challenge_for.is_some()
-                        && !peer_secure_ident.peer_signature_received));
+            let waiting_for_peer_secure_ident = session_state.secure_ident_started
+                && (session_state.peer_secure_ident.peer_challenge_from.is_none()
+                    || session_state.peer_secure_ident.pending_signature
+                    || (session_state.peer_secure_ident.requested_peer_key
+                        && session_state.peer_secure_ident.peer_public_key.is_none())
+                    || (session_state.peer_secure_ident.challenge_for.is_some()
+                        && !session_state.peer_secure_ident.peer_signature_received));
 
-            if send_initial_requests && hello_complete && !secure_ident_started {
-                let secure_ident_probe = begin_secure_ident_probe(&mut peer_secure_ident);
+            if send_initial_requests && session_state.hello_complete && !session_state.secure_ident_started {
+                let secure_ident_probe = begin_secure_ident_probe(&mut session_state.peer_secure_ident);
                 dump_ed2k_tcp_download_send(
                     peer_addr,
                     transport.mode,
@@ -126,15 +112,15 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     .write_all(&secure_ident_probe)
                     .await
                     .with_context(|| format!("failed to send OP_SECIDENTSTATE to {peer_addr}"))?;
-                secure_ident_started = true;
+                session_state.secure_ident_started = true;
             }
 
             if send_initial_requests
-                && hello_complete
-                && !startup_file_requests_sent
+                && session_state.hello_complete
+                && !session_state.startup_file_requests_sent
                 && !waiting_for_peer_secure_ident
             {
-                if remote_supports_file_identifiers {
+                if session_state.remote_supports_file_identifiers {
                     let multipacket_ext2 =
                         encode_multipacket_ext2_request(&request_file_identifier, &manifest);
                     dump_ed2k_tcp_download_send(
@@ -149,8 +135,8 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                         .with_context(|| {
                             format!("failed to send OP_MULTIPACKET_EXT2 to {peer_addr}")
                         })?;
-                    source_request_sent = true;
-                    aich_file_hash_requested = true;
+                    session_state.source_request_sent = true;
+                    session_state.aich_file_hash_requested = true;
                 } else {
                     let request_filename = encode_request_filename(&file_hash, &manifest);
                     dump_ed2k_tcp_download_send(
@@ -182,14 +168,14 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                             })?;
                     }
                 }
-                startup_file_requests_sent = true;
+                session_state.startup_file_requests_sent = true;
             }
 
             if send_initial_requests
-                && hello_complete
-                && !source_request_sent
+                && session_state.hello_complete
+                && !session_state.source_request_sent
                 && !waiting_for_peer_secure_ident
-                && !remote_supports_file_identifiers
+                && !session_state.remote_supports_file_identifiers
             {
                 let source_request = encode_request_sources2(&file_hash);
                 dump_ed2k_tcp_download_send(
@@ -204,14 +190,14 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     .with_context(|| {
                         format!("failed to send OP_REQUESTSOURCES2 to {peer_addr}")
                     })?;
-                source_request_sent = true;
+                session_state.source_request_sent = true;
             }
 
             if send_initial_requests
-                && hello_complete
-                && !aich_file_hash_requested
+                && session_state.hello_complete
+                && !session_state.aich_file_hash_requested
                 && !waiting_for_peer_secure_ident
-                && !remote_supports_file_identifiers
+                && !session_state.remote_supports_file_identifiers
             {
                 let aich_file_hash_request = encode_aich_file_hash_request(&file_hash);
                 dump_ed2k_tcp_download_send(
@@ -226,23 +212,23 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     .with_context(|| {
                         format!("failed to send OP_AICHFILEHASHREQ to {peer_addr}")
                     })?;
-                aich_file_hash_requested = true;
+                session_state.aich_file_hash_requested = true;
             }
 
             if send_initial_requests
-                && hello_complete
+                && session_state.hello_complete
                 && manifest.file_size != 0
                 && !manifest.md4_hashset_acquired
-                && !hashset_requested
+                && !session_state.hashset_requested
                 && !waiting_for_peer_secure_ident
-                && startup_file_response_received
+                && session_state.startup_file_response_received
             {
                 if manifest.file_size <= ED2K_PART_SIZE {
                     manifest = transfer_runtime
                         .store_md4_hashset(file_hash_hex, Vec::new())
                         .await?;
                 } else {
-                    let hashset_request = if remote_supports_file_identifiers {
+                    let hashset_request = if session_state.remote_supports_file_identifiers {
                         encode_hashset_request2(
                             &request_file_identifier,
                             Ed2kHashsetRequestOptions {
@@ -264,26 +250,26 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                         .write_all(&hashset_request)
                         .await
                         .with_context(|| {
-                            if remote_supports_file_identifiers {
+                            if session_state.remote_supports_file_identifiers {
                                 format!("failed to send OP_HASHSETREQUEST2 to {peer_addr}")
                             } else {
                                 format!("failed to send OP_HASHSETREQUEST to {peer_addr}")
                             }
                         })?;
-                    hashset_requested = true;
-                    hashset_requested_at = Some(tokio::time::Instant::now());
+                    session_state.hashset_requested = true;
+                    session_state.hashset_requested_at = Some(tokio::time::Instant::now());
                 }
             }
 
-            let hashset_request_stalled = hashset_requested_at
+            let hashset_request_stalled = session_state.hashset_requested_at
                 .is_some_and(|requested_at| requested_at.elapsed() >= HASHSET_STALL_UPLOAD_FALLBACK);
             if send_initial_requests
-                && hello_complete
+                && session_state.hello_complete
                 && manifest.file_size != 0
                 && (manifest.md4_hashset_acquired || hashset_request_stalled)
-                && !upload_requested
+                && !session_state.upload_requested
                 && !waiting_for_peer_secure_ident
-                && startup_file_response_received
+                && session_state.startup_file_response_received
             {
                 if hashset_request_stalled && !manifest.md4_hashset_acquired {
                     dump_ed2k_tcp_download_meta(
@@ -304,11 +290,11 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     .write_all(&start_upload)
                     .await
                     .with_context(|| format!("failed to send OP_STARTUPLOADREQ to {peer_addr}"))?;
-                upload_requested = true;
+                session_state.upload_requested = true;
             }
 
             if manifest.md4_hashset_acquired
-                && upload_accepted
+                && session_state.upload_accepted
                 && let Some(next_deadline) = pump_download_request_window(
                     transport,
                     peer_addr,
@@ -318,28 +304,28 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                         file_hash_hex,
                         file_size: manifest.file_size,
                         manifest: &manifest,
-                        active_piece_request: &mut active_piece_request,
+                        active_piece_request: &mut session_state.active_piece_request,
                         pending_part_requests: &mut pending_part_requests,
-                        upload_accepted_at: upload_accepted_at
+                        upload_accepted_at: session_state.upload_accepted_at
                             .unwrap_or_else(tokio::time::Instant::now),
-                        completed_block_count,
-                        session_payload_down,
+                        completed_block_count: session_state.completed_block_count,
+                        session_payload_down: session_state.session_payload_down,
                         part_response_grace: PART_RESPONSE_GRACE,
                     },
                 )
                 .await?
             {
-                part_response_deadline = Some(next_deadline);
+                session_state.part_response_deadline = Some(next_deadline);
             }
 
             let fallback_poll_delay = if send_initial_requests
-                && hello_complete
-                && hashset_requested
+                && session_state.hello_complete
+                && session_state.hashset_requested
                 && !manifest.md4_hashset_acquired
-                && !upload_requested
+                && !session_state.upload_requested
                 && !waiting_for_peer_secure_ident
             {
-                hashset_requested_at.map(|requested_at| {
+                session_state.hashset_requested_at.map(|requested_at| {
                     HASHSET_STALL_UPLOAD_FALLBACK.saturating_sub(requested_at.elapsed())
                 })
             } else {
@@ -350,13 +336,13 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                 now,
                 timeout,
                 fallback_poll_delay,
-                queued_until,
-                part_response_deadline,
+                session_state.queued_until,
+                session_state.part_response_deadline,
             );
             let packet = match tokio::time::timeout(read_timeout, transport.read_packet()).await {
                 Ok(Ok(Some(packet))) => packet,
                 Ok(Ok(None)) => {
-                    if hello_complete {
+                    if session_state.hello_complete {
                         dump_ed2k_tcp_download_meta(
                             peer_addr,
                             Some(transport.mode),
@@ -368,7 +354,7 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     anyhow::bail!("peer {peer_addr} closed ED2K download session");
                 }
                 Ok(Err(error)) => {
-                    if hello_complete && is_connection_shutdown_error(&error) {
+                    if session_state.hello_complete && is_connection_shutdown_error(&error) {
                         dump_ed2k_tcp_download_meta(
                             peer_addr,
                             Some(transport.mode),
@@ -384,18 +370,18 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     if fallback_poll_delay.is_some() {
                         continue;
                     }
-                    if queued_until.is_some_and(|deadline| tokio::time::Instant::now() < deadline) {
+                    if session_state.queued_until.is_some_and(|deadline| tokio::time::Instant::now() < deadline) {
                         continue;
                     }
                     if !pending_part_requests.iter().any(|request| request.queued) {
-                        part_response_deadline = None;
+                        session_state.part_response_deadline = None;
                     }
-                    if part_response_deadline
+                    if session_state.part_response_deadline
                         .is_some_and(|deadline| tokio::time::Instant::now() < deadline)
                     {
                         continue;
                     }
-                    if hello_complete {
+                    if session_state.hello_complete {
                         dump_ed2k_tcp_download_meta(
                             peer_addr,
                             Some(transport.mode),
@@ -418,10 +404,10 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                             format!("failed to reply to OP_HELLO during download with {peer_addr}")
                         })?;
                     }
-                    hello_complete = true;
-                    remote_supports_file_identifiers = hello_profile.supports_file_identifiers;
-                    if hello_profile.is_mule_hello && !peer_secure_ident.requested_peer_key {
-                        let secure_ident_probe = begin_secure_ident_probe(&mut peer_secure_ident);
+                    session_state.hello_complete = true;
+                    session_state.remote_supports_file_identifiers = hello_profile.supports_file_identifiers;
+                    if hello_profile.is_mule_hello && !session_state.peer_secure_ident.requested_peer_key {
+                        let secure_ident_probe = begin_secure_ident_probe(&mut session_state.peer_secure_ident);
                         dump_ed2k_tcp_download_send(
                             peer_addr,
                             transport.mode,
@@ -434,18 +420,18 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                             .with_context(|| {
                                 format!("failed to send OP_SECIDENTSTATE to {peer_addr}")
                             })?;
-                        secure_ident_started = true;
+                        session_state.secure_ident_started = true;
                     }
                 }
                 (OP_EDONKEYPROT, OP_HELLOANSWER) => {
                     let hello_profile = decode_hello_profile(&packet.payload)?;
-                    hello_complete = true;
-                    remote_supports_file_identifiers = hello_profile.supports_file_identifiers;
+                    session_state.hello_complete = true;
+                    session_state.remote_supports_file_identifiers = hello_profile.supports_file_identifiers;
                     if send_initial_requests
                         && hello_profile.is_mule_hello
-                        && !peer_secure_ident.requested_peer_key
+                        && !session_state.peer_secure_ident.requested_peer_key
                     {
-                        let secure_ident_probe = begin_secure_ident_probe(&mut peer_secure_ident);
+                        let secure_ident_probe = begin_secure_ident_probe(&mut session_state.peer_secure_ident);
                         dump_ed2k_tcp_download_send(
                             peer_addr,
                             transport.mode,
@@ -458,13 +444,13 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                             .with_context(|| {
                                 format!("failed to send OP_SECIDENTSTATE to {peer_addr}")
                             })?;
-                        secure_ident_started = true;
+                        session_state.secure_ident_started = true;
                     }
                 }
                 (OP_EDONKEYPROT, OP_ACCEPTUPLOADREQ) => {
-                    upload_accepted = true;
-                    upload_accepted_at.get_or_insert_with(tokio::time::Instant::now);
-                    queued_until = None;
+                    session_state.upload_accepted = true;
+                    session_state.upload_accepted_at.get_or_insert_with(tokio::time::Instant::now);
+                    session_state.queued_until = None;
                 }
                 (OP_EMULEPROT, OP_EMULEINFO) => {
                     transport
@@ -477,9 +463,9 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                 (OP_EMULEPROT, OP_EMULEINFOANSWER) => {}
                 (OP_EMULEPROT, OP_SECIDENTSTATE) => {
                     let (state, challenge) = decode_secident_state(&packet.payload)?;
-                    peer_secure_ident.peer_challenge_from = Some(challenge);
+                    session_state.peer_secure_ident.peer_challenge_from = Some(challenge);
                     if state != 0 {
-                        peer_secure_ident.pending_signature = true;
+                        session_state.peer_secure_ident.pending_signature = true;
                     }
                     if state == ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED {
                         let public_key = encode_packet(
@@ -501,13 +487,13 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                         transport,
                         peer_addr,
                         secure_ident,
-                        &mut peer_secure_ident,
+                        &mut session_state.peer_secure_ident,
                     )
                     .await?
                         && state == ED2K_SECURE_IDENT_SIGNATURE_NEEDED
-                        && !peer_secure_ident.requested_peer_key
+                        && !session_state.peer_secure_ident.requested_peer_key
                     {
-                        let secure_ident_probe = begin_secure_ident_probe(&mut peer_secure_ident);
+                        let secure_ident_probe = begin_secure_ident_probe(&mut session_state.peer_secure_ident);
                         dump_ed2k_tcp_download_send(
                             peer_addr,
                             transport.mode,
@@ -520,22 +506,22 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                             .with_context(|| {
                                 format!("failed to send fallback OP_SECIDENTSTATE to {peer_addr}")
                             })?;
-                        secure_ident_started = true;
+                        session_state.secure_ident_started = true;
                     }
                 }
                 (OP_EMULEPROT, OP_PUBLICKEY) => {
-                    peer_secure_ident.peer_public_key =
+                    session_state.peer_secure_ident.peer_public_key =
                         Some(decode_public_key_payload(&packet.payload)?);
                     let _ = try_send_secure_ident_signature(
                         transport,
                         peer_addr,
                         secure_ident,
-                        &mut peer_secure_ident,
+                        &mut session_state.peer_secure_ident,
                     )
                     .await?;
                 }
                 (OP_EMULEPROT, OP_SIGNATURE) => {
-                    peer_secure_ident.peer_signature_received = true;
+                    session_state.peer_secure_ident.peer_signature_received = true;
                 }
                 (OP_EDONKEYPROT, OP_HASHSETANSWER) => {
                     let (returned_hash, hashset) = decode_hashset_answer(&packet.payload)?;
@@ -598,7 +584,7 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                         )
                         .await?;
                     request_file_identifier = Ed2kFileIdentifier::from_manifest(&manifest)?;
-                    startup_file_response_received = true;
+                    session_state.startup_file_response_received = true;
                 }
                 (OP_EDONKEYPROT, OP_FILESTATUS) => {
                     let (returned_hash, _part_count) = decode_file_status_payload(&packet.payload)?;
@@ -608,7 +594,7 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                             returned_hash
                         );
                     }
-                    startup_file_response_received = true;
+                    session_state.startup_file_response_received = true;
                 }
                 (OP_EMULEPROT, OP_MULTIPACKETANSWER_EXT2) => {
                     let (returned_identifier, mut remaining) =
@@ -649,7 +635,7 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                         returned_file_name.as_deref(),
                     )
                     .await?;
-                    startup_file_response_received = true;
+                    session_state.startup_file_response_received = true;
                 }
                 (OP_EMULEPROT, OP_AICHFILEHASHANS) => {
                     let returned_hash = decode_aich_file_hash_answer(&packet.payload)?;
@@ -671,7 +657,7 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     // emit the request during startup, so stay tolerant here.
                 }
                 (OP_EMULEPROT, OP_QUEUERANKING) => {
-                    queued_until = Some(tokio::time::Instant::now() + QUEUE_RANK_GRACE);
+                    session_state.queued_until = Some(tokio::time::Instant::now() + QUEUE_RANK_GRACE);
                     dump_ed2k_tcp_download_meta(
                         peer_addr,
                         Some(transport.mode),
@@ -825,13 +811,13 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                             transfer_runtime,
                             file_hash_hex,
                             pending_part_requests: &mut pending_part_requests,
-                            active_piece_request: &mut active_piece_request,
+                            active_piece_request: &mut session_state.active_piece_request,
                             manifest: &mut manifest,
                             peer_addr,
                             transport_mode: transport.mode,
-                            completed_block_count: &mut completed_block_count,
-                            session_payload_down: &mut session_payload_down,
-                            part_response_deadline: &mut part_response_deadline,
+                            completed_block_count: &mut session_state.completed_block_count,
+                            session_payload_down: &mut session_state.session_payload_down,
+                            part_response_deadline: &mut session_state.part_response_deadline,
                         })
                         .await?;
                     } else {
@@ -891,13 +877,13 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                             transfer_runtime,
                             file_hash_hex,
                             pending_part_requests: &mut pending_part_requests,
-                            active_piece_request: &mut active_piece_request,
+                            active_piece_request: &mut session_state.active_piece_request,
                             manifest: &mut manifest,
                             peer_addr,
                             transport_mode: transport.mode,
-                            completed_block_count: &mut completed_block_count,
-                            session_payload_down: &mut session_payload_down,
-                            part_response_deadline: &mut part_response_deadline,
+                            completed_block_count: &mut session_state.completed_block_count,
+                            session_payload_down: &mut session_state.session_payload_down,
+                            part_response_deadline: &mut session_state.part_response_deadline,
                         })
                         .await?;
                     }
@@ -916,7 +902,7 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
             transfer_runtime,
             file_hash_hex,
             &mut pending_part_requests,
-            &mut active_piece_request,
+            &mut session_state.active_piece_request,
             &mut manifest,
             peer_addr,
             transport.mode,
@@ -924,7 +910,7 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
         .await?;
     }
 
-    if let Some(active_piece) = active_piece_request.or_else(|| {
+    if let Some(active_piece) = session_state.active_piece_request.or_else(|| {
         pending_part_requests
             .first()
             .map(|request| ActiveDownloadPiece {
