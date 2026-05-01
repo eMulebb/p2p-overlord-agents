@@ -57,8 +57,8 @@ pub(in crate::ed2k_tcp) async fn flush_ready_download_blocks(
         .is_some_and(|request| request.queued && request.is_ready())
     {
         let request = pending_part_requests.remove(0);
-        let piece_completed = transfer_runtime
-            .append_piece_block(
+        let (piece_completed, refreshed_manifest) = transfer_runtime
+            .append_piece_block_with_manifest(
                 file_hash_hex,
                 request.piece_index,
                 request.start,
@@ -66,7 +66,7 @@ pub(in crate::ed2k_tcp) async fn flush_ready_download_blocks(
                 &request.response_bytes,
             )
             .await?;
-        *manifest = transfer_runtime.manifest(file_hash_hex).await?;
+        *manifest = refreshed_manifest;
         if piece_completed {
             *active_piece_request = None;
         }
@@ -121,10 +121,10 @@ pub(in crate::ed2k_tcp) async fn flush_buffered_download_prefixes(
             )
         };
 
-        let piece_completed = transfer_runtime
-            .append_piece_block(file_hash_hex, piece_index, start, end, &bytes)
+        let (piece_completed, refreshed_manifest) = transfer_runtime
+            .append_piece_block_with_manifest(file_hash_hex, piece_index, start, end, &bytes)
             .await?;
-        *manifest = transfer_runtime.manifest(file_hash_hex).await?;
+        *manifest = refreshed_manifest;
         if piece_completed {
             *active_piece_request = None;
         }

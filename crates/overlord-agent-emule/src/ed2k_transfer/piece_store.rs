@@ -9,7 +9,7 @@ use tracing::debug;
 use super::hashset::refresh_completed_manifest_aich_hashset;
 use super::manifest::{rebuild_verified_ranges, verify_piece_against_manifest};
 use super::{
-    Ed2kClaimedPart, Ed2kTransferRuntime, Ed2kTransferState, PAYLOAD_FILE_NAME,
+    Ed2kClaimedPart, Ed2kResumeManifest, Ed2kTransferRuntime, Ed2kTransferState, PAYLOAD_FILE_NAME,
     expected_piece_length,
 };
 
@@ -309,6 +309,23 @@ impl Ed2kTransferRuntime {
             checkpoint_reason,
         );
         Ok(piece_completed)
+    }
+
+    /// Append a block and return the refreshed manifest snapshot used by
+    /// downloader orchestration after a persistence boundary.
+    pub async fn append_piece_block_with_manifest(
+        &self,
+        file_hash: &str,
+        piece_index: u32,
+        start: u64,
+        end: u64,
+        data: &[u8],
+    ) -> Result<(bool, Ed2kResumeManifest)> {
+        let piece_completed = self
+            .append_piece_block(file_hash, piece_index, start, end, data)
+            .await?;
+        let manifest = self.manifest(file_hash).await?;
+        Ok((piece_completed, manifest))
     }
 
     /// Read a fully verified range for upload serving.
