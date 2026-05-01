@@ -15,15 +15,15 @@ use super::activity::{
     finish_agent_activity, new_activity_snapshot, update_agent_activity_error,
 };
 use super::lifecycle::persist_nodes_dat_for;
-use super::publish::{set_synthetic_publish_queue_depth, source_publish_client_hash};
+use super::publish::{
+    SYNTHETIC_POPULAR_SEEDS, SourcePublishSettings, next_synthetic_publish_batch,
+    set_synthetic_publish_queue_depth, source_publish_client_hash, synthetic_publish_queue_depth,
+};
 use super::publish_runtime::{
     PublishExecutionContext, fetch_coordinator_popular_hashes,
     seed_coordinator_popular_if_available, seed_popular_with_activity,
 };
-use super::{
-    AgentNetworkRuntime, BOOTSTRAP_RETRY_SECS, OverlordAgentEmule, SYNTHETIC_POPULAR_SEEDS,
-    SourcePublishSettings, next_synthetic_publish_batch, synthetic_publish_queue_depth,
-};
+use super::{AgentNetworkRuntime, BOOTSTRAP_RETRY_SECS, OverlordAgentEmule};
 
 impl OverlordAgentEmule {
     pub(super) async fn spawn_bootstrap_publish_task(

@@ -2,17 +2,240 @@ use std::{fs, net::SocketAddr, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use md4::{Digest, Md4};
 use overlord_agent_common::{
-    KadPublishObservability, PublishBatchSummary, PublishCounters, PublishSeedSource,
+    HashType, KadPublishObservability, PopularHash, PublishBatchSummary, PublishCounters,
+    PublishSeedSource,
 };
 use overlord_kad_dht::PublishAttemptStats;
-use overlord_kad_proto::{NodeId, Tag, TagValue, tag_name};
+use overlord_kad_proto::{Ed2kHash, NodeId, Tag, TagValue, tag_name};
 use rand::RngCore;
+use sha1::Sha1;
 use tokio::sync::Mutex;
 use tracing::info;
 
-use super::{EMULE_LARGE_FILE_SIZE_THRESHOLD, SourcePublishSettings};
 use crate::ed2k_tcp::emule_connect_options;
+use crate::ed2k_transfer::{Ed2kSharedCatalog, Ed2kSharedEntry};
+
+use super::EMULE_LARGE_FILE_SIZE_THRESHOLD;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SyntheticPopularSeed {
+    title: &'static str,
+    size: u64,
+    source_count: u32,
+}
+
+pub(super) const SYNTHETIC_POPULAR_SEEDS: [SyntheticPopularSeed; 40] = [
+    SyntheticPopularSeed {
+        title: "ubuntu linux 24.04 desktop amd64.iso",
+        size: 734_003_200,
+        source_count: 31,
+    },
+    SyntheticPopularSeed {
+        title: "mario paint quorlith orchestra live at the moon.avi",
+        size: 1_417_965_568,
+        source_count: 24,
+    },
+    SyntheticPopularSeed {
+        title: "10 hours of nyan cat.mp4",
+        size: 92_381_184,
+        source_count: 19,
+    },
+    SyntheticPopularSeed {
+        title: "laser dolphin documentary 1997.mkv",
+        size: 2_486_124_544,
+        source_count: 16,
+    },
+    SyntheticPopularSeed {
+        title: "cat-powered data center walkthrough.iso",
+        size: 4_597_211_136,
+        source_count: 11,
+    },
+    SyntheticPopularSeed {
+        title: "unofficial windows 98 vaporwave patch.zip",
+        size: 803_471_360,
+        source_count: 27,
+    },
+    SyntheticPopularSeed {
+        title: "beep test but every beep is a fax machine.flac",
+        size: 558_366_720,
+        source_count: 14,
+    },
+    SyntheticPopularSeed {
+        title: "office 2010 professional plus x86.iso",
+        size: 128_661_504,
+        source_count: 22,
+    },
+    SyntheticPopularSeed {
+        title: "retro hamster workstation benchmark.mov",
+        size: 1_934_155_776,
+        source_count: 17,
+    },
+    SyntheticPopularSeed {
+        title: "flying toaster championship finals.mp4",
+        size: 1_215_102_976,
+        source_count: 29,
+    },
+    SyntheticPopularSeed {
+        title: "synthwave aquarium screensaver collection.rar",
+        size: 677_478_400,
+        source_count: 13,
+    },
+    SyntheticPopularSeed {
+        title: "ubuntu linux server 24.04 live amd64.iso",
+        size: 18_456_321,
+        source_count: 18,
+    },
+    SyntheticPopularSeed {
+        title: "very long train horn ambience.wav",
+        size: 2_812_747_776,
+        source_count: 12,
+    },
+    SyntheticPopularSeed {
+        title: "adobe photoshop cs6 portable.rar",
+        size: 943_128_576,
+        source_count: 15,
+    },
+    SyntheticPopularSeed {
+        title: "windows 7 ultimate sp1 x64 dvd.iso",
+        size: 421_388_288,
+        source_count: 9,
+    },
+    SyntheticPopularSeed {
+        title: "museum of broken gamepads.pdf",
+        size: 67_210_240,
+        source_count: 21,
+    },
+    SyntheticPopularSeed {
+        title: "game of thrones season 1 complete 720p.mkv",
+        size: 44_992_610,
+        source_count: 10,
+    },
+    SyntheticPopularSeed {
+        title: "the office us season 2 dvdrip xvid.avi",
+        size: 134_742_016,
+        source_count: 8,
+    },
+    SyntheticPopularSeed {
+        title: "midnight subway cat rave.mkv",
+        size: 3_288_334_336,
+        source_count: 26,
+    },
+    SyntheticPopularSeed {
+        title: "top 100 dance hits 2009.mp3",
+        size: 77_414_400,
+        source_count: 23,
+    },
+    SyntheticPopularSeed {
+        title: "vhs rip of the internet weather channel.ts",
+        size: 5_188_911_104,
+        source_count: 14,
+    },
+    SyntheticPopularSeed {
+        title: "ubuntu linux 22.04 desktop amd64.iso",
+        size: 1_104_199_680,
+        source_count: 28,
+    },
+    SyntheticPopularSeed {
+        title: "the lord of the rings extended trilogy 1080p.mkv",
+        size: 612_892_672,
+        source_count: 20,
+    },
+    SyntheticPopularSeed {
+        title: "microsoft office 2007 enterprise.iso",
+        size: 695_205_888,
+        source_count: 17,
+    },
+    SyntheticPopularSeed {
+        title: "grand theft auto vice city full rip.iso",
+        size: 1_544_269_824,
+        source_count: 12,
+    },
+    SyntheticPopularSeed {
+        title: "breaking bad season 3 complete 720p.mkv",
+        size: 88_199_168,
+        source_count: 25,
+    },
+    SyntheticPopularSeed {
+        title: "ubuntu linux 20.04.6 live server amd64.iso",
+        size: 3_964_108_800,
+        source_count: 16,
+    },
+    SyntheticPopularSeed {
+        title: "top gear complete specials collection x264.mp4",
+        size: 233_308_160,
+        source_count: 13,
+    },
+    SyntheticPopularSeed {
+        title: "the beatles abbey road remastered.flac",
+        size: 1_572_864,
+        source_count: 7,
+    },
+    SyntheticPopularSeed {
+        title: "harry potter complete 1080p bluray x264.mkv",
+        size: 376_877_056,
+        source_count: 11,
+    },
+    SyntheticPopularSeed {
+        title: "visual studio 2010 professional.iso",
+        size: 190_513_152,
+        source_count: 9,
+    },
+    SyntheticPopularSeed {
+        title: "ubuntu linux 18.04 desktop amd64.iso",
+        size: 1_672_331_264,
+        source_count: 18,
+    },
+    SyntheticPopularSeed {
+        title: "pink floyd the wall remastered.flac",
+        size: 49_283_072,
+        source_count: 15,
+    },
+    SyntheticPopularSeed {
+        title: "friends complete season 5 dvdrip xvid.avi",
+        size: 2_965_983_232,
+        source_count: 19,
+    },
+    SyntheticPopularSeed {
+        title: "ubuntu linux handbook 2026.pdf",
+        size: 821_051_392,
+        source_count: 24,
+    },
+    SyntheticPopularSeed {
+        title: "windows xp professional sp3 corporate.iso",
+        size: 1_281_286_144,
+        source_count: 17,
+    },
+    SyntheticPopularSeed {
+        title: "portable rave lighthouse screensaver.scr",
+        size: 28_311_552,
+        source_count: 12,
+    },
+    SyntheticPopularSeed {
+        title: "greatest floppy disk solos anthology.flac",
+        size: 607_518_720,
+        source_count: 20,
+    },
+    SyntheticPopularSeed {
+        title: "galactic sandwich emulator setup.exe",
+        size: 509_607_936,
+        source_count: 14,
+    },
+    SyntheticPopularSeed {
+        title: "vintage webcam ghost sightings collection.mkv",
+        size: 2_118_541_312,
+        source_count: 22,
+    },
+];
+
+/// Static settings that make source publishes look like a stable eMule-style
+/// high-ID client on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SourcePublishSettings {
+    pub(super) tcp_port: u16,
+    pub(super) obfuscation_enabled: bool,
+}
 
 pub(super) fn build_publish_batch_summary(
     seed_source: PublishSeedSource,
@@ -185,6 +408,138 @@ pub(super) async fn set_synthetic_publish_queue_depth(
 ) {
     let mut observability = publish_observability.lock().await;
     observability.synthetic_drip_queue_depth = Some(remaining_items as u32);
+}
+
+/// Infer the oracle-style eD2k search term for a filename's published file type.
+///
+/// eMule publishes keyword `FILETYPE` tags using a compact search vocabulary:
+/// `Audio`, `Video`, `Image`, `Doc`, `Pro`, or `EmuleCollection`.
+/// Archives, programs, and CD-image style extensions all collapse to `Pro`.
+#[must_use]
+pub(super) fn ed2k_file_type_search_term(file_name: &str) -> Option<&'static str> {
+    let extension = file_name.rsplit('.').next()?;
+    if extension == file_name {
+        return None;
+    }
+
+    match extension.to_ascii_lowercase().as_str() {
+        "mp3" | "aac" | "ac3" | "flac" | "m4a" | "ogg" | "wav" | "wma" => Some("Audio"),
+        "avi" | "mkv" | "mov" | "mp4" | "mpeg" | "mpg" | "wmv" => Some("Video"),
+        "bmp" | "gif" | "jpeg" | "jpg" | "png" | "tif" | "tiff" | "webp" => Some("Image"),
+        "chm" | "csv" | "doc" | "docx" | "epub" | "htm" | "html" | "odt" | "pdf" | "pps"
+        | "ppt" | "pptx" | "rtf" | "txt" | "xls" | "xlsx" => Some("Doc"),
+        "7z" | "ace" | "apk" | "bat" | "bin" | "bz2" | "cab" | "cmd" | "com" | "dll" | "dmg"
+        | "exe" | "gz" | "img" | "iso" | "jar" | "msi" | "pkg" | "rar" | "sh" | "tar" | "tgz"
+        | "xz" | "zip" => Some("Pro"),
+        "emulecollection" => Some("EmuleCollection"),
+        _ => None,
+    }
+}
+
+/// Derive a stable synthetic AICH root for seeded publishes.
+///
+/// Seeded hashes do not have a real AICH tree behind them, but eMule adds an
+/// AICH root on keyword publishes to Kad v9+ peers. A deterministic SHA-1 over
+/// the advertised file identity keeps our wire shape stable across runs and
+/// lets the publish fanout mirror the oracle's version-gated tag branch.
+#[must_use]
+pub(super) fn synthetic_publish_aich_hash(
+    file_hash: &Ed2kHash,
+    file_name: &str,
+    file_size: u64,
+) -> [u8; 20] {
+    let mut hasher = Sha1::new();
+    hasher.update(file_hash.0);
+    hasher.update(file_size.to_le_bytes());
+    hasher.update(file_name.as_bytes());
+    let digest = hasher.finalize();
+    let mut aich_hash = [0u8; 20];
+    aich_hash.copy_from_slice(&digest);
+    aich_hash
+}
+
+/// Builds the fixed synthetic seed list used when the coordinator has no popular hashes yet.
+pub(super) fn synthetic_popular_hashes() -> Vec<PopularHash> {
+    SYNTHETIC_POPULAR_SEEDS
+        .iter()
+        .enumerate()
+        .map(|(index, seed)| synthetic_popular_hash(index, seed))
+        .collect()
+}
+
+/// Produces a deterministic fake Ed2k hash so the synthetic seed set is stable across restarts.
+pub(super) fn synthetic_file_hash(index: usize, seed: &SyntheticPopularSeed) -> Ed2kHash {
+    let mut hasher = Md4::new();
+    hasher.update(
+        format!(
+            "overlord-synthetic-kad-seed|{index}|{}|{}|{}",
+            seed.title, seed.size, seed.source_count
+        )
+        .as_bytes(),
+    );
+    let digest: [u8; 16] = hasher.finalize().into();
+    Ed2kHash::from_bytes(digest)
+}
+
+pub(super) fn synthetic_popular_hash(index: usize, seed: &SyntheticPopularSeed) -> PopularHash {
+    PopularHash {
+        hash: HashType::Ed2k(hex::encode(synthetic_file_hash(index, seed).0)),
+        canonical_name: seed.title.to_string(),
+        size: seed.size,
+        source_count: seed.source_count,
+    }
+}
+
+pub(super) async fn refresh_ed2k_shared_catalog(
+    shared_catalog: &Ed2kSharedCatalog,
+    hashes: &[PopularHash],
+) {
+    let mut guard = shared_catalog.write().await;
+    guard.retain(|entry| !entry.compatibility_hint);
+    let replacements = if hashes.is_empty() {
+        synthetic_popular_hashes()
+    } else {
+        hashes.to_vec()
+    };
+    guard.extend(
+        replacements
+            .iter()
+            .filter_map(Ed2kSharedEntry::from_popular_hash),
+    );
+}
+
+pub(super) fn synthetic_publish_queue_depth(cursor: usize) -> usize {
+    let total = SYNTHETIC_POPULAR_SEEDS.len();
+    if total == 0 {
+        return 0;
+    }
+    let normalized = cursor % total;
+    if normalized == 0 {
+        total
+    } else {
+        total - normalized
+    }
+}
+
+pub(super) fn next_synthetic_publish_batch(
+    cursor: &mut usize,
+    batch_items: usize,
+) -> Vec<PopularHash> {
+    if SYNTHETIC_POPULAR_SEEDS.is_empty() {
+        return Vec::new();
+    }
+
+    let total = SYNTHETIC_POPULAR_SEEDS.len();
+    let start = *cursor % total;
+    let batch_len = batch_items.max(1).min(total);
+    let batch = (0..batch_len)
+        .map(|offset| {
+            let index = (start + offset) % total;
+            synthetic_popular_hash(index, &SYNTHETIC_POPULAR_SEEDS[index])
+        })
+        .collect::<Vec<_>>();
+    *cursor = (start + batch_len) % total;
+    batch
 }
 
 /// Returns the eMule high-ID source type used for source publishes in the non-firewalled case.

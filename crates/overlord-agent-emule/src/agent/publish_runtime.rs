@@ -12,17 +12,17 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use super::{
-    SourcePublishSettings,
     activity::{
         AgentActivityTracker, begin_agent_activity, clear_agent_degraded_activity,
         finish_agent_activity, new_activity_snapshot, publish_activity_key,
         record_agent_degraded_activity, update_agent_activity_progress,
     },
-    build_notes_publish_tags, build_source_publish_tags, ed2k_file_type_search_term,
     keyword_target,
-    publish::record_publish_summaries,
-    publish::update_publish_progress,
-    refresh_ed2k_shared_catalog, synthetic_publish_aich_hash,
+    publish::{
+        SourcePublishSettings, build_notes_publish_tags, build_source_publish_tags,
+        ed2k_file_type_search_term, record_publish_summaries, refresh_ed2k_shared_catalog,
+        synthetic_publish_aich_hash, update_publish_progress,
+    },
 };
 use crate::{ed2k_transfer::Ed2kSharedCatalog, kad_store::KadLocalStore};
 

@@ -29,9 +29,10 @@ use super::lifecycle::{
     load_or_create_node_id, load_or_create_udp_key, read_optional_bytes, resolved_socket_addr,
 };
 use super::networking::p2p_interface_reconcile_target;
+use super::publish::synthetic_popular_hashes;
 use super::{
     AgentNetworkRuntime, ED2K_BACKGROUND_SEARCH_QUEUE_CAPACITY, OverlordAgentEmule,
-    PASSIVE_REPLAY_CONCURRENCY, synthetic_popular_hashes,
+    PASSIVE_REPLAY_CONCURRENCY,
 };
 
 impl OverlordAgentEmule {
