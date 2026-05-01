@@ -60,6 +60,7 @@ use crate::snoop_queue::SnoopQueue;
 
 mod activity;
 mod background_ed2k;
+mod background_routing;
 mod background_tasks;
 mod control_runtime;
 mod ed2k_download;
@@ -116,7 +117,6 @@ use self::kad_runtime::{
 use self::kad_unsolicited::{UnsolicitedPacketContext, handle_unsolicited_packet};
 use self::lifecycle::{
     AgentStatePaths, ensure_parent_dir, load_or_create_indexer_id, persist_nodes_dat_for,
-    random_routing_refresh_target,
 };
 #[cfg(test)]
 use self::networking::apply_networking_config;
