@@ -27,6 +27,7 @@ mod flags;
 mod loop_runtime;
 mod obfuscation;
 mod packet_codec;
+mod packet_handler;
 mod result_decoder;
 mod search_expr;
 mod server_entry;
@@ -54,8 +55,6 @@ pub use background::{
 };
 use diagnostics::{dump_ed2k_server_meta, dump_ed2k_server_packet};
 use flags::{format_connect_options, format_server_flags, is_low_id};
-#[cfg(test)]
-use loop_runtime::decode_server_ident;
 pub use loop_runtime::run_ed2k_server_loop;
 use loop_runtime::{
     annotate_found_sources_server, ipv4_from_client_id, merge_found_sources, validate_found_sources,
@@ -65,6 +64,9 @@ use obfuscation::{
     random_nonzero_biguint, should_use_server_obfuscation,
 };
 use packet_codec::{decode_server_payload, encode_packet};
+#[cfg(test)]
+use packet_handler::decode_server_ident;
+use packet_handler::handle_server_packet;
 use result_decoder::{
     decode_found_sources, decode_search_result_page, decode_udp_found_source_sets,
     decode_udp_search_result_pages,
