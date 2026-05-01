@@ -14,14 +14,12 @@
 //! - keep the TCP session alive with empty `OP_OFFERFILES` packets
 
 use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -38,7 +36,7 @@ use overlord_kad_proto::Ed2kHash;
 use crate::{
     config::Ed2kConfig,
     ed2k_tcp::{Ed2kHelloIdentity, connect_callback_peer, enrich_hello_identity},
-    ed2k_transfer::{Ed2kSharedCatalog, Ed2kSharedEntry},
+    ed2k_transfer::Ed2kSharedCatalog,
     kad_firewall::KadFirewallState,
 };
 
@@ -54,6 +52,7 @@ mod result_decoder;
 mod search_expr;
 mod server_entry;
 mod session;
+mod startup;
 mod tag_codec;
 mod udp;
 pub use active_callback::{Ed2kCallbackRequestOptions, request_callback_on_server};
@@ -89,10 +88,14 @@ use server_entry::{
     resolve_server_entry,
 };
 use session::{Ed2kPacket, ServerSession, ServerSessionPhase};
-use tag_codec::{
-    decode_ed2k_string, decode_tag, push_short_string_tag, push_short_u8_tag, push_short_u32_tag,
-    push_string_tag, push_u32_tag,
+use startup::{
+    encode_login_request, encode_source_request, encode_udp_search_request,
+    encode_udp_source_request, login_identity_for_server_transport, send_connected_server_startup,
+    send_offer_files_advertisement, source_request_opcode, wait_for_offer_files_settle,
 };
+#[cfg(test)]
+use startup::{encode_offer_files_payload, offer_files_catalog_fingerprint, server_capabilities};
+use tag_codec::{decode_ed2k_string, decode_tag};
 use udp::{decode_server_udp_datagram, encode_server_udp_datagram, server_udp_endpoint};
 
 #[cfg(test)]
@@ -1160,288 +1163,6 @@ async fn read_server_udp_packet(
         payload: packet[2..].to_vec(),
         from,
     }))
-}
-
-fn encode_login_request(identity: Ed2kHelloIdentity) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(96);
-    payload.extend_from_slice(&identity.user_hash);
-    payload.extend_from_slice(&0u32.to_le_bytes());
-    payload.extend_from_slice(&identity.tcp_port.to_le_bytes());
-    payload.extend_from_slice(&4u32.to_le_bytes());
-    push_string_tag(&mut payload, CT_NAME, HELLO_NICKNAME);
-    push_u32_tag(&mut payload, CT_VERSION, EDONKEY_VERSION);
-    push_u32_tag(
-        &mut payload,
-        CT_SERVER_FLAGS,
-        server_capabilities(identity.connect_options),
-    );
-    push_u32_tag(&mut payload, CT_EMULE_VERSION, emule_version_tag());
-    payload
-}
-
-fn login_identity_for_server_transport(
-    identity: Ed2kHelloIdentity,
-    use_server_obfuscation: bool,
-) -> Ed2kHelloIdentity {
-    let _ = use_server_obfuscation;
-    identity
-}
-
-fn encode_offer_files_payload(
-    shared_catalog: &[Ed2kSharedEntry],
-    client_id: Option<u32>,
-    tcp_port: u16,
-    server_flags: Option<u32>,
-) -> Vec<u8> {
-    let (advertised_client_id, advertised_client_port) =
-        advertised_client_endpoint_for_offer_file(client_id, tcp_port, server_flags);
-    let offered_files = offered_files_catalog(shared_catalog);
-    let mut payload = Vec::with_capacity(80 * offered_files.len());
-    payload.extend_from_slice(
-        &u32::try_from(offered_files.len())
-            .expect("offered file count fits in u32")
-            .to_le_bytes(),
-    );
-    for (file_hash, file_name, file_size, file_type) in offered_files {
-        payload.extend_from_slice(&file_hash);
-        payload.extend_from_slice(&advertised_client_id.to_le_bytes());
-        payload.extend_from_slice(&advertised_client_port.to_le_bytes());
-        payload.extend_from_slice(&3u32.to_le_bytes());
-        push_short_string_tag(&mut payload, FT_FILENAME, &file_name);
-        push_short_u32_tag(&mut payload, FT_FILESIZE, file_size);
-        push_short_u8_tag(&mut payload, FT_FILETYPE, file_type);
-    }
-    payload
-}
-
-fn advertised_client_endpoint_for_offer_file(
-    client_id: Option<u32>,
-    tcp_port: u16,
-    server_flags: Option<u32>,
-) -> (u32, u16) {
-    if server_flags.unwrap_or_default() & SERVER_TCP_FLAG_COMPRESSION != 0 {
-        return (
-            OFFER_FILE_COMPLETE_SENTINEL_CLIENT_ID,
-            OFFER_FILE_COMPLETE_SENTINEL_CLIENT_PORT,
-        );
-    }
-    match client_id {
-        Some(client_id) if !is_low_id(client_id) => (client_id, tcp_port),
-        _ => (0, 0),
-    }
-}
-
-/// Encode the ED2K local-server source request payload.
-///
-/// Modern eMule sends the file hash plus file size in the TCP local-server
-/// source-request path. Large files use the `0` sentinel followed by a `u64`.
-/// When the caller does not yet know the file size, fall back to the legacy
-/// hash-only payload so hash-only live probes can still acquire sources.
-fn encode_source_request(file_hash: Ed2kHash, file_size: u64) -> Vec<u8> {
-    if file_size == 0 {
-        return file_hash.0.to_vec();
-    }
-    let mut payload = Vec::with_capacity(28);
-    payload.extend_from_slice(&file_hash.0);
-    if file_size > u64::from(u32::MAX) {
-        payload.extend_from_slice(&0u32.to_le_bytes());
-        payload.extend_from_slice(&file_size.to_le_bytes());
-    } else {
-        payload.extend_from_slice(&(file_size as u32).to_le_bytes());
-    }
-    payload
-}
-
-fn encode_udp_search_request(server: &ResolvedServerEntry, search_payload: &[u8]) -> (u8, Vec<u8>) {
-    if server.entry.udp_flags & SERVER_UDP_FLAG_EXT_GETFILES != 0
-        && server.entry.udp_flags & SERVER_UDP_FLAG_LARGEFILES != 0
-    {
-        let mut payload = Vec::with_capacity(search_payload.len() + 11);
-        payload.extend_from_slice(&1u32.to_le_bytes());
-        push_u32_tag(
-            &mut payload,
-            CT_SERVER_UDPSEARCH_FLAGS,
-            SRVCAP_UDP_NEWTAGS_LARGEFILES,
-        );
-        payload.extend_from_slice(search_payload);
-        (OP_GLOBSEARCHREQ3, payload)
-    } else if server.entry.udp_flags & SERVER_UDP_FLAG_EXT_GETFILES != 0 {
-        (OP_GLOBSEARCHREQ2, search_payload.to_vec())
-    } else {
-        (OP_GLOBSEARCHREQ, search_payload.to_vec())
-    }
-}
-
-fn encode_udp_source_request(
-    server: &ResolvedServerEntry,
-    file_hash: Ed2kHash,
-    file_size: u64,
-) -> (u8, Vec<u8>) {
-    if server.entry.udp_flags & SERVER_UDP_FLAG_EXT_GETSOURCES2 != 0 {
-        (
-            OP_GLOBGETSOURCES2,
-            encode_source_request(file_hash, file_size),
-        )
-    } else {
-        let _supports_legacy_getsources =
-            server.entry.udp_flags & SERVER_UDP_FLAG_EXT_GETSOURCES != 0;
-        (OP_GLOBGETSOURCES, file_hash.0.to_vec())
-    }
-}
-
-fn source_request_opcode(connect_options: u8, server_flags: Option<u32>) -> u8 {
-    // A source-search session may still need the obfuscated reply family even
-    // when the TCP session itself stayed plaintext because the configured
-    // server entry lacked an obfuscation port. Once OP_IDCHANGE confirms the
-    // server supports TCP obfuscation, prefer the obfuscated found-sources
-    // shape so peer user-hash metadata is preserved.
-    if connect_options != 0
-        && server_flags.unwrap_or_default() & SERVER_TCP_FLAG_TCPOBFUSCATION != 0
-    {
-        OP_GETSOURCES_OBFU
-    } else {
-        OP_GETSOURCES
-    }
-}
-
-fn offered_files_catalog(shared_catalog: &[Ed2kSharedEntry]) -> Vec<([u8; 16], String, u32, u8)> {
-    let mut offered_files = shared_catalog
-        .iter()
-        .filter_map(popular_hash_offer_file)
-        .take(200)
-        .collect::<Vec<_>>();
-    if offered_files.is_empty() {
-        offered_files.push((
-            OFFER_FILE_SAMPLE_HASH,
-            OFFER_FILE_SAMPLE_NAME.to_string(),
-            OFFER_FILE_SAMPLE_SIZE,
-            ED2K_FILETYPE_PROGRAM,
-        ));
-    }
-    offered_files
-}
-
-fn offer_files_catalog_fingerprint(shared_catalog: &[Ed2kSharedEntry]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    offered_files_catalog(shared_catalog).hash(&mut hasher);
-    hasher.finish()
-}
-
-fn popular_hash_offer_file(hash: &Ed2kSharedEntry) -> Option<([u8; 16], String, u32, u8)> {
-    let file_hash = hash.parsed_hash().ok()?;
-    let file_size = u32::try_from(hash.file_size).unwrap_or(u32::MAX);
-    Some((
-        file_hash.0,
-        hash.canonical_name.clone(),
-        file_size,
-        ed2k_offer_file_type(&hash.canonical_name),
-    ))
-}
-
-fn ed2k_offer_file_type(file_name: &str) -> u8 {
-    match file_name
-        .rsplit('.')
-        .next()
-        .map(|extension| extension.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("avi" | "mp4" | "mkv" | "mov" | "wmv" | "mpeg" | "mpg") => ED2K_FILETYPE_VIDEO,
-        Some("mp3" | "flac" | "ogg" | "wav" | "aac" | "m4a") => ED2K_FILETYPE_AUDIO,
-        Some("zip" | "rar" | "7z" | "tar" | "gz" | "bz2") => ED2K_FILETYPE_ARCHIVE,
-        Some("pdf" | "doc" | "docx" | "txt" | "rtf" | "epub") => ED2K_FILETYPE_DOCUMENT,
-        _ => ED2K_FILETYPE_PROGRAM,
-    }
-}
-
-fn server_capabilities(connect_options: u8) -> u32 {
-    let mut flags = SRVCAP_ZLIB | SRVCAP_NEWTAGS | SRVCAP_LARGEFILES | SRVCAP_UNICODE;
-    if connect_options & 0x01 != 0 {
-        flags |= SRVCAP_SUPPORTCRYPT;
-    }
-    if connect_options & 0x02 != 0 {
-        flags |= SRVCAP_REQUESTCRYPT;
-    }
-    if connect_options & 0x04 != 0 {
-        flags |= SRVCAP_REQUIRECRYPT;
-    }
-    flags
-}
-
-fn emule_version_tag() -> u32 {
-    (EMULE_VERSION_MAJOR << 17) | (EMULE_VERSION_MINOR << 10) | (EMULE_VERSION_UPDATE << 7)
-}
-
-async fn send_offer_files_advertisement(
-    session: &mut ServerSession,
-    shared_catalog: &Ed2kSharedCatalog,
-    tcp_port: u16,
-) -> Result<()> {
-    let shared_catalog = shared_catalog.read().await.clone();
-    let catalog_fingerprint = offer_files_catalog_fingerprint(&shared_catalog);
-    if session.offer_files_sent
-        && session.offer_files_catalog_fingerprint == Some(catalog_fingerprint)
-    {
-        return Ok(());
-    }
-    let payload = encode_offer_files_payload(
-        &shared_catalog,
-        session.assigned_client_id,
-        tcp_port,
-        session.server_flags,
-    );
-    let was_sent = session.offer_files_sent;
-    session.send_packet(OP_OFFERFILES, &payload).await?;
-    session.offer_files_sent = true;
-    session.offer_files_sent_at = Some(Instant::now());
-    session.offer_files_catalog_fingerprint = Some(catalog_fingerprint);
-    session.set_phase(
-        ServerSessionPhase::OfferFilesSent,
-        format!(
-            "{} offer-files advertisement entries={}",
-            if was_sent { "refreshed" } else { "sent" },
-            offered_files_catalog(&shared_catalog).len()
-        ),
-    );
-    debug!(
-        "{} ED2K offer-files advertisement to {}",
-        if was_sent { "refreshed" } else { "sent" },
-        session.endpoint
-    );
-    Ok(())
-}
-
-async fn send_connected_server_startup(
-    session: &mut ServerSession,
-    shared_catalog: &Ed2kSharedCatalog,
-    tcp_port: u16,
-) -> Result<()> {
-    session.set_phase(
-        ServerSessionPhase::Connected,
-        "server session accepted after OP_IDCHANGE",
-    );
-    send_offer_files_advertisement(session, shared_catalog, tcp_port).await?;
-    send_server_list_request(session).await?;
-    Ok(())
-}
-
-async fn send_server_list_request(session: &mut ServerSession) -> Result<()> {
-    if session.server_list_requested {
-        return Ok(());
-    }
-    session.send_packet(OP_GETSERVERLIST, &[]).await?;
-    session.server_list_requested = true;
-    dump_ed2k_server_meta(session, "requested server list after connected transition");
-    Ok(())
-}
-
-async fn wait_for_offer_files_settle(session: &ServerSession) {
-    let Some(sent_at) = session.offer_files_sent_at else {
-        return;
-    };
-    let elapsed = sent_at.elapsed();
-    if elapsed < OFFER_FILE_SEARCH_SETTLE_DELAY {
-        tokio::time::sleep(OFFER_FILE_SEARCH_SETTLE_DELAY - elapsed).await;
-    }
 }
 
 fn decode_server_ident(payload: &[u8]) -> Result<(Option<String>, Option<String>)> {
