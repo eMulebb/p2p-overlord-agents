@@ -18,7 +18,6 @@ use tracing::{info, warn};
 use super::{
     AgentNetworkRuntime, ED2K_DOWNLOAD_KAD_SOURCE_TIMEOUT_FLOOR_SECS,
     ED2K_DOWNLOAD_SOURCE_REQUERY_DELAY_SECS, ED2K_DOWNLOAD_SOURCE_REQUERY_ROUNDS,
-    NativeDirectDownloadOptions, NativeDirectDownloadOutcome,
     ed2k_enrich::{EnrichEd2kDownloadRequest, is_hash_only_ed2k_placeholder_name},
     ed2k_runtime::{
         Ed2kSourceEndpointKey, direct_download_candidate_sources, ed2k_source_attempt_key,
@@ -51,6 +50,25 @@ use crate::{
     },
 };
 use overlord_kad_proto::Ed2kHash;
+
+pub(super) struct NativeDirectDownloadOutcome {
+    pub(super) completed: bool,
+    pub(super) accepted_incomplete_peers: u32,
+    pub(super) last_error: Option<anyhow::Error>,
+}
+
+pub(super) struct NativeDirectDownloadOptions {
+    pub(super) bind_ip: Ipv4Addr,
+    pub(super) hello_identity: Ed2kHelloIdentity,
+    pub(super) secure_ident: Arc<Ed2kSecureIdent>,
+    pub(super) transfer_runtime: Arc<Ed2kTransferRuntime>,
+    pub(super) file_hash_hex: String,
+    pub(super) file_name: String,
+    pub(super) file_size: u64,
+    pub(super) sources: Vec<Ed2kFoundSource>,
+    pub(super) connect_timeout: Duration,
+    pub(super) max_parallel_download_peers: usize,
+}
 
 /// Attempts direct-dial ED2K peer downloads until the transfer manifest
 /// completes or all discovered direct peers fail.

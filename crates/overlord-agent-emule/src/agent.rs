@@ -1,5 +1,7 @@
 #[cfg(test)]
 use std::future::Future;
+#[cfg(test)]
+use std::time::Duration;
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -9,7 +11,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use anyhow::{Context, Result};
@@ -43,8 +45,10 @@ use overlord_kad_proto::NodeId;
 use crate::config::EmuleAgentConfig;
 use crate::ed2k_server::{Ed2kFoundSource, Ed2kServerSearchHandle, Ed2kServerState};
 #[cfg(test)]
+use crate::ed2k_tcp::Ed2kHelloIdentity;
+#[cfg(test)]
 use crate::ed2k_tcp::Ed2kPeerDownloadOutcome;
-use crate::ed2k_tcp::{Ed2kHelloIdentity, Ed2kSecureIdent};
+use crate::ed2k_tcp::Ed2kSecureIdent;
 use crate::ed2k_transfer::{Ed2kLocalIngestSummary, Ed2kSharedCatalog, Ed2kTransferRuntime};
 use crate::kad_firewall::KadFirewallState;
 use crate::kad_store::{KadLocalStore, KadLocalStoreConfig};
@@ -85,6 +89,8 @@ use self::activity::{
     publish_activity_key, record_agent_degraded_activity, runtime_activity_error,
     search_activity_context,
 };
+#[cfg(test)]
+use self::ed2k_download::{NativeDirectDownloadOptions, NativeDirectDownloadOutcome};
 #[cfg(test)]
 use self::ed2k_enrich::EnrichEd2kDownloadSource;
 use self::ed2k_enrich::{EnrichEd2kDownloadRequest, IngestLocalFileRequest};
@@ -309,12 +315,6 @@ struct ActiveSearchHandle {
     cancel: CancellationToken,
 }
 
-struct NativeDirectDownloadOutcome {
-    completed: bool,
-    accepted_incomplete_peers: u32,
-    last_error: Option<anyhow::Error>,
-}
-
 pub struct OverlordAgentEmule {
     config: Arc<RwLock<EmuleAgentConfig>>,
     coordinator: CoordinatorClient,
@@ -351,19 +351,6 @@ enum NetworkingConfigApplyOutcome {
     Unchanged,
     ReconciledInPlace,
     RestartRequired,
-}
-
-struct NativeDirectDownloadOptions {
-    bind_ip: Ipv4Addr,
-    hello_identity: Ed2kHelloIdentity,
-    secure_ident: Arc<Ed2kSecureIdent>,
-    transfer_runtime: Arc<Ed2kTransferRuntime>,
-    file_hash_hex: String,
-    file_name: String,
-    file_size: u64,
-    sources: Vec<Ed2kFoundSource>,
-    connect_timeout: Duration,
-    max_parallel_download_peers: usize,
 }
 
 impl OverlordAgentEmule {
