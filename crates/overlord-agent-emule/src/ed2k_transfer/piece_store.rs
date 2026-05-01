@@ -271,43 +271,43 @@ impl Ed2kTransferRuntime {
                 file.flush().await?;
                 drop(file);
                 self.store_manifest_unlocked(&manifest).await?;
-                self.log_append_piece_block(
-                    &manifest,
+                log_append_piece_block(AppendPieceBlockLog {
+                    manifest: &manifest,
                     piece_index,
                     start,
                     end,
                     block_received_at,
                     should_checkpoint,
                     checkpoint_reason,
-                );
+                });
                 return Ok(piece_completed);
             }
 
             drop(file);
             self.cache_manifest_unlocked(&manifest).await;
-            self.log_append_piece_block(
-                &manifest,
+            log_append_piece_block(AppendPieceBlockLog {
+                manifest: &manifest,
                 piece_index,
                 start,
                 end,
                 block_received_at,
                 should_checkpoint,
                 checkpoint_reason,
-            );
+            });
             return Ok(piece_completed);
         }
 
         let should_checkpoint = true;
         self.store_manifest_unlocked(&manifest).await?;
-        self.log_append_piece_block(
-            &manifest,
+        log_append_piece_block(AppendPieceBlockLog {
+            manifest: &manifest,
             piece_index,
             start,
             end,
             block_received_at,
             should_checkpoint,
             checkpoint_reason,
-        );
+        });
         Ok(piece_completed)
     }
 
@@ -357,27 +357,28 @@ impl Ed2kTransferRuntime {
         file.read_exact(&mut bytes).await?;
         Ok(Some(bytes))
     }
+}
 
-    fn log_append_piece_block(
-        &self,
-        manifest: &super::Ed2kResumeManifest,
-        piece_index: u32,
-        start: u64,
-        end: u64,
-        block_received_at: Instant,
-        should_checkpoint: bool,
-        checkpoint_reason: Option<&'static str>,
-    ) {
-        debug!(
-            file_hash = %manifest.file_hash,
-            piece_index,
-            start,
-            end,
-            block_write_ms = block_received_at.elapsed().as_millis(),
-            checkpoint = should_checkpoint,
-            checkpoint_reason = checkpoint_reason.unwrap_or("cached_only"),
-            completed = manifest.completed,
-            "ED2K append_piece_block applied"
-        );
-    }
+struct AppendPieceBlockLog<'a> {
+    manifest: &'a Ed2kResumeManifest,
+    piece_index: u32,
+    start: u64,
+    end: u64,
+    block_received_at: Instant,
+    should_checkpoint: bool,
+    checkpoint_reason: Option<&'static str>,
+}
+
+fn log_append_piece_block(event: AppendPieceBlockLog<'_>) {
+    debug!(
+        file_hash = %event.manifest.file_hash,
+        piece_index = event.piece_index,
+        start = event.start,
+        end = event.end,
+        block_write_ms = event.block_received_at.elapsed().as_millis(),
+        checkpoint = event.should_checkpoint,
+        checkpoint_reason = event.checkpoint_reason.unwrap_or("cached_only"),
+        completed = event.manifest.completed,
+        "ED2K append_piece_block applied"
+    );
 }
