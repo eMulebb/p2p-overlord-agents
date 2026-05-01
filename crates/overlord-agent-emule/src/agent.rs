@@ -58,6 +58,7 @@ use crate::snoop_queue::SnoopQueue;
 mod activity;
 mod background_ed2k;
 mod background_firewall;
+mod background_publish;
 mod background_routing;
 mod background_tasks;
 mod control_runtime;
@@ -78,12 +79,12 @@ mod search;
 mod snoop;
 
 use self::activity::{
-    ACTIVITY_KEY_BOOTSTRAPPING, ACTIVITY_KEY_FLUSHING_SNOOPS, ACTIVITY_KEY_RECONFIGURING,
-    ACTIVITY_KEY_STARTING, AgentActivityTracker, active_ed2k_download_key, active_search_key,
-    begin_agent_activity, clear_agent_degraded_activity, finish_agent_activity,
-    new_activity_snapshot, passive_replay_activity_context, passive_replay_key,
-    publish_activity_key, record_agent_degraded_activity, runtime_activity_error,
-    search_activity_context, update_agent_activity_error,
+    ACTIVITY_KEY_FLUSHING_SNOOPS, ACTIVITY_KEY_RECONFIGURING, ACTIVITY_KEY_STARTING,
+    AgentActivityTracker, active_ed2k_download_key, active_search_key, begin_agent_activity,
+    clear_agent_degraded_activity, finish_agent_activity, new_activity_snapshot,
+    passive_replay_activity_context, passive_replay_key, publish_activity_key,
+    record_agent_degraded_activity, runtime_activity_error, search_activity_context,
+    update_agent_activity_error,
 };
 use self::ed2k_runtime::manifest_has_ed2k_transfer_progress;
 #[cfg(test)]
@@ -112,9 +113,7 @@ use self::kad_runtime::{
     build_kad_hello_request_tags, build_kad_hello_response_tags, parse_kad_hello_metadata,
 };
 use self::kad_unsolicited::{UnsolicitedPacketContext, handle_unsolicited_packet};
-use self::lifecycle::{
-    AgentStatePaths, ensure_parent_dir, load_or_create_indexer_id, persist_nodes_dat_for,
-};
+use self::lifecycle::{AgentStatePaths, ensure_parent_dir, load_or_create_indexer_id};
 #[cfg(test)]
 use self::networking::apply_networking_config;
 #[cfg(test)]
@@ -140,16 +139,13 @@ use self::passive_runtime::{
 use self::publish::{apply_publish_summary, build_publish_batch_summary};
 use self::publish::{
     build_notes_publish_tags, build_source_publish_tags, effective_publish_counters,
-    load_or_create_ed2k_user_hash, set_synthetic_publish_queue_depth, source_publish_client_hash,
+    load_or_create_ed2k_user_hash, source_publish_client_hash,
 };
 #[cfg(test)]
 use self::publish::{
     emule_high_id_source_type, normalize_ed2k_user_hash_markers, record_publish_summaries,
 };
-use self::publish_runtime::{
-    PublishExecutionContext, fetch_coordinator_popular_hashes,
-    seed_coordinator_popular_if_available, seed_popular_from_source, seed_popular_with_activity,
-};
+use self::publish_runtime::{PublishExecutionContext, seed_popular_from_source};
 use self::search::{
     SearchRunStats, do_active_keyword_search, do_active_notes_search, do_active_source_search,
     emit_search_event,
