@@ -45,15 +45,12 @@ use overlord_kad_dht::{DhtNode, RpcObservabilitySnapshot, RpcWorkClass};
 use overlord_kad_proto::{Ed2kHash, KadPacket, NodeId};
 
 use crate::config::EmuleAgentConfig;
-use crate::ed2k_server::{
-    Ed2kFoundSource, Ed2kServerLoopOptions, Ed2kServerSearchHandle, Ed2kServerState,
-    run_ed2k_server_loop,
-};
+use crate::ed2k_server::{Ed2kFoundSource, Ed2kServerSearchHandle, Ed2kServerState};
 #[cfg(test)]
 use crate::ed2k_tcp::Ed2kPeerDownloadOutcome;
 use crate::ed2k_tcp::{
-    Ed2kHelloIdentity, Ed2kListenerOptions, Ed2kSecureIdent, FirewallCheckUdpRequest,
-    emule_connect_options, enrich_hello_identity, request_udp_firewall_check, run_ed2k_listener,
+    Ed2kHelloIdentity, Ed2kSecureIdent, FirewallCheckUdpRequest, emule_connect_options,
+    enrich_hello_identity, request_udp_firewall_check,
 };
 use crate::ed2k_transfer::{Ed2kLocalIngestSummary, Ed2kSharedCatalog, Ed2kTransferRuntime};
 use crate::kad_firewall::KadFirewallState;
@@ -62,6 +59,7 @@ use crate::logging::current_log_file_status;
 use crate::snoop_queue::SnoopQueue;
 
 mod activity;
+mod background_ed2k;
 mod background_tasks;
 mod control_runtime;
 mod ed2k_download;
