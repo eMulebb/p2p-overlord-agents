@@ -39,26 +39,6 @@ fn upload_part_packets_split_large_uncompressed_ranges() {
 
 #[tokio::test]
 async fn listener_upload_session_serves_verified_file_via_compressed_parts() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
-    async fn read_until_opcode(stream: &mut TcpStream, protocol: u8, opcode: u8) -> Vec<u8> {
-        loop {
-            let packet = read_packet(stream).await;
-            if packet[0] == protocol && packet[5] == opcode {
-                return packet;
-            }
-        }
-    }
-
     let mut payload = Vec::new();
     for index in 0..12_000u32 {
         writeln!(
@@ -218,26 +198,6 @@ async fn listener_upload_session_serves_verified_file_via_compressed_parts() {
 
 #[tokio::test]
 async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
-    async fn read_until_opcode(stream: &mut TcpStream, protocol: u8, opcode: u8) -> Vec<u8> {
-        loop {
-            let packet = read_packet(stream).await;
-            if packet[0] == protocol && packet[5] == opcode {
-                return packet;
-            }
-        }
-    }
-
     let payload = b"ubuntu linux upload startup handshake".repeat(512);
     let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
     let file_hash_hex = file_hash.to_string();
@@ -379,26 +339,6 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
 
 #[tokio::test]
 async fn listener_hashset_request2_returns_aich_when_available() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
-    async fn read_until_opcode(stream: &mut TcpStream, protocol: u8, opcode: u8) -> Vec<u8> {
-        loop {
-            let packet = read_packet(stream).await;
-            if packet[0] == protocol && packet[5] == opcode {
-                return packet;
-            }
-        }
-    }
-
     let mut payload = vec![0x5A; ED2K_PART_SIZE as usize];
     payload.extend_from_slice(&vec![0x37; 32_768]);
     let md4_hashset = payload
@@ -530,26 +470,6 @@ async fn listener_hashset_request2_returns_aich_when_available() {
 
 #[tokio::test]
 async fn listener_upload_queue_promotes_waiter_after_disconnect() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
-    async fn read_until_opcode(stream: &mut TcpStream, protocol: u8, opcode: u8) -> Vec<u8> {
-        loop {
-            let packet = read_packet(stream).await;
-            if packet[0] == protocol && packet[5] == opcode {
-                return packet;
-            }
-        }
-    }
-
     let payload = vec![0x51; 4096];
     let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
     let file_hash_hex = file_hash.to_string();
@@ -721,26 +641,6 @@ async fn listener_upload_queue_promotes_waiter_after_disconnect() {
 
 #[tokio::test]
 async fn listener_upload_queue_promotes_waiter_after_cancel_transfer() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
-    async fn read_until_opcode(stream: &mut TcpStream, protocol: u8, opcode: u8) -> Vec<u8> {
-        loop {
-            let packet = read_packet(stream).await;
-            if packet[0] == protocol && packet[5] == opcode {
-                return packet;
-            }
-        }
-    }
-
     let payload = vec![0x61; 4096];
     let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
     let file_hash_hex = file_hash.to_string();
@@ -920,26 +820,6 @@ async fn listener_upload_queue_promotes_waiter_after_cancel_transfer() {
 
 #[tokio::test]
 async fn listener_upload_queue_refreshes_waiting_rank_before_promotion() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
-    async fn read_until_opcode(stream: &mut TcpStream, protocol: u8, opcode: u8) -> Vec<u8> {
-        loop {
-            let packet = read_packet(stream).await;
-            if packet[0] == protocol && packet[5] == opcode {
-                return packet;
-            }
-        }
-    }
-
     let payload = vec![0x71; 4096];
     let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
     let file_hash_hex = file_hash.to_string();
@@ -1127,26 +1007,6 @@ async fn listener_upload_queue_refreshes_waiting_rank_before_promotion() {
 
 #[tokio::test]
 async fn listener_upload_queue_reconnects_waiter_by_hello_identity() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
-    async fn read_until_opcode(stream: &mut TcpStream, protocol: u8, opcode: u8) -> Vec<u8> {
-        loop {
-            let packet = read_packet(stream).await;
-            if packet[0] == protocol && packet[5] == opcode {
-                return packet;
-            }
-        }
-    }
-
     let payload = vec![0x7B; 4096];
     let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
     let file_hash_hex = file_hash.to_string();
@@ -1324,26 +1184,6 @@ async fn listener_upload_queue_reconnects_waiter_by_hello_identity() {
 
 #[tokio::test]
 async fn listener_upload_queue_preserves_waiter_rank_across_file_switch() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
-    async fn read_until_opcode(stream: &mut TcpStream, protocol: u8, opcode: u8) -> Vec<u8> {
-        loop {
-            let packet = read_packet(stream).await;
-            if packet[0] == protocol && packet[5] == opcode {
-                return packet;
-            }
-        }
-    }
-
     let first_payload = vec![0x7B; 4096];
     let second_payload = vec![0x8C; 4096];
     let first_file_hash = Ed2kHash::from_bytes(Md4::digest(&first_payload).into());
@@ -1567,40 +1407,6 @@ async fn listener_upload_queue_preserves_waiter_rank_across_file_switch() {
 
 #[tokio::test]
 async fn listener_upload_peer_can_resume_partial_download_after_reconnect() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
-    async fn read_until_opcode(stream: &mut TcpStream, protocol: u8, opcode: u8) -> Vec<u8> {
-        loop {
-            let packet = read_packet(stream).await;
-            if packet[0] == protocol && packet[5] == opcode {
-                return packet;
-            }
-        }
-    }
-
-    async fn read_until_opcode_timeout(
-        stream: &mut TcpStream,
-        protocol: u8,
-        opcode: u8,
-        context: &str,
-    ) -> Vec<u8> {
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            read_until_opcode(stream, protocol, opcode),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for {context}"))
-    }
-
     async fn read_upload_bytes(
         stream: &mut TcpStream,
         file_hash: &Ed2kHash,

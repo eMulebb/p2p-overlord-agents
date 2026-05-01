@@ -190,6 +190,9 @@ fn encode_startup_multipacket_ext2_answer(
     )
 }
 
+mod common;
 mod download;
 mod listener;
 mod protocol;
+
+use common::*;

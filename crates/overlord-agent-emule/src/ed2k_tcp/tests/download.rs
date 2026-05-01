@@ -2,17 +2,6 @@ use super::*;
 
 #[tokio::test]
 async fn small_file_download_waits_for_peer_signature_before_start_upload() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
     let root = unique_test_dir("ed2k-small-file-capture");
     let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
     let payload = vec![0x5A; 2_409_452];
@@ -151,17 +140,6 @@ async fn small_file_download_waits_for_peer_signature_before_start_upload() {
 
 #[tokio::test]
 async fn small_file_download_accepts_split_sending_part_frames() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
     let root = unique_test_dir("ed2k-small-file-split-sendingpart");
     let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
     let payload = vec![0x5A; 180 * 1024];
@@ -317,17 +295,6 @@ async fn small_file_download_accepts_split_sending_part_frames() {
 
 #[tokio::test]
 async fn hash_only_small_file_download_learns_metadata_from_startup_answer() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
     let root = unique_test_dir("ed2k-hash-only-small-file-download");
     let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
     let payload = vec![0x41; 180 * 1024];
@@ -466,17 +433,6 @@ async fn hash_only_small_file_download_learns_metadata_from_startup_answer() {
 
 #[tokio::test]
 async fn small_file_download_accepts_split_compressed_part_frames() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
     let root = unique_test_dir("ed2k-small-file-split-compressedpart");
     let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
     let payload = vec![0x5A; 8 * 1024];
@@ -806,17 +762,6 @@ async fn small_file_download_accepts_obfuscated_packed_startup_and_compressed_pa
 
 #[tokio::test]
 async fn small_file_download_rejects_wrong_payload_and_keeps_manifest_incomplete() {
-    async fn read_packet(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await?;
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await?;
-        packet.extend_from_slice(&payload);
-        Ok(packet)
-    }
-
     let root = unique_test_dir("ed2k-small-file-bad-payload");
     let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
     let payload = vec![0x5A; 32_768];
@@ -837,7 +782,7 @@ async fn small_file_download_rejects_wrong_payload_and_keeps_manifest_incomplete
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
 
-        let Ok(hello) = read_packet(&mut stream).await else {
+        let Ok(hello) = try_read_packet(&mut stream).await else {
             return;
         };
         assert_eq!(hello[5], OP_HELLO);
@@ -854,7 +799,7 @@ async fn small_file_download_rejects_wrong_payload_and_keeps_manifest_incomplete
         });
         stream.write_all(&hello_answer).await.unwrap();
 
-        let Ok(_secure_ident_probe) = read_packet(&mut stream).await else {
+        let Ok(_secure_ident_probe) = try_read_packet(&mut stream).await else {
             return;
         };
         stream
@@ -865,7 +810,7 @@ async fn small_file_download_rejects_wrong_payload_and_keeps_manifest_incomplete
             .await
             .unwrap();
 
-        let Ok(_public_key) = read_packet(&mut stream).await else {
+        let Ok(_public_key) = try_read_packet(&mut stream).await else {
             return;
         };
         let peer_public_key = Arc::new(
@@ -879,7 +824,7 @@ async fn small_file_download_rejects_wrong_payload_and_keeps_manifest_incomplete
         );
         stream.write_all(&peer_public_key_packet).await.unwrap();
 
-        let Ok(_signature) = read_packet(&mut stream).await else {
+        let Ok(_signature) = try_read_packet(&mut stream).await else {
             return;
         };
         stream
@@ -890,7 +835,7 @@ async fn small_file_download_rejects_wrong_payload_and_keeps_manifest_incomplete
             ))
             .await
             .unwrap();
-        let Ok(startup_request) = read_packet(&mut stream).await else {
+        let Ok(startup_request) = try_read_packet(&mut stream).await else {
             return;
         };
         assert_startup_multipacket_ext2(
@@ -908,12 +853,12 @@ async fn small_file_download_rejects_wrong_payload_and_keeps_manifest_incomplete
             false,
         );
         stream.write_all(&startup_answer).await.unwrap();
-        let Ok(_start_upload) = read_packet(&mut stream).await else {
+        let Ok(_start_upload) = try_read_packet(&mut stream).await else {
             return;
         };
         stream.write_all(&encode_accept_upload_req()).await.unwrap();
 
-        let Ok(request_parts) = read_packet(&mut stream).await else {
+        let Ok(request_parts) = try_read_packet(&mut stream).await else {
             return;
         };
         assert_eq!(request_parts[5], super::OP_REQUESTPARTS);
@@ -977,17 +922,6 @@ async fn small_file_download_rejects_wrong_payload_and_keeps_manifest_incomplete
 
 #[tokio::test]
 async fn large_file_download_waits_for_secure_ident_before_hashset_and_upload() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
     let root = unique_test_dir("ed2k-large-file-secure-ident-order");
     let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
     let payload = vec![0x5A; (ED2K_PART_SIZE as usize) + 32_768];
@@ -1249,17 +1183,6 @@ async fn large_file_download_waits_for_secure_ident_before_hashset_and_upload() 
 
 #[tokio::test]
 async fn queue_only_peer_is_accepted_without_counting_as_failure() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
     let root = unique_test_dir("ed2k-queue-only-accepted");
     let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
     let payload = vec![0x5A; 32_768];
@@ -1364,17 +1287,6 @@ async fn queue_only_peer_is_accepted_without_counting_as_failure() {
 
 #[tokio::test]
 async fn queued_peer_waits_past_read_timeout_for_late_accept_upload() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
     let root = unique_test_dir("ed2k-queued-peer-late-accept");
     let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
     let payload = vec![0x5A; 32_768];
@@ -1641,17 +1553,6 @@ fn download_window_stays_small_for_slow_endgame_transfer() {
 
 #[tokio::test]
 async fn callback_session_with_completed_hello_starts_upload_flow() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
     let root = unique_test_dir("ed2k-callback-session-start-upload");
     let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
     let payload = vec![0x5A; 32_768];
@@ -1782,17 +1683,6 @@ async fn callback_session_with_completed_hello_starts_upload_flow() {
 
 #[tokio::test]
 async fn large_file_download_falls_back_to_upload_request_when_hashset_stalls() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
     let root = unique_test_dir("ed2k-large-file-hashset-stall-fallback");
     let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
     let payload = vec![0x5A; (ED2K_PART_SIZE as usize) + 32_768];
@@ -1999,17 +1889,6 @@ async fn large_file_download_falls_back_to_upload_request_when_hashset_stalls() 
 
 #[tokio::test]
 async fn small_file_download_resumes_partial_piece_after_reconnect() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
     let root = unique_test_dir("ed2k-small-file-download-resume-reconnect");
     let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
     let payload = vec![0x5A; 32_768];
@@ -2276,17 +2155,6 @@ async fn small_file_download_resumes_partial_piece_after_reconnect() {
 
 #[tokio::test]
 async fn small_file_download_ignores_malformed_range_and_releases_pending_piece() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
     let root = unique_test_dir("ed2k-small-file-malformed-range");
     let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
     let payload = vec![0x5A; 32_768];
@@ -2431,17 +2299,6 @@ async fn small_file_download_ignores_malformed_range_and_releases_pending_piece(
 
 #[tokio::test]
 async fn small_file_download_releases_piece_after_out_of_order_multi_range_response() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
     let root = unique_test_dir("ed2k-small-file-out-of-order-window");
     let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
     let payload = vec![0x5A; (super::ED2K_EMBLOCK_SIZE as usize) * 4];
@@ -2635,17 +2492,6 @@ async fn small_file_download_releases_piece_after_out_of_order_multi_range_respo
 
 #[tokio::test]
 async fn small_file_download_completes_after_out_of_order_multi_range_response() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
     let root = unique_test_dir("ed2k-small-file-out-of-order-window-complete");
     let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
     let payload = vec![0x6C; (super::ED2K_EMBLOCK_SIZE as usize) * 4];
@@ -2846,17 +2692,6 @@ async fn small_file_download_completes_after_out_of_order_multi_range_response()
 
 #[tokio::test]
 async fn small_file_download_completes_after_out_of_order_multi_range_compressed_response() {
-    async fn read_packet(stream: &mut TcpStream) -> Vec<u8> {
-        let mut header = [0u8; 6];
-        stream.read_exact(&mut header).await.unwrap();
-        let packet_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let mut packet = header.to_vec();
-        let mut payload = vec![0u8; packet_len - 1];
-        stream.read_exact(&mut payload).await.unwrap();
-        packet.extend_from_slice(&payload);
-        packet
-    }
-
     let root = unique_test_dir("ed2k-small-file-out-of-order-window-compressed");
     let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
     let payload = vec![0x37; (super::ED2K_EMBLOCK_SIZE as usize) * 4];
