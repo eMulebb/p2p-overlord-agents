@@ -16,19 +16,15 @@ use overlord_kad_proto::{Ed2kHash, FirewallUdp, KadPacket};
 
 use crate::{
     ed2k_server::Ed2kServerState,
-    ed2k_transfer::{
-        Ed2kTransferRuntime, Ed2kUploadPeerIdentity, Ed2kUploadSessionHandle,
-        Ed2kUploadSessionStatus,
-    },
+    ed2k_transfer::{Ed2kTransferRuntime, Ed2kUploadPeerIdentity},
     kad_firewall::KadFirewallState,
 };
 
 use super::super::codec::{
     build_upload_part_packets, decode_file_hash_payload, decode_hashset_request2,
-    decode_request_parts_payload, decode_request_sources_payload, encode_accept_upload_req,
-    encode_answer_sources_empty, encode_answer_sources2_empty, encode_file_req_ans_nofil,
-    encode_file_status_complete, encode_hashset_answer, encode_hashset_answer2,
-    encode_multipacket_ext2_answer, encode_packet, encode_queue_ranking,
+    decode_request_parts_payload, decode_request_sources_payload, encode_answer_sources_empty,
+    encode_answer_sources2_empty, encode_file_req_ans_nofil, encode_file_status_complete,
+    encode_hashset_answer, encode_hashset_answer2, encode_multipacket_ext2_answer, encode_packet,
     encode_request_filename_answer, skip_request_filename_ext_info,
 };
 use super::super::download::{
@@ -47,8 +43,7 @@ use super::super::identity::{
 };
 use super::super::{
     ED2K_CONNECTION_IDLE_TIMEOUT, ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED,
-    ED2K_SECURE_IDENT_SIGNATURE_NEEDED, ED2K_SOURCE_EXCHANGE2_VERSION,
-    ED2K_UPLOAD_QUEUE_POLL_INTERVAL, ED2K_UPLOAD_QUEUE_REFRESH_INTERVAL, Ed2kFileIdentifier,
+    ED2K_SECURE_IDENT_SIGNATURE_NEEDED, ED2K_SOURCE_EXCHANGE2_VERSION, Ed2kFileIdentifier,
     Ed2kHelloIdentity, Ed2kSecureIdent, Ed2kTransport, FirewallCheckUdpRequest, OP_AICHFILEHASHREQ,
     OP_CANCELTRANSFER, OP_EDONKEYPROT, OP_EMULEINFO, OP_EMULEINFOANSWER, OP_EMULEPROT,
     OP_FWCHECKUDPREQ, OP_HASHSETREQUEST, OP_HASHSETREQUEST2, OP_HELLO, OP_HELLOANSWER,
@@ -56,6 +51,10 @@ use super::super::{
     OP_REQUESTSOURCES, OP_REQUESTSOURCES2, OP_SECIDENTSTATE, OP_SETREQFILEID, OP_SIGNATURE,
     OP_STARTUPLOADREQ, apply_server_state,
 };
+
+mod upload_queue;
+
+use upload_queue::{ListenerQueueDecision, ListenerQueuePoll, ListenerUploadQueue};
 
 pub(in crate::ed2k_tcp) struct Ed2kConnectionContext<'a> {
     pub(in crate::ed2k_tcp) dht: &'a DhtNode,
@@ -146,73 +145,21 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
     let mut peer_secure_ident = Ed2kPeerSecureIdentState::default();
     let mut requested_file_hash: Option<Ed2kHash> = None;
     let mut peer_upload_identity = upload_peer_identity_from_socket(peer_addr);
-    let mut upload_session: Option<Ed2kUploadSessionHandle> = None;
-    let mut upload_session_file_hash: Option<Ed2kHash> = None;
-    let mut upload_granted_sent = false;
-    let mut last_queue_rank = None;
-    let mut last_queue_rank_sent_at = None;
+    let mut upload_queue = ListenerUploadQueue::new();
 
     let result = loop {
-        let read_timeout = if upload_session.is_some() {
-            ED2K_UPLOAD_QUEUE_POLL_INTERVAL
-        } else {
-            ED2K_CONNECTION_IDLE_TIMEOUT
-        };
+        let read_timeout = upload_queue.read_timeout();
         let packet = match tokio::time::timeout(read_timeout, transport.read_packet()).await {
             Ok(packet) => {
                 packet.with_context(|| format!("failed to read eD2k packet from {peer_addr}"))?
             }
-            Err(_) => {
-                let Some(upload_session_handle) = upload_session.as_ref() else {
-                    break Ok(());
-                };
-                match transfer_runtime
-                    .poll_upload_session(upload_session_handle, true)
-                    .await
-                {
-                    Ed2kUploadSessionStatus::Granted => {
-                        if !upload_granted_sent {
-                            let reply = encode_accept_upload_req();
-                            dump_ed2k_tcp_listener_send(
-                                peer_addr,
-                                transport.mode,
-                                "accept_upload",
-                                &reply,
-                            );
-                            transport.write_all(&reply).await.with_context(|| {
-                                format!("failed to send OP_ACCEPTUPLOADREQ to {peer_addr}")
-                            })?;
-                            upload_granted_sent = true;
-                            last_queue_rank = None;
-                            last_queue_rank_sent_at = None;
-                        }
-                        continue;
-                    }
-                    Ed2kUploadSessionStatus::Waiting { rank } => {
-                        let now = tokio::time::Instant::now();
-                        let should_refresh = last_queue_rank != Some(rank)
-                            || last_queue_rank_sent_at.is_none_or(|sent_at| {
-                                now.duration_since(sent_at) >= ED2K_UPLOAD_QUEUE_REFRESH_INTERVAL
-                            });
-                        if should_refresh {
-                            let reply = encode_queue_ranking(rank);
-                            dump_ed2k_tcp_listener_send(
-                                peer_addr,
-                                transport.mode,
-                                "queue_ranking",
-                                &reply,
-                            );
-                            transport.write_all(&reply).await.with_context(|| {
-                                format!("failed to send OP_QUEUERANKING to {peer_addr}")
-                            })?;
-                            last_queue_rank = Some(rank);
-                            last_queue_rank_sent_at = Some(now);
-                        }
-                        continue;
-                    }
-                    Ed2kUploadSessionStatus::Stale => break Ok(()),
-                }
-            }
+            Err(_) => match upload_queue
+                .poll_on_timeout(transfer_runtime, &mut transport, peer_addr)
+                .await?
+            {
+                ListenerQueuePoll::Continue => continue,
+                ListenerQueuePoll::Close => break Ok(()),
+            },
         };
         let Some(packet) = packet else {
             break Ok(());
@@ -426,43 +373,13 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
                 let requested = decode_file_hash_payload(&packet.payload)?;
                 requested_file_hash = Some(requested);
                 let reply = if transfer_runtime.local_entry(&requested).await?.is_some() {
-                    let status = if upload_session_file_hash == Some(requested) {
-                        match upload_session.as_ref() {
-                            Some(upload_session_handle) => {
-                                transfer_runtime
-                                    .poll_upload_session(upload_session_handle, true)
-                                    .await
-                            }
-                            None => Ed2kUploadSessionStatus::Stale,
-                        }
-                    } else {
-                        let (session_handle, status) = transfer_runtime
-                            .begin_upload_session(peer_upload_identity.clone(), &requested)
-                            .await;
-                        upload_session = Some(session_handle);
-                        upload_session_file_hash = Some(requested);
-                        status
-                    };
-                    match status {
-                        Ed2kUploadSessionStatus::Granted => {
-                            upload_granted_sent = true;
-                            last_queue_rank = None;
-                            last_queue_rank_sent_at = None;
-                            encode_accept_upload_req()
-                        }
-                        Ed2kUploadSessionStatus::Waiting { rank } => {
-                            upload_granted_sent = false;
-                            last_queue_rank = Some(rank);
-                            last_queue_rank_sent_at = Some(tokio::time::Instant::now());
-                            encode_queue_ranking(rank)
-                        }
-                        Ed2kUploadSessionStatus::Stale => {
-                            upload_granted_sent = false;
-                            last_queue_rank = Some(1);
-                            last_queue_rank_sent_at = Some(tokio::time::Instant::now());
-                            encode_queue_ranking(1)
-                        }
-                    }
+                    upload_queue
+                        .start_upload_reply(
+                            transfer_runtime,
+                            peer_upload_identity.clone(),
+                            &requested,
+                        )
+                        .await
                 } else {
                     encode_file_req_ans_nofil(&requested)
                 };
@@ -472,12 +389,7 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
                 })?;
             }
             (OP_EDONKEYPROT, OP_CANCELTRANSFER) => {
-                if let Some(upload_session_handle) = upload_session.as_ref() {
-                    transfer_runtime
-                        .release_upload_session(upload_session_handle)
-                        .await;
-                }
-                upload_session = None;
+                upload_queue.release(transfer_runtime).await;
                 break Ok(());
             }
             (OP_EDONKEYPROT, OP_HASHSETREQUEST) => {
@@ -585,88 +497,26 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
                     continue;
                 };
 
-                if upload_session_file_hash != Some(requested) {
-                    let (session_handle, status) = transfer_runtime
-                        .begin_upload_session(peer_upload_identity.clone(), &requested)
-                        .await;
-                    upload_session = Some(session_handle);
-                    upload_session_file_hash = Some(requested);
-                    upload_granted_sent = false;
-                    match status {
-                        Ed2kUploadSessionStatus::Granted => {
-                            let reply = encode_accept_upload_req();
-                            dump_ed2k_tcp_listener_send(
-                                peer_addr,
-                                transport.mode,
-                                "accept_upload",
-                                &reply,
-                            );
-                            transport.write_all(&reply).await.with_context(|| {
-                                format!("failed to send OP_ACCEPTUPLOADREQ to {peer_addr}")
-                            })?;
-                            upload_granted_sent = true;
-                            last_queue_rank = None;
-                            last_queue_rank_sent_at = None;
-                        }
-                        Ed2kUploadSessionStatus::Waiting { rank } => {
-                            let reply = encode_queue_ranking(rank);
-                            dump_ed2k_tcp_listener_send(
-                                peer_addr,
-                                transport.mode,
-                                "queue_ranking",
-                                &reply,
-                            );
-                            transport.write_all(&reply).await.with_context(|| {
-                                format!("failed to send OP_QUEUERANKING to {peer_addr}")
-                            })?;
-                            last_queue_rank = Some(rank);
-                            last_queue_rank_sent_at = Some(tokio::time::Instant::now());
-                            continue;
-                        }
-                        Ed2kUploadSessionStatus::Stale => continue,
-                    }
-                }
-
-                let Some(upload_session_handle) = upload_session.as_ref() else {
-                    continue;
-                };
-                match transfer_runtime
-                    .note_upload_request_parts(upload_session_handle)
-                    .await
+                match upload_queue
+                    .ensure_session_for_parts(
+                        transfer_runtime,
+                        peer_upload_identity.clone(),
+                        &requested,
+                        &mut transport,
+                        peer_addr,
+                    )
+                    .await?
                 {
-                    Ed2kUploadSessionStatus::Granted => {
-                        if !upload_granted_sent {
-                            let reply = encode_accept_upload_req();
-                            dump_ed2k_tcp_listener_send(
-                                peer_addr,
-                                transport.mode,
-                                "accept_upload",
-                                &reply,
-                            );
-                            transport.write_all(&reply).await.with_context(|| {
-                                format!("failed to send OP_ACCEPTUPLOADREQ to {peer_addr}")
-                            })?;
-                            upload_granted_sent = true;
-                        }
-                        last_queue_rank = None;
-                        last_queue_rank_sent_at = None;
-                    }
-                    Ed2kUploadSessionStatus::Waiting { rank } => {
-                        let reply = encode_queue_ranking(rank);
-                        dump_ed2k_tcp_listener_send(
-                            peer_addr,
-                            transport.mode,
-                            "queue_ranking",
-                            &reply,
-                        );
-                        transport.write_all(&reply).await.with_context(|| {
-                            format!("failed to send OP_QUEUERANKING to {peer_addr}")
-                        })?;
-                        last_queue_rank = Some(rank);
-                        last_queue_rank_sent_at = Some(tokio::time::Instant::now());
-                        continue;
-                    }
-                    Ed2kUploadSessionStatus::Stale => break Ok(()),
+                    ListenerQueueDecision::Granted => {}
+                    ListenerQueueDecision::Waiting | ListenerQueueDecision::Stale => continue,
+                }
+                match upload_queue
+                    .note_request_parts(transfer_runtime, &mut transport, peer_addr)
+                    .await?
+                {
+                    ListenerQueueDecision::Granted => {}
+                    ListenerQueueDecision::Waiting => continue,
+                    ListenerQueueDecision::Stale => break Ok(()),
                 }
                 for (start, end) in ranges {
                     let Some(bytes) = transfer_runtime
@@ -832,11 +682,7 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
         }
     };
 
-    if let Some(upload_session_handle) = upload_session.as_ref() {
-        transfer_runtime
-            .release_upload_session(upload_session_handle)
-            .await;
-    }
+    upload_queue.release(transfer_runtime).await;
     result
 }
 
