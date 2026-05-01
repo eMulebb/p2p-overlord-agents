@@ -2182,9 +2182,6 @@ fn next_download_read_timeout(
     read_timeout
 }
 
-/// Decode one peer TCP payload exactly like the oracle socket path: packed
-/// frames inflate first and then continue through the eMule extension opcode
-/// dispatcher as `OP_EMULEPROT`.
 /// Return the eMule TCP/Kad connect-option bits mirrored from the oracle
 /// `GetMyConnectOptions(true, false)` path, minus the direct-callback flag.
 #[must_use]
