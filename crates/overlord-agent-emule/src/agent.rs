@@ -81,6 +81,8 @@ mod publish;
 mod publish_runtime;
 mod search;
 mod snoop;
+#[cfg(test)]
+mod test_support;
 
 use self::activity::{
     ACTIVITY_KEY_RECONFIGURING, ACTIVITY_KEY_STARTING, AgentActivityTracker,
@@ -91,74 +93,23 @@ use self::activity::{
 };
 #[cfg(test)]
 use self::ed2k_download::{NativeDirectDownloadOptions, NativeDirectDownloadOutcome};
-#[cfg(test)]
-use self::ed2k_enrich::EnrichEd2kDownloadSource;
 use self::ed2k_enrich::{EnrichEd2kDownloadRequest, IngestLocalFileRequest};
 use self::ed2k_runtime::manifest_has_ed2k_transfer_progress;
-#[cfg(test)]
-use self::ed2k_runtime::plaintext_fallback_for_obfuscated_source;
-#[cfg(test)]
-use self::ed2k_runtime::{
-    direct_download_candidate_sources, should_skip_no_progress_source_requery,
-};
 use self::ed2k_search::{
     ActiveEd2kSearchContext, do_active_ed2k_keyword_search, do_active_ed2k_source_search,
     exact_ed2k_hash_query_token,
 };
-#[cfg(test)]
-use self::ed2k_search::{
-    ed2k_download_source_server_attempt_budget, ed2k_keyword_server_attempt_budget,
-    kad_source_result_to_ed2k_found_source, select_ed2k_keyword_metadata,
-    select_kad_keyword_metadata,
-};
-#[cfg(test)]
-use self::kad_runtime::build_hello_request;
-#[cfg(test)]
-use self::kad_runtime::current_tcp_firewalled;
-#[cfg(test)]
-use self::kad_runtime::{build_hello_response, should_request_hello_response_ack};
-#[cfg(test)]
-use self::kad_runtime::{
-    build_kad_hello_request_tags, build_kad_hello_response_tags, parse_kad_hello_metadata,
-};
 use self::lifecycle::{AgentStatePaths, ensure_parent_dir, load_or_create_indexer_id};
-#[cfg(test)]
-use self::networking::apply_networking_config;
-#[cfg(test)]
-use self::networking::empty_networking_config;
-#[cfg(test)]
-use self::networking::p2p_interface_reconcile_target;
 use self::passive_replay::apply_queue_family_counts;
-#[cfg(test)]
-use self::passive_replay::{
-    PassiveReplaySelection, apply_harvest_record, next_passive_replay_request,
-    next_passive_replay_request_for_family, record_passive_replay_complete,
-    record_passive_replay_enqueue_wait, record_passive_replay_idle,
-    record_passive_replay_post_failure, record_passive_replay_post_latency,
-    record_passive_replay_start, try_acquire_passive_replay_gate,
-};
-#[cfg(test)]
-use self::publish::{
-    SYNTHETIC_POPULAR_SEEDS, ed2k_file_type_search_term, emule_high_id_source_type,
-    next_synthetic_publish_batch, normalize_ed2k_user_hash_markers, record_publish_summaries,
-    synthetic_file_hash, synthetic_popular_hash, synthetic_popular_hashes,
-    synthetic_publish_aich_hash, synthetic_publish_queue_depth,
-};
 use self::publish::{
     SourcePublishSettings, effective_publish_counters, load_or_create_ed2k_user_hash,
     source_publish_client_hash,
 };
-#[cfg(test)]
-use self::publish::{apply_publish_summary, build_publish_batch_summary};
-#[cfg(test)]
-use self::publish::{build_notes_publish_tags, build_source_publish_tags};
 use self::publish_runtime::{PublishExecutionContext, seed_popular_from_source};
 use self::search::{
     SearchRunStats, do_active_keyword_search, do_active_notes_search, do_active_source_search,
     emit_search_event,
 };
-#[cfg(test)]
-use self::snoop::{build_keyword_snoop_entry, build_notes_snoop_entry, build_source_snoop_entry};
 use self::snoop::{flush_snoop_queue, restore_snoop_queue};
 
 const ACTIVE_BATCH_SIZE: usize = 25;
