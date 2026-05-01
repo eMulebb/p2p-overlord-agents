@@ -28,7 +28,6 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::SecondsFormat;
-use md5::compute as md5_compute;
 use num_bigint::BigUint;
 use rand::{Rng, RngCore};
 use serde::Serialize;
@@ -52,6 +51,7 @@ use crate::{
 };
 
 mod flags;
+mod obfuscation;
 mod packet_codec;
 mod result_decoder;
 mod search_expr;
@@ -59,6 +59,10 @@ mod server_entry;
 mod tag_codec;
 mod udp;
 use flags::{format_connect_options, format_server_flags, is_low_id};
+use obfuscation::{
+    Rc4KeyStream, biguint_to_fixed_be, derive_server_cipher, random_non_protocol_marker,
+    random_nonzero_biguint, should_use_server_obfuscation,
+};
 use packet_codec::{decode_server_payload, encode_packet};
 use result_decoder::{
     decode_found_sources, decode_search_result_page, decode_udp_found_source_sets,
@@ -216,50 +220,6 @@ const SERVER_OBFUSCATION_PRIME_BYTES: [u8; SERVER_OBFUSCATION_PUBLIC_KEY_LEN] = 
     0x7D, 0xF7, 0x78, 0x18, 0x28, 0x10, 0x5F, 0x34, 0x0F, 0x76, 0x23, 0x87, 0xF8, 0x8B, 0x28, 0x91,
     0x42, 0xFB, 0x42, 0x68, 0x8F, 0x05, 0x15, 0x0F, 0x54, 0x8B, 0x5F, 0x43, 0x6A, 0xF7, 0x0D, 0xF3,
 ];
-
-#[derive(Debug)]
-struct Rc4KeyStream {
-    s: [u8; 256],
-    i: usize,
-    j: usize,
-}
-
-impl Rc4KeyStream {
-    fn new(key: &[u8]) -> Self {
-        Self::new_with_discard(key, EMULE_TCP_CRYPT_DISCARD_LEN)
-    }
-
-    fn new_without_discard(key: &[u8]) -> Self {
-        Self::new_with_discard(key, 0)
-    }
-
-    fn new_with_discard(key: &[u8], discard_len: usize) -> Self {
-        let mut s = [0u8; 256];
-        for (index, value) in s.iter_mut().enumerate() {
-            *value = index as u8;
-        }
-        let mut j = 0usize;
-        for i in 0..256usize {
-            j = (j + s[i] as usize + key[i % key.len()] as usize) & 0xFF;
-            s.swap(i, j);
-        }
-        let mut stream = Self { s, i: 0, j: 0 };
-        for _ in 0..discard_len {
-            let mut discard = [0u8; 1];
-            stream.apply(&mut discard);
-        }
-        stream
-    }
-
-    fn apply(&mut self, bytes: &mut [u8]) {
-        for byte in bytes {
-            self.i = (self.i + 1) & 0xFF;
-            self.j = (self.j + self.s[self.i] as usize) & 0xFF;
-            self.s.swap(self.i, self.j);
-            *byte ^= self.s[(self.s[self.i] as usize + self.s[self.j] as usize) & 0xFF];
-        }
-    }
-}
 
 /// Live ED2K server session view used by the agent to decide whether TCP is
 /// still effectively firewalled from the network's point of view.
@@ -768,16 +728,6 @@ pub async fn request_callback_on_server(options: Ed2kCallbackRequestOptions<'_>)
             _ => {}
         }
     }
-}
-
-/// Returns whether the agent should start an ED2K server session with TCP
-/// obfuscation.
-///
-/// The oracle only chooses an obfuscated server TCP connect when the server
-/// advertises the needed metadata, primarily `ST_TCPPORTOBFUSCATION` plus the
-/// UDP capability bits which signal TCP obfuscation support.
-fn should_use_server_obfuscation(connect_options: u8, server: &ResolvedServerEntry) -> bool {
-    connect_options != 0 && server.entry.supports_obfuscation_tcp()
 }
 
 fn ed2k_server_dump_file() -> &'static StdMutex<Option<fs::File>> {
@@ -3171,47 +3121,6 @@ async fn wait_for_offer_files_settle(session: &ServerSession) {
     let elapsed = sent_at.elapsed();
     if elapsed < OFFER_FILE_SEARCH_SETTLE_DELAY {
         tokio::time::sleep(OFFER_FILE_SEARCH_SETTLE_DELAY - elapsed).await;
-    }
-}
-
-fn random_nonzero_biguint(byte_len: usize) -> BigUint {
-    let mut bytes = vec![0u8; byte_len];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    if bytes.iter().all(|byte| *byte == 0) {
-        bytes[byte_len - 1] = 1;
-    }
-    BigUint::from_bytes_be(&bytes)
-}
-
-fn biguint_to_fixed_be(value: &BigUint, byte_len: usize) -> Result<Vec<u8>> {
-    let bytes = value.to_bytes_be();
-    if bytes.len() > byte_len {
-        anyhow::bail!(
-            "big integer requires {} bytes, expected at most {}",
-            bytes.len(),
-            byte_len
-        );
-    }
-    let mut fixed = vec![0u8; byte_len];
-    fixed[byte_len - bytes.len()..].copy_from_slice(&bytes);
-    Ok(fixed)
-}
-
-fn derive_server_cipher(shared_secret: &[u8], magic: u8) -> Rc4KeyStream {
-    let mut key_material = Vec::with_capacity(shared_secret.len() + 1);
-    key_material.extend_from_slice(shared_secret);
-    key_material.push(magic);
-    Rc4KeyStream::new(&md5_compute(key_material).0)
-}
-
-fn random_non_protocol_marker() -> u8 {
-    loop {
-        let mut marker = [0u8; 1];
-        rand::thread_rng().fill_bytes(&mut marker);
-        let marker = marker[0];
-        if !matches!(marker, OP_EDONKEYPROT | OP_EMULEPROT | OP_PACKEDPROT) {
-            return marker;
-        }
     }
 }
 

@@ -3,10 +3,11 @@ use std::net::{IpAddr, SocketAddr};
 use md5::compute as md5_compute;
 use rand::Rng;
 
+use super::obfuscation::Rc4KeyStream;
 use super::{
     EMULE_UDP_CRYPT_HEADER_LEN, EMULE_UDP_CRYPT_MAGIC_CLIENT_SERVER,
     EMULE_UDP_CRYPT_MAGIC_SERVER_CLIENT, EMULE_UDP_CRYPT_MAGIC_SYNC_SERVER, OP_EDONKEYPROT,
-    Rc4KeyStream, ResolvedServerEntry,
+    ResolvedServerEntry,
 };
 
 pub(super) fn server_udp_endpoint(server: &ResolvedServerEntry) -> SocketAddr {
