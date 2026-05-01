@@ -47,4 +47,14 @@ impl DownloadSessionState {
             session_payload_down: 0,
         }
     }
+
+    pub(super) fn waiting_for_peer_secure_ident(&self) -> bool {
+        self.secure_ident_started
+            && (self.peer_secure_ident.peer_challenge_from.is_none()
+                || self.peer_secure_ident.pending_signature
+                || (self.peer_secure_ident.requested_peer_key
+                    && self.peer_secure_ident.peer_public_key.is_none())
+                || (self.peer_secure_ident.challenge_for.is_some()
+                    && !self.peer_secure_ident.peer_signature_received))
+    }
 }

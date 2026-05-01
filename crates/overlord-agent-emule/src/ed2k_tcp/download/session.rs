@@ -4,34 +4,34 @@ use anyhow::{Context, Result};
 use flate2::Decompress;
 use overlord_kad_proto::Ed2kHash;
 
-use crate::ed2k_transfer::{ED2K_PART_SIZE, Ed2kTransferRuntime};
+use crate::ed2k_transfer::Ed2kTransferRuntime;
 
 use super::super::{
     ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, ED2K_SECURE_IDENT_SIGNATURE_NEEDED,
-    Ed2kFileIdentifier, Ed2kHashsetRequestOptions, Ed2kHelloIdentity, Ed2kSecureIdent,
-    Ed2kTransport, OP_ACCEPTUPLOADREQ, OP_AICHFILEHASHANS, OP_ANSWERSOURCES, OP_ANSWERSOURCES2,
-    OP_COMPRESSEDPART, OP_COMPRESSEDPART_I64, OP_EDONKEYPROT, OP_EMULEINFO, OP_EMULEINFOANSWER,
-    OP_EMULEPROT, OP_FILEDESC, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_HASHSETANSWER,
-    OP_HASHSETANSWER2, OP_HELLO, OP_HELLOANSWER, OP_MULTIPACKETANSWER_EXT2, OP_PUBLICKEY,
-    OP_QUEUERANKING, OP_REQFILENAMEANSWER, OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64,
-    OP_SETREQFILEID, OP_SIGNATURE, begin_secure_ident_probe, build_hello_responses,
-    decode_aich_file_hash_answer, decode_compressed_part_fragment, decode_file_status_payload,
-    decode_hashset_answer, decode_hashset_answer2, decode_hello_profile, decode_public_key_payload,
+    Ed2kFileIdentifier, Ed2kHelloIdentity, Ed2kSecureIdent, Ed2kTransport, OP_ACCEPTUPLOADREQ,
+    OP_AICHFILEHASHANS, OP_ANSWERSOURCES, OP_ANSWERSOURCES2, OP_COMPRESSEDPART,
+    OP_COMPRESSEDPART_I64, OP_EDONKEYPROT, OP_EMULEINFO, OP_EMULEINFOANSWER, OP_EMULEPROT,
+    OP_FILEDESC, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_HASHSETANSWER, OP_HASHSETANSWER2, OP_HELLO,
+    OP_HELLOANSWER, OP_MULTIPACKETANSWER_EXT2, OP_PUBLICKEY, OP_QUEUERANKING, OP_REQFILENAMEANSWER,
+    OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64, OP_SETREQFILEID, OP_SIGNATURE,
+    begin_secure_ident_probe, build_hello_responses, decode_aich_file_hash_answer,
+    decode_compressed_part_fragment, decode_file_status_payload, decode_hashset_answer,
+    decode_hashset_answer2, decode_hello_profile, decode_public_key_payload,
     decode_request_filename_answer, decode_request_filename_answer_body, decode_secident_state,
     decode_sending_part_payload, dump_ed2k_tcp_download_meta, dump_ed2k_tcp_download_recv,
-    dump_ed2k_tcp_download_send, encode_aich_file_hash_request, encode_emule_info_answer,
-    encode_hashset_request, encode_hashset_request2, encode_multipacket_ext2_request,
-    encode_packet, encode_request_filename, encode_request_sources2, encode_set_req_file_id,
-    encode_start_upload_req, inflate_compressed_part_fragment, is_connection_shutdown_error,
-    skip_file_status_body, try_send_secure_ident_signature,
+    dump_ed2k_tcp_download_send, encode_emule_info_answer, encode_packet,
+    inflate_compressed_part_fragment, is_connection_shutdown_error, skip_file_status_body,
+    try_send_secure_ident_signature,
 };
 use super::{
     ActiveDownloadPiece, DownloadRequestWindowState, PendingCompressedPart, PendingPartRequest,
     ReadyDownloadBlocks, flush_buffered_download_prefixes, flush_ready_download_blocks,
     next_download_read_timeout, pump_download_request_window, reconcile_download_manifest_metadata,
 };
+mod startup;
 mod state;
 
+use startup::{DownloadStartupStep, HASHSET_STALL_UPLOAD_FALLBACK, advance_download_startup};
 use state::DownloadSessionState;
 /// Outcome of one outbound ED2K peer download attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +73,6 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
         initial_hello_complete,
         initial_secure_ident_started,
     } = options;
-    const HASHSET_STALL_UPLOAD_FALLBACK: Duration = Duration::from_millis(500);
     const QUEUE_RANK_GRACE: Duration = Duration::from_secs(20);
     const PART_RESPONSE_GRACE: Duration = Duration::from_secs(20);
     // eMule keeps a pending block scheduler that is broader than one live wire
@@ -92,206 +91,19 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                 return Ok(Ed2kPeerDownloadOutcome::Completed);
             }
 
-            let waiting_for_peer_secure_ident = session_state.secure_ident_started
-                && (session_state.peer_secure_ident.peer_challenge_from.is_none()
-                    || session_state.peer_secure_ident.pending_signature
-                    || (session_state.peer_secure_ident.requested_peer_key
-                        && session_state.peer_secure_ident.peer_public_key.is_none())
-                    || (session_state.peer_secure_ident.challenge_for.is_some()
-                        && !session_state.peer_secure_ident.peer_signature_received));
-
-            if send_initial_requests && session_state.hello_complete && !session_state.secure_ident_started {
-                let secure_ident_probe = begin_secure_ident_probe(&mut session_state.peer_secure_ident);
-                dump_ed2k_tcp_download_send(
-                    peer_addr,
-                    transport.mode,
-                    "secure_ident_probe",
-                    &secure_ident_probe,
-                );
-                transport
-                    .write_all(&secure_ident_probe)
-                    .await
-                    .with_context(|| format!("failed to send OP_SECIDENTSTATE to {peer_addr}"))?;
-                session_state.secure_ident_started = true;
-            }
-
-            if send_initial_requests
-                && session_state.hello_complete
-                && !session_state.startup_file_requests_sent
-                && !waiting_for_peer_secure_ident
-            {
-                if session_state.remote_supports_file_identifiers {
-                    let multipacket_ext2 =
-                        encode_multipacket_ext2_request(&request_file_identifier, &manifest);
-                    dump_ed2k_tcp_download_send(
-                        peer_addr,
-                        transport.mode,
-                        "multipacket_ext2_request",
-                        &multipacket_ext2,
-                    );
-                    transport
-                        .write_all(&multipacket_ext2)
-                        .await
-                        .with_context(|| {
-                            format!("failed to send OP_MULTIPACKET_EXT2 to {peer_addr}")
-                        })?;
-                    session_state.source_request_sent = true;
-                    session_state.aich_file_hash_requested = true;
-                } else {
-                    let request_filename = encode_request_filename(&file_hash, &manifest);
-                    dump_ed2k_tcp_download_send(
-                        peer_addr,
-                        transport.mode,
-                        "request_filename",
-                        &request_filename,
-                    );
-                    transport
-                        .write_all(&request_filename)
-                        .await
-                        .with_context(|| {
-                            format!("failed to send OP_REQUESTFILENAME to {peer_addr}")
-                        })?;
-
-                    if manifest.file_size > ED2K_PART_SIZE {
-                        let set_req_file_id = encode_set_req_file_id(&file_hash);
-                        dump_ed2k_tcp_download_send(
-                            peer_addr,
-                            transport.mode,
-                            "set_req_file_id",
-                            &set_req_file_id,
-                        );
-                        transport
-                            .write_all(&set_req_file_id)
-                            .await
-                            .with_context(|| {
-                                format!("failed to send OP_SETREQFILEID to {peer_addr}")
-                            })?;
-                    }
-                }
-                session_state.startup_file_requests_sent = true;
-            }
-
-            if send_initial_requests
-                && session_state.hello_complete
-                && !session_state.source_request_sent
-                && !waiting_for_peer_secure_ident
-                && !session_state.remote_supports_file_identifiers
-            {
-                let source_request = encode_request_sources2(&file_hash);
-                dump_ed2k_tcp_download_send(
-                    peer_addr,
-                    transport.mode,
-                    "request_sources2",
-                    &source_request,
-                );
-                transport
-                    .write_all(&source_request)
-                    .await
-                    .with_context(|| {
-                        format!("failed to send OP_REQUESTSOURCES2 to {peer_addr}")
-                    })?;
-                session_state.source_request_sent = true;
-            }
-
-            if send_initial_requests
-                && session_state.hello_complete
-                && !session_state.aich_file_hash_requested
-                && !waiting_for_peer_secure_ident
-                && !session_state.remote_supports_file_identifiers
-            {
-                let aich_file_hash_request = encode_aich_file_hash_request(&file_hash);
-                dump_ed2k_tcp_download_send(
-                    peer_addr,
-                    transport.mode,
-                    "aich_file_hash_request",
-                    &aich_file_hash_request,
-                );
-                transport
-                    .write_all(&aich_file_hash_request)
-                    .await
-                    .with_context(|| {
-                        format!("failed to send OP_AICHFILEHASHREQ to {peer_addr}")
-                    })?;
-                session_state.aich_file_hash_requested = true;
-            }
-
-            if send_initial_requests
-                && session_state.hello_complete
-                && manifest.file_size != 0
-                && !manifest.md4_hashset_acquired
-                && !session_state.hashset_requested
-                && !waiting_for_peer_secure_ident
-                && session_state.startup_file_response_received
-            {
-                if manifest.file_size <= ED2K_PART_SIZE {
-                    manifest = transfer_runtime
-                        .store_md4_hashset(file_hash_hex, Vec::new())
-                        .await?;
-                } else {
-                    let hashset_request = if session_state.remote_supports_file_identifiers {
-                        encode_hashset_request2(
-                            &request_file_identifier,
-                            Ed2kHashsetRequestOptions {
-                                request_md4: true,
-                                request_aich: manifest.file_size > ED2K_PART_SIZE
-                                    && request_file_identifier.aich_root.is_some(),
-                            },
-                        )?
-                    } else {
-                        encode_hashset_request(&file_hash)
-                    };
-                    dump_ed2k_tcp_download_send(
-                        peer_addr,
-                        transport.mode,
-                        "hashset_request",
-                        &hashset_request,
-                    );
-                    transport
-                        .write_all(&hashset_request)
-                        .await
-                        .with_context(|| {
-                            if session_state.remote_supports_file_identifiers {
-                                format!("failed to send OP_HASHSETREQUEST2 to {peer_addr}")
-                            } else {
-                                format!("failed to send OP_HASHSETREQUEST to {peer_addr}")
-                            }
-                        })?;
-                    session_state.hashset_requested = true;
-                    session_state.hashset_requested_at = Some(tokio::time::Instant::now());
-                }
-            }
-
-            let hashset_request_stalled = session_state.hashset_requested_at
-                .is_some_and(|requested_at| requested_at.elapsed() >= HASHSET_STALL_UPLOAD_FALLBACK);
-            if send_initial_requests
-                && session_state.hello_complete
-                && manifest.file_size != 0
-                && (manifest.md4_hashset_acquired || hashset_request_stalled)
-                && !session_state.upload_requested
-                && !waiting_for_peer_secure_ident
-                && session_state.startup_file_response_received
-            {
-                if hashset_request_stalled && !manifest.md4_hashset_acquired {
-                    dump_ed2k_tcp_download_meta(
-                        peer_addr,
-                        Some(transport.mode),
-                        "upload_request_hashset_fallback",
-                        format!("file_hash={file_hash_hex}"),
-                    );
-                }
-                let start_upload = encode_start_upload_req(&file_hash);
-                dump_ed2k_tcp_download_send(
-                    peer_addr,
-                    transport.mode,
-                    "start_upload",
-                    &start_upload,
-                );
-                transport
-                    .write_all(&start_upload)
-                    .await
-                    .with_context(|| format!("failed to send OP_STARTUPLOADREQ to {peer_addr}"))?;
-                session_state.upload_requested = true;
-            }
+            advance_download_startup(DownloadStartupStep {
+                transport,
+                peer_addr,
+                secure_ident,
+                transfer_runtime,
+                file_hash: &file_hash,
+                file_hash_hex,
+                send_initial_requests,
+                manifest: &mut manifest,
+                request_file_identifier: &request_file_identifier,
+                session_state: &mut session_state,
+            })
+            .await?;
 
             if manifest.md4_hashset_acquired
                 && session_state.upload_accepted
@@ -323,7 +135,7 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                 && session_state.hashset_requested
                 && !manifest.md4_hashset_acquired
                 && !session_state.upload_requested
-                && !waiting_for_peer_secure_ident
+                && !session_state.waiting_for_peer_secure_ident()
             {
                 session_state.hashset_requested_at.map(|requested_at| {
                     HASHSET_STALL_UPLOAD_FALLBACK.saturating_sub(requested_at.elapsed())
