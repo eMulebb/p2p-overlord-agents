@@ -19,7 +19,6 @@
 
 use std::{
     collections::VecDeque,
-    fs,
     io::{self, Read},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
@@ -37,14 +36,6 @@ use flate2::{
 };
 use md5::compute as md5_compute;
 use rand::Rng;
-use rsa::{
-    RsaPrivateKey, RsaPublicKey,
-    pkcs1v15::SigningKey,
-    pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey},
-    rand_core::OsRng,
-    signature::{RandomizedSigner, SignatureEncoding},
-};
-use sha1::Sha1;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpSocket, TcpStream},
@@ -65,6 +56,7 @@ use overlord_kad_proto::{Ed2kHash, FirewallUdp, KadPacket};
 
 mod dump;
 mod hello;
+mod identity;
 pub(crate) use dump::dump_ed2k_tcp_download_meta;
 use dump::{
     dump_ed2k_tcp_download_recv, dump_ed2k_tcp_download_send, dump_ed2k_tcp_helper_meta,
@@ -79,6 +71,12 @@ use hello::{
 use hello::{
     ed2k_string_tag_type, emule_misc_options1, emule_misc_options2, emule_version_tag,
     encode_emule_info_request,
+};
+pub use identity::Ed2kSecureIdent;
+use identity::{
+    Ed2kPeerSecureIdentState, begin_secure_ident_probe, decode_public_key_payload,
+    decode_secident_state, encode_secident_state, random_nonzero_u32,
+    try_send_secure_ident_signature,
 };
 
 const OP_EMULEPROT: u8 = 0xC5;
@@ -421,88 +419,6 @@ struct Ed2kHashsetAnswer2 {
     file_identifier: Ed2kFileIdentifier,
     md4_hashset: Option<Ed2kMd4Hashset>,
     aich_hashset: Option<Ed2kAichHashset>,
-}
-
-/// Persistent RSA identity used for the eMule secure-ident side channel.
-#[derive(Debug)]
-pub struct Ed2kSecureIdent {
-    private_key: RsaPrivateKey,
-    public_key_der: Vec<u8>,
-}
-
-impl Ed2kSecureIdent {
-    /// Load the oracle-compatible ED2K secure-ident keypair from disk or create it on first use.
-    pub fn load_or_create(path: &Path) -> Result<Self> {
-        if path.exists() {
-            let bytes =
-                fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-            let private_key = RsaPrivateKey::from_pkcs8_der(&bytes).with_context(|| {
-                format!("invalid PKCS#8 ED2K secure-ident key at {}", path.display())
-            })?;
-            return Self::from_private_key(private_key);
-        }
-
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-
-        let private_key = RsaPrivateKey::new(&mut OsRng, ED2K_SECURE_IDENT_KEY_BITS)
-            .context("failed to generate ED2K secure-ident RSA keypair")?;
-        let encoded = private_key
-            .to_pkcs8_der()
-            .context("failed to encode ED2K secure-ident private key")?;
-        fs::write(path, encoded.as_bytes())
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        Self::from_private_key(private_key)
-    }
-
-    fn from_private_key(private_key: RsaPrivateKey) -> Result<Self> {
-        let public_key_der = RsaPublicKey::from(&private_key)
-            .to_public_key_der()
-            .context("failed to encode ED2K secure-ident public key")?
-            .as_bytes()
-            .to_vec();
-        Ok(Self {
-            private_key,
-            public_key_der,
-        })
-    }
-
-    fn public_key_payload(&self) -> Result<Vec<u8>> {
-        let key_len = u8::try_from(self.public_key_der.len())
-            .context("ED2K secure-ident public key exceeds u8 length")?;
-        let mut payload = Vec::with_capacity(1 + self.public_key_der.len());
-        payload.push(key_len);
-        payload.extend_from_slice(&self.public_key_der);
-        Ok(payload)
-    }
-
-    fn signature_payload(&self, peer_public_key: &[u8], challenge: u32) -> Result<Vec<u8>> {
-        let mut message = Vec::with_capacity(peer_public_key.len() + 4);
-        message.extend_from_slice(peer_public_key);
-        message.extend_from_slice(&challenge.to_le_bytes());
-
-        let signing_key = SigningKey::<Sha1>::new(self.private_key.clone());
-        let signature = signing_key.sign_with_rng(&mut OsRng, &message);
-        let signature_bytes = signature.to_bytes();
-        let sig_len = u8::try_from(signature_bytes.len())
-            .context("ED2K secure-ident signature exceeds u8 length")?;
-        let mut payload = Vec::with_capacity(1 + signature_bytes.len());
-        payload.push(sig_len);
-        payload.extend_from_slice(signature_bytes.as_ref());
-        Ok(payload)
-    }
-}
-
-#[derive(Debug, Default)]
-struct Ed2kPeerSecureIdentState {
-    peer_public_key: Option<Vec<u8>>,
-    peer_challenge_from: Option<u32>,
-    challenge_for: Option<u32>,
-    pending_signature: bool,
-    peer_signature_received: bool,
-    requested_peer_key: bool,
 }
 
 /// Incremental inflate state for one pending compressed part stream.
@@ -2529,37 +2445,6 @@ pub const fn emule_connect_options(obfuscation_enabled: bool) -> u8 {
     }
 }
 
-fn encode_secident_state(state: u8, challenge: u32) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(5);
-    payload.push(state);
-    payload.extend_from_slice(&challenge.to_le_bytes());
-    encode_packet(OP_EMULEPROT, OP_SECIDENTSTATE, &payload)
-}
-
-fn decode_secident_state(payload: &[u8]) -> Result<(u8, u32)> {
-    if payload.len() != 5 {
-        anyhow::bail!("invalid OP_SECIDENTSTATE payload size {}", payload.len());
-    }
-    Ok((
-        payload[0],
-        u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]),
-    ))
-}
-
-fn decode_public_key_payload(payload: &[u8]) -> Result<Vec<u8>> {
-    let Some((&key_len, key_bytes)) = payload.split_first() else {
-        anyhow::bail!("empty OP_PUBLICKEY payload");
-    };
-    if usize::from(key_len) != key_bytes.len() {
-        anyhow::bail!(
-            "invalid OP_PUBLICKEY length prefix {} for payload size {}",
-            key_len,
-            key_bytes.len()
-        );
-    }
-    Ok(key_bytes.to_vec())
-}
-
 fn decode_file_status_payload(payload: &[u8]) -> Result<(overlord_kad_proto::Ed2kHash, u16)> {
     if payload.len() < 18 {
         anyhow::bail!("short OP_FILESTATUS payload size {}", payload.len());
@@ -3485,50 +3370,6 @@ fn upload_peer_identity_from_hello(
         user_hash: Some(remote_hello.user_hash),
         client_id: Some(remote_hello.client_id),
     }
-}
-
-fn random_nonzero_u32() -> u32 {
-    loop {
-        let value: u32 = rand::random();
-        if value != 0 {
-            return value;
-        }
-    }
-}
-
-fn begin_secure_ident_probe(peer_state: &mut Ed2kPeerSecureIdentState) -> Vec<u8> {
-    let challenge_for = random_nonzero_u32();
-    peer_state.challenge_for = Some(challenge_for);
-    peer_state.requested_peer_key = true;
-    encode_secident_state(ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, challenge_for)
-}
-
-async fn try_send_secure_ident_signature(
-    transport: &mut Ed2kTransport,
-    peer_addr: SocketAddr,
-    secure_ident: &Ed2kSecureIdent,
-    peer_state: &mut Ed2kPeerSecureIdentState,
-) -> Result<bool> {
-    let Some(peer_public_key) = peer_state.peer_public_key.as_deref() else {
-        return Ok(false);
-    };
-    let Some(challenge) = peer_state.peer_challenge_from else {
-        return Ok(false);
-    };
-    if !peer_state.pending_signature {
-        return Ok(false);
-    }
-    let signature = encode_packet(
-        OP_EMULEPROT,
-        OP_SIGNATURE,
-        &secure_ident.signature_payload(peer_public_key, challenge)?,
-    );
-    transport
-        .write_all(&signature)
-        .await
-        .with_context(|| format!("failed to send OP_SIGNATURE to {peer_addr}"))?;
-    peer_state.pending_signature = false;
-    Ok(true)
 }
 
 async fn reply_with_firewall_udp(
