@@ -20,8 +20,7 @@ use std::{
 use anyhow::{Context, Result};
 use tokio::sync::{Mutex, RwLock};
 
-use overlord_agent_common::PopularHash;
-
+mod callback;
 mod catalog;
 mod hashset;
 mod ingest;
@@ -29,6 +28,7 @@ mod manifest;
 mod metadata;
 mod model;
 mod piece_store;
+mod shared_catalog;
 mod store;
 mod upload;
 mod upload_queue;
@@ -39,7 +39,7 @@ use hashset::build_aich_hashset_from_payload;
 pub(crate) use hashset::decode_aich_hash_hex;
 pub(crate) use manifest::expected_piece_length;
 pub use manifest::new_transfer_job;
-use manifest::{Ed2kManifestCheckpointState, dedupe_entries, load_catalog_from_manifests};
+use manifest::{Ed2kManifestCheckpointState, load_catalog_from_manifests};
 pub(crate) use model::{Ed2kAichHashset, Ed2kClaimedPart};
 pub use model::{
     Ed2kCallbackIntent, Ed2kLocalIngestSummary, Ed2kPieceState, Ed2kResumeManifest, Ed2kSourceHint,
@@ -98,55 +98,6 @@ impl Ed2kTransferRuntime {
             upload_queue: Arc::new(Mutex::new(Ed2kUploadQueueState::new(upload_queue_config))),
             next_upload_connection_id: AtomicU64::new(1),
         })
-    }
-
-    /// Borrow the shared catalog used by server-session advertisement and
-    /// listener-side upload serving.
-    #[must_use]
-    pub fn shared_catalog(&self) -> Ed2kSharedCatalog {
-        Arc::clone(&self.shared_catalog)
-    }
-
-    /// Register one pending LowID callback download intent.
-    pub async fn register_callback_intent(&self, intent: Ed2kCallbackIntent) {
-        let mut intents = self.callback_intents.write().await;
-        if !intents.iter().any(|existing| existing == &intent) {
-            intents.push(intent);
-        }
-    }
-
-    /// Claim the oldest pending LowID callback intent for the specified peer client-id.
-    pub async fn claim_callback_intent(&self, client_id: u32) -> Option<Ed2kCallbackIntent> {
-        let mut intents = self.callback_intents.write().await;
-        let index = intents
-            .iter()
-            .position(|intent| intent.client_id == client_id)?;
-        Some(intents.remove(index))
-    }
-
-    /// Replace compatibility-hint catalog entries while preserving verified
-    /// local files loaded from manifests.
-    pub async fn replace_catalog_hints(&self, hashes: &[PopularHash]) {
-        let mut preserved_verified = {
-            let guard = self.shared_catalog.read().await;
-            guard
-                .iter()
-                .filter(|entry| !entry.compatibility_hint)
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        preserved_verified.extend(hashes.iter().filter_map(Ed2kSharedEntry::from_popular_hash));
-        let mut guard = self.shared_catalog.write().await;
-        *guard = dedupe_entries(preserved_verified);
-    }
-
-    async fn upsert_verified_catalog_entry(&self, manifest: &Ed2kResumeManifest) {
-        let mut entries = self.shared_catalog.write().await;
-        entries.retain(|entry| entry.file_hash != manifest.file_hash || entry.compatibility_hint);
-        if manifest.completed || !manifest.verified_ranges.is_empty() {
-            entries.push(Ed2kSharedEntry::from_manifest(manifest));
-        }
-        *entries = dedupe_entries(entries.clone());
     }
 }
 
