@@ -20,10 +20,7 @@ use crate::{
     kad_firewall::KadFirewallState,
 };
 
-use super::super::codec::{
-    build_upload_part_packets, decode_file_hash_payload, decode_request_parts_payload,
-    encode_file_req_ans_nofil, encode_packet,
-};
+use super::super::codec::{decode_file_hash_payload, encode_file_req_ans_nofil, encode_packet};
 use super::super::download::{
     DownloadSessionOptions, Ed2kPeerDownloadOutcome, drive_download_session,
 };
@@ -49,6 +46,7 @@ use super::super::{
 };
 
 mod shared_file;
+mod upload_payload;
 mod upload_queue;
 
 use shared_file::{
@@ -56,7 +54,8 @@ use shared_file::{
     handle_multipacket_ext2_request, handle_request_filename, handle_set_req_file_id,
     handle_source_request,
 };
-use upload_queue::{ListenerQueueDecision, ListenerQueuePoll, ListenerUploadQueue};
+use upload_payload::{UploadPayloadOutcome, UploadPayloadRequest, serve_upload_payload};
+use upload_queue::{ListenerQueuePoll, ListenerUploadQueue};
 
 pub(in crate::ed2k_tcp) struct Ed2kConnectionContext<'a> {
     pub(in crate::ed2k_tcp) dht: &'a DhtNode,
@@ -321,68 +320,22 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
                     handle_aich_file_hash_request(transfer_runtime, &packet.payload).await?;
             }
             (OP_EDONKEYPROT, OP_REQUESTPARTS) | (OP_EMULEPROT, OP_REQUESTPARTS_I64) => {
-                let is_i64 = packet.opcode == OP_REQUESTPARTS_I64;
-                let (requested, ranges) = decode_request_parts_payload(&packet.payload, is_i64)?;
-                requested_file_hash = Some(requested);
-                let Some(shared) = transfer_runtime.local_entry(&requested).await? else {
-                    let reply = encode_file_req_ans_nofil(&requested);
-                    dump_ed2k_tcp_listener_send(
-                        peer_addr,
-                        transport.mode,
-                        "request_parts_nofil",
-                        &reply,
-                    );
-                    transport.write_all(&reply).await.with_context(|| {
-                        format!("failed to send OP_FILEREQANSNOFIL to {peer_addr}")
-                    })?;
-                    continue;
-                };
-
-                match upload_queue
-                    .ensure_session_for_parts(
-                        transfer_runtime,
-                        peer_upload_identity.clone(),
-                        &requested,
-                        &mut transport,
-                        peer_addr,
-                    )
-                    .await?
+                match serve_upload_payload(UploadPayloadRequest {
+                    transfer_runtime,
+                    upload_queue: &mut upload_queue,
+                    peer_upload_identity: peer_upload_identity.clone(),
+                    transport: &mut transport,
+                    peer_addr,
+                    opcode: packet.opcode,
+                    payload: &packet.payload,
+                })
+                .await?
                 {
-                    ListenerQueueDecision::Granted => {}
-                    ListenerQueueDecision::Waiting | ListenerQueueDecision::Stale => continue,
-                }
-                match upload_queue
-                    .note_request_parts(transfer_runtime, &mut transport, peer_addr)
-                    .await?
-                {
-                    ListenerQueueDecision::Granted => {}
-                    ListenerQueueDecision::Waiting => continue,
-                    ListenerQueueDecision::Stale => break Ok(()),
-                }
-                for (start, end) in ranges {
-                    let Some(bytes) = transfer_runtime
-                        .read_verified_range(&requested, start, end)
-                        .await?
-                    else {
-                        continue;
-                    };
-                    for reply in build_upload_part_packets(
-                        &requested,
-                        &shared.canonical_name,
-                        start,
-                        end,
-                        &bytes,
-                        is_i64,
-                    )? {
-                        dump_ed2k_tcp_listener_send(
-                            peer_addr,
-                            transport.mode,
-                            reply.phase,
-                            &reply.packet,
-                        );
-                        transport.write_all(&reply.packet).await.with_context(|| {
-                            format!("failed to send ED2K upload payload to {peer_addr}")
-                        })?;
+                    UploadPayloadOutcome::Continue { requested } => {
+                        requested_file_hash = Some(requested);
+                    }
+                    UploadPayloadOutcome::Close => {
+                        break Ok(());
                     }
                 }
             }
