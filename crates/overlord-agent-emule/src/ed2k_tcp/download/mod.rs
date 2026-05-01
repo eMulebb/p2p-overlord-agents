@@ -2,16 +2,16 @@
 
 pub(in crate::ed2k_tcp) mod blocks;
 pub(in crate::ed2k_tcp) mod session;
+pub(in crate::ed2k_tcp) mod startup;
 pub(in crate::ed2k_tcp) mod window;
 
 pub(in crate::ed2k_tcp) use blocks::{
     PendingCompressedPart, ReadyDownloadBlocks, flush_buffered_download_prefixes,
     flush_ready_download_blocks, reconcile_download_manifest_metadata,
 };
+pub(crate) use session::Ed2kPeerDownloadOutcome;
 pub(in crate::ed2k_tcp) use session::{DownloadSessionOptions, drive_download_session};
-pub(crate) use session::{
-    Ed2kPeerDownloadOptions, Ed2kPeerDownloadOutcome, download_file_from_peer,
-};
+pub(crate) use startup::{Ed2kPeerDownloadOptions, download_file_from_peer};
 pub(in crate::ed2k_tcp) use window::{
     ActiveDownloadPiece, DownloadRequestWindowState, PendingPartRequest,
     next_download_read_timeout, pump_download_request_window,
