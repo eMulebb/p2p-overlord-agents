@@ -34,12 +34,11 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use overlord_agent_common::{
-    AgentActivityState, ConfigUpdate, CoordinatorClient, HarvestFamily, HarvestReplayContext,
-    HarvestReplayRecord, HashType, IndexerService, IndexerStats, KadHarvestObservability,
-    KadPublishObservability, KadRpcObservability, KadRpcResponseOpcodeObservability,
-    KadRpcTrackerBucketObservability, KadRpcWorkClassObservability, PopularHash, Protocol,
-    PublishSeedSource, RegisterRequest, RunningIndexerServer, SearchEventStatus, SearchJob,
-    SearchKind, SnoopEntry, SnoopObservation,
+    AgentActivityState, ConfigUpdate, CoordinatorClient, HashType, IndexerService, IndexerStats,
+    KadHarvestObservability, KadPublishObservability, KadRpcObservability,
+    KadRpcResponseOpcodeObservability, KadRpcTrackerBucketObservability,
+    KadRpcWorkClassObservability, PopularHash, Protocol, PublishSeedSource, RegisterRequest,
+    RunningIndexerServer, SearchEventStatus, SearchJob, SearchKind, SnoopEntry, SnoopObservation,
 };
 use overlord_kad_dht::{DhtNode, RpcObservabilitySnapshot, RpcWorkClass};
 use overlord_kad_proto::{Ed2kHash, KadPacket, NodeId};
@@ -58,6 +57,7 @@ use crate::snoop_queue::SnoopQueue;
 mod activity;
 mod background_ed2k;
 mod background_firewall;
+mod background_passive;
 mod background_publish;
 mod background_routing;
 mod background_tasks;
@@ -82,9 +82,8 @@ use self::activity::{
     ACTIVITY_KEY_FLUSHING_SNOOPS, ACTIVITY_KEY_RECONFIGURING, ACTIVITY_KEY_STARTING,
     AgentActivityTracker, active_ed2k_download_key, active_search_key, begin_agent_activity,
     clear_agent_degraded_activity, finish_agent_activity, new_activity_snapshot,
-    passive_replay_activity_context, passive_replay_key, publish_activity_key,
-    record_agent_degraded_activity, runtime_activity_error, search_activity_context,
-    update_agent_activity_error,
+    publish_activity_key, record_agent_degraded_activity, runtime_activity_error,
+    search_activity_context, update_agent_activity_error,
 };
 use self::ed2k_runtime::manifest_has_ed2k_transfer_progress;
 #[cfg(test)]
@@ -120,20 +119,14 @@ use self::networking::apply_networking_config;
 use self::networking::empty_networking_config;
 #[cfg(test)]
 use self::networking::p2p_interface_reconcile_target;
-use self::passive_replay::{
-    PassiveReplaySelection, apply_queue_family_counts, next_passive_replay_request,
-    next_passive_replay_request_for_family, record_passive_replay_complete,
-    record_passive_replay_idle_for_worker, record_passive_replay_outcome,
-    record_passive_replay_start, try_acquire_passive_replay_gate,
-};
+use self::passive_replay::apply_queue_family_counts;
 #[cfg(test)]
 use self::passive_replay::{
-    apply_harvest_record, record_passive_replay_enqueue_wait, record_passive_replay_idle,
+    PassiveReplaySelection, apply_harvest_record, next_passive_replay_request,
+    next_passive_replay_request_for_family, record_passive_replay_complete,
+    record_passive_replay_enqueue_wait, record_passive_replay_idle,
     record_passive_replay_post_failure, record_passive_replay_post_latency,
-};
-use self::passive_runtime::{
-    PassiveReplayContext, run_passive_keyword_replay, run_passive_notes_replay,
-    run_passive_source_replay,
+    record_passive_replay_start, try_acquire_passive_replay_gate,
 };
 #[cfg(test)]
 use self::publish::{apply_publish_summary, build_publish_batch_summary};
