@@ -61,7 +61,6 @@ pub(super) fn listener_test_identity(
 
 pub(super) struct VerifiedUploadFile {
     pub(super) file_hash: Ed2kHash,
-    pub(super) file_hash_hex: String,
     pub(super) payload: Vec<u8>,
 }
 
@@ -138,11 +137,7 @@ impl ListenerTestRuntime {
             .await
             .unwrap();
 
-        VerifiedUploadFile {
-            file_hash,
-            file_hash_hex,
-            payload,
-        }
+        VerifiedUploadFile { file_hash, payload }
     }
 
     pub(super) fn spawn_listener_connections(

@@ -23,17 +23,3 @@ pub(super) async fn read_until_opcode(stream: &mut TcpStream, protocol: u8, opco
         }
     }
 }
-
-pub(super) async fn read_until_opcode_timeout(
-    stream: &mut TcpStream,
-    protocol: u8,
-    opcode: u8,
-    label: &str,
-) -> Vec<u8> {
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        read_until_opcode(stream, protocol, opcode),
-    )
-    .await
-    .unwrap_or_else(|_| panic!("timed out waiting for {label} opcode 0x{opcode:02X}"))
-}
