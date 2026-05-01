@@ -629,7 +629,7 @@ mod tests {
         let close = close_publish_contact(1, 2);
         let far = TraversalContact {
             id: NodeId::from_bytes([0xFF; 16]),
-            addr: "127.0.0.3:4672".parse().unwrap(),
+            addr: "8.8.8.8:4672".parse().unwrap(),
             version: 9,
         };
 
