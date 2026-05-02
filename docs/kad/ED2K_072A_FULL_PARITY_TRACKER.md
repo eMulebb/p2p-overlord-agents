@@ -279,6 +279,13 @@ saturating large advertised sizes into the legacy low 32-bit file-size tag.
 and regression coverage asserts that large shared-file adverts no longer lose
 their upper size bits.
 
+The same server-obfuscation audit now has regression coverage for the transport
+gate itself: an auxiliary obfuscation port alone is not treated as permission to
+use obfuscated ED2K server TCP. The agent requires the matching server
+capability flags before selecting DH server transport, while still allowing
+plain TCP sessions to request the obfuscated found-sources reply family once
+server flags prove that metadata shape.
+
 Also on **May 2, 2026**, `ITEM_033` moved into its first UploadQueue parity
 slice. The inbound listener queue no longer ranks and promotes waiters by FIFO
 position alone: it now uses a deterministic score path with waiting age,
