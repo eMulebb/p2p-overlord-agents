@@ -198,6 +198,14 @@ fn metadata_poor_server_defaults_to_plaintext_even_if_client_supports_crypt() {
 }
 
 #[test]
+fn server_obfuscation_requires_capability_flags_not_only_aux_port() {
+    assert!(!should_use_server_obfuscation(
+        emule_connect_options(true),
+        &test_server(4661, 0)
+    ));
+}
+
+#[test]
 fn server_obfuscation_requires_positive_server_metadata() {
     assert!(should_use_server_obfuscation(
         emule_connect_options(true),
