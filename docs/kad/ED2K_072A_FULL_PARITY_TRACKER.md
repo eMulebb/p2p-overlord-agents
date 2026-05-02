@@ -58,7 +58,8 @@ The following remain in scope for "full parity":
       identity and capability profile
 - [x] Secure-ident probe, public-key, and signature exchange
 - [x] `OP_REQUESTSOURCES2` / `OP_ANSWERSOURCES2` request-answer coverage
-- [x] Callback-aware server source acquisition
+- [x] Callback-aware server source acquisition, including manifest-backed
+      plaintext and obfuscated callback-only source-acquisition cells
 - [x] Listener upload subset with queue-rank and file-description handling
 - [x] Verified upload serving and resumable download coverage for the current
       subset
@@ -305,6 +306,16 @@ partial-piece resume and listener upload resume across plaintext and obfuscated
 ED2K TCP, composed under `ed2k.campaign.resume.v1`.
 Durable credit weighting and stock harness/live queue evidence remain open
 before this checklist item can be closed.
+
+Also on **May 2, 2026**, `ITEM_034` gained the first runnable obfuscated
+callback-source-acquisition coverage. The manifest-backed cell
+`ed2k.cell.downloader.obfuscated.callback.callback-issued.fresh.private.v1`
+now runs through `ed2k.private.callback-source-acquisition` and is included in
+`ed2k.campaign.callback.v1` alongside the plaintext callback cell. The passing
+private run proves callback-request issuance, callback-only source observation,
+direct-dial suppression, and obfuscated found-sources metadata without treating
+the path as completed buddy parity. Full buddy setup/teardown, buddy tags, and
+true firewalled callback state transitions remain open.
 
 ## Validation Standard
 
