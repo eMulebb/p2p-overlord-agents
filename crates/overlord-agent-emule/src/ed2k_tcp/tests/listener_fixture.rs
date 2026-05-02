@@ -256,6 +256,31 @@ pub(super) async fn connect_peer_and_exchange_hello(
     stream
 }
 
+pub(super) async fn connect_obfuscated_peer_and_exchange_hello(
+    peer_addr: SocketAddr,
+    listener_user_hash: [u8; 16],
+    peer_identity: Ed2kHelloIdentity,
+) -> Ed2kTransport {
+    let mut transport = Ed2kTransport::connect_outgoing(
+        Ipv4Addr::LOCALHOST,
+        peer_addr,
+        emule_connect_options(true),
+        Some(listener_user_hash),
+        Some(emule_connect_options(true)),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(transport.mode, Ed2kTransportMode::Obfuscated);
+    transport
+        .write_all(&encode_hello_request(peer_identity))
+        .await
+        .unwrap();
+    let _hello_answer =
+        read_transport_until_opcode(&mut transport, OP_EDONKEYPROT, OP_HELLOANSWER).await;
+    transport
+}
+
 pub(super) async fn connect_peer_and_request_upload(
     peer_addr: SocketAddr,
     peer_identity: Ed2kHelloIdentity,
@@ -269,6 +294,22 @@ pub(super) async fn connect_peer_and_request_upload(
     stream
 }
 
+pub(super) async fn connect_obfuscated_peer_and_request_upload(
+    peer_addr: SocketAddr,
+    listener_user_hash: [u8; 16],
+    peer_identity: Ed2kHelloIdentity,
+    file_hash: &Ed2kHash,
+) -> Ed2kTransport {
+    let mut transport =
+        connect_obfuscated_peer_and_exchange_hello(peer_addr, listener_user_hash, peer_identity)
+            .await;
+    transport
+        .write_all(&encode_start_upload_req(file_hash))
+        .await
+        .unwrap();
+    transport
+}
+
 pub(super) async fn connect_peer_until_upload_accepted(
     peer_addr: SocketAddr,
     peer_identity: Ed2kHelloIdentity,
@@ -278,6 +319,23 @@ pub(super) async fn connect_peer_until_upload_accepted(
     let accepted = wait_for_upload_accept(&mut stream).await;
     assert_eq!(accepted.len(), 6);
     stream
+}
+
+pub(super) async fn connect_obfuscated_peer_until_upload_accepted(
+    peer_addr: SocketAddr,
+    listener_user_hash: [u8; 16],
+    peer_identity: Ed2kHelloIdentity,
+    file_hash: &Ed2kHash,
+) -> Ed2kTransport {
+    let mut transport = connect_obfuscated_peer_and_request_upload(
+        peer_addr,
+        listener_user_hash,
+        peer_identity,
+        file_hash,
+    )
+    .await;
+    wait_for_transport_upload_accept(&mut transport).await;
+    transport
 }
 
 pub(super) async fn connect_peer_until_queue_rank(
@@ -291,10 +349,39 @@ pub(super) async fn connect_peer_until_queue_rank(
     stream
 }
 
+pub(super) async fn connect_obfuscated_peer_until_queue_rank(
+    peer_addr: SocketAddr,
+    listener_user_hash: [u8; 16],
+    peer_identity: Ed2kHelloIdentity,
+    file_hash: &Ed2kHash,
+    expected_rank: u16,
+) -> Ed2kTransport {
+    let mut transport = connect_obfuscated_peer_and_request_upload(
+        peer_addr,
+        listener_user_hash,
+        peer_identity,
+        file_hash,
+    )
+    .await;
+    wait_for_transport_queue_rank(&mut transport, expected_rank).await;
+    transport
+}
+
 pub(super) async fn wait_for_queue_rank(stream: &mut TcpStream, expected_rank: u16) {
     let queue_ranking = read_until_opcode(stream, OP_EMULEPROT, OP_QUEUERANKING).await;
     assert_eq!(
         u16::from_le_bytes([queue_ranking[6], queue_ranking[7]]),
+        expected_rank
+    );
+}
+
+pub(super) async fn wait_for_transport_queue_rank(
+    transport: &mut Ed2kTransport,
+    expected_rank: u16,
+) {
+    let queue_ranking = read_transport_until_opcode(transport, OP_EMULEPROT, OP_QUEUERANKING).await;
+    assert_eq!(
+        u16::from_le_bytes([queue_ranking.payload[0], queue_ranking.payload[1]]),
         expected_rank
     );
 }
@@ -312,6 +399,11 @@ pub(super) async fn wait_for_upload_accept(stream: &mut TcpStream) -> Vec<u8> {
     read_until_opcode(stream, OP_EDONKEYPROT, OP_ACCEPTUPLOADREQ).await
 }
 
+pub(super) async fn wait_for_transport_upload_accept(transport: &mut Ed2kTransport) {
+    let accepted = read_transport_until_opcode(transport, OP_EDONKEYPROT, OP_ACCEPTUPLOADREQ).await;
+    assert!(accepted.payload.is_empty());
+}
+
 pub(super) async fn wait_for_upload_accept_timeout(stream: &mut TcpStream) {
     let accepted = tokio::time::timeout(Duration::from_secs(3), wait_for_upload_accept(stream))
         .await
@@ -319,8 +411,24 @@ pub(super) async fn wait_for_upload_accept_timeout(stream: &mut TcpStream) {
     assert_eq!(accepted.len(), 6);
 }
 
+pub(super) async fn wait_for_transport_upload_accept_timeout(transport: &mut Ed2kTransport) {
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        wait_for_transport_upload_accept(transport),
+    )
+    .await
+    .unwrap();
+}
+
 pub(super) async fn send_cancel_transfer(stream: &mut TcpStream) {
     stream
+        .write_all(&encode_packet(OP_EDONKEYPROT, OP_CANCELTRANSFER, &[]))
+        .await
+        .unwrap();
+}
+
+pub(super) async fn send_transport_cancel_transfer(transport: &mut Ed2kTransport) {
+    transport
         .write_all(&encode_packet(OP_EDONKEYPROT, OP_CANCELTRANSFER, &[]))
         .await
         .unwrap();
@@ -393,4 +501,21 @@ pub(super) async fn read_upload_bytes(
         }
     }
     reconstructed
+}
+
+pub(super) async fn read_transport_until_opcode(
+    transport: &mut Ed2kTransport,
+    protocol: u8,
+    opcode: u8,
+) -> EmuleTcpPacket {
+    loop {
+        let packet = tokio::time::timeout(Duration::from_secs(5), transport.read_packet())
+            .await
+            .expect("timed out waiting for eD2k transport packet")
+            .unwrap()
+            .expect("transport closed before expected packet");
+        if packet.protocol == protocol && packet.opcode == opcode {
+            return packet;
+        }
+    }
 }

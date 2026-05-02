@@ -275,9 +275,13 @@ friend-slot boost, LowID penalty, duplicate reconnect refresh, and a neutral
 file-priority hook for the later stock priority field. Focused regression
 coverage asserts friend-slot rank promotion, LowID rank penalty, duplicate
 reconnect staleness for the replaced handle, file-switch rank preservation, and
-listener queue-rank / accept-upload behavior. Durable credit weighting and
-stock harness/live queue evidence remain open before this checklist item can be
-closed.
+listener queue-rank / accept-upload behavior. The manifest-backed e2e cells
+`ed2k.cell.listener.plaintext.inbound.queue-only.fresh.private.v1` and
+`ed2k.cell.listener.obfuscated.inbound.queue-only.fresh.private.v1` are now
+available and execute the native listener queue module, including an obfuscated
+inbound ED2K TCP queue-rank and late accept-upload path. Durable credit
+weighting and stock harness/live queue evidence remain open before this
+checklist item can be closed.
 
 ## Validation Standard
 

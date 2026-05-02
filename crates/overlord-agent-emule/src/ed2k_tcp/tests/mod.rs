@@ -9,7 +9,7 @@ use super::{
     ET_FEATURES, Ed2kAichHashset, Ed2kConnectionContext, Ed2kFileIdentifier,
     Ed2kHashsetRequestOptions, Ed2kHelloIdentity, Ed2kPeerConnectMode, Ed2kPeerDownloadOptions,
     Ed2kPeerDownloadOutcome, Ed2kPeerSecureIdentState, Ed2kSecureIdent, Ed2kTransport,
-    Ed2kTransportMode, FirewallCheckUdpRequest, HELLO_NICKNAME, OP_ACCEPTUPLOADREQ,
+    Ed2kTransportMode, EmuleTcpPacket, FirewallCheckUdpRequest, HELLO_NICKNAME, OP_ACCEPTUPLOADREQ,
     OP_AICHFILEHASHREQ, OP_ANSWERSOURCES2, OP_CANCELTRANSFER, OP_COMPRESSEDPART, OP_EDONKEYPROT,
     OP_EMULEINFO, OP_EMULEINFOANSWER, OP_EMULEPROT, OP_FILEDESC, OP_FILESTATUS, OP_FWCHECKUDPREQ,
     OP_HASHSETANSWER2, OP_HASHSETREQUEST2, OP_HELLO, OP_HELLOANSWER, OP_PACKEDPROT, OP_PUBLICKEY,
