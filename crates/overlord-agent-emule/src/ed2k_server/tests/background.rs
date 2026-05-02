@@ -171,6 +171,10 @@ async fn server_obfuscation_handshake_encrypts_login_request() {
             &encrypted_tail[response_padding_len..],
             expected_login_for_server.as_slice()
         );
+
+        let mut id_change = encode_packet(OP_IDCHANGE, &[0x10, 0x20, 0x30, 0x40], false).unwrap();
+        send_cipher.apply(&mut id_change);
+        stream.write_all(&id_change).await.unwrap();
     });
 
     let state = Arc::new(RwLock::new(Ed2kServerState::default()));
@@ -187,6 +191,10 @@ async fn server_obfuscation_handshake_encrypts_login_request() {
         .negotiate_obfuscation_and_send(&expected_login)
         .await
         .unwrap();
+
+    let packet = session.read_packet().await.unwrap().unwrap();
+    assert_eq!(packet.opcode, OP_IDCHANGE);
+    assert_eq!(packet.payload, [0x10, 0x20, 0x30, 0x40]);
 
     server.await.unwrap();
 }
