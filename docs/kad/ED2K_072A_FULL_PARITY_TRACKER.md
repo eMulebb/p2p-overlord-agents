@@ -324,6 +324,14 @@ direct-dial suppression, and obfuscated found-sources metadata without treating
 the path as completed buddy parity. Full buddy setup/teardown, buddy tags, and
 true firewalled callback state transitions remain open.
 
+`ITEM_035` also moved into its first active-notes slice on **May 2, 2026**.
+Stock `v0.72a` searches file comments/ratings through Kad notes for ED2K file
+hashes, so `Protocol::Ed2k` + `SearchKind::Notes` now uses the same active Kad
+notes search path instead of failing as unwired. Result batches preserve the
+coordinator-requested protocol label so ED2K notes jobs remain distinguishable
+from direct Kad notes jobs. Preview request/answer plus shared-files and
+shared-directories browsing remain open.
+
 ## Validation Standard
 
 Every milestone on this tracker should be validated with all of:
