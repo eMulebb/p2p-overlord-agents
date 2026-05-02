@@ -250,13 +250,16 @@ The live stress cell then passed in bounded mode for all canonical terms, which
 supports general network health but does not close `ITEM_031`.
 
 The latest same-server live attempt,
-`ed2k.cell.modern-aich.plaintext.server-roundtrip.large.realnet.v1.plaintext-20260502-183400`,
+`ed2k.cell.modern-aich.plaintext.server-roundtrip.large.realnet.v1.plaintext-20260502-205635`,
 observed the harness login server, prioritized that same endpoint in the agent
 stage-1 search, and recorded a same-server background source search without a
-source hint. The server did not return usable sources before the live gate
-timed out, so stage 1 still finished with zero sources, no MD4/AICH hashset,
-and no bytes. `ITEM_031` remains open as a live source-discovery blocker rather
-than an AICH transport or local-generation failure.
+source hint. The runner summary reported `sameServerSourceDiscovery.status` as
+`no_sources`: the agent log and transfer manifest existed, source search was
+attempted, the same-server search path was attempted, and the server still
+returned zero usable sources before timeout. Stage 1 therefore again finished
+with no MD4/AICH hashset and no bytes. `ITEM_031` remains open as a live
+source-discovery blocker rather than an AICH transport or local-generation
+failure.
 
 Also on **May 2, 2026**, `supports_captcha` was cleared in the hello
 misc-options profile because chat/captcha challenge handling is not yet
