@@ -284,6 +284,12 @@ available and execute the native queue modules, including downloader queue-only
 and late accept-upload handling plus obfuscated ED2K TCP queue-rank and late
 accept-upload paths. The composed
 `ed2k.campaign.queue-and-slot.v1` gate is now runnable over those four cells.
+The obfuscated listener serving cell
+`ed2k.cell.listener.obfuscated.inbound.serving.fresh.private.v1` now proves
+verified upload bytes and compressed-part serving through the real obfuscated
+ED2K TCP transport, and
+`ed2k.cell.listener.plaintext.inbound.serving.resume.private.v1` now proves
+partial upload reconnect and resumed byte-range serving by peer hello identity.
 Durable credit weighting and stock harness/live queue evidence remain open
 before this checklist item can be closed.
 

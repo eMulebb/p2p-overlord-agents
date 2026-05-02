@@ -452,6 +452,17 @@ pub(super) async fn request_upload_parts(
         .unwrap();
 }
 
+pub(super) async fn request_transport_upload_parts(
+    transport: &mut Ed2kTransport,
+    file_hash: &Ed2kHash,
+    ranges: &[(u64, u64)],
+) {
+    transport
+        .write_all(&encode_request_parts_batch(file_hash, ranges).unwrap())
+        .await
+        .unwrap();
+}
+
 pub(super) async fn read_upload_bytes(
     stream: &mut TcpStream,
     file_hash: &Ed2kHash,
@@ -501,6 +512,61 @@ pub(super) async fn read_upload_bytes(
         }
     }
     reconstructed
+}
+
+pub(super) async fn read_transport_upload_bytes(
+    transport: &mut Ed2kTransport,
+    file_hash: &Ed2kHash,
+    expected_start: u64,
+    expected_end: u64,
+) -> (Vec<u8>, bool) {
+    let mut reconstructed = Vec::new();
+    let mut saw_compressed = false;
+    let mut pending = None;
+    while reconstructed.len() < usize::try_from(expected_end - expected_start).unwrap() {
+        let packet = tokio::time::timeout(Duration::from_secs(5), transport.read_packet())
+            .await
+            .expect("timed out waiting for upload payload")
+            .unwrap()
+            .expect("transport closed before upload payload completed");
+        match (packet.protocol, packet.opcode) {
+            (OP_EMULEPROT, OP_COMPRESSEDPART) => {
+                saw_compressed = true;
+                let (decoded_hash, start, advertised_len, fragment) =
+                    decode_compressed_part_fragment(&packet.payload, false).unwrap();
+                assert_eq!(decoded_hash, *file_hash);
+                assert_eq!(start, expected_start);
+                let pending_stream = pending.get_or_insert_with(|| PendingCompressedPart {
+                    piece_index: 0,
+                    start: expected_start,
+                    end: expected_end,
+                    advertised_compressed_len: advertised_len,
+                    compressed_received: 0,
+                    uncompressed_written: 0,
+                    inflater: Decompress::new(true),
+                });
+                let (bytes, finished) =
+                    inflate_compressed_part_fragment(pending_stream, fragment).unwrap();
+                reconstructed.extend_from_slice(&bytes);
+                if finished {
+                    pending = None;
+                }
+            }
+            (OP_EDONKEYPROT, OP_SENDINGPART) => {
+                let (decoded_hash, start, end, bytes) =
+                    decode_sending_part_payload(&packet.payload, false).unwrap();
+                assert_eq!(decoded_hash, *file_hash);
+                assert_eq!(
+                    start,
+                    expected_start + u64::try_from(reconstructed.len()).unwrap()
+                );
+                assert_eq!(end, start + u64::try_from(bytes.len()).unwrap());
+                reconstructed.extend_from_slice(&bytes);
+            }
+            _ => {}
+        }
+    }
+    (reconstructed, saw_compressed)
 }
 
 pub(super) async fn read_transport_until_opcode(

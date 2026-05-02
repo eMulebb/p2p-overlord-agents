@@ -150,3 +150,67 @@ async fn listener_upload_session_serves_verified_file_via_compressed_parts() {
     drop(stream);
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn listener_obfuscated_upload_session_serves_verified_file_via_compressed_parts() {
+    let mut payload = Vec::new();
+    for index in 0..12_000u32 {
+        writeln!(
+            &mut payload,
+            "ubuntu linux obfuscated upload parity line {:05} repeated request surface",
+            index % 1024
+        )
+        .unwrap();
+    }
+    let listener_identity = Ed2kHelloIdentity {
+        connect_options: emule_connect_options(true),
+        ..listener_hello_identity()
+    };
+    let listener_user_hash = listener_identity.user_hash;
+    let mut runtime = ListenerTestRuntime::new(
+        "ed2k-upload-listener-obfuscated-compressed",
+        listener_identity,
+        [0x7E; 16],
+        0xAA55_9900,
+    )
+    .await;
+    let file = runtime
+        .seed_verified_upload_file("upload-obfuscated.txt", payload)
+        .await;
+    let server = runtime.spawn_listener_connections(1);
+
+    let mut transport = connect_obfuscated_peer_and_exchange_hello(
+        runtime.peer_addr,
+        listener_user_hash,
+        Ed2kHelloIdentity {
+            connect_options: emule_connect_options(true),
+            ..peer_hello_identity()
+        },
+    )
+    .await;
+
+    transport
+        .write_all(&encode_start_upload_req(&file.file_hash))
+        .await
+        .unwrap();
+    wait_for_transport_upload_accept(&mut transport).await;
+
+    request_transport_upload_parts(
+        &mut transport,
+        &file.file_hash,
+        &[(0, file.payload.len() as u64)],
+    )
+    .await;
+    let (reconstructed, saw_compressed) = read_transport_upload_bytes(
+        &mut transport,
+        &file.file_hash,
+        0,
+        file.payload.len() as u64,
+    )
+    .await;
+
+    assert!(saw_compressed);
+    assert_eq!(reconstructed, file.payload);
+    drop(transport);
+    server.await.unwrap();
+}
