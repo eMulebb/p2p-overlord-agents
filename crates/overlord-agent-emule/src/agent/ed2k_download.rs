@@ -5,15 +5,23 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+#[cfg(test)]
+use std::{future::Future, net::Ipv4Addr};
 
 use anyhow::{Context, Result};
+use chrono::Utc;
+use overlord_agent_common::{AgentActivityState, Protocol};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::{
     AgentNetworkRuntime, ED2K_DOWNLOAD_SOURCE_REQUERY_DELAY_SECS,
-    ED2K_DOWNLOAD_SOURCE_REQUERY_ROUNDS,
+    ED2K_DOWNLOAD_SOURCE_REQUERY_ROUNDS, OverlordAgentEmule,
+    activity::{
+        active_ed2k_download_key, begin_agent_activity, clear_agent_degraded_activity,
+        finish_agent_activity, new_activity_snapshot, record_agent_degraded_activity,
+    },
     ed2k_enrich::{EnrichEd2kDownloadRequest, is_hash_only_ed2k_placeholder_name},
     ed2k_runtime::{
         Ed2kSourceEndpointKey, direct_download_candidate_sources, ed2k_source_attempt_key,
@@ -24,6 +32,10 @@ use super::{
     ed2k_search::resolve_hash_only_ed2k_metadata,
     merge_download_sources,
 };
+#[cfg(test)]
+use crate::ed2k_server::Ed2kFoundSource;
+#[cfg(test)]
+use crate::ed2k_tcp::{Ed2kPeerDownloadOutcome, Ed2kSecureIdent};
 use crate::{
     config::EmuleAgentConfig,
     ed2k_server::{
@@ -48,6 +60,145 @@ mod sources;
 pub(super) use direct::NativeDirectDownloadOutcome;
 pub(super) use direct::{NativeDirectDownloadOptions, run_native_ed2k_direct_downloads};
 use sources::native_ed2k_download_sources;
+
+impl OverlordAgentEmule {
+    #[cfg(test)]
+    /// Attempts direct-dial ED2K peer downloads until the transfer manifest
+    /// completes or all discovered direct peers fail.
+    ///
+    /// The native download path keeps several peers in flight concurrently so a
+    /// single dead or non-serving source does not block completion when another
+    /// discovered peer can provide the file.
+    pub(super) async fn run_native_ed2k_direct_downloads<DownloadFn, DownloadFuture>(
+        options: NativeDirectDownloadOptions,
+        download_peer: DownloadFn,
+    ) -> Result<NativeDirectDownloadOutcome>
+    where
+        DownloadFn: Fn(
+                Ipv4Addr,
+                Ed2kFoundSource,
+                Ed2kHelloIdentity,
+                Arc<Ed2kSecureIdent>,
+                Arc<Ed2kTransferRuntime>,
+                String,
+                u64,
+                Duration,
+            ) -> DownloadFuture
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        DownloadFuture: Future<Output = Result<Ed2kPeerDownloadOutcome>> + Send + 'static,
+    {
+        direct::run_native_ed2k_direct_downloads(options, download_peer).await
+    }
+
+    pub(super) async fn spawn_native_ed2k_download(
+        &self,
+        request: EnrichEd2kDownloadRequest,
+    ) -> Result<()> {
+        if request.kind != "ed2k_download" {
+            anyhow::bail!("unsupported enrich kind {}", request.kind);
+        }
+
+        self.reconcile_p2p_runtime_if_interface_moved().await?;
+        let normalized_file_hash = request.file_hash.to_lowercase();
+        {
+            let mut active = self.active_ed2k_downloads.lock().await;
+            if !active.insert(normalized_file_hash.clone()) {
+                anyhow::bail!("ED2K download {normalized_file_hash} is already active");
+            }
+        }
+
+        let runtime_handle = Arc::clone(&self.runtime);
+        let config_handle = Arc::clone(&self.config);
+        let agent_activity = Arc::clone(&self.agent_activity);
+        let active_downloads = Arc::clone(&self.active_ed2k_downloads);
+        let download_gate = Arc::clone(&self.ed2k_download_gate);
+        let ed2k_user_hash = self.ed2k_user_hash;
+        tokio::spawn(async move {
+            let download_permit = match Arc::clone(&download_gate).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    info!(
+                        "native ED2K download queued behind active limit file_hash={normalized_file_hash}"
+                    );
+                    match Arc::clone(&download_gate).acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(error) => {
+                            let mut degraded_snapshot =
+                                new_activity_snapshot(AgentActivityState::Degraded, Utc::now());
+                            degraded_snapshot.query_or_target =
+                                Some(format!("ED2K download {normalized_file_hash}"));
+                            degraded_snapshot.last_error = Some(error.to_string());
+                            record_agent_degraded_activity(&agent_activity, degraded_snapshot)
+                                .await;
+                            active_downloads.lock().await.remove(&normalized_file_hash);
+                            return;
+                        }
+                    }
+                }
+            };
+            let activity_key = active_ed2k_download_key(&normalized_file_hash);
+            let started_at = Utc::now();
+            let mut activity_snapshot =
+                new_activity_snapshot(AgentActivityState::Downloading, started_at);
+            activity_snapshot.protocol = Some(Protocol::Ed2k);
+            let activity_name = request.canonical_name();
+            activity_snapshot.query_or_target =
+                Some(format!("{} ({})", activity_name, normalized_file_hash));
+            begin_agent_activity(&agent_activity, activity_key.clone(), activity_snapshot).await;
+
+            if let Some(runtime) = runtime_handle.lock().await.clone()
+                && let Ok(manifest) = runtime.ed2k_transfer.manifest(&normalized_file_hash).await
+            {
+                let persisted_bytes = manifest
+                    .pieces
+                    .iter()
+                    .map(|piece| piece.bytes_written)
+                    .sum::<u64>();
+                if manifest.completed {
+                    info!(
+                        "native ED2K download already completed file_hash={} bytes_written={} md4_hashset_acquired={}",
+                        normalized_file_hash, persisted_bytes, manifest.md4_hashset_acquired
+                    );
+                    finish_agent_activity(&agent_activity, &activity_key, Utc::now()).await;
+                    clear_agent_degraded_activity(&agent_activity).await;
+                    active_downloads.lock().await.remove(&normalized_file_hash);
+                    drop(download_permit);
+                    return;
+                }
+                if manifest_has_ed2k_transfer_progress(&manifest) {
+                    info!(
+                        "native ED2K download resuming persisted progress file_hash={} bytes_written={} md4_hashset_acquired={}",
+                        normalized_file_hash, persisted_bytes, manifest.md4_hashset_acquired
+                    );
+                }
+            }
+
+            let outcome =
+                start_native_ed2k_download(runtime_handle, config_handle, ed2k_user_hash, request)
+                    .await;
+            finish_agent_activity(&agent_activity, &activity_key, Utc::now()).await;
+            match outcome {
+                Ok(()) => {
+                    clear_agent_degraded_activity(&agent_activity).await;
+                }
+                Err(error) => {
+                    let mut degraded_snapshot =
+                        new_activity_snapshot(AgentActivityState::Degraded, Utc::now());
+                    degraded_snapshot.query_or_target =
+                        Some(format!("ED2K download {normalized_file_hash}"));
+                    degraded_snapshot.last_error = Some(error.to_string());
+                    record_agent_degraded_activity(&agent_activity, degraded_snapshot).await;
+                }
+            }
+            active_downloads.lock().await.remove(&normalized_file_hash);
+            drop(download_permit);
+        });
+        Ok(())
+    }
+}
 
 pub(super) async fn start_native_ed2k_download(
     runtime_handle: Arc<Mutex<Option<AgentNetworkRuntime>>>,
