@@ -7,6 +7,7 @@ on:
       - "AGENTS.md"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "clippy.toml"
       - "rustfmt.toml"
       - "crates/**"
   pull_request:
@@ -15,6 +16,7 @@ on:
       - "AGENTS.md"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "clippy.toml"
       - "rustfmt.toml"
       - "crates/**"
 
@@ -38,4 +40,4 @@ jobs:
         shell: pwsh
         run: |
           cargo fmt --all --check
-          cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::all
+          cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::all -W clippy::too_many_arguments -W clippy::type_complexity -W clippy::cognitive_complexity

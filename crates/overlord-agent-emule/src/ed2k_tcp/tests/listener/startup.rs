@@ -1,0 +1,116 @@
+use super::*;
+
+#[tokio::test]
+async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
+    let payload = b"ubuntu linux upload startup handshake".repeat(512);
+    let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
+    let file_hash_hex = file_hash.to_string();
+    let root = unique_test_dir("ed2k-upload-listener-startup");
+    let transfer_runtime = Arc::new(Ed2kTransferRuntime::load_or_create(&root).unwrap());
+    let job = new_transfer_job(file_hash, "startup.txt".to_string(), payload.len() as u64);
+    transfer_runtime.ensure_job(&job).await.unwrap();
+    transfer_runtime
+        .store_md4_hashset(&file_hash_hex, Vec::new())
+        .await
+        .unwrap();
+    transfer_runtime
+        .store_piece_data(&file_hash_hex, 0, &payload)
+        .await
+        .unwrap();
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let peer_addr = listener.local_addr().unwrap();
+    let dht = test_dht().await;
+    let server_state = Arc::new(RwLock::new(Ed2kServerState::default()));
+    let kad_firewall = Arc::new(Mutex::new(KadFirewallState::default()));
+    let secure_ident = listener_secure_ident();
+    let hello_identity = Ed2kHelloIdentity {
+        user_hash: [0x31; 16],
+        client_id: 0x1357_2468,
+        tcp_port: 41011,
+        udp_port: 41010,
+        server_ip: 0,
+        server_port: 0,
+        connect_options: emule_connect_options(false),
+        direct_udp_callback: false,
+    };
+
+    let server = spawn_single_listener_connection(
+        listener,
+        dht,
+        server_state,
+        kad_firewall,
+        secure_ident,
+        Arc::clone(&transfer_runtime),
+        hello_identity,
+    );
+
+    let peer_identity = Ed2kHelloIdentity {
+        user_hash: [0x41; 16],
+        client_id: 0x2468_1357,
+        tcp_port: 4662,
+        udp_port: 4672,
+        server_ip: 0,
+        server_port: 0,
+        connect_options: emule_connect_options(false),
+        direct_udp_callback: false,
+    };
+    let mut stream = connect_peer_and_exchange_hello(peer_addr, peer_identity).await;
+
+    let manifest = transfer_runtime.manifest(&file_hash_hex).await.unwrap();
+    stream
+        .write_all(&super::encode_request_filename(&file_hash, &manifest))
+        .await
+        .unwrap();
+    let filename_answer =
+        read_until_opcode(&mut stream, OP_EDONKEYPROT, OP_REQFILENAMEANSWER).await;
+    assert_eq!(&filename_answer[6..22], &file_hash.0);
+
+    stream
+        .write_all(&super::encode_request_sources2(&file_hash))
+        .await
+        .unwrap();
+    let source_answer =
+        read_until_opcode(&mut stream, OP_EMULEPROT, super::OP_ANSWERSOURCES2).await;
+    assert_eq!(source_answer[6], super::ED2K_SOURCE_EXCHANGE2_VERSION);
+    assert_eq!(&source_answer[7..23], &file_hash.0);
+    assert_eq!(
+        u16::from_le_bytes([source_answer[23], source_answer[24]]),
+        0
+    );
+
+    let modern_hashset_request = super::encode_hashset_request2(
+        &super::Ed2kFileIdentifier::from_manifest(&manifest).unwrap(),
+        super::Ed2kHashsetRequestOptions {
+            request_md4: true,
+            request_aich: false,
+        },
+    )
+    .unwrap();
+    stream.write_all(&modern_hashset_request).await.unwrap();
+    let modern_hashset_answer =
+        read_until_opcode(&mut stream, OP_EMULEPROT, super::OP_HASHSETANSWER2).await;
+    let returned = super::decode_hashset_answer2(&modern_hashset_answer[6..]).unwrap();
+    assert_eq!(returned.file_identifier.file_hash, file_hash);
+    assert_eq!(
+        returned.file_identifier.file_size,
+        Some(payload.len() as u64)
+    );
+    assert!(returned.md4_hashset.is_none());
+    assert!(returned.aich_hashset.is_none());
+
+    stream
+        .write_all(&super::encode_aich_file_hash_request(&file_hash))
+        .await
+        .unwrap();
+    stream
+        .write_all(&super::encode_start_upload_req(&file_hash))
+        .await
+        .unwrap();
+    let accept_upload =
+        read_until_opcode(&mut stream, OP_EDONKEYPROT, super::OP_ACCEPTUPLOADREQ).await;
+    assert_eq!(accept_upload.len(), 6);
+
+    drop(stream);
+    server.await.unwrap();
+}

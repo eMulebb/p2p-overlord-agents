@@ -6,7 +6,11 @@
 - Use `../p2p-overlord-be/BACKLOG.md` as the canonical active backlog.
 - Before finishing Rust changes, run:
   - `cargo fmt --all --check`
-  - `cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::all`
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::all -W clippy::too_many_arguments -W clippy::type_complexity -W clippy::cognitive_complexity`
+- Do not add new oversized tracked source files or grow baselined oversized
+  files; the workspace source-size ratchet is enforced from tooling.
+- Keep tracked text files normalized to UTF-8 with LF endings; the workspace
+  line-ending guard is enforced from tooling.
 - Keep public-facing Rust items documented with `///` or `//!`.
 - Treat `rustfmt` output as canonical.
 - Prefer JSONL dumps for packet-level runtime evidence.

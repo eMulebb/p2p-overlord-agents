@@ -65,3 +65,9 @@ Shared protocol reference docs currently reused by the ED2K work:
   `python -m overlord_tooling guard-tracked-files --repo-root ../p2p-overlord-agents`
   to validate tracked files for local path leaks and configured personal-name
   filename leaks.
+- The required Rust gate promotes `clippy::too_many_arguments`,
+  `clippy::type_complexity`, and `clippy::cognitive_complexity` using the
+  thresholds in `../clippy.toml`.
+- Keep `clippy::too_many_lines` advisory until the existing large session and
+  protocol functions are refactored. For local inventory, run
+  `cargo clippy --workspace --all-targets --all-features -- -W clippy::all -W clippy::too_many_lines -W clippy::cognitive_complexity -W clippy::too_many_arguments -W clippy::type_complexity`.

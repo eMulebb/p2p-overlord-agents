@@ -1,0 +1,4 @@
+cognitive-complexity-threshold = 150
+too-many-lines-threshold = 250
+too-many-arguments-threshold = 8
+type-complexity-threshold = 250
