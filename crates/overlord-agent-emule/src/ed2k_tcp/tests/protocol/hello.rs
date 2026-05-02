@@ -135,7 +135,51 @@ fn hello_answer_advertises_emule_style_tags() {
 }
 
 #[test]
-fn hello_answer_matches_stock_072a_plaintext_sample() {
+fn hello_misc_options2_does_not_advertise_unsupported_chat_captcha() {
+    let misc_options2 = emule_misc_options2(emule_connect_options(false), false);
+
+    assert_eq!(
+        (misc_options2 >> 13) & 1,
+        1,
+        "file identifiers are implemented"
+    );
+    assert_eq!(
+        (misc_options2 >> 11) & 1,
+        0,
+        "chat/captcha is not implemented"
+    );
+    assert_eq!(
+        (misc_options2 >> 10) & 1,
+        1,
+        "source exchange 2 is implemented"
+    );
+}
+
+#[test]
+fn hello_misc_options1_does_not_advertise_unsupported_comments_or_preview() {
+    let misc_options1 = emule_misc_options1();
+
+    assert_eq!((misc_options1 >> 29) & 0x7, 1, "AICH is implemented");
+    assert_eq!(
+        (misc_options1 >> 12) & 0x0F,
+        4,
+        "source exchange is implemented"
+    );
+    assert_eq!(
+        (misc_options1 >> 4) & 0x0F,
+        0,
+        "comments are not implemented"
+    );
+    assert_eq!(
+        (misc_options1 >> 2) & 1,
+        1,
+        "shared-file browsing is disabled"
+    );
+    assert_eq!(misc_options1 & 1, 0, "preview is not implemented");
+}
+
+#[test]
+fn hello_answer_matches_truthful_plaintext_profile() {
     let packet = encode_hello_answer(Ed2kHelloIdentity {
         user_hash: [
             0x73, 0xBE, 0xC5, 0x66, 0x14, 0x0E, 0x7E, 0x60, 0x83, 0xC4, 0x50, 0xC9, 0xAF, 0x02,
@@ -151,7 +195,7 @@ fn hello_answer_matches_stock_072a_plaintext_sample() {
     });
 
     let expected = decode(
-            "e3520000004c73bec566140e7e6083c450c9af026f8395581b524fb60600000015010001654d756c65030100113c000000030100f951b651b6030100fa16421334030100fe3a2c0000030100fb00200100b07b02ef8810",
+            "e3520000004c73bec566140e7e6083c450c9af026f8395581b524fb60600000015010001654d756c65030100113c000000030100f951b651b6030100fa06421334030100fe3a240000030100fb00200100b07b02ef8810",
         )
         .unwrap();
 
@@ -173,6 +217,27 @@ fn emule_info_request_uses_expected_protocol_and_tag_count() {
 }
 
 #[test]
+fn emule_info_does_not_advertise_unsupported_comments_or_preview() {
+    let packet = encode_emule_info_answer(41000);
+
+    assert_eq!(emule_info_u32_tag(&packet, ET_COMMENTS), Some(0));
+    assert_eq!(
+        emule_info_u32_tag(&packet, ET_FEATURES),
+        Some(EMULE_INFO_FEATURES)
+    );
+    assert_eq!(
+        EMULE_INFO_FEATURES & 0x03,
+        0x03,
+        "secure ident is implemented"
+    );
+    assert_eq!(
+        (EMULE_INFO_FEATURES >> 7) & 1,
+        0,
+        "preview is not implemented"
+    );
+}
+
+#[test]
 fn emule_info_answer_uses_expected_protocol_and_tag_count() {
     let packet = encode_emule_info_answer(41000);
 
@@ -184,6 +249,15 @@ fn emule_info_answer_uses_expected_protocol_and_tag_count() {
         u32::from_le_bytes([packet[8], packet[9], packet[10], packet[11]]),
         7
     );
+}
+
+fn emule_info_u32_tag(packet: &[u8], name: u8) -> Option<u32> {
+    let header = [TAGTYPE_UINT32, 0x01, 0x00, name];
+    let offset = packet
+        .windows(header.len())
+        .position(|window| window == header)?;
+    let value = packet.get(offset + header.len()..offset + header.len() + 4)?;
+    Some(u32::from_le_bytes(value.try_into().unwrap()))
 }
 
 #[test]

@@ -1,20 +1,14 @@
 use super::{
     ED2K_PART_SIZE, Ed2kResumeManifest, Ed2kSharedEntry, Ed2kSourceHint, Ed2kTransferRuntime,
-    Ed2kTransferState, Ed2kUploadPeerIdentity, Ed2kUploadQueueConfig, Ed2kUploadSessionStatus,
-    MANIFEST_FILE_NAME, PAYLOAD_FILE_NAME, new_transfer_job,
+    Ed2kTransferState, MANIFEST_FILE_NAME, PAYLOAD_FILE_NAME, new_transfer_job,
 };
 use crate::paths::unique_test_dir;
 use md4::{Digest, Md4};
 use overlord_agent_common::{HashType, PopularHash};
 use overlord_kad_proto::Ed2kHash;
-use std::{
-    fs,
-    io::Write,
-    net::{IpAddr, Ipv4Addr},
-    path::Path,
-    str::FromStr,
-    time::Duration,
-};
+use std::{fs, io::Write, path::Path, str::FromStr};
+
+mod upload_queue;
 
 fn write_repeating_pattern_file(path: &Path, size: usize, pattern: &[u8]) {
     assert!(!pattern.is_empty());
@@ -642,158 +636,4 @@ fn manifest_new_initializes_missing_piece_state() {
             .all(|piece| piece.state == Ed2kTransferState::Missing)
     );
     assert_eq!(manifest.sources, Vec::<Ed2kSourceHint>::new());
-}
-
-#[tokio::test]
-async fn upload_queue_grants_immediately_then_promotes_waiter() {
-    let root = unique_test_dir("ed2k-upload-queue-promote");
-    let runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
-    runtime
-        .configure_upload_queue(Ed2kUploadQueueConfig {
-            active_slots: 1,
-            waiting_capacity: 8,
-            waiting_timeout: Duration::from_secs(30),
-            granted_timeout: Duration::from_secs(30),
-            upload_timeout: Duration::from_secs(30),
-        })
-        .await;
-    let file_hash = Ed2kHash::from_bytes([0x5A; 16]);
-
-    let first_peer = Ed2kUploadPeerIdentity {
-        ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-        tcp_port: 4662,
-        user_hash: Some([0x11; 16]),
-        client_id: Some(1),
-    };
-    let second_peer = Ed2kUploadPeerIdentity {
-        ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
-        tcp_port: 4662,
-        user_hash: Some([0x22; 16]),
-        client_id: Some(2),
-    };
-
-    let (first_handle, first_status) = runtime.begin_upload_session(first_peer, &file_hash).await;
-    assert_eq!(first_status, Ed2kUploadSessionStatus::Granted);
-
-    let (second_handle, second_status) =
-        runtime.begin_upload_session(second_peer, &file_hash).await;
-    assert_eq!(second_status, Ed2kUploadSessionStatus::Waiting { rank: 1 });
-
-    runtime.release_upload_session(&first_handle).await;
-    assert_eq!(
-        runtime.poll_upload_session(&second_handle, true).await,
-        Ed2kUploadSessionStatus::Granted
-    );
-}
-
-#[tokio::test]
-async fn upload_queue_reconnect_replaces_stale_connection() {
-    let root = unique_test_dir("ed2k-upload-queue-reconnect");
-    let runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
-    runtime
-        .configure_upload_queue(Ed2kUploadQueueConfig {
-            active_slots: 1,
-            waiting_capacity: 8,
-            waiting_timeout: Duration::from_secs(30),
-            granted_timeout: Duration::from_secs(30),
-            upload_timeout: Duration::from_secs(30),
-        })
-        .await;
-    let file_hash = Ed2kHash::from_bytes([0xA5; 16]);
-    let peer = Ed2kUploadPeerIdentity {
-        ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)),
-        tcp_port: 4662,
-        user_hash: Some([0x44; 16]),
-        client_id: Some(9),
-    };
-
-    let (first_handle, first_status) = runtime.begin_upload_session(peer.clone(), &file_hash).await;
-    assert_eq!(first_status, Ed2kUploadSessionStatus::Granted);
-
-    let (second_handle, second_status) = runtime.begin_upload_session(peer, &file_hash).await;
-    assert_eq!(second_status, Ed2kUploadSessionStatus::Granted);
-    assert_eq!(
-        runtime.poll_upload_session(&first_handle, true).await,
-        Ed2kUploadSessionStatus::Stale
-    );
-    runtime.release_upload_session(&first_handle).await;
-    assert_eq!(
-        runtime.poll_upload_session(&second_handle, true).await,
-        Ed2kUploadSessionStatus::Granted
-    );
-}
-
-#[tokio::test]
-async fn upload_queue_same_peer_different_file_preserves_waiting_rank() {
-    let root = unique_test_dir("ed2k-upload-queue-peer-file-switch");
-    let runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
-    runtime
-        .configure_upload_queue(Ed2kUploadQueueConfig {
-            active_slots: 1,
-            waiting_capacity: 8,
-            waiting_timeout: Duration::from_secs(30),
-            granted_timeout: Duration::from_secs(30),
-            upload_timeout: Duration::from_secs(30),
-        })
-        .await;
-    let first_file_hash = Ed2kHash::from_bytes([0xA1; 16]);
-    let second_file_hash = Ed2kHash::from_bytes([0xB2; 16]);
-    let third_file_hash = Ed2kHash::from_bytes([0xC3; 16]);
-
-    let first_peer = Ed2kUploadPeerIdentity {
-        ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-        tcp_port: 4661,
-        user_hash: Some([0x11; 16]),
-        client_id: Some(1),
-    };
-    let waiting_peer = Ed2kUploadPeerIdentity {
-        ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
-        tcp_port: 4662,
-        user_hash: Some([0x22; 16]),
-        client_id: Some(2),
-    };
-    let trailing_peer = Ed2kUploadPeerIdentity {
-        ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)),
-        tcp_port: 4663,
-        user_hash: Some([0x33; 16]),
-        client_id: Some(3),
-    };
-
-    let (_first_handle, first_status) = runtime
-        .begin_upload_session(first_peer, &first_file_hash)
-        .await;
-    assert_eq!(first_status, Ed2kUploadSessionStatus::Granted);
-
-    let (waiting_handle, waiting_status) = runtime
-        .begin_upload_session(waiting_peer.clone(), &first_file_hash)
-        .await;
-    assert_eq!(waiting_status, Ed2kUploadSessionStatus::Waiting { rank: 1 });
-
-    let (trailing_handle, trailing_status) = runtime
-        .begin_upload_session(trailing_peer, &third_file_hash)
-        .await;
-    assert_eq!(
-        trailing_status,
-        Ed2kUploadSessionStatus::Waiting { rank: 2 }
-    );
-
-    let (replacement_handle, replacement_status) = runtime
-        .begin_upload_session(waiting_peer, &second_file_hash)
-        .await;
-    assert_eq!(
-        replacement_status,
-        Ed2kUploadSessionStatus::Waiting { rank: 1 }
-    );
-    assert_eq!(
-        runtime.poll_upload_session(&waiting_handle, true).await,
-        Ed2kUploadSessionStatus::Stale
-    );
-    assert_eq!(
-        runtime.poll_upload_session(&replacement_handle, true).await,
-        Ed2kUploadSessionStatus::Waiting { rank: 1 }
-    );
-    assert_eq!(
-        runtime.poll_upload_session(&trailing_handle, true).await,
-        Ed2kUploadSessionStatus::Waiting { rank: 2 }
-    );
 }

@@ -83,7 +83,8 @@ The following remain in scope for "full parity":
 - [ ] Fresh large-file real-network evidence that the locally generated AICH
       identity remains truthful outside the private harness matrix
 - [ ] Stock `UploadQueue.cpp`-style credit, score, LowID, and friend-slot
-      behavior
+      behavior; the first score-ranked queue slice is implemented, but durable
+      credit inputs and harness/live parity evidence remain open
 - [ ] Full buddy / callback matrix and buddy-tag parity for firewalled mode
 - [ ] Preview request / answer parity
 - [ ] Shared-files and shared-directories browsing parity
@@ -100,9 +101,12 @@ feature remains unsupported.
 
 Current example:
 
-- `supports_captcha=1` is currently advertised in the hello profile, so chat /
-  captcha support is part of the parity backlog until the implementation lands
-  or the advert is made truthful again.
+- chat and captcha remain part of the parity backlog because stock `v0.72a`
+  exposes them, but the hello profile must not advertise unsupported captcha
+  support until a truthful challenge/response implementation exists.
+- file comments remain part of the parity backlog because stock `v0.72a`
+  exposes them, but `CT_EMULE_MISCOPTIONS1` and `OP_EMULEINFO` must not
+  advertise comment support until comment exchange and persistence exist.
 
 ## Vector Hygiene
 
@@ -126,7 +130,9 @@ The active next milestone is:
 4. rerun the dedicated large-file realnet scenario until the stock-truthful
    local generation path also stays green outside the local harness matrix
 5. extend the same truthfulness rule to every still-advertised non-obsolete
-   ED2K feature that remains unimplemented, starting with chat-captcha
+   ED2K feature that remains unimplemented; chat-captcha remains in the backlog
+   and file comments remain in the backlog, but unsupported captcha and
+   comments are no longer advertised in the hello / eMuleInfo profiles
 
 This remains the highest-leverage next step because the downloader and listener
 now use the modern `FileIdentifier` + `EXT2` + `HASHSETREQUEST2` transport and
@@ -137,39 +143,27 @@ payload.
 ## Current Evidence
 
 As of **April 17, 2026**, the private deterministic harness path confirms the
-new modern startup flow:
+modern startup flow:
 
 - `cargo test --workspace` passed after the `FileIdentifier` / `EXT2` changes
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::all` passed
-- the downloader now accepts hash-only requests and upgrades the manifest from
-  peer `OP_MULTIPACKETANSWER_EXT2` / `OP_REQFILENAMEANSWER` metadata, covered
-  by the `hash_only_small_file_download_learns_metadata_from_startup_answer`
-  and `reconcile_job_metadata_adopts_unknown_size_and_name` regressions
+- the downloader accepts hash-only requests and upgrades the manifest from peer
+  `OP_MULTIPACKETANSWER_EXT2` / `OP_REQFILENAMEANSWER` metadata, covered by
+  `hash_only_small_file_download_learns_metadata_from_startup_answer` and
+  `reconcile_job_metadata_adopts_unknown_size_and_name`
 - the private scenario `ed2k.server.emule-harness.agent.private.v1` completed
-  successfully with the harness logging:
-  - inbound `OP_MULTIPACKET_EXT2` from the agent at
-    [emule-harness-ed2k-tcp-dump-2026.04.17-17.16.54.366-p9544.jsonl](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.emule-harness.agent.private.v1/ed2k.server.emule-harness.agent.private.v1-20260417-171635/emule-harness-artifacts/emule-harness-ed2k-tcp-dump-2026.04.17-17.16.54.366-p9544.jsonl>)
-  - outbound `OP_MULTIPACKETANSWER_EXT2` back to the agent in the same dump
+  successfully and captured inbound `OP_MULTIPACKET_EXT2` plus outbound
+  `OP_MULTIPACKETANSWER_EXT2`
 
-As of **April 17, 2026**, live `server.met` validation is also green for the
-current acceptance gate:
+As of **April 17, 2026**, live `server.met` validation is green for the current
+small-file acceptance gate:
 
-- the real-network scenario
-  `ed2k.server.emule-harness.agent.roundtrip.realnet.v1` completed
-  successfully on run
-  `ed2k.server.emule-harness.agent.roundtrip.realnet.v1-20260417-172433`
+- `ed2k.server.emule-harness.agent.roundtrip.realnet.v1-20260417-172433`
+  completed successfully
 - the selected live server came from the canonical imported `server.met` bundle
-  and was pinned as `145.239.2.134:4661` in
-  [run-manifest.json](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.emule-harness.agent.roundtrip.realnet.v1/ed2k.server.emule-harness.agent.roundtrip.realnet.v1-20260417-172433/run-manifest.json>)
-- the run summary confirms server-session establishment, agent download,
-  republish, and harness download completion in
-  [run-summary.json](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.emule-harness.agent.roundtrip.realnet.v1/ed2k.server.emule-harness.agent.roundtrip.realnet.v1-20260417-172433/run-summary.json>)
-- the agent log shows successful live-server session establishment and native
-  download completion against that server in
-  [overlord-agent-emule.log](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.emule-harness.agent.roundtrip.realnet.v1/ed2k.server.emule-harness.agent.roundtrip.realnet.v1-20260417-172433/agent-stage1-artifacts/overlord-agent-emule.log>)
-- the harness downloader log confirms the re-offered file verified as
-  `MD4: OK - AICH: OK` in
-  [eMule_Verbose.log](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.emule-harness.agent.roundtrip.realnet.v1/ed2k.server.emule-harness.agent.roundtrip.realnet.v1-20260417-172433/harness-downloader-artifacts/eMule_Verbose.log>)
+- the run confirmed live server-session establishment, agent download,
+  republish, harness download completion, and harness verifier `MD4: OK -
+  AICH: OK`
 
 Important limitation:
 
@@ -183,40 +177,30 @@ Important limitation:
 As of **April 17, 2026**, the dedicated large-file live `server.met` validation
 is also green for the modern `FileIdentifier` transport branch:
 
-- the real-network scenario `ed2k.server.roundtrip.realnet.large.v1` completed
-  successfully on run
-  [ed2k.server.roundtrip.realnet.large.v1-20260417-182434 run-summary.json](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.roundtrip.realnet.large.v1/ed2k.server.roundtrip.realnet.large.v1-20260417-182434/run-summary.json>)
+- `ed2k.server.roundtrip.realnet.large.v1-20260417-182434` completed
+  successfully
 - the selected live server again came from the canonical imported `server.met`
-  bundle and was pinned as `145.239.2.134:4661` in
-  [run-manifest.json](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.roundtrip.realnet.large.v1/ed2k.server.roundtrip.realnet.large.v1-20260417-182434/run-manifest.json>)
+  bundle
 - the seeder-side harness dump shows the agent driving the modern large-file
   startup path with `OP_MULTIPACKET_EXT2`, `OP_MULTIPACKETANSWER_EXT2`,
-  `OP_HASHSETREQUEST2`, and `OP_HASHSETANSWER2` in
-  [emule-harness-ed2k-tcp-dump-2026.04.17-18.24.40.356-p18176.jsonl](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.roundtrip.realnet.large.v1/ed2k.server.roundtrip.realnet.large.v1-20260417-182434/harness-seeder-artifacts/emule-harness-ed2k-tcp-dump-2026.04.17-18.24.40.356-p18176.jsonl>)
-- the same dump and the downloader-side harness dump confirm sustained
-  compressed-part transfer on the large-file path in
-  [harness-seeder-artifacts/emule-harness-ed2k-tcp-dump-2026.04.17-18.24.40.356-p18176.jsonl](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.roundtrip.realnet.large.v1/ed2k.server.roundtrip.realnet.large.v1-20260417-182434/harness-seeder-artifacts/emule-harness-ed2k-tcp-dump-2026.04.17-18.24.40.356-p18176.jsonl>)
-  and
-  [harness-downloader-artifacts/emule-harness-ed2k-tcp-dump-2026.04.17-18.26.30.400-p16340.jsonl](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.roundtrip.realnet.large.v1/ed2k.server.roundtrip.realnet.large.v1-20260417-182434/harness-downloader-artifacts/emule-harness-ed2k-tcp-dump-2026.04.17-18.26.30.400-p16340.jsonl>)
-- the agent completed the native large-file download in
-  [agent-stage1-artifacts/overlord-agent-emule.log](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.roundtrip.realnet.large.v1/ed2k.server.roundtrip.realnet.large.v1-20260417-182434/agent-stage1-artifacts/overlord-agent-emule.log>)
-- the harness verifier confirms the large-file parts as `MD4: OK` while still
+  `OP_HASHSETREQUEST2`, and `OP_HASHSETANSWER2`
+- the seeder-side and downloader-side harness dumps confirm sustained
+  compressed-part transfer on the large-file path
+- the harness verifier confirms large-file parts as `MD4: OK` while still
   reporting `AICH: Unavailable`, which is the remaining truth gap for this
-  branch, in
-  [harness-downloader-artifacts/eMule_Verbose.log](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.roundtrip.realnet.large.v1/ed2k.server.roundtrip.realnet.large.v1-20260417-182434/harness-downloader-artifacts/eMule_Verbose.log>)
+  branch
 - the agent artifacts for this successful run do not contain the prior
   `out_of_order_compressed_part_range` / `out_of_order_part_range` diagnostics
 
 As of **April 17, 2026**, an additional private local-vector probe against the
 canonical imported `server.met` pool confirms the hash-only live search path:
 
-- the agent now issues exact background ED2K keyword search queries using the
+- the agent issues exact background ED2K keyword search queries using the
   `ed2k::<hash>` form, reconciles manifest name and size from the matching live
   server result before source acquisition, and then proceeds to `OP_GETSOURCES`
   with the learned size
-- the same live probe also confirms that Kad source search is now executed as a
-  supplement after server-assisted discovery once the file size is known,
-  instead of remaining a zero-source fallback only
+- Kad source search is executed as a supplement after server-assisted discovery
+  once the file size is known
 - the tested private vector remained single-source in that run, so this is
   evidence that the search path is truthful and wider than before, but **not**
   yet evidence that live multi-source acquisition is consistently available for
@@ -225,26 +209,18 @@ canonical imported `server.met` pool confirms the hash-only live search path:
 As of **April 19, 2026**, deterministic local large-file loopback coverage is
 also green for the active modern path:
 
-- the private roundtrip scenario
-  [ed2k.server.emule-harness.agent.roundtrip.private.large.v1-20260418-211341 run-summary.json](</C:/tmp/p2p-overlord/overlord-tooling/runs/ed2k.server.emule-harness.agent.roundtrip.private.large.v1/ed2k.server.emule-harness.agent.roundtrip.private.large.v1-20260418-211341/run-summary.json>)
-  completed successfully with `2148532224` bytes, exported AICH links,
-  stage1/stage2 `OP_HASHSETREQUEST2` and `OP_HASHSETANSWER2` AICH coverage,
-  compressed parts, and harness verifier `AICH: OK`
-- the Kad harness->agent scenario
-  [kad.emule-harness.agent.download.private.large.v1-20260418-220231 run-summary.json](</C:/tmp/p2p-overlord/overlord-tooling/runs/kad.emule-harness.agent.download.private.large.v1/kad.emule-harness.agent.download.private.large.v1-20260418-220231/run-summary.json>)
+- `ed2k.server.emule-harness.agent.roundtrip.private.large.v1-20260418-211341`
+  completed successfully with exported AICH links, stage1/stage2
+  `OP_HASHSETREQUEST2` and `OP_HASHSETANSWER2` AICH coverage, compressed parts,
+  and harness verifier `AICH: OK`
+- `kad.emule-harness.agent.download.private.large.v1-20260418-220231`
   completed successfully in obfuscated mode and confirms Kad-discovered
   large-file transfer with exported AICH sidecar data, `OP_HASHSETREQUEST2` /
   `OP_HASHSETANSWER2` AICH exchange, and compressed parts
-- the reverse Kad agent->harness scenario
-  [kad.agent.emule-harness.download.private.large.v1-20260418-235210 run-summary.json](</C:/tmp/p2p-overlord/overlord-tooling/runs/kad.agent.emule-harness.download.private.large.v1/kad.agent.emule-harness.download.private.large.v1-20260418-235210/run-summary.json>)
+- `kad.agent.emule-harness.download.private.large.v1-20260418-235210`
   completed successfully in obfuscated mode after fixing the source-publish
-  identity byte order
-- the same reverse-Kad run shows the corrected source discovery and obfuscated
-  direct-connect path in
-  [emule-harness-kad-trace.log](</C:/tmp/p2p-overlord/overlord-tooling/runs/kad.agent.emule-harness.download.private.large.v1/kad.agent.emule-harness.download.private.large.v1-20260418-235210/downloader-harness-profile/logs/emule-harness-kad-trace.log>)
-  and the harness confirms `Sending HashSet Request: MD4 Yes, AICH Yes` plus
-  repeated per-part `MD4: OK - AICH: OK` in
-  [eMule_Verbose.log](</C:/tmp/p2p-overlord/overlord-tooling/runs/kad.agent.emule-harness.download.private.large.v1/kad.agent.emule-harness.download.private.large.v1-20260418-235210/downloader-harness-profile/logs/eMule_Verbose.log>)
+  identity byte order, and the harness confirms `Sending HashSet Request: MD4
+  Yes, AICH Yes` plus per-part `MD4: OK - AICH: OK`
 
 This closes the previous reverse-Kad obfuscated transport blocker. The
 remaining `ITEM_031` gap is fresh large-file real-network evidence for the
@@ -263,15 +239,45 @@ side against the deterministic tracing-harness fixture:
   the network-learned AICH identity authoritative when a modern peer already
   supplied canonical metadata
 
-Also on **May 2, 2026**, the new live closure cell
+Also on **May 2, 2026**, the live closure cell
 `ed2k.cell.modern-aich.plaintext.server-roundtrip.large.realnet.v1` was added
 to make `ITEM_031` evidence runnable through the manifest-backed pytest
-catalog. The first live attempt,
-`ed2k.cell.modern-aich.plaintext.server-roundtrip.large.realnet.v1.plaintext-20260502-152338`,
-failed before network execution because the eMule tracing-harness debug
-directory could not be resolved under the configured eMule workspace. This is
-an environment blocker, not AICH protocol evidence. `ITEM_031` remains open
-until the same cell passes with large-file real-network evidence.
+catalog. `ed2k.cell.modern-aich.plaintext.server-roundtrip.large.realnet.v1.plaintext-20260502-154313`
+resolved the community tracing-harness runtime and reached live execution, but
+the AICH gate still failed in stage 1 because the agent acquired no usable
+sources, no MD4/AICH hashset, and no bytes for the harness-exported large file.
+The live stress cell then passed in bounded mode for all canonical terms, which
+supports general network health but does not close `ITEM_031`.
+
+The latest same-server live attempt,
+`ed2k.cell.modern-aich.plaintext.server-roundtrip.large.realnet.v1.plaintext-20260502-183400`,
+observed the harness login server, prioritized that same endpoint in the agent
+stage-1 search, and recorded a same-server background source search without a
+source hint. The server did not return usable sources before the live gate
+timed out, so stage 1 still finished with zero sources, no MD4/AICH hashset,
+and no bytes. `ITEM_031` remains open as a live source-discovery blocker rather
+than an AICH transport or local-generation failure.
+
+Also on **May 2, 2026**, `supports_captcha` was cleared in the hello
+misc-options profile because chat/captcha challenge handling is not yet
+implemented. Regression coverage now asserts that file identifiers and source
+exchange remain advertised while unsupported chat/captcha is de-advertised.
+
+The same truthfulness pass also cleared comment support in
+`CT_EMULE_MISCOPTIONS1` and `OP_EMULEINFO`. Regression coverage now asserts
+that AICH, source exchange, secure ident, no-shared-files, and no-preview bits
+stay intentional while unsupported comments and preview remain de-advertised.
+
+Also on **May 2, 2026**, `ITEM_033` moved into its first UploadQueue parity
+slice. The inbound listener queue no longer ranks and promotes waiters by FIFO
+position alone: it now uses a deterministic score path with waiting age,
+friend-slot boost, LowID penalty, duplicate reconnect refresh, and a neutral
+file-priority hook for the later stock priority field. Focused regression
+coverage asserts friend-slot rank promotion, LowID rank penalty, duplicate
+reconnect staleness for the replaced handle, file-switch rank preservation, and
+listener queue-rank / accept-upload behavior. Durable credit weighting and
+stock harness/live queue evidence remain open before this checklist item can be
+closed.
 
 ## Validation Standard
 

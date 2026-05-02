@@ -77,7 +77,9 @@ pub(super) fn emule_misc_options1() -> u32 {
     let secure_ident_version = EMULE_SECURE_IDENT_VERSION;
     let source_exchange_version = 4u32;
     let extended_requests_version = 2u32;
-    let comments_version = 1u32;
+    // File-description packets are tolerated, but the stock comments surface
+    // is not implemented yet, so do not advertise comment exchange support.
+    let comments_version = 0u32;
     // Recent stock eMule no longer advertises peer cache support.
     let peer_cache = 0u32;
     let no_view_shared_files = 1u32;
@@ -105,7 +107,9 @@ pub(super) fn emule_misc_options2(connect_options: u8, direct_udp_callback: bool
     // hashset-request2 startup path that recent peers expect.
     let supports_file_identifiers = 1u32;
     let direct_udp_callback = u32::from(direct_udp_callback);
-    let supports_captcha = 1u32;
+    // Chat/captcha is still an `ITEM_032` parity gap, so do not advertise it
+    // until the peer-facing challenge/response surface exists.
+    let supports_captcha = 0u32;
     let supports_source_exchange2 = 1u32;
     let requires_crypt_layer = 0u32;
     let requests_crypt_layer = u32::from((connect_options & EMULE_CRYPT_REQUESTS) != 0);
@@ -174,7 +178,7 @@ fn encode_emule_info_payload(kad_udp_port: u16) -> Vec<u8> {
     push_ed2k_u32_tag(&mut payload, ET_UDPVER, 4);
     push_ed2k_u32_tag(&mut payload, ET_UDPPORT, u32::from(kad_udp_port));
     push_ed2k_u32_tag(&mut payload, ET_SOURCEEXCHANGE, 3);
-    push_ed2k_u32_tag(&mut payload, ET_COMMENTS, 1);
+    push_ed2k_u32_tag(&mut payload, ET_COMMENTS, 0);
     push_ed2k_u32_tag(&mut payload, ET_EXTENDEDREQUEST, 2);
     push_ed2k_u32_tag(&mut payload, ET_FEATURES, EMULE_INFO_FEATURES);
     payload
