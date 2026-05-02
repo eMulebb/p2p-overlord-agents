@@ -1,11 +1,12 @@
 #[cfg(test)]
 use std::future::Future;
 #[cfg(test)]
+use std::net::Ipv4Addr;
+#[cfg(test)]
 use std::time::Duration;
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    net::{Ipv4Addr, SocketAddr},
     path::Path,
     sync::{
         Arc,
@@ -17,40 +18,32 @@ use std::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use md4::{Digest, Md4};
-use overlord_agent_nat::{
-    AgentNetworkReport, AgentNetworkingConfig, NatManager, ResolvedInterfaceBindingReport,
-    detect_interfaces,
-};
+use overlord_agent_nat::{AgentNetworkReport, AgentNetworkingConfig, detect_interfaces};
 use serde_json::Value;
-use tokio::{
-    net::TcpListener,
-    sync::{Mutex, Notify, RwLock, Semaphore},
-    task::JoinHandle,
-};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use overlord_agent_common::{
     AgentActivityState, ConfigUpdate, CoordinatorClient, IndexerService, IndexerStats,
-    KadHarvestObservability, KadPublishObservability, KadRpcObservability,
-    KadRpcResponseOpcodeObservability, KadRpcTrackerBucketObservability,
-    KadRpcWorkClassObservability, PopularHash, Protocol, PublishSeedSource, RegisterRequest,
-    RunningIndexerServer, SearchEventStatus, SearchJob, SearchKind, SnoopEntry, SnoopObservation,
+    KadHarvestObservability, KadPublishObservability, PopularHash, Protocol, PublishSeedSource,
+    RegisterRequest, SearchEventStatus, SearchJob, SearchKind, SnoopEntry,
 };
-use overlord_kad_dht::{DhtNode, RpcObservabilitySnapshot, RpcWorkClass};
-use overlord_kad_proto::NodeId;
+use overlord_kad_dht::RpcWorkClass;
 
 use crate::config::EmuleAgentConfig;
-use crate::ed2k_server::{Ed2kFoundSource, Ed2kServerSearchHandle, Ed2kServerState};
+#[cfg(test)]
+use crate::ed2k_server::Ed2kFoundSource;
 #[cfg(test)]
 use crate::ed2k_tcp::Ed2kHelloIdentity;
 #[cfg(test)]
 use crate::ed2k_tcp::Ed2kPeerDownloadOutcome;
+#[cfg(test)]
 use crate::ed2k_tcp::Ed2kSecureIdent;
-use crate::ed2k_transfer::{Ed2kLocalIngestSummary, Ed2kSharedCatalog, Ed2kTransferRuntime};
-use crate::kad_firewall::KadFirewallState;
+use crate::ed2k_transfer::Ed2kLocalIngestSummary;
+#[cfg(test)]
+use crate::ed2k_transfer::Ed2kTransferRuntime;
 use crate::kad_store::{KadLocalStore, KadLocalStoreConfig};
 use crate::logging::current_log_file_status;
 use crate::snoop_queue::SnoopQueue;
@@ -72,6 +65,7 @@ mod ed2k_search;
 mod kad_firewall_runtime;
 mod kad_runtime;
 mod kad_unsolicited;
+mod keyword;
 mod lifecycle;
 mod networking;
 mod p2p_runtime;
@@ -79,8 +73,12 @@ mod passive_replay;
 mod passive_runtime;
 mod publish;
 mod publish_runtime;
+mod rpc_observability;
+mod runtime_state;
 mod search;
+mod signals;
 mod snoop;
+mod source_merge;
 #[cfg(test)]
 mod test_support;
 
@@ -97,8 +95,10 @@ use self::ed2k_enrich::{EnrichEd2kDownloadRequest, IngestLocalFileRequest};
 use self::ed2k_runtime::manifest_has_ed2k_transfer_progress;
 use self::ed2k_search::{
     ActiveEd2kSearchContext, do_active_ed2k_keyword_search, do_active_ed2k_source_search,
-    exact_ed2k_hash_query_token,
 };
+use self::keyword::keyword_target;
+#[cfg(test)]
+use self::keyword::significant_keyword_words;
 use self::lifecycle::{AgentStatePaths, ensure_parent_dir, load_or_create_indexer_id};
 use self::passive_replay::apply_queue_family_counts;
 use self::publish::{
@@ -106,11 +106,18 @@ use self::publish::{
     source_publish_client_hash,
 };
 use self::publish_runtime::{PublishExecutionContext, seed_popular_from_source};
+use self::rpc_observability::map_rpc_observability;
+use self::runtime_state::{
+    ActiveSearchHandle, AgentNetworkRuntime, ControlServerRuntime, NetworkingConfigApplyOutcome,
+};
+pub use self::runtime_state::{AgentExit, OverlordAgentEmule};
 use self::search::{
     SearchRunStats, do_active_keyword_search, do_active_notes_search, do_active_source_search,
     emit_search_event,
 };
+use self::signals::wait_for_shutdown_signal;
 use self::snoop::{flush_snoop_queue, restore_snoop_queue};
+use self::source_merge::merge_download_sources;
 
 const ACTIVE_BATCH_SIZE: usize = 25;
 /// Large passive harvest floods should be posted in bigger coordinator batches
@@ -152,157 +159,6 @@ const ED2K_DOWNLOAD_SOURCE_REQUERY_ROUNDS: usize = 2;
 const ED2K_DOWNLOAD_SOURCE_REQUERY_DELAY_SECS: u64 = 5;
 const ED2K_SOURCE_OBFUSCATION_REQUIRES_CRYPT: u8 = 0x04;
 const ED2K_HASH_ONLY_QUERY_PREFIX: &str = "ed2k::";
-
-async fn wait_for_shutdown_signal() -> Result<&'static str> {
-    #[cfg(windows)]
-    {
-        use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
-
-        let mut ctrl_c_stream = ctrl_c().context("failed to install Ctrl+C handler")?;
-        let mut ctrl_break_stream = ctrl_break().context("failed to install Ctrl+Break handler")?;
-        let mut ctrl_close_stream =
-            ctrl_close().context("failed to install console-close handler")?;
-        let mut ctrl_shutdown_stream =
-            ctrl_shutdown().context("failed to install console-shutdown handler")?;
-
-        tokio::select! {
-            _ = ctrl_c_stream.recv() => Ok("Ctrl+C"),
-            _ = ctrl_break_stream.recv() => Ok("Ctrl+Break"),
-            _ = ctrl_close_stream.recv() => Ok("ConsoleClose"),
-            _ = ctrl_shutdown_stream.recv() => Ok("ConsoleShutdown"),
-        }
-    }
-
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-
-        let mut sigint =
-            signal(SignalKind::interrupt()).context("failed to install SIGINT handler")?;
-        let mut sigterm =
-            signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
-
-        tokio::select! {
-            _ = sigint.recv() => Ok("SIGINT"),
-            _ = sigterm.recv() => Ok("SIGTERM"),
-        }
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        tokio::signal::ctrl_c()
-            .await
-            .context("failed while waiting for Ctrl+C")?;
-        Ok("Ctrl+C")
-    }
-}
-
-fn map_rpc_observability(snapshot: RpcObservabilitySnapshot) -> KadRpcObservability {
-    KadRpcObservability {
-        decode_failures: snapshot.decode_failures,
-        global_max_outbound_pps: snapshot.global_max_outbound_pps,
-        tracker_buckets: snapshot
-            .tracker_buckets
-            .into_iter()
-            .map(|bucket| KadRpcTrackerBucketObservability {
-                bucket: bucket.bucket.to_string(),
-                accepted_requests: bucket.accepted_requests,
-                tracker_drops: bucket.tracker_drops,
-                tracker_massive_drops: bucket.tracker_massive_drops,
-            })
-            .collect(),
-        response_opcodes: snapshot
-            .response_opcodes
-            .into_iter()
-            .map(|opcode| KadRpcResponseOpcodeObservability {
-                opcode: opcode.opcode.to_string(),
-                matched_pending: opcode.matched_pending,
-                matched_tracked: opcode.matched_tracked,
-                dropped_unrequested: opcode.dropped_unrequested,
-                accepted_unsolicited: opcode.accepted_unsolicited,
-            })
-            .collect(),
-        work_classes: snapshot
-            .work_classes
-            .into_iter()
-            .map(|work_class| KadRpcWorkClassObservability {
-                class: work_class.class.label().to_string(),
-                max_outbound_pps: work_class.max_outbound_pps,
-                sent_packets: work_class.sent_packets,
-                delayed_packets: work_class.delayed_packets,
-                total_wait_millis: work_class.total_wait_millis,
-                last_sent_at: work_class.last_sent_at,
-            })
-            .collect(),
-    }
-}
-
-#[derive(Clone)]
-struct AgentNetworkRuntime {
-    bind_ip: Ipv4Addr,
-    dht: DhtNode,
-    ed2k_listener: Arc<TcpListener>,
-    ed2k_shared_catalog: Ed2kSharedCatalog,
-    ed2k_transfer: Arc<Ed2kTransferRuntime>,
-    ed2k_server_search: Ed2kServerSearchHandle,
-    ed2k_server_search_inbox: Arc<Mutex<Option<crate::ed2k_server::Ed2kServerSearchInbox>>>,
-    ed2k_server_state: Arc<RwLock<Ed2kServerState>>,
-    ed2k_secure_ident: Arc<Ed2kSecureIdent>,
-    nat: Arc<NatManager>,
-    kad_firewall: Arc<Mutex<KadFirewallState>>,
-    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
-    shutdown: Arc<AtomicBool>,
-    passive_result_count: Arc<std::sync::atomic::AtomicU64>,
-    passive_replay_gate: Arc<Semaphore>,
-}
-
-struct ControlServerRuntime {
-    bind_addr: SocketAddr,
-    server: RunningIndexerServer,
-}
-
-#[derive(Clone)]
-struct ActiveSearchHandle {
-    cancel: CancellationToken,
-}
-
-pub struct OverlordAgentEmule {
-    config: Arc<RwLock<EmuleAgentConfig>>,
-    coordinator: CoordinatorClient,
-    indexer_id: Uuid,
-    ed2k_user_hash: [u8; 16],
-    started_at: Instant,
-    state_paths: AgentStatePaths,
-    snoop_queue: Arc<Mutex<SnoopQueue>>,
-    observed_snoop_events: Arc<Mutex<Vec<SnoopObservation>>>,
-    local_store: Arc<Mutex<KadLocalStore>>,
-    publish_batch_gate: Arc<Mutex<()>>,
-    publish_observability: Arc<Mutex<KadPublishObservability>>,
-    harvest_observability: Arc<Mutex<KadHarvestObservability>>,
-    agent_activity: Arc<Mutex<AgentActivityTracker>>,
-    runtime: Arc<Mutex<Option<AgentNetworkRuntime>>>,
-    control_server: Arc<Mutex<Option<ControlServerRuntime>>>,
-    control_selection_state: Arc<RwLock<ResolvedInterfaceBindingReport>>,
-    p2p_selection_state: Arc<RwLock<ResolvedInterfaceBindingReport>>,
-    active_searches: Arc<Mutex<HashMap<Uuid, ActiveSearchHandle>>>,
-    active_ed2k_downloads: Arc<Mutex<HashSet<String>>>,
-    ed2k_download_gate: Arc<Semaphore>,
-    restart_requested: Arc<AtomicBool>,
-    restart_notify: Arc<Notify>,
-    started: AtomicBool,
-}
-
-pub enum AgentExit {
-    Stopped,
-    RestartRequested,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NetworkingConfigApplyOutcome {
-    Unchanged,
-    ReconciledInPlace,
-    RestartRequired,
-}
 
 impl OverlordAgentEmule {
     pub async fn new(config: EmuleAgentConfig) -> Result<Self> {
@@ -423,33 +279,6 @@ impl OverlordAgentEmule {
             AgentExit::Stopped
         })
     }
-}
-
-fn significant_keyword_words(query: &str) -> Vec<String> {
-    let words: Vec<String> = query
-        .split(|char: char| !char.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .map(|word| word.to_lowercase())
-        .filter(|word| word.len() >= 3)
-        .collect();
-    if words.is_empty() {
-        vec![query.to_lowercase()]
-    } else {
-        words
-    }
-}
-
-fn keyword_target(query: &str) -> NodeId {
-    let first_word = exact_ed2k_hash_query_token(query).unwrap_or_else(|| {
-        significant_keyword_words(query)
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| query.to_lowercase())
-    });
-    let mut hasher = Md4::new();
-    hasher.update(first_word.as_bytes());
-    let digest: [u8; 16] = hasher.finalize().into();
-    NodeId::from_be_bytes(digest)
 }
 
 #[async_trait]
@@ -1036,23 +865,6 @@ impl OverlordAgentEmule {
             .ed2k_transfer
             .ingest_local_file(Path::new(&request.source_path), &request.canonical_name()?)
             .await
-    }
-}
-
-fn merge_download_sources(
-    aggregated_sources: &mut Vec<Ed2kFoundSource>,
-    new_sources: Vec<Ed2kFoundSource>,
-) {
-    for source in new_sources {
-        if aggregated_sources.iter().any(|existing| {
-            existing.ip == source.ip
-                && existing.tcp_port == source.tcp_port
-                && existing.obfuscation_options == source.obfuscation_options
-                && existing.user_hash == source.user_hash
-        }) {
-            continue;
-        }
-        aggregated_sources.push(source);
     }
 }
 

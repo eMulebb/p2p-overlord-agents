@@ -5,13 +5,21 @@
 //! bootstrap, lookup, search, and publish, so their docs should explain the
 //! wire-facing role of each call rather than only the local implementation.
 
+mod config;
+mod contact_helpers;
+
+pub use config::DhtConfig;
+use contact_helpers::{
+    addr_from_contact, bootstrap_ready_with_contacts, expire_contact_for_massive_flood,
+};
+
 use crate::bootstrap::{BootstrapContact, hardcoded_bootstrap, parse_nodes_dat, parse_nodes_text};
 use crate::error::DhtError;
 use crate::traversal::{TraversalConfig, TraversalContact, TraversalKind, run_traversal};
 use crate::types::{NoteResult, SearchResult, SourceResult};
 use overlord_kad_net::{
-    ObfuscationLayer, ReceivedKadPacket, RpcClassBudgetConfig, RpcConfig, RpcManager,
-    RpcObservabilitySnapshot, RpcWorkClass, UdpTransport,
+    ObfuscationLayer, ReceivedKadPacket, RpcConfig, RpcManager, RpcObservabilitySnapshot,
+    RpcWorkClass, UdpTransport,
 };
 use overlord_kad_proto::{
     Ed2kHash, KadPacket, KadUdpKey, NodeId, SearchKeyReq, SearchSourceReq, Tag, constants::K,
@@ -27,75 +35,6 @@ use tokio::sync::broadcast;
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-
-/// Configuration for DhtNode.
-#[derive(Debug, Clone)]
-pub struct DhtConfig {
-    /// UDP bind address.
-    pub bind_addr: SocketAddr,
-    /// Our Kad2 node ID. All-zeros = generate random on start.
-    pub node_id: NodeId,
-    /// Max contacts in routing table.
-    pub max_routing_table_size: usize,
-    /// Minimum number of routing contacts required before the node is treated as bootstrapped.
-    pub bootstrap_min_routing_contacts: usize,
-    /// Max concurrent searches (semaphore).
-    pub max_concurrent_searches: usize,
-    /// Search timeout.
-    pub search_timeout: Duration,
-    /// Store/publish timeout.
-    pub store_timeout: Duration,
-    /// Republish interval.
-    pub republish_interval: Duration,
-    /// Maximum number of closest contacts to publish to per publish round.
-    pub publish_contact_fanout: usize,
-    /// Max outbound packets per second. 0 = unlimited.
-    pub max_outbound_pps: u32,
-    /// Per-class outbound budgets layered underneath `max_outbound_pps`.
-    pub class_budgets: RpcClassBudgetConfig,
-    /// Max number of phase-2 search packets to send after traversal.
-    pub search_phase2_fanout: usize,
-    /// Harvest-oriented keyword result cap.
-    pub keyword_result_cap: usize,
-    /// Harvest-oriented source result cap.
-    pub source_result_cap: usize,
-    /// Harvest-oriented notes result cap.
-    pub notes_result_cap: usize,
-    /// Obfuscation enabled.
-    pub obfuscation_enabled: bool,
-    /// Our UDP key (anti-spoofing). 0 = generate random.
-    pub udp_key: u32,
-    /// Bootstrap sources: binary nodes.dat content.
-    pub nodes_dat: Option<Vec<u8>>,
-    /// Bootstrap sources: plain text format.
-    pub nodes_text: Option<String>,
-}
-
-impl Default for DhtConfig {
-    fn default() -> Self {
-        Self {
-            bind_addr: "0.0.0.0:4672".parse().unwrap(),
-            node_id: NodeId::ZERO,
-            max_routing_table_size: 12000,
-            bootstrap_min_routing_contacts: 10,
-            max_concurrent_searches: 5,
-            search_timeout: Duration::from_secs(45),
-            store_timeout: Duration::from_secs(140),
-            republish_interval: Duration::from_secs(18000),
-            publish_contact_fanout: 4,
-            max_outbound_pps: 8,
-            class_budgets: RpcClassBudgetConfig::default(),
-            search_phase2_fanout: 50,
-            keyword_result_cap: 5000,
-            source_result_cap: 1000,
-            notes_result_cap: 1000,
-            obfuscation_enabled: true,
-            udp_key: 0,
-            nodes_dat: None,
-            nodes_text: None,
-        }
-    }
-}
 
 struct DhtInner {
     own_id: NodeId,
@@ -1040,62 +979,5 @@ impl DhtNode {
         }
 
         contacts
-    }
-}
-
-fn addr_from_contact(contact: &Contact) -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(contact.ip), contact.udp_port)
-}
-
-/// Mirrors the oracle's higher punishment path for massive request floods by
-/// expiring the matching routing-table contact when we can identify one.
-async fn expire_contact_for_massive_flood(
-    routing_table: &Arc<Mutex<RoutingTable>>,
-    addr: SocketAddr,
-) {
-    let IpAddr::V4(ip) = addr.ip() else {
-        return;
-    };
-    let mut routing_table = routing_table.lock().await;
-    let contact_id = routing_table
-        .all_contacts()
-        .into_iter()
-        .find(|contact| contact.ip == ip && contact.udp_port == addr.port())
-        .map(|contact| contact.id);
-    if let Some(contact_id) = contact_id {
-        let _ = routing_table.remove(&contact_id);
-        warn!(
-            "expired routing contact after massive Kad request flood from {}",
-            addr
-        );
-    }
-}
-
-fn bootstrap_ready_with_contacts(min_ready_contacts: usize, routing_contacts: usize) -> bool {
-    routing_contacts >= min_ready_contacts.max(1)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::bootstrap_ready_with_contacts;
-
-    #[test]
-    fn bootstrap_log_messages_are_ascii_only() {
-        assert!(
-            "bootstrap response from {addr} - routing table now {contacts} contacts".is_ascii()
-        );
-        assert!("bootstrap complete - routing table has {contacts} contacts".is_ascii());
-    }
-
-    #[test]
-    fn bootstrap_ready_threshold_is_never_zero() {
-        assert!(bootstrap_ready_with_contacts(0, 1));
-        assert!(!bootstrap_ready_with_contacts(0, 0));
-    }
-
-    #[test]
-    fn bootstrap_ready_threshold_honors_configured_contact_floor() {
-        assert!(!bootstrap_ready_with_contacts(3, 2));
-        assert!(bootstrap_ready_with_contacts(3, 3));
     }
 }
