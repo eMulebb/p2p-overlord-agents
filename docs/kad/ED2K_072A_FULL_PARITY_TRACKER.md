@@ -276,12 +276,13 @@ file-priority hook for the later stock priority field. Focused regression
 coverage asserts friend-slot rank promotion, LowID rank penalty, duplicate
 reconnect staleness for the replaced handle, file-switch rank preservation, and
 listener queue-rank / accept-upload behavior. The manifest-backed e2e cells
-`ed2k.cell.listener.plaintext.inbound.queue-only.fresh.private.v1` and
+`ed2k.cell.downloader.plaintext.direct.queue-only.fresh.private.v1`,
+`ed2k.cell.listener.plaintext.inbound.queue-only.fresh.private.v1`, and
 `ed2k.cell.listener.obfuscated.inbound.queue-only.fresh.private.v1` are now
-available and execute the native listener queue module, including an obfuscated
-inbound ED2K TCP queue-rank and late accept-upload path. Durable credit
-weighting and stock harness/live queue evidence remain open before this
-checklist item can be closed.
+available and execute the native queue modules, including downloader queue-only
+and late accept-upload handling plus an obfuscated inbound ED2K TCP queue-rank
+and late accept-upload path. Durable credit weighting and stock harness/live
+queue evidence remain open before this checklist item can be closed.
 
 ## Validation Standard
 
