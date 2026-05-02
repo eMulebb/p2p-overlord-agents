@@ -90,7 +90,7 @@ The following remain in scope for "full parity":
 - [ ] Preview request / answer parity
 - [ ] Shared-files and shared-directories browsing parity
 - [ ] Chat and chat-captcha parity
-- [ ] Active ED2K notes search parity
+- [x] Active ED2K notes search parity
 - [ ] Broader downloader scheduler parity where stock `v0.72a` behavior depends
       on A4AF / global scheduling decisions
 - [ ] Broader `ServerSocket.cpp` parity beyond the current focused subset
@@ -331,6 +331,15 @@ notes search path instead of failing as unwired. Result batches preserve the
 coordinator-requested protocol label so ED2K notes jobs remain distinguishable
 from direct Kad notes jobs. Preview request/answer plus shared-files and
 shared-directories browsing remain open.
+
+Later on **May 2, 2026**, the manifest-backed
+`ed2k.cell.notes.search.private.v1` gate passed against the private eMule
+harness triplet after rebuilding the Rust agent. The run produced active
+`KADEMLIA2_SEARCH_NOTES_REQ` evidence, notes-publish evidence, one ED2K-labeled
+result batch, and the expected synthetic note record for the deterministic
+fixture. That closes the active ED2K notes-search blocker while leaving preview,
+shared browsing, chat/captcha truthfulness, and broader note-result modeling as
+separate backlog work.
 
 ## Validation Standard
 

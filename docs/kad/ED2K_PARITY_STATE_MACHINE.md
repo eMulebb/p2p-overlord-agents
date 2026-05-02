@@ -55,7 +55,9 @@ And across the main live-mode dimensions:
 - ED2K server sessions are intentionally partial: they are sufficient for the
   current search and source-search workflow, but they do not yet claim the full
   `ServerSocket.cpp` feature surface.
-- active ED2K notes search is still missing from the agent dispatch path.
+- active ED2K notes search now reuses the stock-aligned Kad notes transport and
+  preserves ED2K-labeled result batches; richer note-author result modeling is
+  still pending.
 
 ## Core State Machine Axes
 
