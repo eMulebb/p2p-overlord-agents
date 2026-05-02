@@ -341,6 +341,10 @@ fixture. That closes the active ED2K notes-search blocker while leaving preview,
 shared browsing, chat/captcha truthfulness, and broader note-result modeling as
 separate backlog work.
 
+The runnable `ed2k.campaign.surface.v1` campaign now anchors `ITEM_035` with
+the notes-search cell as its first required member. Preview and shared-browsing
+cells should be added to that campaign as they become runnable.
+
 ## Validation Standard
 
 Every milestone on this tracker should be validated with all of:
