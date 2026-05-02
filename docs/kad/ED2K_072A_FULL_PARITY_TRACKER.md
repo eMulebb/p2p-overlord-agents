@@ -290,6 +290,9 @@ verified upload bytes and compressed-part serving through the real obfuscated
 ED2K TCP transport, and
 `ed2k.cell.listener.plaintext.inbound.serving.resume.private.v1` now proves
 partial upload reconnect and resumed byte-range serving by peer hello identity.
+The resume lane now also has runnable manifest-backed cells for downloader
+partial-piece resume and listener upload resume across plaintext and obfuscated
+ED2K TCP, composed under `ed2k.campaign.resume.v1`.
 Durable credit weighting and stock harness/live queue evidence remain open
 before this checklist item can be closed.
 
