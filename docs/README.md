@@ -61,6 +61,9 @@ Shared protocol reference docs currently reused by the ED2K work:
 
 ## Repo Guards
 
+- Shared workspace quality and opportunistic-refactoring policy lives in
+  `../../p2p-overlord-tooling/docs/WORKSPACE_POLICY.md`; this section keeps the
+  Rust-specific guard notes.
 - From `../p2p-overlord-tooling`, run
   `python -m overlord_tooling guard-tracked-files --repo-root ../p2p-overlord-agents`
   to validate tracked files for local path leaks and configured personal-name
