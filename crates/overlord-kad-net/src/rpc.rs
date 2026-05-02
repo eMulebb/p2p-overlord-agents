@@ -19,8 +19,6 @@ pub use observability::{
     RpcWorkClassSnapshot,
 };
 
-#[cfg(test)]
-use crate::error::NetError;
 use crate::obfuscation::ObfuscationLayer;
 use crate::rate_limit::RateLimiter;
 use crate::tracker::{OutboundRequestTracker, PacketTracker};
