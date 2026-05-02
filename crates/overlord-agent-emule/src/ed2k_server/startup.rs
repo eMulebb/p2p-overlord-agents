@@ -21,7 +21,7 @@ use super::{
     CT_EMULE_VERSION, CT_NAME, CT_SERVER_FLAGS, CT_SERVER_UDPSEARCH_FLAGS, CT_VERSION,
     ED2K_FILETYPE_ARCHIVE, ED2K_FILETYPE_AUDIO, ED2K_FILETYPE_DOCUMENT, ED2K_FILETYPE_PROGRAM,
     ED2K_FILETYPE_VIDEO, EDONKEY_VERSION, EMULE_VERSION_MAJOR, EMULE_VERSION_MINOR,
-    EMULE_VERSION_UPDATE, FT_FILENAME, FT_FILESIZE, FT_FILETYPE, HELLO_NICKNAME,
+    EMULE_VERSION_UPDATE, FT_FILENAME, FT_FILESIZE, FT_FILESIZE_HI, FT_FILETYPE, HELLO_NICKNAME,
     OFFER_FILE_COMPLETE_SENTINEL_CLIENT_ID, OFFER_FILE_COMPLETE_SENTINEL_CLIENT_PORT,
     OFFER_FILE_SAMPLE_HASH, OFFER_FILE_SAMPLE_NAME, OFFER_FILE_SAMPLE_SIZE,
     OFFER_FILE_SEARCH_SETTLE_DELAY, OP_GETSERVERLIST, OP_GETSOURCES, OP_GETSOURCES_OBFU,
@@ -75,12 +75,18 @@ pub(super) fn encode_offer_files_payload(
             .to_le_bytes(),
     );
     for (file_hash, file_name, file_size, file_type) in offered_files {
+        let lower_file_size = file_size as u32;
+        let upper_file_size = u32::try_from(file_size >> 32).unwrap_or(u32::MAX);
+        let tag_count = if upper_file_size == 0 { 3u32 } else { 4u32 };
         payload.extend_from_slice(&file_hash);
         payload.extend_from_slice(&advertised_client_id.to_le_bytes());
         payload.extend_from_slice(&advertised_client_port.to_le_bytes());
-        payload.extend_from_slice(&3u32.to_le_bytes());
+        payload.extend_from_slice(&tag_count.to_le_bytes());
         push_short_string_tag(&mut payload, FT_FILENAME, &file_name);
-        push_short_u32_tag(&mut payload, FT_FILESIZE, file_size);
+        push_short_u32_tag(&mut payload, FT_FILESIZE, lower_file_size);
+        if upper_file_size != 0 {
+            push_short_u32_tag(&mut payload, FT_FILESIZE_HI, upper_file_size);
+        }
         push_short_u8_tag(&mut payload, FT_FILETYPE, file_type);
     }
     payload
@@ -179,7 +185,7 @@ pub(super) fn source_request_opcode(connect_options: u8, server_flags: Option<u3
     }
 }
 
-fn offered_files_catalog(shared_catalog: &[Ed2kSharedEntry]) -> Vec<([u8; 16], String, u32, u8)> {
+fn offered_files_catalog(shared_catalog: &[Ed2kSharedEntry]) -> Vec<([u8; 16], String, u64, u8)> {
     let mut offered_files = shared_catalog
         .iter()
         .filter_map(popular_hash_offer_file)
@@ -189,7 +195,7 @@ fn offered_files_catalog(shared_catalog: &[Ed2kSharedEntry]) -> Vec<([u8; 16], S
         offered_files.push((
             OFFER_FILE_SAMPLE_HASH,
             OFFER_FILE_SAMPLE_NAME.to_string(),
-            OFFER_FILE_SAMPLE_SIZE,
+            u64::from(OFFER_FILE_SAMPLE_SIZE),
             ED2K_FILETYPE_PROGRAM,
         ));
     }
@@ -202,13 +208,12 @@ pub(super) fn offer_files_catalog_fingerprint(shared_catalog: &[Ed2kSharedEntry]
     hasher.finish()
 }
 
-fn popular_hash_offer_file(hash: &Ed2kSharedEntry) -> Option<([u8; 16], String, u32, u8)> {
+fn popular_hash_offer_file(hash: &Ed2kSharedEntry) -> Option<([u8; 16], String, u64, u8)> {
     let file_hash = hash.parsed_hash().ok()?;
-    let file_size = u32::try_from(hash.file_size).unwrap_or(u32::MAX);
     Some((
         file_hash.0,
         hash.canonical_name.clone(),
-        file_size,
+        hash.file_size,
         ed2k_offer_file_type(&hash.canonical_name),
     ))
 }

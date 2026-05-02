@@ -271,6 +271,13 @@ The same truthfulness pass also cleared comment support in
 that AICH, source exchange, secure ident, no-shared-files, and no-preview bits
 stay intentional while unsupported comments and preview remain de-advertised.
 
+The server-session advert audit also found that `OP_LOGINREQUEST` truthfully
+advertises large-file capability, but the shared-file offer path had still been
+saturating large advertised sizes into the legacy low 32-bit file-size tag.
+`OP_OFFERFILES` now emits the stock high-size tag for files larger than 4 GiB,
+and regression coverage asserts that large shared-file adverts no longer lose
+their upper size bits.
+
 Also on **May 2, 2026**, `ITEM_033` moved into its first UploadQueue parity
 slice. The inbound listener queue no longer ranks and promotes waiters by FIFO
 position alone: it now uses a deterministic score path with waiting age,

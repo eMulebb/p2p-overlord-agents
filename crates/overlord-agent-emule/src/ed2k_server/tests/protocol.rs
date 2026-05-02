@@ -329,6 +329,51 @@ fn offer_files_payload_matches_oracle_search_session_sample() {
 }
 
 #[test]
+fn offer_files_payload_advertises_large_file_size_truthfully() {
+    let large_size = (5u64 << 32) + 12_345;
+    let shared_catalog = vec![Ed2kSharedEntry {
+        file_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        canonical_name: "large-shared-file.iso".to_string(),
+        file_size: large_size,
+        verified_complete: true,
+        verified_ranges: Vec::new(),
+        compatibility_hint: false,
+        source_count_hint: None,
+        aich_root: None,
+    }];
+    let payload = encode_offer_files_payload(
+        &shared_catalog,
+        Some(0x521B_5895),
+        46671,
+        Some(SERVER_TCP_FLAG_LARGEFILES),
+    );
+
+    assert_eq!(u32::from_le_bytes(payload[0..4].try_into().unwrap()), 1);
+    let tag_count_offset = 4 + 16 + 4 + 2;
+    assert_eq!(
+        u32::from_le_bytes(
+            payload[tag_count_offset..tag_count_offset + 4]
+                .try_into()
+                .unwrap()
+        ),
+        4
+    );
+    assert_eq!(
+        short_u32_tag_value(&payload, FT_FILESIZE),
+        Some(large_size as u32)
+    );
+    assert_eq!(
+        short_u32_tag_value(&payload, FT_FILESIZE_HI),
+        Some((large_size >> 32) as u32)
+    );
+    assert_ne!(
+        short_u32_tag_value(&payload, FT_FILESIZE),
+        Some(u32::MAX),
+        "large-file offers must not saturate the low size tag"
+    );
+}
+
+#[test]
 fn offer_files_fingerprint_changes_when_shared_catalog_changes() {
     let base_catalog = vec![Ed2kSharedEntry {
         file_hash: hex::encode(OFFER_FILE_SAMPLE_HASH),
@@ -356,6 +401,15 @@ fn offer_files_fingerprint_changes_when_shared_catalog_changes() {
         offer_files_catalog_fingerprint(&base_catalog),
         offer_files_catalog_fingerprint(&expanded_catalog)
     );
+}
+
+fn short_u32_tag_value(payload: &[u8], tag_name: u8) -> Option<u32> {
+    let header = [TAG_SHORT_NAME_MASK | TAGTYPE_UINT32, tag_name];
+    let offset = payload
+        .windows(header.len())
+        .position(|window| window == header)?;
+    let value = payload.get(offset + header.len()..offset + header.len() + 4)?;
+    Some(u32::from_le_bytes(value.try_into().unwrap()))
 }
 
 #[test]
