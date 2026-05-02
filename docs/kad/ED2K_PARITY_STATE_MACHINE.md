@@ -339,11 +339,17 @@ Do not collapse these buckets:
 
 ## Current Priorities
 
-1. replace FIFO upload queue behavior with stock-eMule-like queue scoring and slot rotation
-2. extend the new adaptive pending-block window into fuller eMule-style scheduler and A4AF control flow
-3. extend callback parity across direct UDP, server callback, and Kad callback branches
-4. wire active ED2K notes search and the remaining targeted server-session surface
-5. keep real-network and private-scenario evidence current for both downloader and listener roles
+1. close `ITEM_031` by rerunning the large-file realnet AICH gate while keeping
+   the local stock-fixture AICH tests green
+2. make every still-advertised non-obsolete ED2K feature truthful, starting
+   with chat/captcha capability adverts
+3. replace FIFO upload queue behavior with stock-eMule-like queue scoring,
+   credit weighting, LowID handling, and slot rotation
+4. extend callback parity across direct UDP, server callback, Kad callback,
+   buddy setup, and firewalled buddy tags
+5. add preview, shared-files/shared-directories browsing, active ED2K notes
+   search, fuller downloader scheduling, and broader `ServerSocket.cpp`
+   behavior in that order
 
 ## Code Ownership
 

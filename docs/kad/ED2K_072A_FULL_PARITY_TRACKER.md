@@ -77,8 +77,11 @@ The following remain in scope for "full parity":
       compressed-part transfer path
 - [x] Modern AICH transport and verifier acceptance on the active
       `FileIdentifier` / `OP_HASHSETREQUEST2` / `OP_HASHSETANSWER2` path
-- [ ] Stock-truthful local AICH root + part-hash generation for locally
-      completed payloads without relying on peer-supplied AICH
+- [x] Stock-truthful local AICH root + part-hash generation for the tracked
+      deterministic tracing-harness fixture and local-ingest path without
+      relying on peer-supplied AICH
+- [ ] Fresh large-file real-network evidence that the locally generated AICH
+      identity remains truthful outside the private harness matrix
 - [ ] Stock `UploadQueue.cpp`-style credit, score, LowID, and friend-slot
       behavior
 - [ ] Full buddy / callback matrix and buddy-tag parity for firewalled mode
@@ -115,12 +118,12 @@ The active next milestone is:
 
 1. keep the network-learned AICH identity authoritative wherever the active
    path has already validated it
-2. align the local AICH builder with the stock tracing harness so locally
-   completed payloads generate the same root and part-hash set without
+2. keep the local AICH builder aligned with the stock tracing harness fixture
+   so completed payloads generate the same root and part-hash set without
    peer-supplied AICH
 3. keep the deterministic private large-file loopback gates green on the direct
    ED2K and Kad-discovered paths while the builder changes land
-4. rerun the dedicated large-file realnet scenario until the same stock-truthful
+4. rerun the dedicated large-file realnet scenario until the stock-truthful
    local generation path also stays green outside the local harness matrix
 5. extend the same truthfulness rule to every still-advertised non-obsolete
    ED2K feature that remains unimplemented, starting with chat-captcha
@@ -244,8 +247,31 @@ also green for the active modern path:
   [eMule_Verbose.log](</C:/tmp/p2p-overlord/overlord-tooling/runs/kad.agent.emule-harness.download.private.large.v1/kad.agent.emule-harness.download.private.large.v1-20260418-235210/downloader-harness-profile/logs/eMule_Verbose.log>)
 
 This closes the previous reverse-Kad obfuscated transport blocker. The
-remaining `ITEM_031` gap is local AICH generation matching stock for the same
-payload, not active-path transport or verifier acceptance.
+remaining `ITEM_031` gap is fresh large-file real-network evidence for the
+stock-truthful local AICH generation path, not active-path transport, verifier
+acceptance, or the deterministic fixture calculation itself.
+
+As of **May 2, 2026**, tracked unit coverage also asserts the local generation
+side against the deterministic tracing-harness fixture:
+
+- `build_aich_hashset_matches_stock_tracing_harness_large_roundtrip_fixture`
+  checks the expected AICH root and per-part hash set for the 10 MiB large-file
+  fixture
+- `ingest_local_file_marks_payload_complete_with_stock_aich_identity` confirms
+  local ingest persists the same stock AICH identity into the transfer manifest
+- `completed_manifest_preserves_remote_aich_identity_over_local_rebuild` keeps
+  the network-learned AICH identity authoritative when a modern peer already
+  supplied canonical metadata
+
+Also on **May 2, 2026**, the new live closure cell
+`ed2k.cell.modern-aich.plaintext.server-roundtrip.large.realnet.v1` was added
+to make `ITEM_031` evidence runnable through the manifest-backed pytest
+catalog. The first live attempt,
+`ed2k.cell.modern-aich.plaintext.server-roundtrip.large.realnet.v1.plaintext-20260502-152338`,
+failed before network execution because the eMule tracing-harness debug
+directory could not be resolved under the configured eMule workspace. This is
+an environment blocker, not AICH protocol evidence. `ITEM_031` remains open
+until the same cell passes with large-file real-network evidence.
 
 ## Validation Standard
 
