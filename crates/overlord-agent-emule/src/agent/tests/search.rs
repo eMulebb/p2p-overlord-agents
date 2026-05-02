@@ -132,3 +132,9 @@ fn ed2k_user_hash_uses_oracle_emule_markers() {
     assert_eq!(user_hash[5], 0x0E);
     assert_eq!(user_hash[14], 0x6F);
 }
+
+#[test]
+fn notes_search_results_keep_requested_protocol_label() {
+    assert_eq!(notes_result_protocol(Protocol::Kad2), Protocol::Kad2);
+    assert_eq!(notes_result_protocol(Protocol::Ed2k), Protocol::Ed2k);
+}

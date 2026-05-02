@@ -128,6 +128,10 @@ pub(super) fn map_note_result(result: &NoteResult, file_size: u64) -> FileRecord
     }
 }
 
+pub(super) const fn notes_result_protocol(request_protocol: Protocol) -> Protocol {
+    request_protocol
+}
+
 pub(super) async fn do_active_keyword_search(
     dht: &DhtNode,
     indexer_id: Uuid,
@@ -239,6 +243,7 @@ pub(super) async fn do_active_notes_search(
     dht: &DhtNode,
     indexer_id: Uuid,
     job: &SearchJob,
+    result_protocol: Protocol,
     cancel: CancellationToken,
 ) -> Result<SearchRunStats> {
     let file_hash = search_file_hash(job)?;
@@ -260,7 +265,7 @@ pub(super) async fn do_active_notes_search(
                 &callback_client,
                 job.job_id,
                 indexer_id,
-                Protocol::Kad2,
+                result_protocol,
                 std::mem::take(&mut files),
                 &mut stats,
             )
@@ -272,7 +277,7 @@ pub(super) async fn do_active_notes_search(
         &callback_client,
         job.job_id,
         indexer_id,
-        Protocol::Kad2,
+        result_protocol,
         files,
         &mut stats,
     )

@@ -40,7 +40,7 @@ use super::{
     runtime_state::{ActiveSearchHandle, NetworkingConfigApplyOutcome, OverlordAgentEmule},
     search::{
         SearchRunStats, do_active_keyword_search, do_active_notes_search, do_active_source_search,
-        emit_search_event,
+        emit_search_event, notes_result_protocol,
     },
     snoop::{flush_snoop_queue, restore_snoop_queue},
 };
@@ -161,7 +161,14 @@ impl IndexerService for OverlordAgentEmule {
                     do_active_source_search(&dht, indexer_id, &job, cancel.clone()).await
                 }
                 (Protocol::Kad2, SearchKind::Notes) => {
-                    do_active_notes_search(&dht, indexer_id, &job, cancel.clone()).await
+                    do_active_notes_search(
+                        &dht,
+                        indexer_id,
+                        &job,
+                        notes_result_protocol(job.protocol),
+                        cancel.clone(),
+                    )
+                    .await
                 }
                 (Protocol::Ed2k, SearchKind::Keyword) => {
                     let (preferred_endpoint, background_search) = {
@@ -208,7 +215,14 @@ impl IndexerService for OverlordAgentEmule {
                     .await
                 }
                 (Protocol::Ed2k, SearchKind::Notes) => {
-                    Err(anyhow::anyhow!("ED2K notes search is not wired yet"))
+                    do_active_notes_search(
+                        &dht,
+                        indexer_id,
+                        &job,
+                        notes_result_protocol(job.protocol),
+                        cancel.clone(),
+                    )
+                    .await
                 }
             };
 

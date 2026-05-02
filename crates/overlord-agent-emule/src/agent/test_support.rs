@@ -34,6 +34,7 @@ pub(super) use super::publish::{
     source_publish_client_hash, synthetic_file_hash, synthetic_popular_hash,
     synthetic_popular_hashes, synthetic_publish_aich_hash, synthetic_publish_queue_depth,
 };
+pub(super) use super::search::notes_result_protocol;
 pub(super) use super::snoop::{
     build_keyword_snoop_entry, build_notes_snoop_entry, build_source_snoop_entry,
     flush_snoop_queue, restore_snoop_queue,
