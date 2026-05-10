@@ -72,7 +72,7 @@ pub(super) fn decode_file_status_payload(
     let returned_hash = overlord_kad_proto::Ed2kHash::from_bytes(payload[..16].try_into()?);
     let part_count = u16::from_le_bytes([payload[16], payload[17]]);
     let expected_bitfield_len = usize::from(part_count).div_ceil(8);
-    if payload.len() != 18 + expected_bitfield_len {
+    if payload.len() < 18 + expected_bitfield_len {
         anyhow::bail!(
             "invalid OP_FILESTATUS payload size {} for part_count {}",
             payload.len(),

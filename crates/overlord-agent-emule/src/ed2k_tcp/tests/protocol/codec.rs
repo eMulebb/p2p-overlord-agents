@@ -72,6 +72,12 @@ fn file_status_validates_stock_part_count() {
     validate_file_status_part_count(0, file_size).unwrap();
     assert!(validate_file_status_part_count(2, file_size).is_err());
     assert!(decode_file_status_payload(&payload[..18]).is_err());
+
+    payload.extend_from_slice(&[0xAA, 0xBB]);
+    assert_eq!(
+        decode_file_status_payload(&payload).unwrap(),
+        (file_hash, 3)
+    );
 }
 
 #[test]
