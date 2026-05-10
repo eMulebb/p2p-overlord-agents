@@ -187,6 +187,29 @@ pub(super) fn decode_reask_callback_tcp_payload(payload: &[u8]) -> Result<ReaskC
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ChatCaptchaRequest {
+    pub(super) tag_count: u8,
+    pub(super) data_len: usize,
+}
+
+pub(super) fn decode_chat_captcha_request_payload(payload: &[u8]) -> Result<ChatCaptchaRequest> {
+    let Some((&tag_count, data)) = payload.split_first() else {
+        anyhow::bail!("short OP_CHATCAPTCHAREQ payload 0");
+    };
+    Ok(ChatCaptchaRequest {
+        tag_count,
+        data_len: data.len(),
+    })
+}
+
+pub(super) fn decode_chat_captcha_result_payload(payload: &[u8]) -> Result<u8> {
+    let Some((&status, _)) = payload.split_first() else {
+        anyhow::bail!("short OP_CHATCAPTCHARES payload 0");
+    };
+    Ok(status)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PreviewRequest {
     pub(super) file_hash: Ed2kHash,
     pub(super) trailing_len: usize,

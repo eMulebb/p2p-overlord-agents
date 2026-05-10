@@ -43,16 +43,18 @@ mod transport;
 pub(in crate::ed2k_tcp) use codec::{
     PeerSourceExchangeRequest, SourceExchangePeer, decode_aich_file_hash_answer,
     decode_aich_recovery_answer_payload, decode_aich_recovery_request_payload,
-    decode_answer_sources_payload, decode_answer_sources2_payload, decode_client_id_change_payload,
-    decode_compressed_part_fragment, decode_file_description_payload, decode_file_hash_payload,
-    decode_file_status_payload, decode_hashset_answer, decode_hashset_answer2,
-    decode_kad_callback_payload, decode_peer_payload, decode_preview_answer_payload,
-    decode_preview_request_payload, decode_public_ip_answer_payload,
-    decode_reask_callback_tcp_payload, decode_request_filename_answer,
-    decode_request_filename_answer_body, decode_sending_part_payload,
-    encode_aich_file_hash_request, encode_aich_recovery_failure_answer, encode_hashset_request,
-    encode_hashset_request2, encode_multipacket_ext2_request, encode_multipacket_request,
-    encode_packet, encode_port_test_answer, encode_public_ip_answer, encode_request_filename,
+    decode_answer_sources_payload, decode_answer_sources2_payload,
+    decode_chat_captcha_request_payload, decode_chat_captcha_result_payload,
+    decode_client_id_change_payload, decode_compressed_part_fragment,
+    decode_file_description_payload, decode_file_hash_payload, decode_file_status_payload,
+    decode_hashset_answer, decode_hashset_answer2, decode_kad_callback_payload,
+    decode_peer_payload, decode_preview_answer_payload, decode_preview_request_payload,
+    decode_public_ip_answer_payload, decode_reask_callback_tcp_payload,
+    decode_request_filename_answer, decode_request_filename_answer_body,
+    decode_sending_part_payload, encode_aich_file_hash_request,
+    encode_aich_recovery_failure_answer, encode_hashset_request, encode_hashset_request2,
+    encode_multipacket_ext2_request, encode_multipacket_request, encode_packet,
+    encode_port_test_answer, encode_public_ip_answer, encode_request_filename,
     encode_request_parts_batch, encode_request_sources, encode_request_sources2,
     encode_set_req_file_id, encode_start_upload_req, inflate_compressed_part_fragment,
     skip_file_status_body,
@@ -161,6 +163,8 @@ const OP_COMPRESSEDPART_I64: u8 = 0xA1;
 const OP_SENDINGPART_I64: u8 = 0xA2;
 const OP_REQUESTPARTS_I64: u8 = 0xA3;
 const OP_MULTIPACKET_EXT: u8 = 0xA4;
+const OP_CHATCAPTCHAREQ: u8 = 0xA5;
+const OP_CHATCAPTCHARES: u8 = 0xA6;
 const OP_KAD_FWTCPCHECK_ACK: u8 = 0xA8;
 const OP_MULTIPACKET_EXT2: u8 = 0xA9;
 const OP_MULTIPACKETANSWER_EXT2: u8 = 0xB0;

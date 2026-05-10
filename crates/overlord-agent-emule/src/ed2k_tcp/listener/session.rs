@@ -22,6 +22,7 @@ use crate::{
 
 use super::super::codec::{
     decode_aich_recovery_answer_payload, decode_aich_recovery_request_payload,
+    decode_chat_captcha_request_payload, decode_chat_captcha_result_payload,
     decode_client_id_change_payload, decode_file_description_payload, decode_file_hash_payload,
     decode_kad_callback_payload, decode_preview_answer_payload, decode_preview_request_payload,
     decode_public_ip_answer_payload, decode_reask_callback_tcp_payload,
@@ -46,14 +47,14 @@ use super::super::{
     ED2K_CONNECTION_IDLE_TIMEOUT, ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED,
     ED2K_SECURE_IDENT_SIGNATURE_NEEDED, Ed2kHelloIdentity, Ed2kSecureIdent, Ed2kTransport,
     FirewallCheckUdpRequest, OP_AICHANSWER, OP_AICHFILEHASHREQ, OP_AICHREQUEST, OP_BUDDYPING,
-    OP_BUDDYPONG, OP_CALLBACK, OP_CANCELTRANSFER, OP_CHANGE_CLIENT_ID, OP_EDONKEYPROT,
-    OP_EMULEINFO, OP_EMULEINFOANSWER, OP_EMULEPROT, OP_END_OF_DOWNLOAD, OP_FILEDESC,
-    OP_FWCHECKUDPREQ, OP_HASHSETREQUEST, OP_HASHSETREQUEST2, OP_HELLO, OP_HELLOANSWER,
-    OP_KAD_FWTCPCHECK_ACK, OP_MULTIPACKET, OP_MULTIPACKET_EXT, OP_MULTIPACKET_EXT2,
-    OP_OUTOFPARTREQS, OP_PORTTEST, OP_PREVIEWANSWER, OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ,
-    OP_PUBLICKEY, OP_REASKCALLBACKTCP, OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64,
-    OP_REQUESTPREVIEW, OP_REQUESTSOURCES, OP_REQUESTSOURCES2, OP_SECIDENTSTATE, OP_SETREQFILEID,
-    OP_SIGNATURE, OP_STARTUPLOADREQ, apply_server_state,
+    OP_BUDDYPONG, OP_CALLBACK, OP_CANCELTRANSFER, OP_CHANGE_CLIENT_ID, OP_CHATCAPTCHAREQ,
+    OP_CHATCAPTCHARES, OP_EDONKEYPROT, OP_EMULEINFO, OP_EMULEINFOANSWER, OP_EMULEPROT,
+    OP_END_OF_DOWNLOAD, OP_FILEDESC, OP_FWCHECKUDPREQ, OP_HASHSETREQUEST, OP_HASHSETREQUEST2,
+    OP_HELLO, OP_HELLOANSWER, OP_KAD_FWTCPCHECK_ACK, OP_MULTIPACKET, OP_MULTIPACKET_EXT,
+    OP_MULTIPACKET_EXT2, OP_OUTOFPARTREQS, OP_PORTTEST, OP_PREVIEWANSWER, OP_PUBLICIP_ANSWER,
+    OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_REASKCALLBACKTCP, OP_REQUESTFILENAME, OP_REQUESTPARTS,
+    OP_REQUESTPARTS_I64, OP_REQUESTPREVIEW, OP_REQUESTSOURCES, OP_REQUESTSOURCES2,
+    OP_SECIDENTSTATE, OP_SETREQFILEID, OP_SIGNATURE, OP_STARTUPLOADREQ, apply_server_state,
 };
 
 mod shared_file;
@@ -553,6 +554,27 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
                         "file_hash={} dest={}:{} extended_info_len={}",
                         reask.file_hash, reask.dest_ip, reask.dest_port, reask.extended_info_len
                     ),
+                );
+            }
+            (OP_EMULEPROT, OP_CHATCAPTCHAREQ) => {
+                let request = decode_chat_captcha_request_payload(&packet.payload)?;
+                dump_ed2k_tcp_listener_meta(
+                    peer_addr,
+                    Some(transport.mode),
+                    "chat_captcha_request",
+                    format!(
+                        "tag_count={} data_len={}",
+                        request.tag_count, request.data_len
+                    ),
+                );
+            }
+            (OP_EMULEPROT, OP_CHATCAPTCHARES) => {
+                let status = decode_chat_captcha_result_payload(&packet.payload)?;
+                dump_ed2k_tcp_listener_meta(
+                    peer_addr,
+                    Some(transport.mode),
+                    "chat_captcha_result",
+                    format!("status={status}"),
                 );
             }
             (OP_EMULEPROT, OP_PORTTEST) => {

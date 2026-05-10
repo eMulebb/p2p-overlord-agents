@@ -339,6 +339,18 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
         ))
         .await
         .unwrap();
+    stream
+        .write_all(&super::encode_packet(
+            OP_EMULEPROT,
+            OP_CHATCAPTCHAREQ,
+            &[0, 0x42, 0x4D],
+        ))
+        .await
+        .unwrap();
+    stream
+        .write_all(&super::encode_packet(OP_EMULEPROT, OP_CHATCAPTCHARES, &[1]))
+        .await
+        .unwrap();
 
     stream
         .write_all(&super::encode_start_upload_req(&file_hash))

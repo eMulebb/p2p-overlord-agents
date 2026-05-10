@@ -12,17 +12,19 @@ use super::super::{
     ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, ED2K_SECURE_IDENT_SIGNATURE_NEEDED,
     Ed2kFileIdentifier, Ed2kHelloIdentity, Ed2kSecureIdent, Ed2kTransport, OP_ACCEPTUPLOADREQ,
     OP_AICHANSWER, OP_AICHFILEHASHANS, OP_AICHREQUEST, OP_ANSWERSOURCES, OP_ANSWERSOURCES2,
-    OP_BUDDYPING, OP_BUDDYPONG, OP_CALLBACK, OP_CHANGE_CLIENT_ID, OP_COMPRESSEDPART,
-    OP_COMPRESSEDPART_I64, OP_EDONKEYPROT, OP_EMULEINFO, OP_EMULEINFOANSWER, OP_EMULEPROT,
-    OP_END_OF_DOWNLOAD, OP_FILEDESC, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_HASHSETANSWER,
-    OP_HASHSETANSWER2, OP_HELLO, OP_HELLOANSWER, OP_KAD_FWTCPCHECK_ACK, OP_MULTIPACKETANSWER,
-    OP_MULTIPACKETANSWER_EXT2, OP_OUTOFPARTREQS, OP_PORTTEST, OP_PREVIEWANSWER, OP_PUBLICIP_ANSWER,
-    OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_QUEUERANK, OP_QUEUERANKING, OP_REASKCALLBACKTCP,
-    OP_REQFILENAMEANSWER, OP_REQUESTPREVIEW, OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64,
-    OP_SETREQFILEID, OP_SIGNATURE, SourceExchangePeer, begin_secure_ident_probe,
-    build_hello_responses, decode_aich_file_hash_answer, decode_aich_recovery_answer_payload,
+    OP_BUDDYPING, OP_BUDDYPONG, OP_CALLBACK, OP_CHANGE_CLIENT_ID, OP_CHATCAPTCHAREQ,
+    OP_CHATCAPTCHARES, OP_COMPRESSEDPART, OP_COMPRESSEDPART_I64, OP_EDONKEYPROT, OP_EMULEINFO,
+    OP_EMULEINFOANSWER, OP_EMULEPROT, OP_END_OF_DOWNLOAD, OP_FILEDESC, OP_FILEREQANSNOFIL,
+    OP_FILESTATUS, OP_HASHSETANSWER, OP_HASHSETANSWER2, OP_HELLO, OP_HELLOANSWER,
+    OP_KAD_FWTCPCHECK_ACK, OP_MULTIPACKETANSWER, OP_MULTIPACKETANSWER_EXT2, OP_OUTOFPARTREQS,
+    OP_PORTTEST, OP_PREVIEWANSWER, OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_QUEUERANK,
+    OP_QUEUERANKING, OP_REASKCALLBACKTCP, OP_REQFILENAMEANSWER, OP_REQUESTPREVIEW,
+    OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64, OP_SETREQFILEID, OP_SIGNATURE,
+    SourceExchangePeer, begin_secure_ident_probe, build_hello_responses,
+    decode_aich_file_hash_answer, decode_aich_recovery_answer_payload,
     decode_aich_recovery_request_payload, decode_answer_sources_payload,
-    decode_answer_sources2_payload, decode_client_id_change_payload,
+    decode_answer_sources2_payload, decode_chat_captcha_request_payload,
+    decode_chat_captcha_result_payload, decode_client_id_change_payload,
     decode_file_description_payload, decode_file_hash_payload, decode_file_status_payload,
     decode_hashset_answer, decode_hashset_answer2, decode_hello_profile,
     decode_kad_callback_payload, decode_preview_answer_payload, decode_preview_request_payload,
@@ -415,6 +417,27 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                             "file_hash={} dest={}:{} extended_info_len={}",
                             reask.file_hash, reask.dest_ip, reask.dest_port, reask.extended_info_len
                         ),
+                    );
+                }
+                (OP_EMULEPROT, OP_CHATCAPTCHAREQ) => {
+                    let request = decode_chat_captcha_request_payload(&packet.payload)?;
+                    dump_ed2k_tcp_download_meta(
+                        peer_addr,
+                        Some(transport.mode),
+                        "chat_captcha_request",
+                        format!(
+                            "tag_count={} data_len={}",
+                            request.tag_count, request.data_len
+                        ),
+                    );
+                }
+                (OP_EMULEPROT, OP_CHATCAPTCHARES) => {
+                    let status = decode_chat_captcha_result_payload(&packet.payload)?;
+                    dump_ed2k_tcp_download_meta(
+                        peer_addr,
+                        Some(transport.mode),
+                        "chat_captcha_result",
+                        format!("status={status}"),
                     );
                 }
                 (OP_EMULEPROT, OP_PORTTEST) => {

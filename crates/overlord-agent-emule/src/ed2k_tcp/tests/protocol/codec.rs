@@ -116,6 +116,17 @@ fn reask_callback_tcp_decodes_buddy_forwarded_udp_reask_shape() {
 }
 
 #[test]
+fn chat_captcha_packets_decode_minimal_stock_shapes() {
+    let request = decode_chat_captcha_request_payload(&[0, 0x42, 0x4D]).unwrap();
+    assert_eq!(request.tag_count, 0);
+    assert_eq!(request.data_len, 2);
+
+    assert_eq!(decode_chat_captcha_result_payload(&[2]).unwrap(), 2);
+    assert!(decode_chat_captcha_request_payload(&[]).is_err());
+    assert!(decode_chat_captcha_result_payload(&[]).is_err());
+}
+
+#[test]
 fn preview_packets_decode_stock_hash_and_frame_shape() {
     let file_hash = Ed2kHash([0x5E; 16]);
     let mut request_payload = file_hash.0.to_vec();
