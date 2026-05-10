@@ -48,9 +48,10 @@ pub(in crate::ed2k_tcp) use codec::{
     decode_request_filename_answer_body, decode_sending_part_payload,
     encode_aich_file_hash_request, encode_hashset_request, encode_hashset_request2,
     encode_multipacket_ext2_request, encode_multipacket_request, encode_packet,
-    encode_public_ip_answer, encode_request_filename, encode_request_parts_batch,
-    encode_request_sources, encode_request_sources2, encode_set_req_file_id,
-    encode_start_upload_req, inflate_compressed_part_fragment, skip_file_status_body,
+    encode_port_test_answer, encode_public_ip_answer, encode_request_filename,
+    encode_request_parts_batch, encode_request_sources, encode_request_sources2,
+    encode_set_req_file_id, encode_start_upload_req, inflate_compressed_part_fragment,
+    skip_file_status_body,
 };
 #[cfg(test)]
 #[allow(unused_imports)]
@@ -149,6 +150,7 @@ const OP_MULTIPACKET_EXT2: u8 = 0xA9;
 const OP_MULTIPACKETANSWER_EXT2: u8 = 0xB0;
 const OP_HASHSETREQUEST2: u8 = 0xB1;
 const OP_HASHSETANSWER2: u8 = 0xB2;
+const OP_PORTTEST: u8 = 0xFE;
 const OP_EMULEINFO: u8 = 0x01;
 const OP_EMULEINFOANSWER: u8 = 0x02;
 const OP_PUBLICKEY: u8 = 0x85;

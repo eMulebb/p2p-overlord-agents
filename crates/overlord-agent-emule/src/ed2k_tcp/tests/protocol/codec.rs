@@ -40,6 +40,15 @@ fn public_ip_answer_uses_stock_four_byte_ipv4_payload() {
 }
 
 #[test]
+fn port_test_answer_matches_stock_edonkey_ack_shape() {
+    let packet = encode_port_test_answer();
+
+    assert_eq!(packet[0], OP_EDONKEYPROT);
+    assert_eq!(packet[5], OP_PORTTEST);
+    assert_eq!(&packet[6..], &[0x12]);
+}
+
+#[test]
 fn file_identifier_roundtrip_matches_stock_md4_plus_size_shape() {
     let identifier = super::Ed2kFileIdentifier {
         file_hash: Ed2kHash([0xAB; 16]),

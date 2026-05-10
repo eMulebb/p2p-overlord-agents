@@ -22,7 +22,7 @@ use crate::{
 
 use super::super::codec::{
     decode_file_hash_payload, decode_public_ip_answer_payload, encode_file_req_ans_nofil,
-    encode_packet, encode_public_ip_answer,
+    encode_packet, encode_port_test_answer, encode_public_ip_answer,
 };
 use super::super::download::{
     DownloadSessionOptions, Ed2kPeerDownloadOutcome, drive_download_session,
@@ -43,7 +43,7 @@ use super::super::{
     ED2K_SECURE_IDENT_SIGNATURE_NEEDED, Ed2kHelloIdentity, Ed2kSecureIdent, Ed2kTransport,
     FirewallCheckUdpRequest, OP_AICHFILEHASHREQ, OP_CANCELTRANSFER, OP_EDONKEYPROT, OP_EMULEINFO,
     OP_EMULEINFOANSWER, OP_EMULEPROT, OP_FWCHECKUDPREQ, OP_HASHSETREQUEST, OP_HASHSETREQUEST2,
-    OP_HELLO, OP_HELLOANSWER, OP_MULTIPACKET, OP_MULTIPACKET_EXT, OP_MULTIPACKET_EXT2,
+    OP_HELLO, OP_HELLOANSWER, OP_MULTIPACKET, OP_MULTIPACKET_EXT, OP_MULTIPACKET_EXT2, OP_PORTTEST,
     OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_REQUESTFILENAME, OP_REQUESTPARTS,
     OP_REQUESTPARTS_I64, OP_REQUESTSOURCES, OP_REQUESTSOURCES2, OP_SECIDENTSTATE, OP_SETREQFILEID,
     OP_SIGNATURE, OP_STARTUPLOADREQ, apply_server_state,
@@ -486,6 +486,18 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
                     "public_ip_answer",
                     format!("public_ip={public_ip}"),
                 );
+            }
+            (OP_EMULEPROT, OP_PORTTEST) => {
+                debug!(
+                    "received eMule OP_PORTTEST from {peer_addr} transport={}",
+                    transport.mode.as_str()
+                );
+                let reply = encode_port_test_answer();
+                dump_ed2k_tcp_listener_send(peer_addr, transport.mode, "port_test", &reply);
+                transport
+                    .write_all(&reply)
+                    .await
+                    .with_context(|| format!("failed to send OP_PORTTEST to {peer_addr}"))?;
             }
             (OP_EMULEPROT, OP_FWCHECKUDPREQ) => {
                 debug!(
