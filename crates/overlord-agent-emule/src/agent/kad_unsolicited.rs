@@ -402,20 +402,24 @@ pub(super) async fn handle_unsolicited_packet(
             }
         }
         KadPacket::PublishNotesReq(req) => {
-            {
+            let load = if let IpAddr::V4(ip) = from.ip() {
                 let mut store = context.local_store.lock().await;
-                store.record_notes_publish(req.target, req.publisher_id, &req.tags, Utc::now());
+                store.record_notes_publish(req.target, req.publisher_id, ip, &req.tags, Utc::now())
+            } else {
+                None
+            };
+            if let Some(load) = load {
+                let _ = dht
+                    .send_packet(
+                        from,
+                        &KadPacket::PublishRes(overlord_kad_proto::PublishRes {
+                            target: req.target,
+                            load,
+                            options: None,
+                        }),
+                    )
+                    .await;
             }
-            let _ = dht
-                .send_packet(
-                    from,
-                    &KadPacket::PublishRes(overlord_kad_proto::PublishRes {
-                        target: req.target,
-                        load: 0,
-                        options: None,
-                    }),
-                )
-                .await;
         }
         _ => {}
     }

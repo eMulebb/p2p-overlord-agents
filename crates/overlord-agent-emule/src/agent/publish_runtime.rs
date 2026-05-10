@@ -326,11 +326,12 @@ async fn seed_popular_impl(
         }
         if context.notes_publish_enabled {
             let notes_tags = build_notes_publish_tags(&hash.canonical_name, hash.size);
-            {
+            if let IpAddr::V4(notes_ip) = bind_addr.ip() {
                 let mut store = context.local_store.lock().await;
                 store.record_notes_publish(
                     NodeId::from_be_bytes(file_hash.0),
                     notes_publish_identity,
+                    notes_ip,
                     &notes_tags,
                     Utc::now(),
                 );

@@ -15,6 +15,7 @@ use overlord_kad_proto::{
 use crate::config::KadConfig;
 
 const STOCK_MAX_SOURCES_PER_FILE: usize = 1000;
+const STOCK_MAX_NOTES_PER_FILE: usize = 150;
 const STOCK_MAX_KEYWORD_INDEX: usize = 50_000;
 const STOCK_MAX_KEYWORD_ENTRIES: usize = 60_000;
 const STOCK_HOT_KEYWORD_REPUBLISH_MARGIN: usize = 5_000;
@@ -72,6 +73,7 @@ struct StoredNotesPublish {
     observed_at: DateTime<Utc>,
     target: NodeId,
     publisher_id: NodeId,
+    publisher_ip: Ipv4Addr,
     tags: Vec<Tag>,
     dedup_key: String,
 }
@@ -194,26 +196,33 @@ impl KadLocalStore {
         &mut self,
         target: NodeId,
         publisher_id: NodeId,
+        publisher_ip: Ipv4Addr,
         tags: &[Tag],
         observed_at: DateTime<Utc>,
-    ) {
+    ) -> Option<u8> {
         if !self.config.enabled {
-            return;
+            return None;
+        }
+        if publisher_ip.octets() == [0, 0, 0, 0] || !has_stock_note_tags(tags) {
+            return None;
         }
         purge_expired(&mut self.notes_entries, self.config.notes_ttl, observed_at);
-        let dedup_key = notes_dedup_key(target, publisher_id, tags);
-        upsert_entry(
+        let load =
+            stock_notes_publish_load(&self.notes_entries, target, publisher_id, publisher_ip);
+        let dedup_key = notes_dedup_key(target, publisher_id, publisher_ip);
+        upsert_notes_entry(
             &mut self.notes_entries,
             self.config.notes_capacity,
-            dedup_key.clone(),
             StoredNotesPublish {
                 observed_at,
                 target,
                 publisher_id,
+                publisher_ip,
                 tags: tags.to_vec(),
                 dedup_key,
             },
         );
+        Some(load)
     }
 
     pub(crate) fn keyword_search_response(
@@ -291,6 +300,7 @@ impl KadLocalStore {
         let results = self
             .notes_entries
             .iter()
+            .rev()
             .filter(|entry| entry.target == request.target)
             .filter(|entry| {
                 stored_file_size(&entry.tags)
@@ -544,6 +554,45 @@ fn upsert_source_entry(
     entries.push(entry);
 }
 
+fn upsert_notes_entry(
+    entries: &mut Vec<StoredNotesPublish>,
+    capacity: usize,
+    entry: StoredNotesPublish,
+) {
+    if let Some(existing) = entries.iter_mut().find(|candidate| {
+        candidate.target == entry.target
+            && (candidate.publisher_ip == entry.publisher_ip
+                || candidate.publisher_id == entry.publisher_id)
+    }) {
+        *existing = entry;
+        return;
+    }
+
+    if entries
+        .iter()
+        .filter(|candidate| candidate.target == entry.target)
+        .count()
+        > STOCK_MAX_NOTES_PER_FILE
+        && let Some((oldest_index, _)) = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| candidate.target == entry.target)
+            .min_by_key(|(_, candidate)| candidate.observed_at())
+    {
+        entries.remove(oldest_index);
+    }
+
+    if entries.len() >= capacity
+        && let Some((oldest_index, _)) = entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, candidate)| candidate.observed_at())
+    {
+        entries.remove(oldest_index);
+    }
+    entries.push(entry);
+}
+
 fn stock_source_publish_load(
     entries: &[StoredSourcePublish],
     target: NodeId,
@@ -578,6 +627,39 @@ fn source_replacement_matches(
             && candidate.source_ip == source_ip
             && (candidate.source_tcp_port == source_tcp_port
                 || candidate.source_udp_port == source_udp_port)
+    })
+}
+
+fn stock_notes_publish_load(
+    entries: &[StoredNotesPublish],
+    target: NodeId,
+    publisher_id: NodeId,
+    publisher_ip: Ipv4Addr,
+) -> u8 {
+    let target_count = entries
+        .iter()
+        .filter(|candidate| candidate.target == target)
+        .count();
+    if target_count == 0 {
+        return 1;
+    }
+    if target_count > STOCK_MAX_NOTES_PER_FILE
+        && !notes_replacement_matches(entries, target, publisher_id, publisher_ip)
+    {
+        return 100;
+    }
+    (target_count * 100 / STOCK_MAX_NOTES_PER_FILE) as u8
+}
+
+fn notes_replacement_matches(
+    entries: &[StoredNotesPublish],
+    target: NodeId,
+    publisher_id: NodeId,
+    publisher_ip: Ipv4Addr,
+) -> bool {
+    entries.iter().any(|candidate| {
+        candidate.target == target
+            && (candidate.publisher_ip == publisher_ip || candidate.publisher_id == publisher_id)
     })
 }
 
@@ -697,34 +779,23 @@ fn source_dedup_key(
     format!("source:{target}:{source_ip}:{source_tcp_port}:{source_udp_port}")
 }
 
-fn notes_dedup_key(target: NodeId, publisher_id: NodeId, tags: &[Tag]) -> String {
-    format!("notes:{target}:{publisher_id}:{}", tag_fingerprint(tags))
+fn has_stock_note_tags(tags: &[Tag]) -> bool {
+    tags.iter().any(|tag| match (&tag.name, &tag.value) {
+        (TagName::Short(name), TagValue::String(value)) if *name == tag_name::FILENAME => {
+            !value.is_empty()
+        }
+        (TagName::Short(name), _) if *name == tag_name::FILESIZE => {
+            stored_file_size(std::slice::from_ref(tag))
+                .map(|size| size > 0)
+                .unwrap_or(false)
+        }
+        (TagName::Short(name), _) => *name != tag_name::FILENAME && *name != tag_name::FILESIZE,
+        (TagName::Long(_), _) => true,
+    })
 }
 
-fn tag_fingerprint(tags: &[Tag]) -> String {
-    tags.iter()
-        .map(|tag| {
-            let name = match &tag.name {
-                TagName::Short(value) => format!("short:{value}"),
-                TagName::Long(value) => format!("long:{value}"),
-            };
-            let value = match &tag.value {
-                TagValue::Hash(value) => format!("hash:{value}"),
-                TagValue::String(value) => format!("string:{value}"),
-                TagValue::UInt(value) => format!("uint:{value}"),
-                TagValue::U64(value) => format!("u64:{value}"),
-                TagValue::U32(value) => format!("u32:{value}"),
-                TagValue::U16(value) => format!("u16:{value}"),
-                TagValue::U8(value) => format!("u8:{value}"),
-                TagValue::Float(value) => format!("float:{value:?}"),
-                TagValue::Bool(value) => format!("bool:{value}"),
-                TagValue::Blob(value) => format!("blob:{}", hex::encode(value)),
-                TagValue::SmallBlob(value) => format!("small_blob:{}", hex::encode(value)),
-            };
-            format!("{name}={value}")
-        })
-        .collect::<Vec<_>>()
-        .join("|")
+fn notes_dedup_key(target: NodeId, publisher_id: NodeId, publisher_ip: Ipv4Addr) -> String {
+    format!("notes:{target}:{publisher_id}:{publisher_ip}")
 }
 
 #[cfg(test)]
@@ -1259,7 +1330,16 @@ mod tests {
             Tag::new_short(tag_name::DESCRIPTION, TagValue::String("good".into())),
         ];
 
-        store.record_notes_publish(target, publisher_id, &tags, ts(1));
+        assert_eq!(
+            store.record_notes_publish(
+                target,
+                publisher_id,
+                Ipv4Addr::new(1, 1, 1, 1),
+                &tags,
+                ts(1),
+            ),
+            Some(1)
+        );
 
         let response = store
             .notes_search_response(
@@ -1283,6 +1363,89 @@ mod tests {
             ts(10),
         );
         assert!(missing.is_none());
+    }
+
+    #[test]
+    fn notes_publish_rejects_empty_stock_identity_or_tags() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([7; 16]);
+        let publisher_id = NodeId::from_bytes([8; 16]);
+
+        assert_eq!(
+            store.record_notes_publish(
+                target,
+                publisher_id,
+                Ipv4Addr::new(0, 0, 0, 0),
+                &[Tag::filesize(900)],
+                ts(1),
+            ),
+            None
+        );
+        assert_eq!(
+            store
+                .record_notes_publish(target, publisher_id, Ipv4Addr::new(1, 1, 1, 1), &[], ts(1),),
+            None
+        );
+        assert_eq!(store.notes_entry_count(), 0);
+    }
+
+    #[test]
+    fn notes_publish_replaces_same_ip_or_publisher_like_stock() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([7; 16]);
+        let first_publisher = NodeId::from_bytes([8; 16]);
+        let second_publisher = NodeId::from_bytes([9; 16]);
+        let first_tags = vec![
+            Tag::filesize(900),
+            Tag::new_short(tag_name::DESCRIPTION, TagValue::String("first".into())),
+        ];
+        let replacement_tags = vec![
+            Tag::filesize(900),
+            Tag::new_short(tag_name::DESCRIPTION, TagValue::String("second".into())),
+        ];
+
+        assert_eq!(
+            store.record_notes_publish(
+                target,
+                first_publisher,
+                Ipv4Addr::new(1, 1, 1, 1),
+                &first_tags,
+                ts(1),
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            store.record_notes_publish(
+                target,
+                second_publisher,
+                Ipv4Addr::new(1, 1, 1, 1),
+                &replacement_tags,
+                ts(2),
+            ),
+            Some(0)
+        );
+
+        assert_eq!(store.notes_entry_count(), 1);
+        let response = store
+            .notes_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchNotesReq { target, size: 900 },
+                10,
+                ts(3),
+            )
+            .expect("notes response");
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(
+            response.results[0].entry_id,
+            Ed2kHash::from_bytes(second_publisher.to_be_bytes())
+        );
+        assert!(response.results[0].tags.iter().any(|tag| {
+            matches!(
+                (&tag.name, &tag.value),
+                (TagName::Short(name), TagValue::String(value))
+                    if *name == tag_name::DESCRIPTION && value == "second"
+            )
+        }));
     }
 
     #[test]
