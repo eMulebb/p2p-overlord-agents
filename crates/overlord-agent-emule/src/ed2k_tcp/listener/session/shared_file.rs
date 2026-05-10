@@ -13,12 +13,12 @@ use crate::{
 };
 
 use super::super::super::codec::{
-    SourceExchangePeer, decode_file_hash_payload, decode_hashset_request2,
-    decode_request_sources_payload, encode_aich_file_hash_answer, encode_answer_sources,
-    encode_answer_sources2, encode_file_req_ans_nofil, encode_file_status_complete,
-    encode_hashset_answer, encode_hashset_answer2, encode_multipacket_answer,
-    encode_multipacket_ext2_answer, encode_request_filename_answer, skip_request_filename_ext_info,
-    source_exchange_entry_count,
+    SourceExchangePeer, decode_exact_file_hash_payload, decode_file_hash_payload,
+    decode_hashset_request2, decode_request_sources_payload, encode_aich_file_hash_answer,
+    encode_answer_sources, encode_answer_sources2, encode_file_req_ans_nofil,
+    encode_file_status_complete, encode_hashset_answer, encode_hashset_answer2,
+    encode_multipacket_answer, encode_multipacket_ext2_answer, encode_request_filename_answer,
+    skip_request_filename_ext_info, source_exchange_entry_count,
 };
 use super::super::super::dump::dump_ed2k_tcp_listener_send;
 
@@ -224,7 +224,7 @@ pub(in crate::ed2k_tcp) async fn handle_set_req_file_id(
     peer_addr: SocketAddr,
     payload: &[u8],
 ) -> Result<Option<Ed2kHash>> {
-    let requested = decode_file_hash_payload(payload)?;
+    let requested = decode_exact_file_hash_payload(payload, "OP_SETREQFILEID")?;
     let reply = if transfer_runtime.local_entry(&requested).await?.is_some() {
         encode_file_status_complete(&requested)
     } else {
@@ -244,7 +244,7 @@ pub(in crate::ed2k_tcp) async fn handle_hashset_request(
     peer_addr: SocketAddr,
     payload: &[u8],
 ) -> Result<Option<Ed2kHash>> {
-    let requested = decode_file_hash_payload(payload)?;
+    let requested = decode_exact_file_hash_payload(payload, "OP_HASHSETREQUEST")?;
     let reply = if transfer_runtime.local_entry(&requested).await?.is_some() {
         if let Some(hashset) = transfer_runtime.md4_hashset(&requested).await? {
             encode_hashset_answer(&requested, &hashset)?

@@ -25,13 +25,14 @@ use super::super::codec::{
     decode_chat_captcha_request_payload, decode_chat_captcha_result_payload,
     decode_client_id_change_payload, decode_client_message_payload,
     decode_edonkey_queue_rank_payload, decode_emule_queue_ranking_payload,
-    decode_file_description_payload, decode_file_hash_payload, decode_kad_callback_payload,
-    decode_preview_answer_payload, decode_preview_request_payload, decode_public_ip_answer_payload,
-    decode_reask_callback_tcp_payload, decode_shared_dirs_answer_payload,
-    decode_shared_files_answer_payload, decode_shared_files_dir_answer_payload,
-    decode_shared_files_dir_request_payload, encode_aich_recovery_failure_answer,
-    encode_empty_shared_files_answer, encode_file_req_ans_nofil, encode_packet,
-    encode_port_test_answer, encode_public_ip_answer, encode_shared_browse_denied_answer,
+    decode_exact_file_hash_payload, decode_file_description_payload, decode_file_hash_payload,
+    decode_kad_callback_payload, decode_preview_answer_payload, decode_preview_request_payload,
+    decode_public_ip_answer_payload, decode_reask_callback_tcp_payload,
+    decode_shared_dirs_answer_payload, decode_shared_files_answer_payload,
+    decode_shared_files_dir_answer_payload, decode_shared_files_dir_request_payload,
+    encode_aich_recovery_failure_answer, encode_empty_shared_files_answer,
+    encode_file_req_ans_nofil, encode_packet, encode_port_test_answer, encode_public_ip_answer,
+    encode_shared_browse_denied_answer,
 };
 use super::super::download::{
     DownloadSessionOptions, Ed2kPeerDownloadOutcome, drive_download_session,
@@ -295,7 +296,8 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
                 .await?;
             }
             (OP_EDONKEYPROT, OP_STARTUPLOADREQ) => {
-                let requested = decode_file_hash_payload(&packet.payload)?;
+                let requested =
+                    decode_exact_file_hash_payload(&packet.payload, "OP_STARTUPLOADREQ")?;
                 requested_file_hash = Some(requested);
                 let reply = if transfer_runtime.local_entry(&requested).await?.is_some() {
                     upload_queue

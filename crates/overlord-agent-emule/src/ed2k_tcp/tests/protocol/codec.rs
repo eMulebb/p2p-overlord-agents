@@ -75,6 +75,20 @@ fn file_status_validates_stock_part_count() {
 }
 
 #[test]
+fn exact_file_hash_payload_rejects_stock_exact_context_trailing_bytes() {
+    let file_hash = Ed2kHash([0x51; 16]);
+    let mut payload = file_hash.0.to_vec();
+    payload.push(0xAA);
+
+    assert_eq!(
+        decode_exact_file_hash_payload(&file_hash.0, "OP_SETREQFILEID").unwrap(),
+        file_hash
+    );
+    assert!(decode_exact_file_hash_payload(&payload, "OP_SETREQFILEID").is_err());
+    assert_eq!(decode_file_hash_payload(&payload).unwrap(), file_hash);
+}
+
+#[test]
 fn port_test_answer_matches_stock_edonkey_ack_shape() {
     let packet = encode_port_test_answer();
 

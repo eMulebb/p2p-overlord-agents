@@ -139,6 +139,13 @@ pub(super) fn decode_file_hash_payload(payload: &[u8]) -> Result<Ed2kHash> {
     Ok(Ed2kHash::from_bytes(hash))
 }
 
+pub(super) fn decode_exact_file_hash_payload(payload: &[u8], context: &str) -> Result<Ed2kHash> {
+    if payload.len() != 16 {
+        anyhow::bail!("invalid {context} payload size {}", payload.len());
+    }
+    decode_file_hash_payload(payload)
+}
+
 pub(super) fn encode_file_req_ans_nofil(file_hash: &Ed2kHash) -> Vec<u8> {
     encode_packet(OP_EDONKEYPROT, OP_FILEREQANSNOFIL, &file_hash.0)
 }
