@@ -495,8 +495,8 @@ pub(super) fn encode_request_sources2_subpayload() -> [u8; 3] {
 
 pub(super) fn encode_request_sources2(file_hash: &Ed2kHash) -> Vec<u8> {
     let mut payload = Vec::with_capacity(19);
-    payload.extend_from_slice(&file_hash.0);
     payload.extend_from_slice(&encode_request_sources2_subpayload());
+    payload.extend_from_slice(&file_hash.0);
     encode_packet(OP_EMULEPROT, OP_REQUESTSOURCES2, &payload)
 }
 
@@ -908,7 +908,7 @@ pub(super) fn decode_request_sources_payload(opcode: u8, payload: &[u8]) -> Resu
             if payload.len() < 19 {
                 anyhow::bail!("short OP_REQUESTSOURCES2 payload {}", payload.len());
             }
-            Ok((decode_file_hash_payload(payload)?, payload[16]))
+            Ok((decode_file_hash_payload(&payload[3..])?, payload[0]))
         }
         _ => anyhow::bail!("unsupported source request opcode 0x{opcode:02X}"),
     }

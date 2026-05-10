@@ -116,7 +116,7 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
     assert_eq!(source_answer[53], 0);
 
     let mut older_source_request = super::encode_request_sources2(&file_hash);
-    older_source_request[22] = 2;
+    older_source_request[6] = 2;
     stream.write_all(&older_source_request).await.unwrap();
     let older_source_answer =
         read_until_opcode(&mut stream, OP_EMULEPROT, super::OP_ANSWERSOURCES2).await;
@@ -129,7 +129,7 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
     assert_eq!(&older_source_answer[25..29], &[10, 20, 30, 40]);
 
     let mut invalid_source_request = super::encode_request_sources2(&file_hash);
-    invalid_source_request[22] = 0;
+    invalid_source_request[6] = 0;
     stream.write_all(&invalid_source_request).await.unwrap();
 
     let no_sources_manifest = transfer_runtime

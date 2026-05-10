@@ -99,6 +99,24 @@ fn optional_file_hash_payload_matches_stock_debug_prefix_handling() {
 }
 
 #[test]
+fn request_sources2_uses_stock_version_options_hash_order() {
+    let file_hash = Ed2kHash([0x83; 16]);
+    let packet = encode_request_sources2(&file_hash);
+
+    assert_eq!(packet[0], OP_EMULEPROT);
+    assert_eq!(packet[5], OP_REQUESTSOURCES2);
+    assert_eq!(packet[6], ED2K_SOURCE_EXCHANGE2_VERSION);
+    assert_eq!(&packet[7..9], &0u16.to_le_bytes());
+    assert_eq!(&packet[9..25], &file_hash.0);
+
+    assert_eq!(
+        decode_request_sources_payload(OP_REQUESTSOURCES2, &packet[6..]).unwrap(),
+        (file_hash, ED2K_SOURCE_EXCHANGE2_VERSION)
+    );
+    assert!(decode_request_sources_payload(OP_REQUESTSOURCES2, &packet[6..24]).is_err());
+}
+
+#[test]
 fn port_test_answer_matches_stock_edonkey_ack_shape() {
     let packet = encode_port_test_answer();
 
