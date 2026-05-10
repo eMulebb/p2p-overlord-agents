@@ -135,7 +135,7 @@ impl KadLocalStore {
                     observed_at,
                     target,
                     file_hash: entry.hash,
-                    tags: entry.tags.clone(),
+                    tags: stock_stored_publish_tags(&entry.tags),
                     dedup_key,
                 },
             );
@@ -185,7 +185,7 @@ impl KadLocalStore {
                 source_ip,
                 source_tcp_port,
                 source_udp_port,
-                tags: tags.to_vec(),
+                tags: stock_stored_publish_tags(tags),
                 dedup_key,
             },
         );
@@ -218,7 +218,7 @@ impl KadLocalStore {
                 target,
                 publisher_id,
                 publisher_ip,
-                tags: tags.to_vec(),
+                tags: stock_stored_publish_tags(tags),
                 dedup_key,
             },
         );
@@ -338,6 +338,18 @@ fn keyword_entry_matches_restrictive_payload(
         return false;
     };
     matches_restrictive_keyword_payload(&filename, &entry.tags, payload)
+}
+
+fn stock_stored_publish_tags(tags: &[Tag]) -> Vec<Tag> {
+    tags.iter()
+        .filter(|tag| {
+            !matches!(
+                tag.name,
+                TagName::Short(tag_name::PUBLISHINFO | tag_name::KADAICHHASHRESULT)
+            )
+        })
+        .cloned()
+        .collect()
 }
 
 fn is_stock_source_publish(tags: &[Tag]) -> bool {
@@ -1496,6 +1508,43 @@ mod tests {
     }
 
     #[test]
+    fn source_publish_filters_result_only_tags_like_stock() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([3; 16]);
+        let tags = vec![
+            Tag::new_short(tag_name::SOURCETYPE, TagValue::UInt(1)),
+            Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(4662)),
+            Tag::new_short(tag_name::PUBLISHINFO, TagValue::U32(0xFFFF_FFFF)),
+            Tag::new_short(tag_name::KADAICHHASHRESULT, TagValue::SmallBlob(vec![1])),
+        ];
+
+        store.record_source_publish(
+            target,
+            NodeId::from_bytes([4; 16]),
+            Ipv4Addr::new(1, 1, 1, 1),
+            4672,
+            &tags,
+            ts(1),
+        );
+
+        let response = store
+            .source_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchSourceReq {
+                    target,
+                    start_position: 0,
+                    size: 0,
+                },
+                10,
+                ts(2),
+            )
+            .expect("source response");
+        let tag_names = short_tag_names(&response.results[0].tags);
+        assert!(!tag_names.contains(&tag_name::PUBLISHINFO));
+        assert!(!tag_names.contains(&tag_name::KADAICHHASHRESULT));
+    }
+
+    #[test]
     fn source_search_zero_size_matches_known_size_like_stock() {
         let mut store = KadLocalStore::new(config());
         let target = NodeId::from_bytes([3; 16]);
@@ -2043,6 +2092,38 @@ mod tests {
             result_tags[1].value,
             TagValue::UInt(value) if value == 900
         ));
+    }
+
+    #[test]
+    fn notes_publish_filters_result_only_tags_like_stock() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([7; 16]);
+        let tags = vec![
+            Tag::filename("ubuntu linux.iso"),
+            Tag::filesize(123),
+            Tag::new_short(tag_name::PUBLISHINFO, TagValue::U32(0xFFFF_FFFF)),
+            Tag::new_short(tag_name::KADAICHHASHRESULT, TagValue::SmallBlob(vec![1])),
+        ];
+
+        store.record_notes_publish(
+            target,
+            NodeId::from_bytes([8; 16]),
+            Ipv4Addr::new(1, 1, 1, 1),
+            &tags,
+            ts(1),
+        );
+
+        let response = store
+            .notes_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchNotesReq { target, size: 0 },
+                10,
+                ts(2),
+            )
+            .expect("notes response");
+        let tag_names = short_tag_names(&response.results[0].tags);
+        assert!(!tag_names.contains(&tag_name::PUBLISHINFO));
+        assert!(!tag_names.contains(&tag_name::KADAICHHASHRESULT));
     }
 
     #[test]
