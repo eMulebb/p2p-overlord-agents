@@ -205,9 +205,10 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
     assert_eq!(legacy_remaining[0], super::OP_FILESTATUS);
     assert_eq!(&legacy_remaining[1..3], &0u16.to_le_bytes());
     legacy_remaining = &legacy_remaining[3..];
-    assert_eq!(legacy_remaining[0], super::OP_AICHFILEHASHANS);
-    assert_eq!(&legacy_remaining[1..21], &aich_root);
-    assert_eq!(legacy_remaining.len(), 21);
+    assert!(
+        legacy_remaining.is_empty(),
+        "file-identifier peers do not receive deprecated multipacket AICH roots"
+    );
 
     stream
         .write_all(&super::encode_aich_file_hash_request(&file_hash))

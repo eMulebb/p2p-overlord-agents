@@ -117,6 +117,8 @@ pub(in crate::ed2k_tcp) async fn handle_multipacket_request(
     peer_addr: SocketAddr,
     opcode: u8,
     payload: &[u8],
+    peer_supports_aich: bool,
+    peer_supports_file_identifiers: bool,
 ) -> Result<Option<Ed2kHash>> {
     if payload.len() < 16 {
         anyhow::bail!("short OP_MULTIPACKET payload {}", payload.len());
@@ -173,7 +175,9 @@ pub(in crate::ed2k_tcp) async fn handle_multipacket_request(
                 .await?;
             }
             OP_AICHFILEHASHREQ => {
-                include_aich_root = shared_aich_root(&shared);
+                if !peer_supports_file_identifiers && peer_supports_aich {
+                    include_aich_root = shared_aich_root(&shared);
+                }
             }
             _ => {
                 anyhow::bail!("unsupported OP_MULTIPACKET sub-op 0x{sub_opcode:02X}");
@@ -421,9 +425,11 @@ pub(in crate::ed2k_tcp) async fn handle_aich_file_hash_request(
     transport: &mut Ed2kTransport,
     peer_addr: SocketAddr,
     payload: &[u8],
+    peer_supports_aich: bool,
 ) -> Result<Option<Ed2kHash>> {
     let requested = decode_file_hash_payload(payload)?;
-    if let Some(shared) = transfer_runtime.local_entry(&requested).await?
+    if peer_supports_aich
+        && let Some(shared) = transfer_runtime.local_entry(&requested).await?
         && let Some(aich_root) = shared_aich_root(&shared)
     {
         let reply = encode_aich_file_hash_answer(&requested, aich_root);

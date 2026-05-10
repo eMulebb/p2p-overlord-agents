@@ -165,6 +165,8 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
     );
     let mut peer_secure_ident = Ed2kPeerSecureIdentState::default();
     let mut requested_file_hash: Option<Ed2kHash> = None;
+    let mut peer_supports_aich = false;
+    let mut peer_supports_file_identifiers = false;
     let mut peer_upload_identity = upload_peer_identity_from_socket(peer_addr);
     let mut upload_queue = ListenerUploadQueue::new();
 
@@ -190,6 +192,8 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
         match (packet.protocol, packet.opcode) {
             (OP_EDONKEYPROT, OP_HELLO) => {
                 let hello_profile = decode_hello_profile(&packet.payload)?;
+                peer_supports_aich = hello_profile.supports_aich;
+                peer_supports_file_identifiers = hello_profile.supports_file_identifiers;
                 peer_upload_identity =
                     upload_peer_identity_from_hello(peer_addr, &hello_profile.identity);
                 debug!(
@@ -265,6 +269,8 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
                     peer_addr,
                     packet.opcode,
                     &packet.payload,
+                    peer_supports_aich,
+                    peer_supports_file_identifiers,
                 )
                 .await?;
             }
@@ -529,6 +535,7 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
                     &mut transport,
                     peer_addr,
                     &packet.payload,
+                    peer_supports_aich,
                 )
                 .await?;
             }
