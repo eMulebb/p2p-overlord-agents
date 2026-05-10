@@ -222,6 +222,18 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
     assert_eq!(returned_aich_root, aich_root);
 
     stream
+        .write_all(&super::encode_packet(OP_EMULEPROT, OP_PUBLICIP_REQ, &[]))
+        .await
+        .unwrap();
+    let public_ip_answer = read_packet(&mut stream).await;
+    assert_eq!(public_ip_answer[0], OP_EMULEPROT);
+    assert_eq!(public_ip_answer[5], OP_PUBLICIP_ANSWER);
+    assert_eq!(
+        super::decode_public_ip_answer_payload(&public_ip_answer[6..]).unwrap(),
+        Ipv4Addr::LOCALHOST
+    );
+
+    stream
         .write_all(&super::encode_start_upload_req(&file_hash))
         .await
         .unwrap();

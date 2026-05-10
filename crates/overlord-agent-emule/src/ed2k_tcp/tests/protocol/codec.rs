@@ -26,6 +26,20 @@ fn queue_ranking_matches_emule_twelve_byte_payload_shape() {
 }
 
 #[test]
+fn public_ip_answer_uses_stock_four_byte_ipv4_payload() {
+    let packet = encode_public_ip_answer(Ipv4Addr::new(203, 0, 113, 99));
+
+    assert_eq!(packet[0], OP_EMULEPROT);
+    assert_eq!(packet[5], OP_PUBLICIP_ANSWER);
+    assert_eq!(&packet[6..], &[203, 0, 113, 99]);
+    assert_eq!(
+        decode_public_ip_answer_payload(&packet[6..]).unwrap(),
+        Ipv4Addr::new(203, 0, 113, 99)
+    );
+    assert!(decode_public_ip_answer_payload(&packet[6..9]).is_err());
+}
+
+#[test]
 fn file_identifier_roundtrip_matches_stock_md4_plus_size_shape() {
     let identifier = super::Ed2kFileIdentifier {
         file_hash: Ed2kHash([0xAB; 16]),

@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::{io::Read, net::Ipv4Addr};
 
 use anyhow::{Context, Result};
 use flate2::read::ZlibDecoder;
@@ -25,9 +25,9 @@ use super::{
     OP_ACCEPTUPLOADREQ, OP_AICHFILEHASHANS, OP_AICHFILEHASHREQ, OP_ANSWERSOURCES,
     OP_ANSWERSOURCES2, OP_EDONKEYPROT, OP_EMULEPROT, OP_FILEREQANSNOFIL, OP_FILESTATUS,
     OP_MULTIPACKET, OP_MULTIPACKET_EXT, OP_MULTIPACKET_EXT2, OP_MULTIPACKETANSWER,
-    OP_MULTIPACKETANSWER_EXT2, OP_PACKEDPROT, OP_QUEUERANKING, OP_REQFILENAMEANSWER,
-    OP_REQUESTFILENAME, OP_REQUESTSOURCES, OP_REQUESTSOURCES2, OP_SETREQFILEID, OP_STARTUPLOADREQ,
-    TCP_PACKET_HEADER_LEN,
+    OP_MULTIPACKETANSWER_EXT2, OP_PACKEDPROT, OP_PUBLICIP_ANSWER, OP_QUEUERANKING,
+    OP_REQFILENAMEANSWER, OP_REQUESTFILENAME, OP_REQUESTSOURCES, OP_REQUESTSOURCES2,
+    OP_SETREQFILEID, OP_STARTUPLOADREQ, TCP_PACKET_HEADER_LEN,
 };
 
 pub(super) fn decode_peer_payload(protocol: u8, payload: Vec<u8>) -> Result<(u8, Vec<u8>)> {
@@ -132,6 +132,19 @@ pub(super) fn encode_queue_ranking(rank: u16) -> Vec<u8> {
     let mut payload = [0u8; 12];
     payload[..2].copy_from_slice(&rank.to_le_bytes());
     encode_packet(OP_EMULEPROT, OP_QUEUERANKING, &payload)
+}
+
+pub(super) fn encode_public_ip_answer(ip: Ipv4Addr) -> Vec<u8> {
+    encode_packet(OP_EMULEPROT, OP_PUBLICIP_ANSWER, &ip.octets())
+}
+
+pub(super) fn decode_public_ip_answer_payload(payload: &[u8]) -> Result<Ipv4Addr> {
+    if payload.len() != 4 {
+        anyhow::bail!("invalid OP_PUBLICIP_ANSWER payload size {}", payload.len());
+    }
+    Ok(Ipv4Addr::new(
+        payload[0], payload[1], payload[2], payload[3],
+    ))
 }
 
 pub(super) fn encode_start_upload_req(file_hash: &Ed2kHash) -> Vec<u8> {
