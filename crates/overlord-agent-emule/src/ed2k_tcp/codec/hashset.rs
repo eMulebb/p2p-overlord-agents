@@ -110,10 +110,7 @@ pub(in crate::ed2k_tcp) fn decode_hashset_request2(
 pub(in crate::ed2k_tcp) fn decode_hashset_answer(
     payload: &[u8],
 ) -> Result<(Ed2kHash, Vec<[u8; 16]>)> {
-    let (file_hash, hashset, remaining) = decode_md4_hashset_body(payload)?;
-    if !remaining.is_empty() {
-        anyhow::bail!("trailing OP_HASHSETANSWER payload {}", remaining.len());
-    }
+    let (file_hash, hashset, _) = decode_md4_hashset_body(payload)?;
     Ok((file_hash, hashset))
 }
 
@@ -138,7 +135,7 @@ pub(in crate::ed2k_tcp) fn decode_hashset_answer2(payload: &[u8]) -> Result<Ed2k
         None
     };
     let aich_hashset = if options.request_aich {
-        let (hashset, rest) = decode_aich_hashset_body(remaining)?;
+        let (hashset, _) = decode_aich_hashset_body(remaining)?;
         if let Some(expected_root) = file_identifier.aich_root
             && hashset.master_hash != expected_root
         {
@@ -147,14 +144,10 @@ pub(in crate::ed2k_tcp) fn decode_hashset_answer2(payload: &[u8]) -> Result<Ed2k
                 file_identifier.file_hash
             );
         }
-        remaining = rest;
         Some(hashset)
     } else {
         None
     };
-    if !remaining.is_empty() {
-        anyhow::bail!("trailing OP_HASHSETANSWER2 payload {}", remaining.len());
-    }
     Ok(Ed2kHashsetAnswer2 {
         file_identifier,
         md4_hashset,

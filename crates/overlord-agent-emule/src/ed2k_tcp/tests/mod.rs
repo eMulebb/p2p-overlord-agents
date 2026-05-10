@@ -31,7 +31,7 @@ use super::{
     decode_compressed_part_fragment, decode_edonkey_queue_rank_payload,
     decode_emule_queue_ranking_payload, decode_exact_file_hash_payload,
     decode_file_description_payload, decode_file_hash_payload, decode_file_status_payload,
-    decode_hashset_answer2, decode_hashset_request2, decode_hello_profile,
+    decode_hashset_answer, decode_hashset_answer2, decode_hashset_request2, decode_hello_profile,
     decode_incoming_obfuscation_header, decode_kad_callback_payload,
     decode_optional_file_hash_payload, decode_peer_payload, decode_preview_answer_payload,
     decode_preview_request_payload, decode_public_ip_answer_payload, decode_public_key_payload,

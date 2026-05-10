@@ -461,6 +461,11 @@ fn hashset_answer2_roundtrip_preserves_modern_md4_and_aich_sections() {
     assert_eq!(decoded.file_identifier, file_identifier);
     assert_eq!(decoded.md4_hashset.unwrap(), md4_hashset);
     assert_eq!(decoded.aich_hashset.unwrap(), aich_hashset);
+
+    let mut payload_with_trailing = packet[6..].to_vec();
+    payload_with_trailing.extend_from_slice(&[0xAA, 0xBB]);
+    let decoded = super::decode_hashset_answer2(&payload_with_trailing).unwrap();
+    assert_eq!(decoded.file_identifier, file_identifier);
 }
 
 #[test]
@@ -481,6 +486,19 @@ fn hashset_answer2_rejects_mismatched_aich_section_root() {
     .unwrap();
 
     assert!(super::decode_hashset_answer2(&packet[6..]).is_err());
+}
+
+#[test]
+fn legacy_hashset_answer_tolerates_stock_trailing_bytes() {
+    let file_hash = Ed2kHash([0x52; 16]);
+    let mut payload = file_hash.0.to_vec();
+    payload.extend_from_slice(&1u16.to_le_bytes());
+    payload.extend_from_slice(&[0x11; 16]);
+    payload.extend_from_slice(&[0xAA, 0xBB]);
+
+    let (returned_hash, hashset) = decode_hashset_answer(&payload).unwrap();
+    assert_eq!(returned_hash, file_hash);
+    assert_eq!(hashset, vec![[0x11; 16]]);
 }
 
 #[test]
