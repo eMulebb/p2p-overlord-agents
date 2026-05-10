@@ -40,9 +40,10 @@ use super::super::{
     ED2K_SECURE_IDENT_SIGNATURE_NEEDED, Ed2kHelloIdentity, Ed2kSecureIdent, Ed2kTransport,
     FirewallCheckUdpRequest, OP_AICHFILEHASHREQ, OP_CANCELTRANSFER, OP_EDONKEYPROT, OP_EMULEINFO,
     OP_EMULEINFOANSWER, OP_EMULEPROT, OP_FWCHECKUDPREQ, OP_HASHSETREQUEST, OP_HASHSETREQUEST2,
-    OP_HELLO, OP_HELLOANSWER, OP_MULTIPACKET_EXT2, OP_PUBLICKEY, OP_REQUESTFILENAME,
-    OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_REQUESTSOURCES, OP_REQUESTSOURCES2, OP_SECIDENTSTATE,
-    OP_SETREQFILEID, OP_SIGNATURE, OP_STARTUPLOADREQ, apply_server_state,
+    OP_HELLO, OP_HELLOANSWER, OP_MULTIPACKET, OP_MULTIPACKET_EXT, OP_MULTIPACKET_EXT2,
+    OP_PUBLICKEY, OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_REQUESTSOURCES,
+    OP_REQUESTSOURCES2, OP_SECIDENTSTATE, OP_SETREQFILEID, OP_SIGNATURE, OP_STARTUPLOADREQ,
+    apply_server_state,
 };
 
 mod shared_file;
@@ -51,8 +52,8 @@ mod upload_queue;
 
 use shared_file::{
     handle_aich_file_hash_request, handle_hashset_request, handle_hashset_request2,
-    handle_multipacket_ext2_request, handle_request_filename, handle_set_req_file_id,
-    handle_source_request,
+    handle_multipacket_ext2_request, handle_multipacket_request, handle_request_filename,
+    handle_set_req_file_id, handle_source_request,
 };
 use upload_payload::{UploadPayloadOutcome, UploadPayloadRequest, serve_upload_payload};
 use upload_queue::{ListenerQueuePoll, ListenerUploadQueue};
@@ -237,6 +238,16 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
                     "received eD2k OP_HELLOANSWER from {peer_addr} transport={}",
                     transport.mode.as_str()
                 );
+            }
+            (OP_EMULEPROT, OP_MULTIPACKET) | (OP_EMULEPROT, OP_MULTIPACKET_EXT) => {
+                requested_file_hash = handle_multipacket_request(
+                    transfer_runtime,
+                    &mut transport,
+                    peer_addr,
+                    packet.opcode,
+                    &packet.payload,
+                )
+                .await?;
             }
             (OP_EMULEPROT, OP_MULTIPACKET_EXT2) => {
                 requested_file_hash = handle_multipacket_ext2_request(

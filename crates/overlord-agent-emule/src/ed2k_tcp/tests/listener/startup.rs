@@ -176,6 +176,39 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
     assert!(returned.md4_hashset.is_none());
     assert!(returned.aich_hashset.is_none());
 
+    let request_filename = super::encode_request_filename(&file_hash, &manifest);
+    let mut legacy_multipacket_payload = Vec::new();
+    legacy_multipacket_payload.extend_from_slice(&file_hash.0);
+    legacy_multipacket_payload.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    legacy_multipacket_payload.push(super::OP_REQUESTFILENAME);
+    legacy_multipacket_payload.extend_from_slice(&request_filename[22..]);
+    legacy_multipacket_payload.push(super::OP_SETREQFILEID);
+    legacy_multipacket_payload.push(super::OP_AICHFILEHASHREQ);
+    let legacy_multipacket = super::encode_packet(
+        OP_EMULEPROT,
+        super::OP_MULTIPACKET_EXT,
+        &legacy_multipacket_payload,
+    );
+    stream.write_all(&legacy_multipacket).await.unwrap();
+    let legacy_answer = read_packet(&mut stream).await;
+    assert_eq!(legacy_answer[0], OP_EMULEPROT);
+    assert_eq!(legacy_answer[5], super::OP_MULTIPACKETANSWER);
+    assert_eq!(&legacy_answer[6..22], &file_hash.0);
+    let mut legacy_remaining = &legacy_answer[22..];
+    assert_eq!(legacy_remaining[0], super::OP_REQFILENAMEANSWER);
+    let name_len = usize::from(u16::from_le_bytes([
+        legacy_remaining[1],
+        legacy_remaining[2],
+    ]));
+    assert_eq!(&legacy_remaining[3..3 + name_len], b"startup.txt");
+    legacy_remaining = &legacy_remaining[3 + name_len..];
+    assert_eq!(legacy_remaining[0], super::OP_FILESTATUS);
+    assert_eq!(&legacy_remaining[1..3], &0u16.to_le_bytes());
+    legacy_remaining = &legacy_remaining[3..];
+    assert_eq!(legacy_remaining[0], super::OP_AICHFILEHASHANS);
+    assert_eq!(&legacy_remaining[1..21], &aich_root);
+    assert_eq!(legacy_remaining.len(), 21);
+
     stream
         .write_all(&super::encode_aich_file_hash_request(&file_hash))
         .await

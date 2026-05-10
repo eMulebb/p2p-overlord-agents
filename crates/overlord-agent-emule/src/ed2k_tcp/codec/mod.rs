@@ -24,9 +24,9 @@ use super::{
     ED2K_SOURCE_EXCHANGE2_VERSION, Ed2kFileIdentifier, MAX_PEER_DECOMPRESSED_PACKET_LEN,
     OP_ACCEPTUPLOADREQ, OP_AICHFILEHASHANS, OP_AICHFILEHASHREQ, OP_ANSWERSOURCES,
     OP_ANSWERSOURCES2, OP_EDONKEYPROT, OP_EMULEPROT, OP_FILEREQANSNOFIL, OP_FILESTATUS,
-    OP_MULTIPACKET_EXT2, OP_MULTIPACKETANSWER_EXT2, OP_PACKEDPROT, OP_QUEUERANKING,
-    OP_REQFILENAMEANSWER, OP_REQUESTFILENAME, OP_REQUESTSOURCES, OP_REQUESTSOURCES2,
-    OP_SETREQFILEID, OP_STARTUPLOADREQ, TCP_PACKET_HEADER_LEN,
+    OP_MULTIPACKET_EXT2, OP_MULTIPACKETANSWER, OP_MULTIPACKETANSWER_EXT2, OP_PACKEDPROT,
+    OP_QUEUERANKING, OP_REQFILENAMEANSWER, OP_REQUESTFILENAME, OP_REQUESTSOURCES,
+    OP_REQUESTSOURCES2, OP_SETREQFILEID, OP_STARTUPLOADREQ, TCP_PACKET_HEADER_LEN,
 };
 
 pub(super) fn decode_peer_payload(protocol: u8, payload: Vec<u8>) -> Result<(u8, Vec<u8>)> {
@@ -421,6 +421,30 @@ pub(super) fn encode_multipacket_ext2_answer(
         OP_MULTIPACKETANSWER_EXT2,
         &payload,
     ))
+}
+
+pub(super) fn encode_multipacket_answer(
+    file_hash: &Ed2kHash,
+    file_name: &str,
+    include_filename_answer: bool,
+    include_file_status: bool,
+    aich_root: Option<[u8; 20]>,
+) -> Result<Vec<u8>> {
+    let mut payload = Vec::with_capacity(64);
+    payload.extend_from_slice(&file_hash.0);
+    if include_filename_answer {
+        payload.push(OP_REQFILENAMEANSWER);
+        payload.extend_from_slice(&encode_request_filename_answer_body(file_name)?);
+    }
+    if include_file_status {
+        payload.push(OP_FILESTATUS);
+        payload.extend_from_slice(&encode_file_status_body_complete());
+    }
+    if let Some(aich_root) = aich_root {
+        payload.push(OP_AICHFILEHASHANS);
+        payload.extend_from_slice(&aich_root);
+    }
+    Ok(encode_packet(OP_EMULEPROT, OP_MULTIPACKETANSWER, &payload))
 }
 
 pub(super) fn encode_request_filename_answer(

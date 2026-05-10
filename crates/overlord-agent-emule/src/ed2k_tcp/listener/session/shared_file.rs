@@ -6,17 +6,19 @@ use overlord_kad_proto::Ed2kHash;
 use crate::{
     ed2k_tcp::{
         ED2K_SOURCE_EXCHANGE2_VERSION, Ed2kFileIdentifier, Ed2kTransport, OP_AICHFILEHASHREQ,
-        OP_REQUESTFILENAME, OP_REQUESTSOURCES, OP_REQUESTSOURCES2, OP_SETREQFILEID,
+        OP_MULTIPACKET_EXT, OP_REQUESTFILENAME, OP_REQUESTSOURCES, OP_REQUESTSOURCES2,
+        OP_SETREQFILEID,
     },
-    ed2k_transfer::Ed2kTransferRuntime,
+    ed2k_transfer::{Ed2kSharedEntry, Ed2kTransferRuntime},
 };
 
 use super::super::super::codec::{
     SourceExchangePeer, decode_file_hash_payload, decode_hashset_request2,
     decode_request_sources_payload, encode_aich_file_hash_answer, encode_answer_sources,
     encode_answer_sources2, encode_file_req_ans_nofil, encode_file_status_complete,
-    encode_hashset_answer, encode_hashset_answer2, encode_multipacket_ext2_answer,
-    encode_request_filename_answer, skip_request_filename_ext_info, source_exchange_entry_count,
+    encode_hashset_answer, encode_hashset_answer2, encode_multipacket_answer,
+    encode_multipacket_ext2_answer, encode_request_filename_answer, skip_request_filename_ext_info,
+    source_exchange_entry_count,
 };
 use super::super::super::dump::dump_ed2k_tcp_listener_send;
 
@@ -105,6 +107,93 @@ pub(in crate::ed2k_tcp) async fn handle_multipacket_ext2_request(
             .write_all(&reply)
             .await
             .with_context(|| format!("failed to send OP_MULTIPACKETANSWER_EXT2 to {peer_addr}"))?;
+    }
+    Ok(Some(requested))
+}
+
+pub(in crate::ed2k_tcp) async fn handle_multipacket_request(
+    transfer_runtime: &Ed2kTransferRuntime,
+    transport: &mut Ed2kTransport,
+    peer_addr: SocketAddr,
+    opcode: u8,
+    payload: &[u8],
+) -> Result<Option<Ed2kHash>> {
+    if payload.len() < 16 {
+        anyhow::bail!("short OP_MULTIPACKET payload {}", payload.len());
+    }
+    let requested = Ed2kHash::from_bytes(payload[..16].try_into()?);
+    let mut remaining = &payload[16..];
+    let requested_size = if opcode == OP_MULTIPACKET_EXT {
+        if remaining.len() < 8 {
+            anyhow::bail!("short OP_MULTIPACKET_EXT size payload {}", payload.len());
+        }
+        let size = u64::from_le_bytes(remaining[..8].try_into()?);
+        remaining = &remaining[8..];
+        Some(size).filter(|size| *size != 0)
+    } else {
+        None
+    };
+    let Some(shared) = transfer_runtime.local_entry(&requested).await? else {
+        send_nofile(transport, peer_addr, &requested, "multipacket_nofil").await?;
+        return Ok(Some(requested));
+    };
+    if requested_size.is_some_and(|size| size != shared.file_size) {
+        send_nofile(
+            transport,
+            peer_addr,
+            &requested,
+            "multipacket_size_mismatch",
+        )
+        .await?;
+        return Ok(Some(requested));
+    }
+
+    let mut include_filename = false;
+    let mut include_status = false;
+    let mut include_aich_root = None;
+    while let Some((&sub_opcode, rest)) = remaining.split_first() {
+        remaining = rest;
+        match sub_opcode {
+            OP_REQUESTFILENAME => {
+                remaining = skip_request_filename_ext_info(remaining, shared.file_size)?;
+                include_filename = true;
+            }
+            OP_SETREQFILEID => {
+                include_status = true;
+            }
+            OP_REQUESTSOURCES | OP_REQUESTSOURCES2 => {
+                remaining = answer_source_request_subpacket(
+                    transfer_runtime,
+                    transport,
+                    peer_addr,
+                    &requested,
+                    sub_opcode,
+                    remaining,
+                )
+                .await?;
+            }
+            OP_AICHFILEHASHREQ => {
+                include_aich_root = shared_aich_root(&shared);
+            }
+            _ => {
+                anyhow::bail!("unsupported OP_MULTIPACKET sub-op 0x{sub_opcode:02X}");
+            }
+        }
+    }
+
+    if include_filename || include_status || include_aich_root.is_some() {
+        let reply = encode_multipacket_answer(
+            &requested,
+            &shared.canonical_name,
+            include_filename,
+            include_status,
+            include_aich_root,
+        )?;
+        dump_ed2k_tcp_listener_send(peer_addr, transport.mode, "multipacket_answer", &reply);
+        transport
+            .write_all(&reply)
+            .await
+            .with_context(|| format!("failed to send OP_MULTIPACKETANSWER to {peer_addr}"))?;
     }
     Ok(Some(requested))
 }
@@ -251,6 +340,52 @@ pub(in crate::ed2k_tcp) async fn handle_source_request(
     Ok(Some(requested))
 }
 
+async fn answer_source_request_subpacket<'a>(
+    transfer_runtime: &Ed2kTransferRuntime,
+    transport: &mut Ed2kTransport,
+    peer_addr: SocketAddr,
+    requested: &Ed2kHash,
+    opcode: u8,
+    remaining: &'a [u8],
+) -> Result<&'a [u8]> {
+    let requested_version = if opcode == OP_REQUESTSOURCES2 {
+        if remaining.len() < 3 {
+            anyhow::bail!("short OP_REQUESTSOURCES2 sub-payload in OP_MULTIPACKET");
+        }
+        remaining[0]
+    } else {
+        1
+    };
+    let remaining = if opcode == OP_REQUESTSOURCES2 {
+        &remaining[3..]
+    } else {
+        remaining
+    };
+    if requested_version == 0 {
+        return Ok(remaining);
+    }
+    let used_version = if opcode == OP_REQUESTSOURCES2 {
+        requested_version.min(ED2K_SOURCE_EXCHANGE2_VERSION)
+    } else {
+        1
+    };
+    let sources = source_exchange_peers(transfer_runtime, requested).await?;
+    if source_exchange_entry_count(used_version, &sources) == 0 {
+        return Ok(remaining);
+    }
+    let reply = if opcode == OP_REQUESTSOURCES2 {
+        encode_answer_sources2(requested, used_version, &sources)
+    } else {
+        encode_answer_sources(requested, &sources)
+    };
+    dump_ed2k_tcp_listener_send(peer_addr, transport.mode, "answer_sources", &reply);
+    transport
+        .write_all(&reply)
+        .await
+        .with_context(|| format!("failed to send source exchange reply to {peer_addr}"))?;
+    Ok(remaining)
+}
+
 async fn source_exchange_peers(
     transfer_runtime: &Ed2kTransferRuntime,
     requested: &Ed2kHash,
@@ -289,11 +424,7 @@ pub(in crate::ed2k_tcp) async fn handle_aich_file_hash_request(
 ) -> Result<Option<Ed2kHash>> {
     let requested = decode_file_hash_payload(payload)?;
     if let Some(shared) = transfer_runtime.local_entry(&requested).await?
-        && let Some(aich_root) = shared
-            .aich_root
-            .as_deref()
-            .and_then(|root| hex::decode(root).ok())
-            .and_then(|bytes| bytes.try_into().ok())
+        && let Some(aich_root) = shared_aich_root(&shared)
     {
         let reply = encode_aich_file_hash_answer(&requested, aich_root);
         dump_ed2k_tcp_listener_send(peer_addr, transport.mode, "aich_file_hash_answer", &reply);
@@ -303,6 +434,14 @@ pub(in crate::ed2k_tcp) async fn handle_aich_file_hash_request(
             .with_context(|| format!("failed to send OP_AICHFILEHASHANS to {peer_addr}"))?;
     }
     Ok(Some(requested))
+}
+
+fn shared_aich_root(shared: &Ed2kSharedEntry) -> Option<[u8; 20]> {
+    shared
+        .aich_root
+        .as_deref()
+        .and_then(|root| hex::decode(root).ok())
+        .and_then(|bytes| bytes.try_into().ok())
 }
 
 async fn send_nofile(

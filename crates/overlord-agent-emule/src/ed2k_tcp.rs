@@ -58,9 +58,10 @@ use codec::{
     decode_hashset_request2, decode_request_parts_payload, decode_request_sources_payload,
     encode_accept_upload_req, encode_aich_file_hash_answer, encode_answer_sources2,
     encode_compressed_part_fragment, encode_file_req_ans_nofil, encode_file_status_complete,
-    encode_hashset_answer, encode_hashset_answer2, encode_multipacket_ext2_answer,
-    encode_packed_packet, encode_queue_ranking, encode_request_filename_answer,
-    encode_request_sources2_subpayload, encode_sending_part, skip_request_filename_ext_info,
+    encode_hashset_answer, encode_hashset_answer2, encode_multipacket_answer,
+    encode_multipacket_ext2_answer, encode_packed_packet, encode_queue_ranking,
+    encode_request_filename_answer, encode_request_sources2_subpayload, encode_sending_part,
+    skip_request_filename_ext_info,
 };
 pub(in crate::ed2k_tcp) use download::PendingCompressedPart;
 #[cfg(test)]
@@ -133,11 +134,14 @@ const OP_REQUESTSOURCES: u8 = 0x81;
 const OP_ANSWERSOURCES: u8 = 0x82;
 const OP_REQUESTSOURCES2: u8 = 0x83;
 const OP_ANSWERSOURCES2: u8 = 0x84;
+const OP_MULTIPACKET: u8 = 0x92;
+const OP_MULTIPACKETANSWER: u8 = 0x93;
 const OP_AICHFILEHASHANS: u8 = 0x9D;
 const OP_AICHFILEHASHREQ: u8 = 0x9E;
 const OP_COMPRESSEDPART_I64: u8 = 0xA1;
 const OP_SENDINGPART_I64: u8 = 0xA2;
 const OP_REQUESTPARTS_I64: u8 = 0xA3;
+const OP_MULTIPACKET_EXT: u8 = 0xA4;
 const OP_MULTIPACKET_EXT2: u8 = 0xA9;
 const OP_MULTIPACKETANSWER_EXT2: u8 = 0xB0;
 const OP_HASHSETREQUEST2: u8 = 0xB1;
