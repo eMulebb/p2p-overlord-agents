@@ -252,18 +252,23 @@ pub(super) fn encode_answer_sources2(
     encode_packet(OP_EMULEPROT, OP_ANSWERSOURCES2, &payload)
 }
 
+pub(super) fn source_exchange_entry_count(version: u8, sources: &[SourceExchangePeer]) -> usize {
+    let include_user_hash = version >= 2;
+    sources
+        .iter()
+        .filter(|source| !include_user_hash || source.user_hash.is_some())
+        .take(501)
+        .count()
+}
+
 fn encode_source_exchange_entries(
     payload: &mut Vec<u8>,
     version: u8,
     sources: &[SourceExchangePeer],
 ) {
-    let include_user_hash = version >= 2;
     let include_connect_options = version >= 4;
-    let max_sources = sources
-        .iter()
-        .filter(|source| !include_user_hash || source.user_hash.is_some())
-        .take(501)
-        .count();
+    let include_user_hash = version >= 2;
+    let max_sources = source_exchange_entry_count(version, sources);
     payload.extend_from_slice(
         &u16::try_from(max_sources)
             .expect("source exchange count is capped")

@@ -16,7 +16,7 @@ use super::super::super::codec::{
     decode_request_sources_payload, encode_answer_sources, encode_answer_sources2,
     encode_file_req_ans_nofil, encode_file_status_complete, encode_hashset_answer,
     encode_hashset_answer2, encode_multipacket_ext2_answer, encode_request_filename_answer,
-    skip_request_filename_ext_info,
+    skip_request_filename_ext_info, source_exchange_entry_count,
 };
 use super::super::super::dump::dump_ed2k_tcp_listener_send;
 
@@ -75,12 +75,12 @@ pub(in crate::ed2k_tcp) async fn handle_multipacket_ext2_request(
                 if requested_version == 0 {
                     continue;
                 }
+                let used_version = requested_version.min(ED2K_SOURCE_EXCHANGE2_VERSION);
                 let sources = source_exchange_peers(transfer_runtime, &requested).await?;
-                let reply = encode_answer_sources2(
-                    &requested,
-                    requested_version.min(ED2K_SOURCE_EXCHANGE2_VERSION),
-                    &sources,
-                );
+                if source_exchange_entry_count(used_version, &sources) == 0 {
+                    continue;
+                }
+                let reply = encode_answer_sources2(&requested, used_version, &sources);
                 dump_ed2k_tcp_listener_send(peer_addr, transport.mode, "answer_sources", &reply);
                 transport.write_all(&reply).await.with_context(|| {
                     format!("failed to send source exchange reply to {peer_addr}")
@@ -228,13 +228,17 @@ pub(in crate::ed2k_tcp) async fn handle_source_request(
         return Ok(Some(requested));
     }
     if transfer_runtime.local_entry(&requested).await?.is_some() {
+        let used_version = if opcode == OP_REQUESTSOURCES2 {
+            requested_version.min(ED2K_SOURCE_EXCHANGE2_VERSION)
+        } else {
+            1
+        };
         let sources = source_exchange_peers(transfer_runtime, &requested).await?;
+        if source_exchange_entry_count(used_version, &sources) == 0 {
+            return Ok(Some(requested));
+        }
         let reply = if opcode == OP_REQUESTSOURCES2 {
-            encode_answer_sources2(
-                &requested,
-                requested_version.min(ED2K_SOURCE_EXCHANGE2_VERSION),
-                &sources,
-            )
+            encode_answer_sources2(&requested, used_version, &sources)
         } else {
             encode_answer_sources(&requested, &sources)
         };

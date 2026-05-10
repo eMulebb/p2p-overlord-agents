@@ -5,12 +5,25 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
     let payload = b"ubuntu linux upload startup handshake".repeat(512);
     let file_hash = Ed2kHash::from_bytes(Md4::digest(&payload).into());
     let file_hash_hex = file_hash.to_string();
+    let no_sources_payload = b"ubuntu linux no source exchange peers".repeat(512);
+    let no_sources_hash = Ed2kHash::from_bytes(Md4::digest(&no_sources_payload).into());
+    let no_sources_hash_hex = no_sources_hash.to_string();
     let root = unique_test_dir("ed2k-upload-listener-startup");
     let transfer_runtime = Arc::new(Ed2kTransferRuntime::load_or_create(&root).unwrap());
     let job = new_transfer_job(file_hash, "startup.txt".to_string(), payload.len() as u64);
     transfer_runtime.ensure_job(&job).await.unwrap();
+    let no_sources_job = new_transfer_job(
+        no_sources_hash,
+        "no-sources.txt".to_string(),
+        no_sources_payload.len() as u64,
+    );
+    transfer_runtime.ensure_job(&no_sources_job).await.unwrap();
     transfer_runtime
         .store_md4_hashset(&file_hash_hex, Vec::new())
+        .await
+        .unwrap();
+    transfer_runtime
+        .store_md4_hashset(&no_sources_hash_hex, Vec::new())
         .await
         .unwrap();
     transfer_runtime
@@ -113,6 +126,29 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
     let mut invalid_source_request = super::encode_request_sources2(&file_hash);
     invalid_source_request[22] = 0;
     stream.write_all(&invalid_source_request).await.unwrap();
+
+    let no_sources_manifest = transfer_runtime
+        .manifest(&no_sources_hash_hex)
+        .await
+        .unwrap();
+    stream
+        .write_all(&super::encode_request_sources2(&no_sources_hash))
+        .await
+        .unwrap();
+    let no_sources_hashset_request = super::encode_hashset_request2(
+        &super::Ed2kFileIdentifier::from_manifest(&no_sources_manifest).unwrap(),
+        super::Ed2kHashsetRequestOptions {
+            request_md4: true,
+            request_aich: false,
+        },
+    )
+    .unwrap();
+    stream.write_all(&no_sources_hashset_request).await.unwrap();
+    let no_sources_hashset_answer = read_packet(&mut stream).await;
+    assert_eq!(no_sources_hashset_answer[0], OP_EMULEPROT);
+    assert_eq!(no_sources_hashset_answer[5], super::OP_HASHSETANSWER2);
+    let returned = super::decode_hashset_answer2(&no_sources_hashset_answer[6..]).unwrap();
+    assert_eq!(returned.file_identifier.file_hash, no_sources_hash);
 
     let modern_hashset_request = super::encode_hashset_request2(
         &super::Ed2kFileIdentifier::from_manifest(&manifest).unwrap(),
