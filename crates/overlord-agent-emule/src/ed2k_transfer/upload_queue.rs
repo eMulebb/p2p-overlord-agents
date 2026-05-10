@@ -5,9 +5,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const WAITING_SECONDS_WEIGHT: i128 = 1_000;
+const DEFAULT_FILE_PRIORITY_SCORE: i128 = 7;
 const FRIEND_SLOT_SCORE_BONUS: i128 = 1_000_000_000;
-const LOW_ID_SCORE_PENALTY: i128 = 60_000;
 
 /// Upload-slot and waiting-queue policy used by the inbound ED2K listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,7 +127,6 @@ struct Ed2kUploadSessionEntry {
 struct UploadScoreInputs {
     waiting_seconds: i128,
     friend_slot: bool,
-    low_id: bool,
     file_priority_score: i128,
 }
 
@@ -137,10 +135,7 @@ struct UploadScorePolicy;
 
 impl UploadScorePolicy {
     fn waiting_score(inputs: UploadScoreInputs) -> i128 {
-        inputs.waiting_seconds * WAITING_SECONDS_WEIGHT
-            + friend_slot_score(inputs.friend_slot)
-            + low_id_score(inputs.low_id)
-            + inputs.file_priority_score
+        inputs.waiting_seconds * inputs.file_priority_score + friend_slot_score(inputs.friend_slot)
     }
 }
 
@@ -420,8 +415,8 @@ impl Ed2kUploadQueueState {
     ) -> i128 {
         UploadScorePolicy::waiting_score(UploadScoreInputs {
             waiting_seconds: now.saturating_duration_since(session.queued_at).as_secs() as i128,
-            friend_slot: key.peer.friend_slot,
-            low_id: key.peer.client_id.is_some_and(is_low_id_client_id),
+            friend_slot: key.peer.friend_slot
+                && !key.peer.client_id.is_some_and(is_low_id_client_id),
             file_priority_score: file_priority_score(key),
         })
     }
@@ -441,15 +436,11 @@ fn friend_slot_score(friend_slot: bool) -> i128 {
     }
 }
 
-fn low_id_score(low_id: bool) -> i128 {
-    if low_id { -LOW_ID_SCORE_PENALTY } else { 0 }
-}
-
 fn file_priority_score(_key: &Ed2kUploadSessionKey) -> i128 {
     // The runtime does not persist stock file-priority metadata yet. Keep the
-    // queue hook neutral so priority can be wired in without changing ranking
-    // callers when the shared catalog learns that field.
-    0
+    // queue hook at stock normal priority so priority can be wired in without
+    // changing ranking callers when the shared catalog learns that field.
+    DEFAULT_FILE_PRIORITY_SCORE
 }
 
 fn is_low_id_client_id(client_id: u32) -> bool {

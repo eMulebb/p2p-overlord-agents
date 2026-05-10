@@ -164,7 +164,7 @@ async fn upload_queue_friend_slot_ranks_before_older_waiter() {
 }
 
 #[tokio::test]
-async fn upload_queue_low_id_waiter_ranks_behind_high_id_peer() {
+async fn upload_queue_connected_low_id_waiter_keeps_stock_rank() {
     let root = unique_test_dir("ed2k-upload-queue-low-id-rank");
     let runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
     runtime.configure_upload_queue(one_slot_config()).await;
@@ -183,9 +183,47 @@ async fn upload_queue_low_id_waiter_ranks_behind_high_id_peer() {
     let (high_id_handle, high_id_status) = runtime
         .begin_upload_session(upload_peer(3, 0x66, 0x0A00_0012), &file_hash)
         .await;
-    assert_eq!(high_id_status, Ed2kUploadSessionStatus::Waiting { rank: 1 });
+    assert_eq!(high_id_status, Ed2kUploadSessionStatus::Waiting { rank: 2 });
     assert_eq!(
         runtime.poll_upload_session(&low_id_handle, true).await,
+        Ed2kUploadSessionStatus::Waiting { rank: 1 }
+    );
+
+    runtime.release_upload_session(&active_handle).await;
+    assert_eq!(
+        runtime.poll_upload_session(&low_id_handle, true).await,
+        Ed2kUploadSessionStatus::Granted
+    );
+    assert_eq!(
+        runtime.poll_upload_session(&high_id_handle, true).await,
+        Ed2kUploadSessionStatus::Waiting { rank: 1 }
+    );
+}
+
+#[tokio::test]
+async fn upload_queue_low_id_friend_slot_does_not_bypass_high_id_waiter() {
+    let root = unique_test_dir("ed2k-upload-queue-low-id-friend-slot");
+    let runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+    runtime.configure_upload_queue(one_slot_config()).await;
+    let file_hash = Ed2kHash::from_bytes([0xF6; 16]);
+
+    let (active_handle, active_status) = runtime
+        .begin_upload_session(upload_peer(1, 0x77, 0x0A00_0021), &file_hash)
+        .await;
+    assert_eq!(active_status, Ed2kUploadSessionStatus::Granted);
+
+    let (high_id_handle, high_id_status) = runtime
+        .begin_upload_session(upload_peer(2, 0x88, 0x0A00_0022), &file_hash)
+        .await;
+    assert_eq!(high_id_status, Ed2kUploadSessionStatus::Waiting { rank: 1 });
+
+    let mut low_id_friend = upload_peer(3, 0x99, 0x0000_1234);
+    low_id_friend.friend_slot = true;
+    let (low_id_friend_handle, low_id_friend_status) = runtime
+        .begin_upload_session(low_id_friend, &file_hash)
+        .await;
+    assert_eq!(
+        low_id_friend_status,
         Ed2kUploadSessionStatus::Waiting { rank: 2 }
     );
 
@@ -193,5 +231,11 @@ async fn upload_queue_low_id_waiter_ranks_behind_high_id_peer() {
     assert_eq!(
         runtime.poll_upload_session(&high_id_handle, true).await,
         Ed2kUploadSessionStatus::Granted
+    );
+    assert_eq!(
+        runtime
+            .poll_upload_session(&low_id_friend_handle, true)
+            .await,
+        Ed2kUploadSessionStatus::Waiting { rank: 1 }
     );
 }
