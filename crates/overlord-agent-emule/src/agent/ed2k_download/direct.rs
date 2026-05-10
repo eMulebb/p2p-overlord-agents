@@ -21,6 +21,8 @@ use crate::{
 use super::super::ed2k_runtime::{
     is_retryable_direct_download_error, plaintext_fallback_for_obfuscated_source,
 };
+type DirectDownloadJoin = (SocketAddr, Ed2kFoundSource, Result<Ed2kPeerDownloadOutcome>);
+
 pub(in crate::agent) struct NativeDirectDownloadOutcome {
     pub(in crate::agent) completed: bool,
     pub(in crate::agent) accepted_incomplete_peers: u32,
@@ -38,6 +40,19 @@ pub(in crate::agent) struct NativeDirectDownloadOptions {
     pub(in crate::agent) sources: Vec<Ed2kFoundSource>,
     pub(in crate::agent) connect_timeout: Duration,
     pub(in crate::agent) max_parallel_download_peers: usize,
+}
+
+struct DirectDownloadSpawnContext<'a, DownloadFn> {
+    bind_ip: Ipv4Addr,
+    hello_identity: Ed2kHelloIdentity,
+    secure_ident: &'a Arc<Ed2kSecureIdent>,
+    transfer_runtime: &'a Arc<Ed2kTransferRuntime>,
+    file_hash_hex: &'a str,
+    file_name: &'a str,
+    file_size: u64,
+    connect_timeout: Duration,
+    retry_round: u32,
+    download_peer: &'a DownloadFn,
 }
 
 /// Attempts direct-dial ED2K peer downloads until the transfer manifest
@@ -96,53 +111,24 @@ where
         let mut pending_sources = VecDeque::from(retry_sources.clone());
         let mut active_downloads = JoinSet::new();
 
-        while active_downloads.len() < max_parallel_download_peers {
-            let Some(source) = pending_sources.pop_front() else {
-                break;
-            };
-            let transfer_runtime = Arc::clone(&transfer_runtime);
-            let secure_ident = Arc::clone(&secure_ident);
-            let download_peer = download_peer.clone();
-            let file_name = file_name.clone();
-            let file_hash_hex = file_hash_hex.clone();
-            let peer_addr = SocketAddr::new(IpAddr::V4(source.ip), source.tcp_port);
-            info!(
-                "native ED2K download attempt file_hash={} peer={}:{} client_id={} obfuscated={} has_user_hash={}",
-                file_hash_hex,
-                source.ip,
-                source.tcp_port,
-                source.client_id,
-                source.obfuscated,
-                source.user_hash.is_some()
-            );
-            dump_ed2k_tcp_download_meta(
-                peer_addr,
-                None,
-                "attempt_start",
-                format!(
-                    "file_hash={} client_id={} obfuscated={} has_user_hash={} retry_round={}",
-                    file_hash_hex,
-                    source.client_id,
-                    source.obfuscated,
-                    source.user_hash.is_some(),
-                    retry_round
-                ),
-            );
-            active_downloads.spawn(async move {
-                let result = download_peer(
-                    bind_ip,
-                    source.clone(),
-                    hello_identity,
-                    secure_ident,
-                    transfer_runtime,
-                    file_name,
-                    file_size,
-                    connect_timeout,
-                )
-                .await;
-                (peer_addr, source, result)
-            });
-        }
+        let spawn_context = DirectDownloadSpawnContext {
+            bind_ip,
+            hello_identity,
+            secure_ident: &secure_ident,
+            transfer_runtime: &transfer_runtime,
+            file_hash_hex: &file_hash_hex,
+            file_name: &file_name,
+            file_size,
+            connect_timeout,
+            retry_round,
+            download_peer: &download_peer,
+        };
+        spawn_pending_direct_downloads(
+            &mut active_downloads,
+            &mut pending_sources,
+            &spawn_context,
+            max_parallel_download_peers,
+        );
 
         while let Some(joined) = active_downloads.join_next().await {
             let (peer_addr, source, result) =
@@ -211,53 +197,12 @@ where
                 }
             }
 
-            while active_downloads.len() < max_parallel_download_peers {
-                let Some(source) = pending_sources.pop_front() else {
-                    break;
-                };
-                let transfer_runtime = Arc::clone(&transfer_runtime);
-                let secure_ident = Arc::clone(&secure_ident);
-                let download_peer = download_peer.clone();
-                let file_name = file_name.clone();
-                let file_hash_hex = file_hash_hex.clone();
-                let peer_addr = SocketAddr::new(IpAddr::V4(source.ip), source.tcp_port);
-                info!(
-                    "native ED2K download attempt file_hash={} peer={}:{} client_id={} obfuscated={} has_user_hash={}",
-                    file_hash_hex,
-                    source.ip,
-                    source.tcp_port,
-                    source.client_id,
-                    source.obfuscated,
-                    source.user_hash.is_some()
-                );
-                dump_ed2k_tcp_download_meta(
-                    peer_addr,
-                    None,
-                    "attempt_start",
-                    format!(
-                        "file_hash={} client_id={} obfuscated={} has_user_hash={} retry_round={}",
-                        file_hash_hex,
-                        source.client_id,
-                        source.obfuscated,
-                        source.user_hash.is_some(),
-                        retry_round
-                    ),
-                );
-                active_downloads.spawn(async move {
-                    let result = download_peer(
-                        bind_ip,
-                        source.clone(),
-                        hello_identity,
-                        secure_ident,
-                        transfer_runtime,
-                        file_name,
-                        file_size,
-                        connect_timeout,
-                    )
-                    .await;
-                    (peer_addr, source, result)
-                });
-            }
+            spawn_pending_direct_downloads(
+                &mut active_downloads,
+                &mut pending_sources,
+                &spawn_context,
+                max_parallel_download_peers,
+            );
         }
 
         let outcome = NativeDirectDownloadOutcome {
@@ -289,5 +234,80 @@ where
             file_hash_hex, retry_round, last_error_summary
         );
         tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
+fn spawn_pending_direct_downloads<DownloadFn, DownloadFuture>(
+    active_downloads: &mut JoinSet<DirectDownloadJoin>,
+    pending_sources: &mut VecDeque<Ed2kFoundSource>,
+    context: &DirectDownloadSpawnContext<'_, DownloadFn>,
+    max_parallel_download_peers: usize,
+) where
+    DownloadFn: Fn(
+            Ipv4Addr,
+            Ed2kFoundSource,
+            Ed2kHelloIdentity,
+            Arc<Ed2kSecureIdent>,
+            Arc<Ed2kTransferRuntime>,
+            String,
+            u64,
+            Duration,
+        ) -> DownloadFuture
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    DownloadFuture: Future<Output = Result<Ed2kPeerDownloadOutcome>> + Send + 'static,
+{
+    while active_downloads.len() < max_parallel_download_peers {
+        let Some(source) = pending_sources.pop_front() else {
+            break;
+        };
+        let transfer_runtime = Arc::clone(context.transfer_runtime);
+        let secure_ident = Arc::clone(context.secure_ident);
+        let download_peer = context.download_peer.clone();
+        let file_name = context.file_name.to_string();
+        let file_hash_hex = context.file_hash_hex.to_string();
+        let peer_addr = SocketAddr::new(IpAddr::V4(source.ip), source.tcp_port);
+        info!(
+            "native ED2K download attempt file_hash={} peer={}:{} client_id={} obfuscated={} has_user_hash={}",
+            file_hash_hex,
+            source.ip,
+            source.tcp_port,
+            source.client_id,
+            source.obfuscated,
+            source.user_hash.is_some()
+        );
+        dump_ed2k_tcp_download_meta(
+            peer_addr,
+            None,
+            "attempt_start",
+            format!(
+                "file_hash={} client_id={} obfuscated={} has_user_hash={} retry_round={}",
+                file_hash_hex,
+                source.client_id,
+                source.obfuscated,
+                source.user_hash.is_some(),
+                context.retry_round
+            ),
+        );
+        let bind_ip = context.bind_ip;
+        let hello_identity = context.hello_identity;
+        let file_size = context.file_size;
+        let connect_timeout = context.connect_timeout;
+        active_downloads.spawn(async move {
+            let result = download_peer(
+                bind_ip,
+                source.clone(),
+                hello_identity,
+                secure_ident,
+                transfer_runtime,
+                file_name,
+                file_size,
+                connect_timeout,
+            )
+            .await;
+            (peer_addr, source, result)
+        });
     }
 }
