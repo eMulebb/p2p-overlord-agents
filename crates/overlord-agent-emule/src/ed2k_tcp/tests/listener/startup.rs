@@ -221,6 +221,26 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
     assert_eq!(returned_hash, file_hash);
     assert_eq!(returned_aich_root, aich_root);
 
+    let mut aich_recovery_request = Vec::new();
+    aich_recovery_request.extend_from_slice(&file_hash.0);
+    aich_recovery_request.extend_from_slice(&0u16.to_le_bytes());
+    aich_recovery_request.extend_from_slice(&aich_root);
+    stream
+        .write_all(&super::encode_packet(
+            OP_EMULEPROT,
+            OP_AICHREQUEST,
+            &aich_recovery_request,
+        ))
+        .await
+        .unwrap();
+    let aich_recovery_failure = read_packet(&mut stream).await;
+    assert_eq!(aich_recovery_failure[0], OP_EMULEPROT);
+    assert_eq!(aich_recovery_failure[5], super::OP_AICHANSWER);
+    let aich_recovery_answer =
+        super::decode_aich_recovery_answer_payload(&aich_recovery_failure[6..]).unwrap();
+    assert_eq!(aich_recovery_answer.file_hash, file_hash);
+    assert_eq!(aich_recovery_answer.part, None);
+
     stream
         .write_all(&super::encode_packet(OP_EMULEPROT, OP_PUBLICIP_REQ, &[]))
         .await

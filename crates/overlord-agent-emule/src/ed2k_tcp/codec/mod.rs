@@ -22,7 +22,7 @@ pub(super) use upload::{encode_compressed_part_fragment, encode_sending_part};
 
 use super::{
     ED2K_SOURCE_EXCHANGE2_VERSION, Ed2kFileIdentifier, MAX_PEER_DECOMPRESSED_PACKET_LEN,
-    OP_ACCEPTUPLOADREQ, OP_AICHFILEHASHANS, OP_AICHFILEHASHREQ, OP_ANSWERSOURCES,
+    OP_ACCEPTUPLOADREQ, OP_AICHANSWER, OP_AICHFILEHASHANS, OP_AICHFILEHASHREQ, OP_ANSWERSOURCES,
     OP_ANSWERSOURCES2, OP_EDONKEYPROT, OP_EMULEPROT, OP_FILEREQANSNOFIL, OP_FILESTATUS,
     OP_MULTIPACKET, OP_MULTIPACKET_EXT, OP_MULTIPACKET_EXT2, OP_MULTIPACKETANSWER,
     OP_MULTIPACKETANSWER_EXT2, OP_PACKEDPROT, OP_PORTTEST, OP_PUBLICIP_ANSWER, OP_QUEUERANKING,
@@ -201,6 +201,56 @@ pub(super) fn decode_preview_answer_payload(payload: &[u8]) -> Result<PreviewAns
         frame_payload_bytes,
         trailing_len: payload.len() - offset,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AichRecoveryRequest {
+    pub(super) file_hash: Ed2kHash,
+    pub(super) part: u16,
+    pub(super) master_hash: [u8; 20],
+}
+
+pub(super) fn decode_aich_recovery_request_payload(payload: &[u8]) -> Result<AichRecoveryRequest> {
+    if payload.len() != 38 {
+        anyhow::bail!("invalid OP_AICHREQUEST payload size {}", payload.len());
+    }
+    Ok(AichRecoveryRequest {
+        file_hash: Ed2kHash(payload[..16].try_into().unwrap()),
+        part: u16::from_le_bytes(payload[16..18].try_into().unwrap()),
+        master_hash: payload[18..38].try_into().unwrap(),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AichRecoveryAnswer {
+    pub(super) file_hash: Ed2kHash,
+    pub(super) part: Option<u16>,
+    pub(super) master_hash: Option<[u8; 20]>,
+    pub(super) recovery_payload_len: usize,
+}
+
+pub(super) fn decode_aich_recovery_answer_payload(payload: &[u8]) -> Result<AichRecoveryAnswer> {
+    if payload.len() == 16 {
+        return Ok(AichRecoveryAnswer {
+            file_hash: Ed2kHash(payload[..16].try_into().unwrap()),
+            part: None,
+            master_hash: None,
+            recovery_payload_len: 0,
+        });
+    }
+    if payload.len() < 38 {
+        anyhow::bail!("short OP_AICHANSWER payload {}", payload.len());
+    }
+    Ok(AichRecoveryAnswer {
+        file_hash: Ed2kHash(payload[..16].try_into().unwrap()),
+        part: Some(u16::from_le_bytes(payload[16..18].try_into().unwrap())),
+        master_hash: Some(payload[18..38].try_into().unwrap()),
+        recovery_payload_len: payload.len() - 38,
+    })
+}
+
+pub(super) fn encode_aich_recovery_failure_answer(file_hash: &Ed2kHash) -> Vec<u8> {
+    encode_packet(OP_EMULEPROT, OP_AICHANSWER, &file_hash.0)
 }
 
 pub(super) fn encode_accept_upload_req() -> Vec<u8> {

@@ -11,24 +11,26 @@ use crate::ed2k_transfer::{Ed2kSourceHint, Ed2kTransferRuntime};
 use super::super::{
     ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, ED2K_SECURE_IDENT_SIGNATURE_NEEDED,
     Ed2kFileIdentifier, Ed2kHelloIdentity, Ed2kSecureIdent, Ed2kTransport, OP_ACCEPTUPLOADREQ,
-    OP_AICHFILEHASHANS, OP_ANSWERSOURCES, OP_ANSWERSOURCES2, OP_BUDDYPING, OP_BUDDYPONG,
-    OP_CHANGE_CLIENT_ID, OP_COMPRESSEDPART, OP_COMPRESSEDPART_I64, OP_EDONKEYPROT, OP_EMULEINFO,
-    OP_EMULEINFOANSWER, OP_EMULEPROT, OP_END_OF_DOWNLOAD, OP_FILEDESC, OP_FILEREQANSNOFIL,
-    OP_FILESTATUS, OP_HASHSETANSWER, OP_HASHSETANSWER2, OP_HELLO, OP_HELLOANSWER,
-    OP_KAD_FWTCPCHECK_ACK, OP_MULTIPACKETANSWER, OP_MULTIPACKETANSWER_EXT2, OP_OUTOFPARTREQS,
-    OP_PORTTEST, OP_PREVIEWANSWER, OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_QUEUERANK,
-    OP_QUEUERANKING, OP_REQFILENAMEANSWER, OP_REQUESTPREVIEW, OP_SECIDENTSTATE, OP_SENDINGPART,
-    OP_SENDINGPART_I64, OP_SETREQFILEID, OP_SIGNATURE, SourceExchangePeer,
-    begin_secure_ident_probe, build_hello_responses, decode_aich_file_hash_answer,
-    decode_answer_sources_payload, decode_answer_sources2_payload, decode_client_id_change_payload,
+    OP_AICHANSWER, OP_AICHFILEHASHANS, OP_AICHREQUEST, OP_ANSWERSOURCES, OP_ANSWERSOURCES2,
+    OP_BUDDYPING, OP_BUDDYPONG, OP_CHANGE_CLIENT_ID, OP_COMPRESSEDPART, OP_COMPRESSEDPART_I64,
+    OP_EDONKEYPROT, OP_EMULEINFO, OP_EMULEINFOANSWER, OP_EMULEPROT, OP_END_OF_DOWNLOAD,
+    OP_FILEDESC, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_HASHSETANSWER, OP_HASHSETANSWER2, OP_HELLO,
+    OP_HELLOANSWER, OP_KAD_FWTCPCHECK_ACK, OP_MULTIPACKETANSWER, OP_MULTIPACKETANSWER_EXT2,
+    OP_OUTOFPARTREQS, OP_PORTTEST, OP_PREVIEWANSWER, OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ,
+    OP_PUBLICKEY, OP_QUEUERANK, OP_QUEUERANKING, OP_REQFILENAMEANSWER, OP_REQUESTPREVIEW,
+    OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64, OP_SETREQFILEID, OP_SIGNATURE,
+    SourceExchangePeer, begin_secure_ident_probe, build_hello_responses,
+    decode_aich_file_hash_answer, decode_aich_recovery_answer_payload,
+    decode_aich_recovery_request_payload, decode_answer_sources_payload,
+    decode_answer_sources2_payload, decode_client_id_change_payload,
     decode_file_description_payload, decode_file_hash_payload, decode_file_status_payload,
     decode_hashset_answer, decode_hashset_answer2, decode_hello_profile,
     decode_preview_answer_payload, decode_preview_request_payload, decode_public_ip_answer_payload,
     decode_public_key_payload, decode_request_filename_answer, decode_request_filename_answer_body,
     decode_secident_state, dump_ed2k_tcp_download_meta, dump_ed2k_tcp_download_recv,
-    dump_ed2k_tcp_download_send, encode_emule_info_answer, encode_packet, encode_port_test_answer,
-    encode_public_ip_answer, is_connection_shutdown_error, skip_file_status_body,
-    try_send_secure_ident_signature,
+    dump_ed2k_tcp_download_send, encode_aich_recovery_failure_answer, encode_emule_info_answer,
+    encode_packet, encode_port_test_answer, encode_public_ip_answer, is_connection_shutdown_error,
+    skip_file_status_body, try_send_secure_ident_signature,
 };
 use super::{
     ActiveDownloadPiece, DownloadRequestWindowState, PendingCompressedPart, PendingPartRequest,
@@ -706,6 +708,48 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                             preview_answer.frame_count,
                             preview_answer.frame_payload_bytes,
                             preview_answer.trailing_len
+                        ),
+                    );
+                }
+                (OP_EMULEPROT, OP_AICHREQUEST) => {
+                    let request = decode_aich_recovery_request_payload(&packet.payload)?;
+                    dump_ed2k_tcp_download_meta(
+                        peer_addr,
+                        Some(transport.mode),
+                        "aich_recovery_request",
+                        format!(
+                            "file_hash={} part={} master_hash={}",
+                            request.file_hash,
+                            request.part,
+                            hex::encode(request.master_hash)
+                        ),
+                    );
+                    let reply = encode_aich_recovery_failure_answer(&request.file_hash);
+                    dump_ed2k_tcp_download_send(
+                        peer_addr,
+                        transport.mode,
+                        "aich_recovery_failure",
+                        &reply,
+                    );
+                    transport.write_all(&reply).await.with_context(|| {
+                        format!("failed to send OP_AICHANSWER failure to {peer_addr}")
+                    })?;
+                }
+                (OP_EMULEPROT, OP_AICHANSWER) => {
+                    let answer = decode_aich_recovery_answer_payload(&packet.payload)?;
+                    dump_ed2k_tcp_download_meta(
+                        peer_addr,
+                        Some(transport.mode),
+                        "aich_recovery_answer",
+                        format!(
+                            "file_hash={} part={:?} master_hash={} recovery_payload_len={}",
+                            answer.file_hash,
+                            answer.part,
+                            answer
+                                .master_hash
+                                .map(hex::encode)
+                                .unwrap_or_else(|| "none".to_string()),
+                            answer.recovery_payload_len
                         ),
                     );
                 }

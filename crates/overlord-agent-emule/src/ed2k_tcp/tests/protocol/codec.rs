@@ -102,6 +102,38 @@ fn preview_packets_decode_stock_hash_and_frame_shape() {
 }
 
 #[test]
+fn aich_recovery_packets_decode_stock_shapes() {
+    let file_hash = Ed2kHash([0x67; 16]);
+    let master_hash = [0x68; 20];
+    let mut request_payload = Vec::new();
+    request_payload.extend_from_slice(&file_hash.0);
+    request_payload.extend_from_slice(&3u16.to_le_bytes());
+    request_payload.extend_from_slice(&master_hash);
+
+    let request = decode_aich_recovery_request_payload(&request_payload).unwrap();
+    assert_eq!(request.file_hash, file_hash);
+    assert_eq!(request.part, 3);
+    assert_eq!(request.master_hash, master_hash);
+
+    let failure = encode_aich_recovery_failure_answer(&file_hash);
+    assert_eq!(failure[0], OP_EMULEPROT);
+    assert_eq!(failure[5], OP_AICHANSWER);
+    let decoded_failure = decode_aich_recovery_answer_payload(&failure[6..]).unwrap();
+    assert_eq!(decoded_failure.file_hash, file_hash);
+    assert_eq!(decoded_failure.part, None);
+    assert_eq!(decoded_failure.master_hash, None);
+    assert_eq!(decoded_failure.recovery_payload_len, 0);
+
+    let mut answer_payload = request_payload;
+    answer_payload.extend_from_slice(b"recovery");
+    let answer = decode_aich_recovery_answer_payload(&answer_payload).unwrap();
+    assert_eq!(answer.file_hash, file_hash);
+    assert_eq!(answer.part, Some(3));
+    assert_eq!(answer.master_hash, Some(master_hash));
+    assert_eq!(answer.recovery_payload_len, 8);
+}
+
+#[test]
 fn file_identifier_roundtrip_matches_stock_md4_plus_size_shape() {
     let identifier = super::Ed2kFileIdentifier {
         file_hash: Ed2kHash([0xAB; 16]),
