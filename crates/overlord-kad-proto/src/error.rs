@@ -16,6 +16,12 @@ pub enum ProtoError {
     InvalidUtf8,
     #[error("buffer too short")]
     BufferTooShort,
+    #[error("invalid packet size for opcode {opcode:#x}: expected {expected}, got {actual}")]
+    InvalidPacketSize {
+        opcode: u8,
+        expected: usize,
+        actual: usize,
+    },
     #[error("zlib decompression failed")]
     DecompressError,
 }

@@ -319,6 +319,12 @@ fn test_firewalled_req_roundtrip() {
 }
 
 #[test]
+fn firewalled_req_rejects_stock_exact_size_trailing_bytes() {
+    let bytes = vec![0xE4, opcode::FIREWALLED_REQ, 0x36, 0x12, 0xAA];
+    assert!(KadPacket::decode(&bytes).is_err());
+}
+
+#[test]
 fn test_firewalled2_req_roundtrip() {
     let pkt = KadPacket::Firewalled2Req(Firewalled2Req {
         tcp_port: 4662,
@@ -333,6 +339,29 @@ fn test_firewalled2_req_roundtrip() {
     } else {
         panic!("wrong type");
     }
+}
+
+#[test]
+fn firewalled2_req_tolerates_stock_min_size_trailing_bytes() {
+    let mut bytes = vec![0xE4, opcode::FIREWALLED2_REQ];
+    bytes.extend_from_slice(&4662u16.to_le_bytes());
+    bytes.extend_from_slice(&[0x11; 16]);
+    bytes.push(0x07);
+    bytes.push(0xAA);
+
+    assert!(matches!(
+        KadPacket::decode(&bytes).unwrap(),
+        KadPacket::Firewalled2Req(_)
+    ));
+}
+
+#[test]
+fn firewalled_response_and_legacy_ack_reject_stock_exact_size_trailing_bytes() {
+    let firewalled_res = vec![0xE4, opcode::FIREWALLED_RES, 1, 2, 3, 4, 0xAA];
+    assert!(KadPacket::decode(&firewalled_res).is_err());
+
+    let legacy_ack = vec![0xE4, opcode::FIREWALLED_ACK_RES, 0xAA];
+    assert!(KadPacket::decode(&legacy_ack).is_err());
 }
 
 #[test]

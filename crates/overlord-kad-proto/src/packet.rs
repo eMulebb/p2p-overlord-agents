@@ -29,6 +29,18 @@ use codec::{
     write_find_buddy_res, write_search_key_req, write_search_res, write_search_source_req,
 };
 
+fn require_body_len(opcode: u8, body: &[u8], expected: usize) -> Result<(), ProtoError> {
+    if body.len() == expected {
+        Ok(())
+    } else {
+        Err(ProtoError::InvalidPacketSize {
+            opcode,
+            expected,
+            actual: body.len(),
+        })
+    }
+}
+
 // ── KadPacket ────────────────────────────────────────────────────────────────
 
 /// The top-level Kad2 packet enum.
@@ -156,6 +168,7 @@ impl KadPacket {
             }
             opcode::PUBLISH_RES_ACK => KadPacket::PublishResAck,
             opcode::FIREWALLED_REQ => {
+                require_body_len(op, body, 2)?;
                 let p = cursor.read_le::<FirewalledReq>()?;
                 KadPacket::FirewalledReq(p)
             }
@@ -164,10 +177,14 @@ impl KadPacket {
                 KadPacket::Firewalled2Req(p)
             }
             opcode::FIREWALLED_RES => {
+                require_body_len(op, body, 4)?;
                 let p = cursor.read_le::<FirewalledRes>()?;
                 KadPacket::FirewalledRes(p)
             }
-            opcode::FIREWALLED_ACK_RES => KadPacket::FirewalledAckRes,
+            opcode::FIREWALLED_ACK_RES => {
+                require_body_len(op, body, 0)?;
+                KadPacket::FirewalledAckRes
+            }
             opcode::FIREWALLUDP => {
                 let p = cursor.read_le::<FirewallUdp>()?;
                 KadPacket::FirewallUdp(p)
