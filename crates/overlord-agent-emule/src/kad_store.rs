@@ -273,8 +273,8 @@ impl KadLocalStore {
             .iter()
             .rev()
             .filter(|entry| entry.target == request.target)
-            .filter(|entry| stock_file_size_matches_request(&entry.tags, request.size))
             .skip(offset)
+            .filter(|entry| stock_file_size_matches_request(&entry.tags, request.size))
             .take(limit)
             .map(|entry| SearchResultEntry {
                 entry_id: source_entry_id(entry.publisher_id),
@@ -1565,6 +1565,73 @@ mod tests {
             response.results[0].tags[0].value,
             TagValue::UInt(value) if value == size
         ));
+    }
+
+    #[test]
+    fn source_search_offset_applies_before_size_filter_like_stock() {
+        let mut config = config();
+        config.source_capacity = 3;
+        let mut store = KadLocalStore::new(config);
+        let target = NodeId::from_bytes([3; 16]);
+        let other_size_tags = vec![
+            Tag::new_short(tag_name::SOURCETYPE, TagValue::UInt(1)),
+            Tag::new_short(tag_name::FILESIZE, TagValue::UInt(456)),
+            Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(4662)),
+        ];
+        let requested_size_tags = vec![
+            Tag::new_short(tag_name::SOURCETYPE, TagValue::UInt(1)),
+            Tag::new_short(tag_name::FILESIZE, TagValue::UInt(123)),
+            Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(4662)),
+        ];
+
+        store.record_source_publish(
+            target,
+            NodeId::from_bytes([1; 16]),
+            Ipv4Addr::new(1, 1, 1, 1),
+            4672,
+            &requested_size_tags,
+            ts(1),
+        );
+        store.record_source_publish(
+            target,
+            NodeId::from_bytes([2; 16]),
+            Ipv4Addr::new(2, 2, 2, 2),
+            4672,
+            &requested_size_tags,
+            ts(2),
+        );
+        store.record_source_publish(
+            target,
+            NodeId::from_bytes([3; 16]),
+            Ipv4Addr::new(3, 3, 3, 3),
+            4672,
+            &other_size_tags,
+            ts(3),
+        );
+        assert_eq!(store.source_entry_count(), 3);
+
+        let response = store
+            .source_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchSourceReq {
+                    target,
+                    start_position: 1,
+                    size: 123,
+                },
+                10,
+                ts(4),
+            )
+            .expect("source response");
+
+        assert_eq!(response.results.len(), 2);
+        assert_eq!(
+            response.results[0].entry_id,
+            source_entry_id(NodeId::from_bytes([2; 16]))
+        );
+        assert_eq!(
+            response.results[1].entry_id,
+            source_entry_id(NodeId::from_bytes([1; 16]))
+        );
     }
 
     #[test]
