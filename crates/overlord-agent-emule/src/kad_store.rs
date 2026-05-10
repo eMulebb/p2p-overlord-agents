@@ -56,6 +56,7 @@ struct StoredSourcePublish {
     target: NodeId,
     publisher_id: NodeId,
     source_ip: Ipv4Addr,
+    source_udp_port: u16,
     tags: Vec<Tag>,
     dedup_key: String,
 }
@@ -125,6 +126,7 @@ impl KadLocalStore {
         target: NodeId,
         publisher_id: NodeId,
         source_ip: Ipv4Addr,
+        source_udp_port: u16,
         tags: &[Tag],
         observed_at: DateTime<Utc>,
     ) -> bool {
@@ -149,6 +151,7 @@ impl KadLocalStore {
                 target,
                 publisher_id,
                 source_ip,
+                source_udp_port,
                 tags: tags.to_vec(),
                 dedup_key,
             },
@@ -310,6 +313,7 @@ fn search_response(
 
 fn source_result_tags(entry: &StoredSourcePublish) -> Vec<Tag> {
     let mut saw_source_ip = false;
+    let mut saw_source_udp_port = false;
     let mut tags = entry
         .tags
         .iter()
@@ -322,9 +326,17 @@ fn source_result_tags(entry: &StoredSourcePublish) -> Vec<Tag> {
                     tag.value = TagValue::U32(*value as u32);
                 }
                 (TagName::Short(name), TagValue::UInt(value))
-                    if *name == tag_name::SOURCEUPORT && u16::try_from(*value).is_ok() =>
+                    if *name == tag_name::SOURCEUPORT
+                        && *value > 0
+                        && u16::try_from(*value).is_ok() =>
                 {
                     tag.value = TagValue::U16(*value as u16);
+                    saw_source_udp_port = true;
+                }
+                (TagName::Short(name), TagValue::U16(value))
+                    if *name == tag_name::SOURCEUPORT && *value > 0 =>
+                {
+                    saw_source_udp_port = true;
                 }
                 (TagName::Short(name), _) if *name == tag_name::SOURCEIP => {
                     saw_source_ip = true;
@@ -338,6 +350,12 @@ fn source_result_tags(entry: &StoredSourcePublish) -> Vec<Tag> {
         tags.push(Tag::new_short(
             tag_name::SOURCEIP,
             TagValue::U32(u32::from_be_bytes(entry.source_ip.octets())),
+        ));
+    }
+    if !saw_source_udp_port {
+        tags.push(Tag::new_short(
+            tag_name::SOURCEUPORT,
+            TagValue::U16(entry.source_udp_port),
         ));
     }
     tags
@@ -596,6 +614,7 @@ mod tests {
             target,
             publisher_one,
             Ipv4Addr::new(1, 1, 1, 1),
+            4672,
             &tags,
             ts(1),
         ));
@@ -603,6 +622,7 @@ mod tests {
             target,
             publisher_two,
             Ipv4Addr::new(2, 2, 2, 2),
+            4673,
             &tags,
             ts(2),
         ));
@@ -610,6 +630,7 @@ mod tests {
             target,
             publisher_three,
             Ipv4Addr::new(3, 3, 3, 3),
+            4674,
             &tags,
             ts(3),
         ));
@@ -639,6 +660,14 @@ mod tests {
                 .iter()
                 .any(|tag| matches!(&tag.name, TagName::Short(name) if *name == tag_name::SOURCEIP))
         }));
+        assert!(response.results.iter().all(|entry| {
+            entry.tags.iter().any(|tag| {
+                matches!(
+                    (&tag.name, &tag.value),
+                    (TagName::Short(name), TagValue::U16(_)) if *name == tag_name::SOURCEUPORT
+                )
+            })
+        }));
     }
 
     #[test]
@@ -655,6 +684,7 @@ mod tests {
             target,
             publisher,
             Ipv4Addr::new(1, 1, 1, 1),
+            4672,
             &tags,
             ts(1),
         ));

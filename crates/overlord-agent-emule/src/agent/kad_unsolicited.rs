@@ -372,7 +372,14 @@ pub(super) async fn handle_unsolicited_packet(
         KadPacket::PublishSourceReq(req) => {
             let accepted = if let IpAddr::V4(ip) = from.ip() {
                 let mut store = context.local_store.lock().await;
-                store.record_source_publish(req.target, req.publisher_id, ip, &req.tags, Utc::now())
+                store.record_source_publish(
+                    req.target,
+                    req.publisher_id,
+                    ip,
+                    from.port(),
+                    &req.tags,
+                    Utc::now(),
+                )
             } else {
                 false
             };

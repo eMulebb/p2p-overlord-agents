@@ -291,6 +291,7 @@ async fn seed_popular_impl(
                 NodeId::from_be_bytes(file_hash.0),
                 source_publish_identity,
                 source_ip,
+                bind_addr.port(),
                 &source_tags,
                 Utc::now(),
             );
