@@ -441,7 +441,7 @@ fn keyword_aich_result_tag(hash: [u8; 20]) -> Tag {
 
 fn source_result_tags(entry: &StoredSourcePublish) -> Vec<Tag> {
     let mut tags = Vec::new();
-    if let Some(size) = stored_file_size(&entry.tags) {
+    if let Some(size) = stock_first_file_size(&entry.tags) {
         tags.push(Tag::filesize(size));
     }
 
@@ -612,42 +612,6 @@ fn normalized_source_udp_port_tag(tag: &Tag) -> Option<Tag> {
 
 fn source_entry_id(publisher_id: NodeId) -> Ed2kHash {
     Ed2kHash::from_bytes(publisher_id.to_be_bytes())
-}
-
-fn stored_file_size(tags: &[Tag]) -> Option<u64> {
-    let mut size = None;
-    let mut size_low = None;
-    let mut size_high = None;
-
-    for tag in tags {
-        match &tag.name {
-            TagName::Short(name) if *name == tag_name::FILESIZE => match &tag.value {
-                TagValue::UInt(value) => size = Some(*value),
-                TagValue::U64(value) => size = Some(*value),
-                TagValue::U32(value) => size_low = Some(*value),
-                TagValue::U16(value) => size_low = Some(u32::from(*value)),
-                TagValue::U8(value) => size_low = Some(u32::from(*value)),
-                _ => {}
-            },
-            TagName::Short(name) if *name == tag_name::FILESIZE_HI => match &tag.value {
-                TagValue::UInt(value) if u32::try_from(*value).is_ok() => {
-                    size_high = Some(*value as u32)
-                }
-                TagValue::U32(value) => size_high = Some(*value),
-                TagValue::U16(value) => size_high = Some(u32::from(*value)),
-                TagValue::U8(value) => size_high = Some(u32::from(*value)),
-                _ => {}
-            },
-            _ => {}
-        }
-    }
-
-    size.or_else(|| {
-        size_low.map(|low| {
-            let high = size_high.unwrap_or(0);
-            (u64::from(high) << 32) | u64::from(low)
-        })
-    })
 }
 
 fn purge_expired<T>(entries: &mut Vec<T>, ttl: Duration, now: DateTime<Utc>)
@@ -891,7 +855,7 @@ impl DedupEntry for StoredNotesPublish {
 }
 
 fn stock_keyword_file_size(tags: &[Tag]) -> Option<u64> {
-    stored_file_size(tags).filter(|size| *size > 0)
+    stock_first_file_size(tags).filter(|size| *size > 0)
 }
 
 fn has_stock_keyword_filename(tags: &[Tag]) -> bool {
@@ -983,7 +947,7 @@ fn notes_dedup_key(target: NodeId, publisher_id: NodeId, publisher_ip: Ipv4Addr)
 
 #[cfg(test)]
 mod tests {
-    use super::{KadLocalStore, KadLocalStoreConfig, source_entry_id, stored_file_size};
+    use super::{KadLocalStore, KadLocalStoreConfig, source_entry_id};
     use chrono::{DateTime, TimeZone, Utc};
     use overlord_kad_proto::{
         Ed2kHash, NodeId, PublishEntry, SearchKeyReq, SearchNotesReq, SearchSourceReq, Tag,
@@ -1137,6 +1101,42 @@ mod tests {
                     if *name == tag_name::SOURCES && *value == 9
             )
         }));
+    }
+
+    #[test]
+    fn keyword_publish_uses_primary_file_size_like_stock() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([1; 16]);
+        let file_hash = Ed2kHash::from_bytes([2; 16]);
+        let entry = PublishEntry {
+            hash: file_hash,
+            tags: vec![
+                Tag::filename("ubuntu linux.iso"),
+                Tag::new_short(tag_name::FILESIZE, TagValue::U32(123)),
+                Tag::new_short(tag_name::FILESIZE, TagValue::U32(999)),
+            ],
+        };
+
+        assert_eq!(
+            store.record_keyword_publish_batch(target, std::slice::from_ref(&entry), ts(0)),
+            1
+        );
+        let response = store
+            .keyword_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchKeyReq {
+                    target,
+                    start_position: 0,
+                    restrictive_payload: Vec::new(),
+                },
+                10,
+                ts(1),
+            )
+            .expect("keyword response");
+        assert!(matches!(
+            response.results[0].tags[1].value,
+            TagValue::UInt(value) if value == 123
+        ));
     }
 
     #[test]
@@ -1564,6 +1564,45 @@ mod tests {
         assert!(matches!(
             response.results[0].tags[0].value,
             TagValue::UInt(value) if value == size
+        ));
+    }
+
+    #[test]
+    fn source_search_result_uses_primary_file_size_like_stock() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([3; 16]);
+        let publisher = NodeId::from_bytes([4; 16]);
+        let tags = vec![
+            Tag::new_short(tag_name::SOURCETYPE, TagValue::UInt(1)),
+            Tag::new_short(tag_name::FILESIZE, TagValue::U32(123)),
+            Tag::new_short(tag_name::FILESIZE, TagValue::U32(999)),
+            Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(4662)),
+        ];
+
+        store.record_source_publish(
+            target,
+            publisher,
+            Ipv4Addr::new(1, 1, 1, 1),
+            4672,
+            &tags,
+            ts(1),
+        );
+
+        let response = store
+            .source_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchSourceReq {
+                    target,
+                    start_position: 0,
+                    size: 123,
+                },
+                10,
+                ts(2),
+            )
+            .expect("source response");
+        assert!(matches!(
+            response.results[0].tags[0].value,
+            TagValue::UInt(value) if value == 123
         ));
     }
 
@@ -2090,15 +2129,6 @@ mod tests {
             ts(2),
         );
         assert!(response.is_none());
-    }
-
-    #[test]
-    fn stored_file_size_combines_low_and_high_parts() {
-        let size = stored_file_size(&[
-            Tag::new_short(tag_name::FILESIZE, TagValue::U32(1)),
-            Tag::new_short(tag_name::FILESIZE_HI, TagValue::U32(2)),
-        ]);
-        assert_eq!(size, Some((2_u64 << 32) | 1));
     }
 
     #[test]
