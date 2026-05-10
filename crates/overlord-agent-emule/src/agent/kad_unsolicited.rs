@@ -370,26 +370,29 @@ pub(super) async fn handle_unsolicited_packet(
                 .await;
         }
         KadPacket::PublishSourceReq(req) => {
-            if let IpAddr::V4(ip) = from.ip() {
+            let accepted = if let IpAddr::V4(ip) = from.ip() {
                 let mut store = context.local_store.lock().await;
-                store.record_source_publish(
-                    req.target,
-                    req.publisher_id,
-                    ip,
-                    &req.tags,
-                    Utc::now(),
+                store.record_source_publish(req.target, req.publisher_id, ip, &req.tags, Utc::now())
+            } else {
+                false
+            };
+            if accepted {
+                let _ = dht
+                    .send_packet(
+                        from,
+                        &KadPacket::PublishRes(overlord_kad_proto::PublishRes {
+                            target: req.target,
+                            load: 0,
+                            options: None,
+                        }),
+                    )
+                    .await;
+            } else {
+                debug!(
+                    "rejecting Kad source publish from={} target={} publisher_id={} without stock source marker",
+                    from, req.target, req.publisher_id
                 );
             }
-            let _ = dht
-                .send_packet(
-                    from,
-                    &KadPacket::PublishRes(overlord_kad_proto::PublishRes {
-                        target: req.target,
-                        load: 0,
-                        options: None,
-                    }),
-                )
-                .await;
         }
         KadPacket::PublishNotesReq(req) => {
             {

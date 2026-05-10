@@ -127,9 +127,12 @@ impl KadLocalStore {
         source_ip: Ipv4Addr,
         tags: &[Tag],
         observed_at: DateTime<Utc>,
-    ) {
+    ) -> bool {
         if !self.config.enabled {
-            return;
+            return false;
+        }
+        if !is_stock_source_publish(tags) {
+            return false;
         }
         purge_expired(
             &mut self.source_entries,
@@ -150,6 +153,7 @@ impl KadLocalStore {
                 dedup_key,
             },
         );
+        true
     }
 
     pub(crate) fn record_notes_publish(
@@ -281,6 +285,11 @@ impl KadLocalStore {
     fn notes_entry_count(&self) -> usize {
         self.notes_entries.len()
     }
+}
+
+fn is_stock_source_publish(tags: &[Tag]) -> bool {
+    tags.iter()
+        .any(|tag| matches!(tag.name, TagName::Short(tag_name::SOURCETYPE)))
 }
 
 fn search_response(
@@ -578,31 +587,32 @@ mod tests {
             0x2E, 0x2D,
         ]);
         let tags = vec![
+            Tag::new_short(tag_name::SOURCETYPE, TagValue::UInt(1)),
             Tag::filesize(456),
             Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(4662)),
         ];
 
-        store.record_source_publish(
+        assert!(store.record_source_publish(
             target,
             publisher_one,
             Ipv4Addr::new(1, 1, 1, 1),
             &tags,
             ts(1),
-        );
-        store.record_source_publish(
+        ));
+        assert!(store.record_source_publish(
             target,
             publisher_two,
             Ipv4Addr::new(2, 2, 2, 2),
             &tags,
             ts(2),
-        );
-        store.record_source_publish(
+        ));
+        assert!(store.record_source_publish(
             target,
             publisher_three,
             Ipv4Addr::new(3, 3, 3, 3),
             &tags,
             ts(3),
-        );
+        ));
 
         assert_eq!(store.source_entry_count(), 2);
         let response = store
@@ -629,6 +639,26 @@ mod tests {
                 .iter()
                 .any(|tag| matches!(&tag.name, TagName::Short(name) if *name == tag_name::SOURCEIP))
         }));
+    }
+
+    #[test]
+    fn source_publish_without_stock_source_type_is_rejected() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([3; 16]);
+        let publisher = NodeId::from_bytes([4; 16]);
+        let tags = vec![
+            Tag::filesize(456),
+            Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(4662)),
+        ];
+
+        assert!(!store.record_source_publish(
+            target,
+            publisher,
+            Ipv4Addr::new(1, 1, 1, 1),
+            &tags,
+            ts(1),
+        ));
+        assert_eq!(store.source_entry_count(), 0);
     }
 
     #[test]
