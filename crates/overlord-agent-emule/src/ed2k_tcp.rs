@@ -41,22 +41,22 @@ mod listener;
 mod obfuscation;
 mod transport;
 pub(in crate::ed2k_tcp) use codec::{
-    PeerSourceExchangeRequest, decode_aich_file_hash_answer, decode_answer_sources2_payload,
-    decode_compressed_part_fragment, decode_file_status_payload, decode_hashset_answer,
-    decode_hashset_answer2, decode_peer_payload, decode_request_filename_answer,
-    decode_request_filename_answer_body, decode_sending_part_payload,
-    encode_aich_file_hash_request, encode_hashset_request, encode_hashset_request2,
-    encode_multipacket_ext2_request, encode_multipacket_request, encode_packet,
-    encode_request_filename, encode_request_parts_batch, encode_request_sources,
+    PeerSourceExchangeRequest, SourceExchangePeer, decode_aich_file_hash_answer,
+    decode_answer_sources_payload, decode_answer_sources2_payload, decode_compressed_part_fragment,
+    decode_file_status_payload, decode_hashset_answer, decode_hashset_answer2, decode_peer_payload,
+    decode_request_filename_answer, decode_request_filename_answer_body,
+    decode_sending_part_payload, encode_aich_file_hash_request, encode_hashset_request,
+    encode_hashset_request2, encode_multipacket_ext2_request, encode_multipacket_request,
+    encode_packet, encode_request_filename, encode_request_parts_batch, encode_request_sources,
     encode_request_sources2, encode_set_req_file_id, encode_start_upload_req,
     inflate_compressed_part_fragment, skip_file_status_body,
 };
 #[cfg(test)]
 #[allow(unused_imports)]
 use codec::{
-    SourceExchangePeer, build_upload_part_packets, decode_file_hash_payload,
-    decode_hashset_request2, decode_request_parts_payload, decode_request_sources_payload,
-    encode_accept_upload_req, encode_aich_file_hash_answer, encode_answer_sources2,
+    build_upload_part_packets, decode_file_hash_payload, decode_hashset_request2,
+    decode_request_parts_payload, decode_request_sources_payload, encode_accept_upload_req,
+    encode_aich_file_hash_answer, encode_answer_sources, encode_answer_sources2,
     encode_compressed_part_fragment, encode_file_req_ans_nofil, encode_file_status_complete,
     encode_hashset_answer, encode_hashset_answer2, encode_multipacket_answer,
     encode_multipacket_ext2_answer, encode_packed_packet, encode_queue_ranking,

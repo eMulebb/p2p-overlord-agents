@@ -151,6 +151,9 @@ fn hello_decode_preserves_multipacket_capabilities() {
 
     assert!(profile.supports_multipacket);
     assert!(profile.supports_ext_multipacket);
+    assert_eq!(profile.source_exchange_version, 4);
+    assert!(profile.supports_source_exchange);
+    assert!(profile.supports_source_exchange2);
     assert!(profile.supports_file_identifiers);
 }
 

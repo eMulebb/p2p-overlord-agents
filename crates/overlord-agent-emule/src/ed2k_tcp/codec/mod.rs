@@ -525,14 +525,99 @@ pub(super) fn decode_answer_sources2_payload(
 
     let file_hash = Ed2kHash(payload[1..17].try_into().unwrap());
     let count = usize::from(u16::from_le_bytes([payload[17], payload[18]]));
+    let sources =
+        decode_source_exchange_entries(version, count, &payload[19..], "OP_ANSWERSOURCES2")?;
+
+    Ok((file_hash, sources))
+}
+
+pub(super) fn decode_answer_sources_payload(
+    payload: &[u8],
+    peer_source_exchange_version: u8,
+) -> Result<(Ed2kHash, Vec<SourceExchangePeer>)> {
+    if payload.len() < 16 + 2 {
+        anyhow::bail!("short OP_ANSWERSOURCES payload {}", payload.len());
+    }
+
+    let file_hash = Ed2kHash(payload[..16].try_into().unwrap());
+    let count = usize::from(u16::from_le_bytes([payload[16], payload[17]]));
+    let sources_payload = &payload[18..];
+    let version = infer_source_exchange1_payload_version(
+        count,
+        sources_payload,
+        peer_source_exchange_version,
+    )?;
+    let sources =
+        decode_source_exchange_entries(version, count, sources_payload, "OP_ANSWERSOURCES")?;
+
+    Ok((file_hash, sources))
+}
+
+fn infer_source_exchange1_payload_version(
+    count: usize,
+    sources_payload: &[u8],
+    peer_source_exchange_version: u8,
+) -> Result<u8> {
+    let v1_size = count
+        .checked_mul(source_exchange_entry_size(1))
+        .context("OP_ANSWERSOURCES source count overflow")?;
+    if sources_payload.len() == v1_size {
+        if peer_source_exchange_version < 1 {
+            anyhow::bail!("peer does not advertise source exchange 1 support");
+        }
+        return Ok(1);
+    }
+
+    let v2_or_v3_size = count
+        .checked_mul(source_exchange_entry_size(2))
+        .context("OP_ANSWERSOURCES source count overflow")?;
+    if sources_payload.len() == v2_or_v3_size {
+        if peer_source_exchange_version < 2 {
+            anyhow::bail!(
+                "peer source exchange version {} is too old for hash-bearing OP_ANSWERSOURCES",
+                peer_source_exchange_version
+            );
+        }
+        return Ok(if peer_source_exchange_version == 2 {
+            2
+        } else {
+            3
+        });
+    }
+
+    let v4_size = count
+        .checked_mul(source_exchange_entry_size(4))
+        .context("OP_ANSWERSOURCES source count overflow")?;
+    if sources_payload.len() == v4_size {
+        if peer_source_exchange_version < 4 {
+            anyhow::bail!(
+                "peer source exchange version {} is too old for connect-option OP_ANSWERSOURCES",
+                peer_source_exchange_version
+            );
+        }
+        return Ok(4);
+    }
+
+    anyhow::bail!(
+        "corrupt OP_ANSWERSOURCES payload count={} size={}",
+        count,
+        sources_payload.len()
+    );
+}
+
+fn decode_source_exchange_entries(
+    version: u8,
+    count: usize,
+    sources_payload: &[u8],
+    opcode_name: &str,
+) -> Result<Vec<SourceExchangePeer>> {
     let entry_size = source_exchange_entry_size(version);
-    let sources_payload = &payload[19..];
     let expected_size = count
         .checked_mul(entry_size)
-        .context("OP_ANSWERSOURCES2 source count overflow")?;
+        .with_context(|| format!("{opcode_name} source count overflow"))?;
     if sources_payload.len() != expected_size {
         anyhow::bail!(
-            "corrupt OP_ANSWERSOURCES2 payload version={} count={} size={}",
+            "corrupt {opcode_name} payload version={} count={} size={}",
             version,
             count,
             sources_payload.len()
@@ -565,7 +650,7 @@ pub(super) fn decode_answer_sources2_payload(
         });
     }
 
-    Ok((file_hash, sources))
+    Ok(sources)
 }
 
 const fn source_exchange_entry_size(version: u8) -> usize {

@@ -1,6 +1,6 @@
 use tokio::time::Instant;
 
-use super::super::super::Ed2kPeerSecureIdentState;
+use super::super::super::{ED2K_SOURCE_EXCHANGE2_VERSION, Ed2kPeerSecureIdentState};
 use super::super::ActiveDownloadPiece;
 
 pub(super) struct DownloadSessionState {
@@ -10,6 +10,7 @@ pub(super) struct DownloadSessionState {
     pub(super) remote_supports_file_identifiers: bool,
     pub(super) remote_supports_multipacket: bool,
     pub(super) remote_supports_ext_multipacket: bool,
+    pub(super) remote_source_exchange_version: u8,
     pub(super) remote_supports_source_exchange: bool,
     pub(super) remote_supports_source_exchange2: bool,
     pub(super) source_exchange_allowed: bool,
@@ -42,6 +43,11 @@ impl DownloadSessionState {
             remote_supports_file_identifiers: false,
             remote_supports_multipacket: initial_hello_complete,
             remote_supports_ext_multipacket: initial_hello_complete,
+            remote_source_exchange_version: if initial_hello_complete {
+                ED2K_SOURCE_EXCHANGE2_VERSION
+            } else {
+                0
+            },
             remote_supports_source_exchange: initial_hello_complete,
             remote_supports_source_exchange2: initial_hello_complete,
             source_exchange_allowed,

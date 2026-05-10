@@ -262,6 +262,56 @@ fn legacy_multipacket_request_uses_ext_envelope_for_sized_peer() {
 }
 
 #[test]
+fn legacy_source_answer_v1_uses_peer_advertised_sx1_version() {
+    let file_hash = Ed2kHash([0x58; 16]);
+    let source = SourceExchangePeer {
+        ip: [192, 0, 2, 44],
+        tcp_port: 4662,
+        server_ip: u32::from_le_bytes([203, 0, 113, 7]),
+        server_port: 4242,
+        user_hash: None,
+        connect_options: 0,
+    };
+
+    let packet = encode_answer_sources(&file_hash, &[source]);
+
+    assert_eq!(packet[0], OP_EMULEPROT);
+    assert_eq!(packet[5], OP_ANSWERSOURCES);
+    let (decoded_hash, decoded_sources) = decode_answer_sources_payload(&packet[6..], 4).unwrap();
+
+    assert_eq!(decoded_hash, file_hash);
+    assert_eq!(decoded_sources, vec![source]);
+}
+
+#[test]
+fn legacy_source_answer_rejects_v4_shape_from_v3_peer() {
+    let file_hash = Ed2kHash([0x59; 16]);
+    let source = SourceExchangePeer {
+        ip: [198, 51, 100, 9],
+        tcp_port: 4662,
+        server_ip: u32::from_le_bytes([203, 0, 113, 8]),
+        server_port: 4242,
+        user_hash: Some([0x7B; 16]),
+        connect_options: 0x03,
+    };
+    let mut payload = Vec::with_capacity(16 + 2 + 29);
+    payload.extend_from_slice(&file_hash.0);
+    payload.extend_from_slice(&1u16.to_le_bytes());
+    payload.extend_from_slice(&u32::from_be_bytes(source.ip).to_le_bytes());
+    payload.extend_from_slice(&source.tcp_port.to_le_bytes());
+    payload.extend_from_slice(&source.server_ip.to_le_bytes());
+    payload.extend_from_slice(&source.server_port.to_le_bytes());
+    payload.extend_from_slice(&source.user_hash.unwrap());
+    payload.push(source.connect_options);
+
+    assert!(decode_answer_sources_payload(&payload, 3).is_err());
+    let (decoded_hash, decoded_sources) = decode_answer_sources_payload(&payload, 4).unwrap();
+
+    assert_eq!(decoded_hash, file_hash);
+    assert_eq!(decoded_sources, vec![source]);
+}
+
+#[test]
 fn request_filename_answer_uses_stock_u16_string_length_prefix() {
     let packet =
         super::encode_request_filename_answer(&Ed2kHash([0x55; 16]), "captured.epub").unwrap();

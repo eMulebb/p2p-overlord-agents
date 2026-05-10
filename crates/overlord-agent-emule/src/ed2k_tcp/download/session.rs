@@ -16,12 +16,13 @@ use super::super::{
     OP_FILEDESC, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_HASHSETANSWER, OP_HASHSETANSWER2, OP_HELLO,
     OP_HELLOANSWER, OP_MULTIPACKETANSWER, OP_MULTIPACKETANSWER_EXT2, OP_PUBLICKEY, OP_QUEUERANKING,
     OP_REQFILENAMEANSWER, OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64, OP_SETREQFILEID,
-    OP_SIGNATURE, begin_secure_ident_probe, build_hello_responses, decode_aich_file_hash_answer,
-    decode_answer_sources2_payload, decode_file_status_payload, decode_hashset_answer,
-    decode_hashset_answer2, decode_hello_profile, decode_public_key_payload,
-    decode_request_filename_answer, decode_request_filename_answer_body, decode_secident_state,
-    dump_ed2k_tcp_download_meta, dump_ed2k_tcp_download_recv, dump_ed2k_tcp_download_send,
-    encode_emule_info_answer, encode_packet, is_connection_shutdown_error, skip_file_status_body,
+    OP_SIGNATURE, SourceExchangePeer, begin_secure_ident_probe, build_hello_responses,
+    decode_aich_file_hash_answer, decode_answer_sources_payload, decode_answer_sources2_payload,
+    decode_file_status_payload, decode_hashset_answer, decode_hashset_answer2,
+    decode_hello_profile, decode_public_key_payload, decode_request_filename_answer,
+    decode_request_filename_answer_body, decode_secident_state, dump_ed2k_tcp_download_meta,
+    dump_ed2k_tcp_download_recv, dump_ed2k_tcp_download_send, encode_emule_info_answer,
+    encode_packet, is_connection_shutdown_error, skip_file_status_body,
     try_send_secure_ident_signature,
 };
 use super::{
@@ -229,6 +230,8 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     session_state.remote_supports_multipacket = hello_profile.supports_multipacket;
                     session_state.remote_supports_ext_multipacket =
                         hello_profile.supports_ext_multipacket;
+                    session_state.remote_source_exchange_version =
+                        hello_profile.source_exchange_version;
                     session_state.remote_supports_source_exchange = hello_profile.supports_source_exchange;
                     session_state.remote_supports_source_exchange2 = hello_profile.supports_source_exchange2;
                     if hello_profile.is_mule_hello && !session_state.peer_secure_ident.requested_peer_key {
@@ -255,6 +258,8 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     session_state.remote_supports_multipacket = hello_profile.supports_multipacket;
                     session_state.remote_supports_ext_multipacket =
                         hello_profile.supports_ext_multipacket;
+                    session_state.remote_source_exchange_version =
+                        hello_profile.source_exchange_version;
                     session_state.remote_supports_source_exchange = hello_profile.supports_source_exchange;
                     session_state.remote_supports_source_exchange2 = hello_profile.supports_source_exchange2;
                     if send_initial_requests
@@ -547,27 +552,28 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                 }
                 (OP_EMULEPROT, OP_ANSWERSOURCES2) => {
                     let (answer_hash, sources) = decode_answer_sources2_payload(&packet.payload)?;
-                    if answer_hash == file_hash {
-                        for source in sources {
-                            if source.tcp_port == 0 || source.ip == [0, 0, 0, 0] {
-                                continue;
-                            }
-                            transfer_runtime
-                                .remember_source(
-                                    file_hash_hex,
-                                    Ed2kSourceHint {
-                                        ip: Ipv4Addr::from(source.ip).to_string(),
-                                        tcp_port: source.tcp_port,
-                                        user_hash: source.user_hash.map(hex::encode),
-                                    },
-                                )
-                                .await?;
-                        }
-                    }
+                    remember_source_exchange_sources(
+                        transfer_runtime,
+                        file_hash,
+                        file_hash_hex,
+                        answer_hash,
+                        sources,
+                    )
+                    .await?;
                 }
                 (OP_EMULEPROT, OP_ANSWERSOURCES) => {
-                    // Legacy SX1 replies need the peer's SX1 version to decode safely.
-                    // SX2 replies carry their version in-band and are consumed above.
+                    let (answer_hash, sources) = decode_answer_sources_payload(
+                        &packet.payload,
+                        session_state.remote_source_exchange_version,
+                    )?;
+                    remember_source_exchange_sources(
+                        transfer_runtime,
+                        file_hash,
+                        file_hash_hex,
+                        answer_hash,
+                        sources,
+                    )
+                    .await?;
                 }
                 (OP_EMULEPROT, OP_QUEUERANKING) => {
                     session_state.queued_until = Some(tokio::time::Instant::now() + QUEUE_RANK_GRACE);
@@ -647,4 +653,34 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
     }
 
     session_result
+}
+
+async fn remember_source_exchange_sources(
+    transfer_runtime: &Ed2kTransferRuntime,
+    expected_hash: Ed2kHash,
+    file_hash_hex: &str,
+    answer_hash: Ed2kHash,
+    sources: Vec<SourceExchangePeer>,
+) -> Result<()> {
+    if answer_hash != expected_hash {
+        return Ok(());
+    }
+
+    for source in sources {
+        if source.tcp_port == 0 || source.ip == [0, 0, 0, 0] {
+            continue;
+        }
+        transfer_runtime
+            .remember_source(
+                file_hash_hex,
+                Ed2kSourceHint {
+                    ip: Ipv4Addr::from(source.ip).to_string(),
+                    tcp_port: source.tcp_port,
+                    user_hash: source.user_hash.map(hex::encode),
+                },
+            )
+            .await?;
+    }
+
+    Ok(())
 }

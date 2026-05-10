@@ -328,6 +328,7 @@ pub(super) struct DecodedHelloProfile {
     pub(super) is_mule_hello: bool,
     pub(super) supports_multipacket: bool,
     pub(super) supports_ext_multipacket: bool,
+    pub(super) source_exchange_version: u8,
     pub(super) supports_source_exchange: bool,
     pub(super) supports_source_exchange2: bool,
     pub(super) supports_file_identifiers: bool,
@@ -367,6 +368,7 @@ fn decode_hello_profile_from_type_payload(type_payload: &[u8]) -> Result<Decoded
     let mut is_mule_hello = false;
     let mut supports_multipacket = false;
     let mut supports_ext_multipacket = false;
+    let mut source_exchange_version = 0;
     let mut supports_source_exchange = false;
     let mut supports_source_exchange2 = false;
     let mut supports_file_identifiers = false;
@@ -385,7 +387,8 @@ fn decode_hello_profile_from_type_payload(type_payload: &[u8]) -> Result<Decoded
         if tag.tag_name == Some(CT_EMULE_MISCOPTIONS1)
             && let Some(misc_options1) = decode_hello_tag_u32(&tag)
         {
-            supports_source_exchange = ((misc_options1 >> 12) & 0x0F) != 0;
+            source_exchange_version = ((misc_options1 >> 12) & 0x0F) as u8;
+            supports_source_exchange = source_exchange_version != 0;
             supports_multipacket = ((misc_options1 >> 1) & 1) != 0;
         }
         cursor = tag.remaining;
@@ -396,6 +399,7 @@ fn decode_hello_profile_from_type_payload(type_payload: &[u8]) -> Result<Decoded
         is_mule_hello,
         supports_multipacket,
         supports_ext_multipacket,
+        source_exchange_version,
         supports_source_exchange,
         supports_source_exchange2,
         supports_file_identifiers,
