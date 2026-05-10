@@ -176,6 +176,7 @@ impl KadPacket {
                 KadPacket::PublishNotesReq(p)
             }
             opcode::PUBLISH_RES => {
+                require_min_body_len(op, body, 17)?;
                 let p = read_publish_res(&mut cursor)?;
                 KadPacket::PublishRes(p)
             }

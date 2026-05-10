@@ -303,6 +303,21 @@ fn publish_response_preserves_optional_stock_ack_request_byte() {
 }
 
 #[test]
+fn publish_response_rejects_short_stock_body() {
+    let mut short = vec![OP_KADEMLIAHEADER, opcode::PUBLISH_RES];
+    short.extend_from_slice(&[0x25; 16]);
+
+    assert!(matches!(
+        KadPacket::decode(&short),
+        Err(ProtoError::InvalidPacketSize {
+            expected: 17,
+            actual: 16,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn test_invalid_protocol_byte() {
     let buf = vec![0xE3, 0x60]; // wrong header
     let err = KadPacket::decode(&buf);
