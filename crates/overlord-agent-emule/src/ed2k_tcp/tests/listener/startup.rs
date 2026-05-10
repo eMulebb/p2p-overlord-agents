@@ -351,6 +351,25 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
         .write_all(&super::encode_packet(OP_EMULEPROT, OP_CHATCAPTCHARES, &[1]))
         .await
         .unwrap();
+    stream
+        .write_all(&super::encode_packet(
+            OP_EDONKEYPROT,
+            OP_CHANGE_SLOT,
+            &file_hash.0,
+        ))
+        .await
+        .unwrap();
+    let mut message_payload = Vec::new();
+    message_payload.extend_from_slice(&5u16.to_le_bytes());
+    message_payload.extend_from_slice(b"hello");
+    stream
+        .write_all(&super::encode_packet(
+            OP_EDONKEYPROT,
+            OP_MESSAGE,
+            &message_payload,
+        ))
+        .await
+        .unwrap();
 
     stream
         .write_all(&super::encode_start_upload_req(&file_hash))

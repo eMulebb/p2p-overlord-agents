@@ -45,16 +45,16 @@ pub(in crate::ed2k_tcp) use codec::{
     decode_aich_recovery_answer_payload, decode_aich_recovery_request_payload,
     decode_answer_sources_payload, decode_answer_sources2_payload,
     decode_chat_captcha_request_payload, decode_chat_captcha_result_payload,
-    decode_client_id_change_payload, decode_compressed_part_fragment,
-    decode_file_description_payload, decode_file_hash_payload, decode_file_status_payload,
-    decode_hashset_answer, decode_hashset_answer2, decode_kad_callback_payload,
-    decode_peer_payload, decode_preview_answer_payload, decode_preview_request_payload,
-    decode_public_ip_answer_payload, decode_reask_callback_tcp_payload,
-    decode_request_filename_answer, decode_request_filename_answer_body,
-    decode_sending_part_payload, encode_aich_file_hash_request,
-    encode_aich_recovery_failure_answer, encode_hashset_request, encode_hashset_request2,
-    encode_multipacket_ext2_request, encode_multipacket_request, encode_packet,
-    encode_port_test_answer, encode_public_ip_answer, encode_request_filename,
+    decode_client_id_change_payload, decode_client_message_payload,
+    decode_compressed_part_fragment, decode_file_description_payload, decode_file_hash_payload,
+    decode_file_status_payload, decode_hashset_answer, decode_hashset_answer2,
+    decode_kad_callback_payload, decode_peer_payload, decode_preview_answer_payload,
+    decode_preview_request_payload, decode_public_ip_answer_payload,
+    decode_reask_callback_tcp_payload, decode_request_filename_answer,
+    decode_request_filename_answer_body, decode_sending_part_payload,
+    encode_aich_file_hash_request, encode_aich_recovery_failure_answer, encode_hashset_request,
+    encode_hashset_request2, encode_multipacket_ext2_request, encode_multipacket_request,
+    encode_packet, encode_port_test_answer, encode_public_ip_answer, encode_request_filename,
     encode_request_parts_batch, encode_request_sources, encode_request_sources2,
     encode_set_req_file_id, encode_start_upload_req, inflate_compressed_part_fragment,
     skip_file_status_body,
@@ -128,6 +128,7 @@ const OP_REQUESTPARTS: u8 = 0x47;
 const OP_FILEREQANSNOFIL: u8 = 0x48;
 const OP_END_OF_DOWNLOAD: u8 = 0x49;
 const OP_CHANGE_CLIENT_ID: u8 = 0x4D;
+const OP_MESSAGE: u8 = 0x4E;
 const OP_SETREQFILEID: u8 = 0x4F;
 const OP_FILESTATUS: u8 = 0x50;
 const OP_HASHSETREQUEST: u8 = 0x51;
@@ -138,6 +139,7 @@ const OP_CANCELTRANSFER: u8 = 0x56;
 const OP_OUTOFPARTREQS: u8 = 0x57;
 const OP_REQUESTFILENAME: u8 = 0x58;
 const OP_REQFILENAMEANSWER: u8 = 0x59;
+const OP_CHANGE_SLOT: u8 = 0x5B;
 const OP_QUEUERANK: u8 = 0x5C;
 const OP_QUEUERANKING: u8 = 0x60;
 const OP_FILEDESC: u8 = 0x61;

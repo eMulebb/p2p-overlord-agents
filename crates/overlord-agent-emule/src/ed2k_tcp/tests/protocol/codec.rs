@@ -127,6 +127,19 @@ fn chat_captcha_packets_decode_minimal_stock_shapes() {
 }
 
 #[test]
+fn client_message_decodes_stock_length_prefix_and_truncation_limit() {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&451u16.to_le_bytes());
+    payload.resize(453, b'x');
+
+    let message = decode_client_message_payload(&payload).unwrap();
+
+    assert_eq!(message.message_len, 451);
+    assert_eq!(message.accepted_len, 450);
+    assert!(decode_client_message_payload(&payload[..452]).is_err());
+}
+
+#[test]
 fn preview_packets_decode_stock_hash_and_frame_shape() {
     let file_hash = Ed2kHash([0x5E; 16]);
     let mut request_payload = file_hash.0.to_vec();

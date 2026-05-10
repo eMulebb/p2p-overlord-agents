@@ -9,6 +9,8 @@ use crate::ed2k_transfer::{ED2K_PART_SIZE, Ed2kResumeManifest, Ed2kTransferState
 mod hashset;
 mod upload;
 
+const MAX_CLIENT_MSG_LEN: usize = 450;
+
 pub(super) use hashset::{
     decode_hashset_answer, decode_hashset_answer2, decode_hashset_request2, encode_hashset_answer,
     encode_hashset_answer2, encode_hashset_request, encode_hashset_request2,
@@ -183,6 +185,30 @@ pub(super) fn decode_reask_callback_tcp_payload(payload: &[u8]) -> Result<ReaskC
         dest_port: u16::from_le_bytes(payload[4..6].try_into().unwrap()),
         file_hash: Ed2kHash(payload[6..22].try_into().unwrap()),
         extended_info_len: payload.len() - 22,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ClientMessage {
+    pub(super) message_len: usize,
+    pub(super) accepted_len: usize,
+}
+
+pub(super) fn decode_client_message_payload(payload: &[u8]) -> Result<ClientMessage> {
+    if payload.len() < 2 {
+        anyhow::bail!("short OP_MESSAGE payload {}", payload.len());
+    }
+    let message_len = usize::from(u16::from_le_bytes(payload[..2].try_into().unwrap()));
+    if payload.len() != message_len + 2 {
+        anyhow::bail!(
+            "invalid OP_MESSAGE payload size {} for message_len {}",
+            payload.len(),
+            message_len
+        );
+    }
+    Ok(ClientMessage {
+        message_len,
+        accepted_len: message_len.min(MAX_CLIENT_MSG_LEN),
     })
 }
 
