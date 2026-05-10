@@ -19,9 +19,9 @@ use crate::ed2k_server::{
     Ed2kSourceSearchOptions, search_keyword_servers, search_keyword_via_background_session,
     search_source_servers, search_source_via_background_session,
 };
-use crate::ed2k_tcp::{Ed2kHelloIdentity, emule_connect_options};
 use crate::ed2k_transfer::Ed2kSharedEntry;
 
+use super::ed2k_runtime::ed2k_hello_identity_from_config;
 use super::search::{
     SearchRunStats, post_search_batch, search_file_hash, search_file_size, search_query,
 };
@@ -284,16 +284,7 @@ pub(super) async fn resolve_hash_only_ed2k_metadata(
     let shared_catalog = runtime.ed2k_shared_catalog.read().await.clone();
     let keyword_search_timeout = ed2k_source_search_timeout(&config.p2p.ed2k);
     let keyword_query = hash_only_ed2k_search_query(file_hash);
-    let hello_identity = Ed2kHelloIdentity {
-        user_hash: ed2k_user_hash,
-        client_id: 0,
-        tcp_port: config.p2p.ed2k.listen_port,
-        udp_port: config.p2p.kad.listen_port,
-        server_ip: 0,
-        server_port: 0,
-        connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
-        direct_udp_callback: false,
-    };
+    let hello_identity = ed2k_hello_identity_from_config(config, ed2k_user_hash);
     let (preferred_endpoint, background_search) = {
         let server_state = runtime.ed2k_server_state.read().await;
         if server_state.connected {
@@ -507,16 +498,7 @@ pub(super) async fn do_active_ed2k_keyword_search(
         cancel,
     } = context;
     let callback_client = CoordinatorClient::new(&job.callback_url)?;
-    let hello_identity = Ed2kHelloIdentity {
-        user_hash: ed2k_user_hash,
-        client_id: 0,
-        tcp_port: config.p2p.ed2k.listen_port,
-        udp_port: config.p2p.kad.listen_port,
-        server_ip: 0,
-        server_port: 0,
-        connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
-        direct_udp_callback: false,
-    };
+    let hello_identity = ed2k_hello_identity_from_config(config, ed2k_user_hash);
     let query = search_query(job)?;
     let search_timeout = Duration::from_secs(config.p2p.ed2k.connect_timeout_secs.max(5));
     let active_server_attempts = ed2k_keyword_server_attempt_budget(&config.p2p.ed2k, query);
@@ -626,16 +608,7 @@ pub(super) async fn do_active_ed2k_source_search(
         cancel,
     } = context;
     let callback_client = CoordinatorClient::new(&job.callback_url)?;
-    let hello_identity = Ed2kHelloIdentity {
-        user_hash: ed2k_user_hash,
-        client_id: 0,
-        tcp_port: config.p2p.ed2k.listen_port,
-        udp_port: config.p2p.kad.listen_port,
-        server_ip: 0,
-        server_port: 0,
-        connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
-        direct_udp_callback: false,
-    };
+    let hello_identity = ed2k_hello_identity_from_config(config, ed2k_user_hash);
     let file_hash = search_file_hash(job)?;
     let file_size = search_file_size(job)?;
     let source_search_timeout = ed2k_source_search_timeout(&config.p2p.ed2k);

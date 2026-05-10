@@ -24,8 +24,8 @@ use super::{
     },
     ed2k_enrich::{EnrichEd2kDownloadRequest, is_hash_only_ed2k_placeholder_name},
     ed2k_runtime::{
-        Ed2kSourceEndpointKey, direct_download_candidate_sources, ed2k_source_attempt_key,
-        ed2k_source_endpoint_key, manifest_has_ed2k_transfer_progress,
+        Ed2kSourceEndpointKey, direct_download_candidate_sources, ed2k_hello_identity_from_config,
+        ed2k_source_attempt_key, ed2k_source_endpoint_key, manifest_has_ed2k_transfer_progress,
         new_direct_ed2k_source_count, should_skip_no_progress_source_requery,
         sort_native_ed2k_download_sources,
     },
@@ -35,17 +35,14 @@ use super::{
 #[cfg(test)]
 use crate::ed2k_server::Ed2kFoundSource;
 #[cfg(test)]
-use crate::ed2k_tcp::{Ed2kPeerDownloadOutcome, Ed2kSecureIdent};
+use crate::ed2k_tcp::{Ed2kHelloIdentity, Ed2kPeerDownloadOutcome, Ed2kSecureIdent};
 use crate::{
     config::EmuleAgentConfig,
     ed2k_server::{
         Ed2kCallbackRequestOptions, request_callback_on_server,
         request_callback_via_background_session,
     },
-    ed2k_tcp::{
-        Ed2kHelloIdentity, Ed2kPeerDownloadOptions, download_file_from_peer,
-        dump_ed2k_tcp_download_meta, emule_connect_options,
-    },
+    ed2k_tcp::{Ed2kPeerDownloadOptions, download_file_from_peer, dump_ed2k_tcp_download_meta},
     ed2k_transfer::{
         Ed2kCallbackIntent, Ed2kResumeManifest, Ed2kSourceHint, Ed2kTransferRuntime,
         new_transfer_job,
@@ -258,16 +255,7 @@ pub(super) async fn start_native_ed2k_download(
             request.file_hash, canonical_name, file_size
         );
     }
-    let hello_identity = Ed2kHelloIdentity {
-        user_hash: ed2k_user_hash,
-        client_id: 0,
-        tcp_port: config.p2p.ed2k.listen_port,
-        udp_port: config.p2p.kad.listen_port,
-        server_ip: 0,
-        server_port: 0,
-        connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
-        direct_udp_callback: false,
-    };
+    let hello_identity = ed2k_hello_identity_from_config(&config, ed2k_user_hash);
     let auto_acquire_sources = request.sources.is_empty();
     let mut sources = if auto_acquire_sources {
         native_ed2k_download_sources(&runtime, &config, file_hash, file_size, ed2k_user_hash)

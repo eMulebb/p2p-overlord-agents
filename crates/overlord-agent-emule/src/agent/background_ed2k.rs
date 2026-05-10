@@ -4,11 +4,11 @@ use tracing::warn;
 
 use crate::config::EmuleAgentConfig;
 use crate::ed2k_server::{Ed2kServerLoopOptions, run_ed2k_server_loop};
-use crate::ed2k_tcp::{
-    Ed2kHelloIdentity, Ed2kListenerOptions, emule_connect_options, run_ed2k_listener,
-};
+use crate::ed2k_tcp::{Ed2kListenerOptions, run_ed2k_listener};
 
-use super::{AgentNetworkRuntime, OverlordAgentEmule};
+use super::{
+    AgentNetworkRuntime, OverlordAgentEmule, ed2k_runtime::ed2k_hello_identity_from_config,
+};
 
 impl OverlordAgentEmule {
     pub(super) async fn spawn_ed2k_background_tasks(
@@ -24,16 +24,7 @@ impl OverlordAgentEmule {
         let ed2k_transfer = Arc::clone(&runtime.ed2k_transfer);
         let shutdown = Arc::clone(&runtime.shutdown);
         let ed2k_user_hash = self.ed2k_user_hash;
-        let ed2k_hello_identity = Ed2kHelloIdentity {
-            user_hash: ed2k_user_hash,
-            client_id: 0,
-            tcp_port: config.p2p.ed2k.listen_port,
-            udp_port: config.p2p.kad.listen_port,
-            server_ip: 0,
-            server_port: 0,
-            connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
-            direct_udp_callback: false,
-        };
+        let ed2k_hello_identity = ed2k_hello_identity_from_config(config, ed2k_user_hash);
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             run_ed2k_listener(Ed2kListenerOptions {
                 listener: ed2k_listener,
@@ -57,16 +48,7 @@ impl OverlordAgentEmule {
         let kad_firewall = Arc::clone(&runtime.kad_firewall);
         let ed2k_server_config = config.p2p.ed2k.clone();
         let ed2k_user_hash = self.ed2k_user_hash;
-        let ed2k_hello_identity = Ed2kHelloIdentity {
-            user_hash: ed2k_user_hash,
-            client_id: 0,
-            tcp_port: config.p2p.ed2k.listen_port,
-            udp_port: config.p2p.kad.listen_port,
-            server_ip: 0,
-            server_port: 0,
-            connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
-            direct_udp_callback: false,
-        };
+        let ed2k_hello_identity = ed2k_hello_identity_from_config(config, ed2k_user_hash);
         if let Some(ed2k_server_search_inbox) = ed2k_server_search_inbox {
             runtime.tasks.lock().await.push(tokio::spawn(async move {
                 run_ed2k_server_loop(Ed2kServerLoopOptions {

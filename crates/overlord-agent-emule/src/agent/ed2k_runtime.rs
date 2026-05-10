@@ -1,6 +1,11 @@
 use std::{collections::HashSet, net::Ipv4Addr};
 
-use crate::{ed2k_server::Ed2kFoundSource, ed2k_transfer::Ed2kResumeManifest};
+use crate::{
+    config::EmuleAgentConfig,
+    ed2k_server::Ed2kFoundSource,
+    ed2k_tcp::{Ed2kHelloIdentity, emule_connect_options},
+    ed2k_transfer::Ed2kResumeManifest,
+};
 
 use super::ED2K_SOURCE_OBFUSCATION_REQUIRES_CRYPT;
 
@@ -16,6 +21,22 @@ pub(super) fn manifest_has_ed2k_transfer_progress(manifest: &Ed2kResumeManifest)
         || manifest.md4_hashset_acquired
         || !manifest.verified_ranges.is_empty()
         || manifest.pieces.iter().any(|piece| piece.bytes_written != 0)
+}
+
+pub(super) fn ed2k_hello_identity_from_config(
+    config: &EmuleAgentConfig,
+    ed2k_user_hash: [u8; 16],
+) -> Ed2kHelloIdentity {
+    Ed2kHelloIdentity {
+        user_hash: ed2k_user_hash,
+        client_id: 0,
+        tcp_port: config.p2p.ed2k.listen_port,
+        udp_port: config.p2p.kad.listen_port,
+        server_ip: 0,
+        server_port: 0,
+        connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
+        direct_udp_callback: false,
+    }
 }
 
 pub(super) fn is_retryable_direct_download_error(error: &anyhow::Error) -> bool {

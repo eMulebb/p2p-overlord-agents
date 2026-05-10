@@ -8,11 +8,9 @@ use chrono::Utc;
 use tracing::{debug, info, warn};
 
 use crate::config::EmuleAgentConfig;
-use crate::ed2k_tcp::{
-    Ed2kHelloIdentity, FirewallCheckUdpRequest, emule_connect_options, enrich_hello_identity,
-    request_udp_firewall_check,
-};
+use crate::ed2k_tcp::{FirewallCheckUdpRequest, enrich_hello_identity, request_udp_firewall_check};
 
+use super::ed2k_runtime::ed2k_hello_identity_from_config;
 use super::kad_firewall_runtime::{active_udp_firewall_ports, select_udp_firewall_helpers};
 use super::{AgentNetworkRuntime, OverlordAgentEmule, UDP_FIREWALL_HELPER_CANDIDATE_MULTIPLIER};
 
@@ -35,16 +33,7 @@ impl OverlordAgentEmule {
             Duration::from_secs(config.p2p.kad.udp_firewall_check_timeout_secs.max(1));
         let udp_firewall_check_contact_count = config.p2p.kad.udp_firewall_check_contact_count;
         let ed2k_user_hash = self.ed2k_user_hash;
-        let ed2k_hello_identity = Ed2kHelloIdentity {
-            user_hash: ed2k_user_hash,
-            client_id: 0,
-            tcp_port: config.p2p.ed2k.listen_port,
-            udp_port: config.p2p.kad.listen_port,
-            server_ip: 0,
-            server_port: 0,
-            connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
-            direct_udp_callback: false,
-        };
+        let ed2k_hello_identity = ed2k_hello_identity_from_config(config, ed2k_user_hash);
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             if !udp_firewall_check_enabled {
                 return;

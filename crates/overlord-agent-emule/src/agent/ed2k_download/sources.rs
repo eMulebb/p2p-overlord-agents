@@ -11,13 +11,14 @@ use crate::{
         Ed2kUdpSourceSearchOptions, search_source_servers, search_source_udp_servers,
         search_source_via_background_session,
     },
-    ed2k_tcp::{Ed2kHelloIdentity, emule_connect_options},
+    ed2k_tcp::Ed2kHelloIdentity,
     ed2k_transfer::Ed2kSharedEntry,
 };
 use overlord_kad_proto::Ed2kHash;
 
 use super::super::{
     AgentNetworkRuntime, ED2K_DOWNLOAD_KAD_SOURCE_TIMEOUT_FLOOR_SECS,
+    ed2k_runtime::ed2k_hello_identity_from_config,
     ed2k_search::{
         collect_kad_ed2k_sources, ed2k_download_source_server_attempt_budget,
         ed2k_source_search_timeout,
@@ -46,16 +47,7 @@ pub(super) async fn native_ed2k_download_sources(
     let mut sources = Vec::new();
     let shared_catalog = runtime.ed2k_shared_catalog.read().await.clone();
     let source_search_timeout = ed2k_source_search_timeout(&config.p2p.ed2k);
-    let hello_identity = Ed2kHelloIdentity {
-        user_hash: ed2k_user_hash,
-        client_id: 0,
-        tcp_port: config.p2p.ed2k.listen_port,
-        udp_port: config.p2p.kad.listen_port,
-        server_ip: 0,
-        server_port: 0,
-        connect_options: emule_connect_options(config.p2p.ed2k.obfuscation_enabled),
-        direct_udp_callback: false,
-    };
+    let hello_identity = ed2k_hello_identity_from_config(config, ed2k_user_hash);
     let (preferred_endpoint, background_search) = {
         let server_state = runtime.ed2k_server_state.read().await;
         if server_state.connected {
