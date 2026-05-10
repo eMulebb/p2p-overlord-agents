@@ -40,6 +40,16 @@ mod identity;
 mod listener;
 mod obfuscation;
 mod transport;
+pub(in crate::ed2k_tcp) use codec::{
+    PeerSourceExchangeRequest, decode_aich_file_hash_answer, decode_compressed_part_fragment,
+    decode_file_status_payload, decode_hashset_answer, decode_hashset_answer2, decode_peer_payload,
+    decode_request_filename_answer, decode_request_filename_answer_body,
+    decode_sending_part_payload, encode_aich_file_hash_request, encode_hashset_request,
+    encode_hashset_request2, encode_multipacket_ext2_request, encode_packet,
+    encode_request_filename, encode_request_parts_batch, encode_request_sources,
+    encode_request_sources2, encode_set_req_file_id, encode_start_upload_req,
+    inflate_compressed_part_fragment, skip_file_status_body,
+};
 #[cfg(test)]
 #[allow(unused_imports)]
 use codec::{
@@ -50,16 +60,6 @@ use codec::{
     encode_hashset_answer2, encode_multipacket_ext2_answer, encode_packed_packet,
     encode_queue_ranking, encode_request_filename_answer, encode_request_sources2_subpayload,
     encode_sending_part, skip_request_filename_ext_info,
-};
-pub(in crate::ed2k_tcp) use codec::{
-    decode_aich_file_hash_answer, decode_compressed_part_fragment, decode_file_status_payload,
-    decode_hashset_answer, decode_hashset_answer2, decode_peer_payload,
-    decode_request_filename_answer, decode_request_filename_answer_body,
-    decode_sending_part_payload, encode_aich_file_hash_request, encode_hashset_request,
-    encode_hashset_request2, encode_multipacket_ext2_request, encode_packet,
-    encode_request_filename, encode_request_parts_batch, encode_request_sources2,
-    encode_set_req_file_id, encode_start_upload_req, inflate_compressed_part_fragment,
-    skip_file_status_body,
 };
 pub(in crate::ed2k_tcp) use download::PendingCompressedPart;
 #[cfg(test)]

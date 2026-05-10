@@ -6,10 +6,11 @@ use overlord_kad_proto::Ed2kHash;
 use crate::{
     ed2k_tcp::{
         Ed2kFileIdentifier, Ed2kHashsetRequestOptions, Ed2kSecureIdent, Ed2kTransport,
-        begin_secure_ident_probe, dump_ed2k_tcp_download_meta, dump_ed2k_tcp_download_send,
-        encode_aich_file_hash_request, encode_hashset_request, encode_hashset_request2,
-        encode_multipacket_ext2_request, encode_request_filename, encode_request_sources2,
-        encode_set_req_file_id, encode_start_upload_req,
+        PeerSourceExchangeRequest, begin_secure_ident_probe, dump_ed2k_tcp_download_meta,
+        dump_ed2k_tcp_download_send, encode_aich_file_hash_request, encode_hashset_request,
+        encode_hashset_request2, encode_multipacket_ext2_request, encode_request_filename,
+        encode_request_sources, encode_request_sources2, encode_set_req_file_id,
+        encode_start_upload_req,
     },
     ed2k_transfer::{ED2K_PART_SIZE, Ed2kResumeManifest, Ed2kTransferRuntime},
 };
@@ -68,8 +69,12 @@ pub(super) async fn advance_download_startup(step: DownloadStartupStep<'_>) -> R
         && !waiting_for_peer_secure_ident
     {
         if session_state.remote_supports_file_identifiers {
-            let multipacket_ext2 =
-                encode_multipacket_ext2_request(request_file_identifier, manifest);
+            let source_exchange_request = source_exchange_request_for_peer(session_state);
+            let multipacket_ext2 = encode_multipacket_ext2_request(
+                request_file_identifier,
+                manifest,
+                source_exchange_request,
+            );
             dump_ed2k_tcp_download_send(
                 peer_addr,
                 transport.mode,
@@ -80,7 +85,8 @@ pub(super) async fn advance_download_startup(step: DownloadStartupStep<'_>) -> R
                 .write_all(&multipacket_ext2)
                 .await
                 .with_context(|| format!("failed to send OP_MULTIPACKET_EXT2 to {peer_addr}"))?;
-            session_state.source_request_sent = true;
+            session_state.source_request_sent =
+                source_exchange_request != PeerSourceExchangeRequest::None;
             session_state.aich_file_hash_requested = true;
         } else {
             let request_filename = encode_request_filename(file_hash, manifest);
@@ -117,8 +123,13 @@ pub(super) async fn advance_download_startup(step: DownloadStartupStep<'_>) -> R
         && !session_state.source_request_sent
         && !waiting_for_peer_secure_ident
         && !session_state.remote_supports_file_identifiers
+        && session_state.remote_supports_source_exchange
     {
-        let source_request = encode_request_sources2(file_hash);
+        let source_request = if session_state.remote_supports_source_exchange2 {
+            encode_request_sources2(file_hash)
+        } else {
+            encode_request_sources(file_hash)
+        };
         dump_ed2k_tcp_download_send(
             peer_addr,
             transport.mode,
@@ -231,4 +242,16 @@ pub(super) fn hashset_request_stalled(session_state: &DownloadSessionState) -> b
     session_state
         .hashset_requested_at
         .is_some_and(|requested_at| requested_at.elapsed() >= HASHSET_STALL_UPLOAD_FALLBACK)
+}
+
+fn source_exchange_request_for_peer(
+    session_state: &DownloadSessionState,
+) -> PeerSourceExchangeRequest {
+    if session_state.remote_supports_source_exchange2 {
+        PeerSourceExchangeRequest::V2
+    } else if session_state.remote_supports_source_exchange {
+        PeerSourceExchangeRequest::V1
+    } else {
+        PeerSourceExchangeRequest::None
+    }
 }

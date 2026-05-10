@@ -108,6 +108,46 @@ fn hashset_request2_roundtrip_preserves_file_identifier_and_request_bits() {
 }
 
 #[test]
+fn multipacket_ext2_source_request_matches_peer_source_exchange_version() {
+    let file_identifier = super::Ed2kFileIdentifier {
+        file_hash: Ed2kHash([0x37; 16]),
+        file_size: Some(ED2K_PART_SIZE + 1),
+        aich_root: None,
+    };
+    let job = new_transfer_job(
+        file_identifier.file_hash,
+        "captured.iso".to_string(),
+        ED2K_PART_SIZE + 1,
+    );
+    let manifest = Ed2kResumeManifest::new(&job);
+
+    let sx2 = super::encode_multipacket_ext2_request(
+        &file_identifier,
+        &manifest,
+        PeerSourceExchangeRequest::V2,
+    );
+    assert_eq!(sx2[0], OP_EMULEPROT);
+    assert_eq!(sx2[5], super::OP_MULTIPACKET_EXT2);
+    assert!(sx2[6..].contains(&OP_REQUESTSOURCES2));
+
+    let sx1 = super::encode_multipacket_ext2_request(
+        &file_identifier,
+        &manifest,
+        PeerSourceExchangeRequest::V1,
+    );
+    assert!(sx1[6..].contains(&OP_REQUESTSOURCES));
+    assert!(!sx1[6..].contains(&OP_REQUESTSOURCES2));
+
+    let no_sx = super::encode_multipacket_ext2_request(
+        &file_identifier,
+        &manifest,
+        PeerSourceExchangeRequest::None,
+    );
+    assert!(!no_sx[6..].contains(&OP_REQUESTSOURCES));
+    assert!(!no_sx[6..].contains(&OP_REQUESTSOURCES2));
+}
+
+#[test]
 fn hashset_answer2_roundtrip_preserves_modern_md4_and_aich_sections() {
     let file_identifier = super::Ed2kFileIdentifier {
         file_hash: Ed2kHash([0x44; 16]),

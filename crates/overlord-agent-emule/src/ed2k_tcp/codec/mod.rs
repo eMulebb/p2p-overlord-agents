@@ -216,6 +216,10 @@ pub(super) fn encode_request_sources2(file_hash: &Ed2kHash) -> Vec<u8> {
     encode_packet(OP_EMULEPROT, OP_REQUESTSOURCES2, &payload)
 }
 
+pub(super) fn encode_request_sources(file_hash: &Ed2kHash) -> Vec<u8> {
+    encode_packet(OP_EMULEPROT, OP_REQUESTSOURCES, &file_hash.0)
+}
+
 pub(super) fn encode_answer_sources_empty(file_hash: &Ed2kHash) -> Vec<u8> {
     let mut payload = Vec::with_capacity(18);
     payload.extend_from_slice(&file_hash.0);
@@ -297,9 +301,17 @@ pub(super) fn skip_file_status_body(payload: &[u8]) -> Result<(u16, &[u8])> {
     Ok((part_count, &payload[expected_len..]))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PeerSourceExchangeRequest {
+    None,
+    V1,
+    V2,
+}
+
 pub(super) fn encode_multipacket_ext2_request(
     file_identifier: &Ed2kFileIdentifier,
     manifest: &Ed2kResumeManifest,
+    source_exchange_request: PeerSourceExchangeRequest,
 ) -> Vec<u8> {
     let mut payload = Vec::with_capacity(64);
     file_identifier.encode_into(&mut payload);
@@ -308,8 +320,14 @@ pub(super) fn encode_multipacket_ext2_request(
     if manifest.file_size > ED2K_PART_SIZE {
         payload.push(OP_SETREQFILEID);
     }
-    payload.push(OP_REQUESTSOURCES2);
-    payload.extend_from_slice(&encode_request_sources2_subpayload());
+    match source_exchange_request {
+        PeerSourceExchangeRequest::None => {}
+        PeerSourceExchangeRequest::V1 => payload.push(OP_REQUESTSOURCES),
+        PeerSourceExchangeRequest::V2 => {
+            payload.push(OP_REQUESTSOURCES2);
+            payload.extend_from_slice(&encode_request_sources2_subpayload());
+        }
+    }
     encode_packet(OP_EMULEPROT, OP_MULTIPACKET_EXT2, &payload)
 }
 
