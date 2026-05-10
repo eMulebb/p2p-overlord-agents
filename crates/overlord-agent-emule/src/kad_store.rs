@@ -14,6 +14,8 @@ use overlord_kad_proto::{
 
 use crate::config::KadConfig;
 
+const STOCK_MAX_SOURCES_PER_FILE: usize = 1000;
+
 /// Runtime policy for the local Kad publish cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KadLocalStoreConfig {
@@ -130,23 +132,28 @@ impl KadLocalStore {
         source_udp_port: u16,
         tags: &[Tag],
         observed_at: DateTime<Utc>,
-    ) -> bool {
+    ) -> Option<u8> {
         if !self.config.enabled {
-            return false;
+            return None;
         }
         if !is_stock_source_publish(tags) {
-            return false;
+            return None;
         }
         if source_ip.octets() == [0, 0, 0, 0] || source_udp_port == 0 {
-            return false;
+            return None;
         }
-        let Some(source_tcp_port) = stock_source_tcp_port(tags) else {
-            return false;
-        };
+        let source_tcp_port = stock_source_tcp_port(tags)?;
         purge_expired(
             &mut self.source_entries,
             self.config.source_ttl,
             observed_at,
+        );
+        let load = stock_source_publish_load(
+            &self.source_entries,
+            target,
+            source_ip,
+            source_tcp_port,
+            source_udp_port,
         );
         let dedup_key = source_dedup_key(target, source_ip, source_tcp_port, source_udp_port);
         upsert_source_entry(
@@ -163,7 +170,7 @@ impl KadLocalStore {
                 dedup_key,
             },
         );
-        true
+        Some(load)
     }
 
     pub(crate) fn record_notes_publish(
@@ -469,6 +476,20 @@ fn upsert_source_entry(
         return;
     }
 
+    if entries
+        .iter()
+        .filter(|candidate| candidate.target == entry.target)
+        .count()
+        > STOCK_MAX_SOURCES_PER_FILE
+        && let Some((oldest_index, _)) = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| candidate.target == entry.target)
+            .min_by_key(|(_, candidate)| candidate.observed_at())
+    {
+        entries.remove(oldest_index);
+    }
+
     if entries.len() >= capacity
         && let Some((oldest_index, _)) = entries
             .iter()
@@ -478,6 +499,43 @@ fn upsert_source_entry(
         entries.remove(oldest_index);
     }
     entries.push(entry);
+}
+
+fn stock_source_publish_load(
+    entries: &[StoredSourcePublish],
+    target: NodeId,
+    source_ip: Ipv4Addr,
+    source_tcp_port: u16,
+    source_udp_port: u16,
+) -> u8 {
+    let target_count = entries
+        .iter()
+        .filter(|candidate| candidate.target == target)
+        .count();
+    if target_count == 0 {
+        return 1;
+    }
+    if target_count > STOCK_MAX_SOURCES_PER_FILE
+        && !source_replacement_matches(entries, target, source_ip, source_tcp_port, source_udp_port)
+    {
+        return 100;
+    }
+    (target_count * 100 / STOCK_MAX_SOURCES_PER_FILE) as u8
+}
+
+fn source_replacement_matches(
+    entries: &[StoredSourcePublish],
+    target: NodeId,
+    source_ip: Ipv4Addr,
+    source_tcp_port: u16,
+    source_udp_port: u16,
+) -> bool {
+    entries.iter().any(|candidate| {
+        candidate.target == target
+            && candidate.source_ip == source_ip
+            && (candidate.source_tcp_port == source_tcp_port
+                || candidate.source_udp_port == source_udp_port)
+    })
 }
 
 trait TimedEntry {
@@ -656,30 +714,39 @@ mod tests {
             Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(4662)),
         ];
 
-        assert!(store.record_source_publish(
-            target,
-            publisher_one,
-            Ipv4Addr::new(1, 1, 1, 1),
-            4672,
-            &tags,
-            ts(1),
-        ));
-        assert!(store.record_source_publish(
-            target,
-            publisher_two,
-            Ipv4Addr::new(2, 2, 2, 2),
-            4673,
-            &tags,
-            ts(2),
-        ));
-        assert!(store.record_source_publish(
-            target,
-            publisher_three,
-            Ipv4Addr::new(3, 3, 3, 3),
-            4674,
-            &tags,
-            ts(3),
-        ));
+        assert_eq!(
+            store.record_source_publish(
+                target,
+                publisher_one,
+                Ipv4Addr::new(1, 1, 1, 1),
+                4672,
+                &tags,
+                ts(1),
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            store.record_source_publish(
+                target,
+                publisher_two,
+                Ipv4Addr::new(2, 2, 2, 2),
+                4673,
+                &tags,
+                ts(2),
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            store.record_source_publish(
+                target,
+                publisher_three,
+                Ipv4Addr::new(3, 3, 3, 3),
+                4674,
+                &tags,
+                ts(3),
+            ),
+            Some(0)
+        );
 
         assert_eq!(store.source_entry_count(), 2);
         let response = store
@@ -726,14 +793,17 @@ mod tests {
             Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(4662)),
         ];
 
-        assert!(!store.record_source_publish(
-            target,
-            publisher,
-            Ipv4Addr::new(1, 1, 1, 1),
-            4672,
-            &tags,
-            ts(1),
-        ));
+        assert_eq!(
+            store.record_source_publish(
+                target,
+                publisher,
+                Ipv4Addr::new(1, 1, 1, 1),
+                4672,
+                &tags,
+                ts(1),
+            ),
+            None
+        );
         assert_eq!(store.source_entry_count(), 0);
     }
 
@@ -748,14 +818,17 @@ mod tests {
             Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(0)),
         ];
 
-        assert!(!store.record_source_publish(
-            target,
-            publisher,
-            Ipv4Addr::new(1, 1, 1, 1),
-            4672,
-            &tags,
-            ts(1),
-        ));
+        assert_eq!(
+            store.record_source_publish(
+                target,
+                publisher,
+                Ipv4Addr::new(1, 1, 1, 1),
+                4672,
+                &tags,
+                ts(1),
+            ),
+            None
+        );
         assert_eq!(store.source_entry_count(), 0);
     }
 
@@ -770,22 +843,28 @@ mod tests {
             Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(4662)),
         ];
 
-        assert!(!store.record_source_publish(
-            target,
-            publisher,
-            Ipv4Addr::new(0, 0, 0, 0),
-            4672,
-            &tags,
-            ts(1),
-        ));
-        assert!(!store.record_source_publish(
-            target,
-            publisher,
-            Ipv4Addr::new(1, 1, 1, 1),
-            0,
-            &tags,
-            ts(1),
-        ));
+        assert_eq!(
+            store.record_source_publish(
+                target,
+                publisher,
+                Ipv4Addr::new(0, 0, 0, 0),
+                4672,
+                &tags,
+                ts(1),
+            ),
+            None
+        );
+        assert_eq!(
+            store.record_source_publish(
+                target,
+                publisher,
+                Ipv4Addr::new(1, 1, 1, 1),
+                0,
+                &tags,
+                ts(1),
+            ),
+            None
+        );
         assert_eq!(store.source_entry_count(), 0);
     }
 
@@ -801,22 +880,28 @@ mod tests {
             Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(4662)),
         ];
 
-        assert!(store.record_source_publish(
-            target,
-            first_publisher,
-            Ipv4Addr::new(1, 1, 1, 1),
-            4672,
-            &tags,
-            ts(1),
-        ));
-        assert!(store.record_source_publish(
-            target,
-            second_publisher,
-            Ipv4Addr::new(1, 1, 1, 1),
-            4673,
-            &tags,
-            ts(2),
-        ));
+        assert_eq!(
+            store.record_source_publish(
+                target,
+                first_publisher,
+                Ipv4Addr::new(1, 1, 1, 1),
+                4672,
+                &tags,
+                ts(1),
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            store.record_source_publish(
+                target,
+                second_publisher,
+                Ipv4Addr::new(1, 1, 1, 1),
+                4673,
+                &tags,
+                ts(2),
+            ),
+            Some(0)
+        );
 
         assert_eq!(store.source_entry_count(), 1);
         let response = store
@@ -835,6 +920,70 @@ mod tests {
         assert_eq!(
             response.results[0].entry_id,
             source_entry_id(second_publisher)
+        );
+    }
+
+    #[test]
+    fn source_publish_load_matches_stock_source_count_percentage() {
+        let mut config = config();
+        config.source_capacity = super::STOCK_MAX_SOURCES_PER_FILE + 2;
+        config.source_ttl = std::time::Duration::from_secs(10_000);
+        let mut store = KadLocalStore::new(config);
+        let target = NodeId::from_bytes([3; 16]);
+
+        for index in 0..super::STOCK_MAX_SOURCES_PER_FILE {
+            let source_tcp_port = 4000 + index as u16;
+            let expected_load = if index == 0 {
+                1
+            } else {
+                (index * 100 / super::STOCK_MAX_SOURCES_PER_FILE) as u8
+            };
+            assert_eq!(
+                store.record_source_publish(
+                    target,
+                    numbered_node_id(index),
+                    numbered_ipv4(index),
+                    5000 + index as u16,
+                    &source_publish_tags(source_tcp_port),
+                    ts(index as i64),
+                ),
+                Some(expected_load),
+                "unexpected stock source load at index {index}"
+            );
+        }
+
+        let full_index = super::STOCK_MAX_SOURCES_PER_FILE;
+        assert_eq!(
+            store.record_source_publish(
+                target,
+                numbered_node_id(full_index),
+                numbered_ipv4(full_index),
+                5000 + full_index as u16,
+                &source_publish_tags(4000 + full_index as u16),
+                ts(full_index as i64),
+            ),
+            Some(100)
+        );
+        assert_eq!(
+            store.source_entry_count(),
+            super::STOCK_MAX_SOURCES_PER_FILE + 1
+        );
+
+        let overflow_index = super::STOCK_MAX_SOURCES_PER_FILE + 1;
+        assert_eq!(
+            store.record_source_publish(
+                target,
+                numbered_node_id(overflow_index),
+                numbered_ipv4(overflow_index),
+                5000 + overflow_index as u16,
+                &source_publish_tags(4000 + overflow_index as u16),
+                ts(overflow_index as i64),
+            ),
+            Some(100)
+        );
+        assert_eq!(
+            store.source_entry_count(),
+            super::STOCK_MAX_SOURCES_PER_FILE + 1
         );
     }
 
@@ -907,5 +1056,23 @@ mod tests {
             Tag::new_short(tag_name::FILESIZE_HI, TagValue::U32(2)),
         ]);
         assert_eq!(size, Some((2_u64 << 32) | 1));
+    }
+
+    fn numbered_node_id(index: usize) -> NodeId {
+        let mut bytes = [0; 16];
+        bytes[0..4].copy_from_slice(&(index as u32).to_le_bytes());
+        NodeId::from_bytes(bytes)
+    }
+
+    fn numbered_ipv4(index: usize) -> Ipv4Addr {
+        Ipv4Addr::new(1, 1, (index / 250 + 1) as u8, (index % 250 + 1) as u8)
+    }
+
+    fn source_publish_tags(source_tcp_port: u16) -> Vec<Tag> {
+        vec![
+            Tag::new_short(tag_name::SOURCETYPE, TagValue::UInt(1)),
+            Tag::filesize(456),
+            Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(source_tcp_port)),
+        ]
     }
 }

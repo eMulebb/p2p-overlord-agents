@@ -370,7 +370,7 @@ pub(super) async fn handle_unsolicited_packet(
                 .await;
         }
         KadPacket::PublishSourceReq(req) => {
-            let accepted = if let IpAddr::V4(ip) = from.ip() {
+            let load = if let IpAddr::V4(ip) = from.ip() {
                 let mut store = context.local_store.lock().await;
                 store.record_source_publish(
                     req.target,
@@ -381,15 +381,15 @@ pub(super) async fn handle_unsolicited_packet(
                     Utc::now(),
                 )
             } else {
-                false
+                None
             };
-            if accepted {
+            if let Some(load) = load {
                 let _ = dht
                     .send_packet(
                         from,
                         &KadPacket::PublishRes(overlord_kad_proto::PublishRes {
                             target: req.target,
-                            load: 0,
+                            load,
                             options: None,
                         }),
                     )
