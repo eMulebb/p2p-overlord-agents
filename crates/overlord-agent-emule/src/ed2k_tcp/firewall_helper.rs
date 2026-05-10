@@ -19,10 +19,10 @@ use super::{
     Ed2kPeerSecureIdentState, Ed2kSecureIdent, Ed2kTransport, Ed2kTransportMode, EmuleTcpPacket,
     FIREWALL_HELPER_POST_REQUEST_KEEPALIVE_SECS, FirewallCheckUdpRequest, OP_EDONKEYPROT,
     OP_EMULEINFO, OP_EMULEINFOANSWER, OP_EMULEPROT, OP_FWCHECKUDPREQ, OP_HELLO, OP_HELLOANSWER,
-    OP_PUBLICKEY, OP_SECIDENTSTATE, OP_SIGNATURE, begin_secure_ident_probe, build_hello_responses,
-    decode_public_key_payload, decode_secident_state, encode_emule_info_answer,
-    encode_hello_request, encode_packet, encode_secident_state, random_nonzero_u32,
-    reply_with_firewall_udp, try_send_secure_ident_signature,
+    OP_KAD_FWTCPCHECK_ACK, OP_PUBLICKEY, OP_SECIDENTSTATE, OP_SIGNATURE, begin_secure_ident_probe,
+    build_hello_responses, decode_public_key_payload, decode_secident_state,
+    encode_emule_info_answer, encode_hello_request, encode_packet, encode_secident_state,
+    random_nonzero_u32, reply_with_firewall_udp, try_send_secure_ident_signature,
 };
 
 /// Immutable session metadata shared by one outgoing TCP helper exchange.
@@ -456,6 +456,48 @@ pub(crate) async fn connect_callback_peer(
             _ => return Ok(mode),
         }
     }
+}
+
+/// Mirror the modern Kad TCP firewall-check result path. Stock eMule opens an
+/// eD2k client connection, sends its normal `OP_HELLO`, then reports TCP reachability
+/// with `OP_KAD_FWTCPCHECK_ACK` on that same connection.
+pub(crate) async fn send_kad_firewall_tcp_ack(
+    bind_ip: Ipv4Addr,
+    peer_addr: SocketAddr,
+    hello_identity: Ed2kHelloIdentity,
+    peer_user_hash: [u8; 16],
+    peer_connect_options: u8,
+    timeout: Duration,
+) -> Result<Ed2kPeerConnectMode> {
+    let mut transport = Ed2kTransport::connect_outgoing(
+        bind_ip,
+        peer_addr,
+        hello_identity.connect_options,
+        Some(peer_user_hash),
+        Some(peer_connect_options),
+        timeout,
+    )
+    .await?;
+    let mode = match transport.mode {
+        Ed2kTransportMode::Plaintext => Ed2kPeerConnectMode::Plaintext,
+        Ed2kTransportMode::Obfuscated => Ed2kPeerConnectMode::Obfuscated,
+    };
+
+    let hello_packet = encode_hello_request(hello_identity);
+    tokio::time::timeout(timeout, transport.write_all(&hello_packet))
+        .await
+        .with_context(|| {
+            format!("timed out sending OP_HELLO for Kad TCP firewall ACK to {peer_addr}")
+        })??;
+
+    let ack = encode_packet(OP_EMULEPROT, OP_KAD_FWTCPCHECK_ACK, &[]);
+    tokio::time::timeout(timeout, transport.write_all(&ack))
+        .await
+        .with_context(|| {
+            format!("timed out sending OP_KAD_FWTCPCHECK_ACK to Kad firewall peer {peer_addr}")
+        })??;
+
+    Ok(mode)
 }
 
 /// Return the eMule TCP/Kad connect-option bits mirrored from the oracle

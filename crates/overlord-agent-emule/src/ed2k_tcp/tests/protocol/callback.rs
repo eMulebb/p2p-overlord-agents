@@ -1,5 +1,5 @@
 use super::*;
-use crate::ed2k_tcp::reply_with_firewall_udp;
+use crate::ed2k_tcp::{reply_with_firewall_udp, send_kad_firewall_tcp_ack};
 
 #[tokio::test]
 async fn callback_connect_uses_plaintext_when_peer_has_no_crypt_metadata() {
@@ -374,4 +374,48 @@ async fn firewall_udp_reply_ignores_zero_internal_port_like_stock() {
         recv.is_err(),
         "zero internal port must suppress all UDP replies"
     );
+}
+
+#[tokio::test]
+async fn kad_firewall_tcp_ack_sends_hello_then_modern_ack() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let peer_addr = listener.local_addr().unwrap();
+    let hello_identity = Ed2kHelloIdentity {
+        user_hash: [0x77; 16],
+        client_id: 0x1234_5678,
+        tcp_port: 41001,
+        udp_port: 41000,
+        server_ip: 0,
+        server_port: 0,
+        connect_options: emule_connect_options(false),
+        direct_udp_callback: false,
+    };
+    let expected_hello = encode_hello_request(hello_identity);
+
+    let server = tokio::spawn(async move {
+        let (mut stream, peer) = listener.accept().await.unwrap();
+        assert_eq!(peer.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        let hello = read_packet(&mut stream).await;
+        assert_eq!(hello, expected_hello);
+
+        let ack = read_packet(&mut stream).await;
+        assert_eq!(ack[0], OP_EMULEPROT);
+        assert_eq!(ack[5], OP_KAD_FWTCPCHECK_ACK);
+        assert_eq!(ack.len(), 6);
+    });
+
+    let mode = send_kad_firewall_tcp_ack(
+        Ipv4Addr::LOCALHOST,
+        peer_addr,
+        hello_identity,
+        [0x10; 16],
+        emule_connect_options(false),
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(mode, Ed2kPeerConnectMode::Plaintext);
+    server.await.unwrap();
 }

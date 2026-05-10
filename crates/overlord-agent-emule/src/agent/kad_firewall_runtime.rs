@@ -24,7 +24,9 @@ use super::{
 };
 use crate::{
     ed2k_server::Ed2kServerState,
-    ed2k_tcp::emule_connect_options,
+    ed2k_tcp::{
+        Ed2kHelloIdentity, emule_connect_options, enrich_hello_identity, send_kad_firewall_tcp_ack,
+    },
     kad_firewall::{ExternalPortDiscoveryOutcome, FirewalledResponseOutcome, KadFirewallState},
 };
 
@@ -243,6 +245,87 @@ pub(super) fn spawn_firewalled_response(dht: DhtNode, from: SocketAddr, tcp_port
                 }),
             )
             .await;
+    });
+}
+
+pub(super) fn spawn_modern_firewalled_response(
+    context: KadFirewalledCheckContext,
+    bind_ip: Ipv4Addr,
+    from: SocketAddr,
+    tcp_port: u16,
+    peer_user_hash: [u8; 16],
+    peer_connect_options: u8,
+) {
+    tokio::spawn(async move {
+        let IpAddr::V4(ip) = from.ip() else {
+            return;
+        };
+        let KadFirewalledCheckContext {
+            dht,
+            kad_firewall,
+            ed2k_listener,
+            ed2k_server_state,
+            ed2k_user_hash,
+            ed2k_obfuscation_enabled,
+        } = context;
+
+        let _ = dht
+            .send_packet(
+                from,
+                &KadPacket::FirewalledRes(overlord_kad_proto::FirewalledRes {
+                    ip: u32::from_be_bytes(ip.octets()),
+                }),
+            )
+            .await;
+
+        let local_tcp_port = match ed2k_listener.local_addr() {
+            Ok(addr) => addr.port(),
+            Err(error) => {
+                debug!("failed to read local eD2k TCP port for Kad firewall ACK: {error}");
+                return;
+            }
+        };
+        let local_udp_port = match dht.bind_addr() {
+            Ok(addr) => addr.port(),
+            Err(error) => {
+                debug!("failed to read local Kad UDP port for Kad firewall ACK: {error}");
+                return;
+            }
+        };
+        let hello_identity = enrich_hello_identity(
+            Ed2kHelloIdentity {
+                user_hash: ed2k_user_hash.0,
+                client_id: 0,
+                tcp_port: local_tcp_port,
+                udp_port: local_udp_port,
+                server_ip: 0,
+                server_port: 0,
+                connect_options: emule_connect_options(ed2k_obfuscation_enabled),
+                direct_udp_callback: false,
+            },
+            &ed2k_server_state,
+            &kad_firewall,
+        )
+        .await;
+        let peer_addr = SocketAddr::new(IpAddr::V4(ip), tcp_port);
+
+        match send_kad_firewall_tcp_ack(
+            bind_ip,
+            peer_addr,
+            hello_identity,
+            peer_user_hash,
+            peer_connect_options,
+            Duration::from_secs(FIREWALLED_TCP_PROBE_TIMEOUT_SECS),
+        )
+        .await
+        {
+            Ok(mode) => debug!(
+                "sent Kad TCP firewall ACK to={} transport={}",
+                peer_addr,
+                mode.as_str()
+            ),
+            Err(error) => debug!("failed to send Kad TCP firewall ACK to {peer_addr}: {error}"),
+        }
     });
 }
 

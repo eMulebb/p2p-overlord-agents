@@ -16,6 +16,7 @@ use super::{
     LOCAL_SEARCH_RESPONSE_LIMIT,
     kad_firewall_runtime::{
         KadFirewalledCheckContext, spawn_firewalled_response, spawn_kad_firewalled_check,
+        spawn_modern_firewalled_response,
     },
     kad_runtime::{
         add_contact_from_hello, build_hello_response, should_request_hello_response_ack,
@@ -41,6 +42,7 @@ pub(super) struct UnsolicitedPacketContext<'a> {
     pub(super) ed2k_listener: &'a Arc<TcpListener>,
     pub(super) ed2k_server_state: &'a Arc<RwLock<Ed2kServerState>>,
     pub(super) ed2k_user_hash: Ed2kHash,
+    pub(super) bind_ip: std::net::Ipv4Addr,
     pub(super) ed2k_obfuscation_enabled: bool,
 }
 
@@ -71,7 +73,21 @@ pub(super) async fn handle_unsolicited_packet(
             spawn_firewalled_response(dht.clone(), from, req.tcp_port);
         }
         KadPacket::Firewalled2Req(req) => {
-            spawn_firewalled_response(dht.clone(), from, req.tcp_port);
+            spawn_modern_firewalled_response(
+                KadFirewalledCheckContext {
+                    dht: dht.clone(),
+                    kad_firewall: Arc::clone(context.kad_firewall),
+                    ed2k_listener: Arc::clone(context.ed2k_listener),
+                    ed2k_server_state: Arc::clone(context.ed2k_server_state),
+                    ed2k_user_hash: context.ed2k_user_hash,
+                    ed2k_obfuscation_enabled: context.ed2k_obfuscation_enabled,
+                },
+                context.bind_ip,
+                from,
+                req.tcp_port,
+                req.user_hash.0,
+                req.connect_options,
+            );
         }
         KadPacket::FirewallUdp(packet) => {
             let outcome = {

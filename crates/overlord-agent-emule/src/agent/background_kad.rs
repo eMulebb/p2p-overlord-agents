@@ -24,6 +24,7 @@ impl OverlordAgentEmule {
         let ed2k_listener = Arc::clone(&runtime.ed2k_listener);
         let ed2k_server_state = Arc::clone(&runtime.ed2k_server_state);
         let ed2k_user_hash = self.ed2k_user_hash;
+        let bind_ip = runtime.bind_ip;
         let ed2k_obfuscation_enabled = config.p2p.ed2k.obfuscation_enabled;
         runtime.tasks.lock().await.push(tokio::spawn(async move {
             let mut packets = dht.subscribe_packets();
@@ -41,6 +42,7 @@ impl OverlordAgentEmule {
                                 ed2k_listener: &ed2k_listener,
                                 ed2k_server_state: &ed2k_server_state,
                                 ed2k_user_hash: Ed2kHash::from_bytes(ed2k_user_hash),
+                                bind_ip,
                                 ed2k_obfuscation_enabled,
                             },
                             received,
