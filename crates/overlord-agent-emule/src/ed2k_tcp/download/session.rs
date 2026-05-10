@@ -40,6 +40,7 @@ use super::super::{
     encode_empty_shared_files_answer, encode_emule_info_answer, encode_packet,
     encode_port_test_answer, encode_public_ip_answer, encode_shared_browse_denied_answer,
     is_connection_shutdown_error, skip_file_status_body, try_send_secure_ident_signature,
+    validate_file_status_part_count,
 };
 use super::{
     ActiveDownloadPiece, DownloadRequestWindowState, PendingCompressedPart, PendingPartRequest,
@@ -534,13 +535,14 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     session_state.startup_file_response_received = true;
                 }
                 (OP_EDONKEYPROT, OP_FILESTATUS) => {
-                    let (returned_hash, _part_count) = decode_file_status_payload(&packet.payload)?;
+                    let (returned_hash, part_count) = decode_file_status_payload(&packet.payload)?;
                     if returned_hash != file_hash {
                         anyhow::bail!(
                             "peer {peer_addr} returned file status for unexpected file {}",
                             returned_hash
                         );
                     }
+                    validate_file_status_part_count(part_count, manifest.file_size)?;
                     session_state.startup_file_response_received = true;
                 }
                 (OP_EMULEPROT, OP_MULTIPACKETANSWER) => {
@@ -570,7 +572,8 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                                 returned_file_name = Some(file_name);
                             }
                             OP_FILESTATUS => {
-                                let (_part_count, rest) = skip_file_status_body(remaining)?;
+                                let (part_count, rest) = skip_file_status_body(remaining)?;
+                                validate_file_status_part_count(part_count, manifest.file_size)?;
                                 remaining = rest;
                             }
                             OP_AICHFILEHASHANS => {
@@ -623,7 +626,8 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                                 returned_file_name = Some(file_name);
                             }
                             OP_FILESTATUS => {
-                                let (_part_count, rest) = skip_file_status_body(remaining)?;
+                                let (part_count, rest) = skip_file_status_body(remaining)?;
+                                validate_file_status_part_count(part_count, manifest.file_size)?;
                                 remaining = rest;
                             }
                             _ => {

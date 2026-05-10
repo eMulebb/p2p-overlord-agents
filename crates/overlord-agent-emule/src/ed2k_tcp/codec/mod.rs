@@ -82,6 +82,22 @@ pub(super) fn decode_file_status_payload(
     Ok((returned_hash, part_count))
 }
 
+pub(super) fn validate_file_status_part_count(part_count: u16, file_size: u64) -> Result<()> {
+    if part_count == 0 {
+        return Ok(());
+    }
+    let expected = expected_file_status_part_count(file_size);
+    if part_count != expected {
+        anyhow::bail!("OP_FILESTATUS part_count {part_count} expected {expected}");
+    }
+    Ok(())
+}
+
+fn expected_file_status_part_count(file_size: u64) -> u16 {
+    let part_count = file_size.div_ceil(ED2K_PART_SIZE);
+    u16::try_from(part_count).unwrap_or(u16::MAX)
+}
+
 pub(super) fn encode_file_status_complete(file_hash: &overlord_kad_proto::Ed2kHash) -> Vec<u8> {
     let mut payload = Vec::with_capacity(18);
     payload.extend_from_slice(&file_hash.0);

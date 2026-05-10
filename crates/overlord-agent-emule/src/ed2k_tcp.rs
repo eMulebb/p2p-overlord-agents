@@ -61,7 +61,7 @@ pub(in crate::ed2k_tcp) use codec::{
     encode_port_test_answer, encode_public_ip_answer, encode_request_filename,
     encode_request_parts_batch, encode_request_sources, encode_request_sources2,
     encode_set_req_file_id, encode_shared_browse_denied_answer, encode_start_upload_req,
-    inflate_compressed_part_fragment, skip_file_status_body,
+    inflate_compressed_part_fragment, skip_file_status_body, validate_file_status_part_count,
 };
 #[cfg(test)]
 #[allow(unused_imports)]

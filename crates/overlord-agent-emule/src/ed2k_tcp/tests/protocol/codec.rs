@@ -57,6 +57,24 @@ fn public_ip_answer_uses_stock_four_byte_ipv4_payload() {
 }
 
 #[test]
+fn file_status_validates_stock_part_count() {
+    let file_hash = Ed2kHash([0x4F; 16]);
+    let file_size = ED2K_PART_SIZE * 2 + 1;
+    let mut payload = file_hash.0.to_vec();
+    payload.extend_from_slice(&3u16.to_le_bytes());
+    payload.push(0b0000_0111);
+
+    let (returned_hash, part_count) = decode_file_status_payload(&payload).unwrap();
+
+    assert_eq!(returned_hash, file_hash);
+    assert_eq!(part_count, 3);
+    validate_file_status_part_count(part_count, file_size).unwrap();
+    validate_file_status_part_count(0, file_size).unwrap();
+    assert!(validate_file_status_part_count(2, file_size).is_err());
+    assert!(decode_file_status_payload(&payload[..18]).is_err());
+}
+
+#[test]
 fn port_test_answer_matches_stock_edonkey_ack_shape() {
     let packet = encode_port_test_answer();
 
