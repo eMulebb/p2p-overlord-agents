@@ -123,6 +123,7 @@ pub(super) async fn advance_download_startup(step: DownloadStartupStep<'_>) -> R
         && !session_state.source_request_sent
         && !waiting_for_peer_secure_ident
         && !session_state.remote_supports_file_identifiers
+        && session_state.source_exchange_allowed
         && session_state.remote_supports_source_exchange
     {
         let source_request = if session_state.remote_supports_source_exchange2 {
@@ -247,7 +248,9 @@ pub(super) fn hashset_request_stalled(session_state: &DownloadSessionState) -> b
 fn source_exchange_request_for_peer(
     session_state: &DownloadSessionState,
 ) -> PeerSourceExchangeRequest {
-    if session_state.remote_supports_source_exchange2 {
+    if !session_state.source_exchange_allowed {
+        PeerSourceExchangeRequest::None
+    } else if session_state.remote_supports_source_exchange2 {
         PeerSourceExchangeRequest::V2
     } else if session_state.remote_supports_source_exchange {
         PeerSourceExchangeRequest::V1

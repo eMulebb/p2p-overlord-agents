@@ -53,6 +53,7 @@ pub(in crate::ed2k_tcp) struct DownloadSessionOptions<'a> {
     pub(in crate::ed2k_tcp) file_hash_hex: &'a str,
     pub(in crate::ed2k_tcp) timeout: Duration,
     pub(in crate::ed2k_tcp) send_initial_requests: bool,
+    pub(in crate::ed2k_tcp) source_exchange_allowed: bool,
     pub(in crate::ed2k_tcp) initial_hello_complete: bool,
     pub(in crate::ed2k_tcp) initial_secure_ident_started: bool,
 }
@@ -70,6 +71,7 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
         file_hash_hex,
         timeout,
         send_initial_requests,
+        source_exchange_allowed,
         initial_hello_complete,
         initial_secure_ident_started,
     } = options;
@@ -82,8 +84,11 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
     let mut pending_compressed_parts: Vec<PendingCompressedPart> = Vec::new();
     let mut manifest = transfer_runtime.manifest(file_hash_hex).await?;
     let mut request_file_identifier = Ed2kFileIdentifier::from_manifest(&manifest)?;
-    let mut session_state =
-        DownloadSessionState::new(initial_hello_complete, initial_secure_ident_started);
+    let mut session_state = DownloadSessionState::new(
+        initial_hello_complete,
+        initial_secure_ident_started,
+        source_exchange_allowed,
+    );
 
     let session_result = async {
         loop {

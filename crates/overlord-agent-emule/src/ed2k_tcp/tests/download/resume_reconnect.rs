@@ -157,12 +157,13 @@ async fn small_file_download_resumes_partial_piece_after_reconnect() {
             .unwrap();
 
         let startup_request = read_packet(&mut resumed_stream).await;
-        assert_startup_multipacket_ext2(
+        assert_startup_multipacket_ext2_with_source_exchange(
             startup_request[0],
             startup_request[5],
             &startup_request[6..],
             &file_hash,
             payload_for_server.len() as u64,
+            false,
             false,
         );
         let filename_answer = encode_startup_multipacket_ext2_answer(
@@ -341,11 +342,12 @@ async fn small_file_download_resumes_partial_piece_after_obfuscated_reconnect() 
             &peer_public_key,
         )
         .await;
-        answer_transport_startup_metadata(
+        answer_transport_startup_metadata_with_source_exchange(
             &mut resumed_transport,
             &file_hash,
             payload_for_server.len() as u64,
             source_name,
+            false,
             false,
         )
         .await;

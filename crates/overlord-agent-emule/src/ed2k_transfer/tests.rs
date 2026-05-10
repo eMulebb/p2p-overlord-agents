@@ -6,7 +6,14 @@ use crate::paths::unique_test_dir;
 use md4::{Digest, Md4};
 use overlord_agent_common::{HashType, PopularHash};
 use overlord_kad_proto::Ed2kHash;
-use std::{fs, io::Write, path::Path, str::FromStr};
+use std::{
+    fs,
+    io::Write,
+    net::{Ipv4Addr, SocketAddr},
+    path::Path,
+    str::FromStr,
+    time::{Duration, Instant},
+};
 
 mod upload_queue;
 
@@ -25,6 +32,51 @@ fn write_repeating_pattern_file(path: &Path, size: usize, pattern: &[u8]) {
 fn read_manifest_from_disk(root: &Path, file_hash: &str) -> Ed2kResumeManifest {
     serde_json::from_slice(&fs::read(root.join(file_hash).join(MANIFEST_FILE_NAME)).unwrap())
         .unwrap()
+}
+
+#[tokio::test]
+async fn source_exchange_reask_throttles_same_peer_and_file() {
+    let root = unique_test_dir("ed2k-transfer-source-exchange-reask");
+    let runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+    let now = Instant::now();
+    let peer_addr = SocketAddr::from((Ipv4Addr::new(10, 1, 2, 3), 4662));
+    let user_hash = Some([0x51; 16]);
+
+    assert!(
+        runtime
+            .should_request_source_exchange("aa", peer_addr, user_hash, now)
+            .await
+    );
+    assert!(
+        !runtime
+            .should_request_source_exchange(
+                "aa",
+                peer_addr,
+                user_hash,
+                now + Duration::from_secs(60)
+            )
+            .await
+    );
+    assert!(
+        runtime
+            .should_request_source_exchange(
+                "aa",
+                peer_addr,
+                user_hash,
+                now + Duration::from_secs(40 * 60 + 1)
+            )
+            .await
+    );
+    assert!(
+        runtime
+            .should_request_source_exchange(
+                "bb",
+                peer_addr,
+                user_hash,
+                now + Duration::from_secs(60)
+            )
+            .await
+    );
 }
 
 #[tokio::test]

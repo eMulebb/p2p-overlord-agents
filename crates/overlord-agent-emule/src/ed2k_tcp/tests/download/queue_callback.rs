@@ -118,6 +118,7 @@ async fn callback_session_with_completed_hello_starts_upload_flow() {
         file_hash_hex: &file_hash_hex,
         timeout: Duration::from_secs(3),
         send_initial_requests: true,
+        source_exchange_allowed: true,
         initial_hello_complete: true,
         initial_secure_ident_started: true,
     })

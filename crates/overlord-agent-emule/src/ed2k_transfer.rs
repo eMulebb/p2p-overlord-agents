@@ -13,8 +13,10 @@
 use std::{
     collections::HashMap,
     fs,
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicU64},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -55,6 +57,14 @@ pub(crate) const ED2K_PART_SIZE: u64 = 9_728_000;
 pub(crate) const ED2K_EMBLOCK_SIZE: u64 = 184_320;
 const MANIFEST_FILE_NAME: &str = "resume-manifest.json";
 const PAYLOAD_FILE_NAME: &str = "pieces.bin";
+const SOURCE_EXCHANGE_REASK_INTERVAL: Duration = Duration::from_secs(40 * 60);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SourceExchangeRequestKey {
+    file_hash: String,
+    peer_addr: SocketAddr,
+    user_hash: Option<[u8; 16]>,
+}
 
 /// Runtime owner for ED2K transfer manifests, piece-store payloads, and the
 /// transfer-backed shared catalog.
@@ -66,6 +76,7 @@ pub struct Ed2kTransferRuntime {
     manifest_io: Arc<Mutex<()>>,
     manifest_cache: Arc<Mutex<HashMap<String, Ed2kResumeManifest>>>,
     manifest_checkpoint_state: Arc<Mutex<HashMap<String, Ed2kManifestCheckpointState>>>,
+    source_exchange_requests: Arc<Mutex<HashMap<SourceExchangeRequestKey, Instant>>>,
     upload_queue: Arc<Mutex<Ed2kUploadQueueState>>,
     next_upload_connection_id: AtomicU64,
 }
@@ -95,9 +106,32 @@ impl Ed2kTransferRuntime {
             manifest_io: Arc::new(Mutex::new(())),
             manifest_cache: Arc::new(Mutex::new(HashMap::new())),
             manifest_checkpoint_state: Arc::new(Mutex::new(HashMap::new())),
+            source_exchange_requests: Arc::new(Mutex::new(HashMap::new())),
             upload_queue: Arc::new(Mutex::new(Ed2kUploadQueueState::new(upload_queue_config))),
             next_upload_connection_id: AtomicU64::new(1),
         })
+    }
+
+    pub(crate) async fn should_request_source_exchange(
+        &self,
+        file_hash: &str,
+        peer_addr: SocketAddr,
+        user_hash: Option<[u8; 16]>,
+        now: Instant,
+    ) -> bool {
+        let key = SourceExchangeRequestKey {
+            file_hash: file_hash.to_string(),
+            peer_addr,
+            user_hash,
+        };
+        let mut requests = self.source_exchange_requests.lock().await;
+        let allowed = requests.get(&key).is_none_or(|last_requested| {
+            now.duration_since(*last_requested) > SOURCE_EXCHANGE_REASK_INTERVAL
+        });
+        if allowed {
+            requests.insert(key, now);
+        }
+        allowed
     }
 }
 

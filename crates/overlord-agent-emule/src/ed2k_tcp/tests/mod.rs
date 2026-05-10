@@ -125,6 +125,26 @@ fn assert_startup_multipacket_ext2(
     file_size: u64,
     expect_set_req_file_id: bool,
 ) {
+    assert_startup_multipacket_ext2_with_source_exchange(
+        protocol,
+        opcode,
+        payload,
+        file_hash,
+        file_size,
+        expect_set_req_file_id,
+        true,
+    );
+}
+
+fn assert_startup_multipacket_ext2_with_source_exchange(
+    protocol: u8,
+    opcode: u8,
+    payload: &[u8],
+    file_hash: &Ed2kHash,
+    file_size: u64,
+    expect_set_req_file_id: bool,
+    expect_request_sources2: bool,
+) {
     assert_eq!(protocol, OP_EMULEPROT);
     assert_eq!(opcode, super::OP_MULTIPACKET_EXT2);
     let (identifier, mut remaining) = super::Ed2kFileIdentifier::decode(payload).unwrap();
@@ -161,7 +181,7 @@ fn assert_startup_multipacket_ext2(
     }
 
     assert!(saw_request_filename);
-    assert!(saw_request_sources2);
+    assert_eq!(saw_request_sources2, expect_request_sources2);
     assert_eq!(saw_set_req_file_id, expect_set_req_file_id);
 }
 

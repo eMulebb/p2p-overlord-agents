@@ -176,14 +176,34 @@ pub(super) async fn answer_transport_startup_metadata(
     file_name: &str,
     include_file_status: bool,
 ) {
+    answer_transport_startup_metadata_with_source_exchange(
+        transport,
+        file_hash,
+        file_size,
+        file_name,
+        include_file_status,
+        true,
+    )
+    .await;
+}
+
+pub(super) async fn answer_transport_startup_metadata_with_source_exchange(
+    transport: &mut Ed2kTransport,
+    file_hash: &Ed2kHash,
+    file_size: u64,
+    file_name: &str,
+    include_file_status: bool,
+    expect_request_sources2: bool,
+) {
     let startup_request = transport.read_packet().await.unwrap().unwrap();
-    assert_startup_multipacket_ext2(
+    assert_startup_multipacket_ext2_with_source_exchange(
         startup_request.protocol,
         startup_request.opcode,
         &startup_request.payload,
         file_hash,
         file_size,
         false,
+        expect_request_sources2,
     );
     let filename_answer = encode_startup_multipacket_ext2_answer(
         file_hash,

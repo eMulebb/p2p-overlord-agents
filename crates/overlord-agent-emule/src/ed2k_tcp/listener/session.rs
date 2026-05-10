@@ -221,6 +221,7 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
                         file_hash_hex: &callback_intent.file_hash,
                         timeout: ED2K_CONNECTION_IDLE_TIMEOUT,
                         send_initial_requests: true,
+                        source_exchange_allowed: true,
                         initial_hello_complete: true,
                         initial_secure_ident_started: true,
                     })

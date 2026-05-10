@@ -10,6 +10,7 @@ pub(super) struct DownloadSessionState {
     pub(super) remote_supports_file_identifiers: bool,
     pub(super) remote_supports_source_exchange: bool,
     pub(super) remote_supports_source_exchange2: bool,
+    pub(super) source_exchange_allowed: bool,
     pub(super) startup_file_requests_sent: bool,
     pub(super) startup_file_response_received: bool,
     pub(super) source_request_sent: bool,
@@ -27,7 +28,11 @@ pub(super) struct DownloadSessionState {
 }
 
 impl DownloadSessionState {
-    pub(super) fn new(initial_hello_complete: bool, initial_secure_ident_started: bool) -> Self {
+    pub(super) fn new(
+        initial_hello_complete: bool,
+        initial_secure_ident_started: bool,
+        source_exchange_allowed: bool,
+    ) -> Self {
         Self {
             peer_secure_ident: Ed2kPeerSecureIdentState::default(),
             hello_complete: initial_hello_complete,
@@ -35,6 +40,7 @@ impl DownloadSessionState {
             remote_supports_file_identifiers: false,
             remote_supports_source_exchange: initial_hello_complete,
             remote_supports_source_exchange2: initial_hello_complete,
+            source_exchange_allowed,
             startup_file_requests_sent: false,
             startup_file_response_received: false,
             source_request_sent: false,

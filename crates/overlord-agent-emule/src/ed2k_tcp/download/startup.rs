@@ -99,6 +99,14 @@ pub(crate) async fn download_file_from_peer(
             "connect_ready",
             format!("file_hash={file_hash_hex}"),
         );
+        let source_exchange_allowed = transfer_runtime
+            .should_request_source_exchange(
+                &file_hash_hex,
+                peer_addr,
+                peer.user_hash,
+                std::time::Instant::now(),
+            )
+            .await;
         let hello = encode_hello_request(hello_identity);
         dump_ed2k_tcp_download_send(peer_addr, transport.mode, "hello", &hello);
         transport
@@ -115,6 +123,7 @@ pub(crate) async fn download_file_from_peer(
             file_hash_hex: &file_hash_hex,
             timeout,
             send_initial_requests: true,
+            source_exchange_allowed,
             initial_hello_complete: false,
             initial_secure_ident_started: false,
         })
