@@ -9,25 +9,25 @@ use overlord_kad_proto::Ed2kHash;
 use crate::ed2k_transfer::{Ed2kSourceHint, Ed2kTransferRuntime};
 
 use super::super::{
-    ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, ED2K_SECURE_IDENT_SIGNATURE_NEEDED,
-    Ed2kFileIdentifier, Ed2kHelloIdentity, Ed2kSecureIdent, Ed2kTransport, OP_ACCEPTUPLOADREQ,
-    OP_AICHANSWER, OP_AICHFILEHASHANS, OP_AICHREQUEST, OP_ANSWERSOURCES, OP_ANSWERSOURCES2,
-    OP_ASKSHAREDDENIEDANS, OP_ASKSHAREDDIRS, OP_ASKSHAREDDIRSANS, OP_ASKSHAREDFILES,
-    OP_ASKSHAREDFILESANSWER, OP_ASKSHAREDFILESDIR, OP_ASKSHAREDFILESDIRANS, OP_BUDDYPING,
-    OP_BUDDYPONG, OP_CALLBACK, OP_CHANGE_CLIENT_ID, OP_CHANGE_SLOT, OP_CHATCAPTCHAREQ,
-    OP_CHATCAPTCHARES, OP_COMPRESSEDPART, OP_COMPRESSEDPART_I64, OP_EDONKEYPROT, OP_EMULEINFO,
-    OP_EMULEINFOANSWER, OP_EMULEPROT, OP_END_OF_DOWNLOAD, OP_FILEDESC, OP_FILEREQANSNOFIL,
-    OP_FILESTATUS, OP_HASHSETANSWER, OP_HASHSETANSWER2, OP_HELLO, OP_HELLOANSWER,
-    OP_KAD_FWTCPCHECK_ACK, OP_MESSAGE, OP_MULTIPACKETANSWER, OP_MULTIPACKETANSWER_EXT2,
-    OP_OUTOFPARTREQS, OP_PORTTEST, OP_PREVIEWANSWER, OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ,
-    OP_PUBLICKEY, OP_QUEUERANK, OP_QUEUERANKING, OP_REASKCALLBACKTCP, OP_REQFILENAMEANSWER,
-    OP_REQUESTPREVIEW, OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64, OP_SETREQFILEID,
-    OP_SIGNATURE, SourceExchangePeer, begin_secure_ident_probe, build_hello_responses,
-    decode_aich_file_hash_answer, decode_aich_recovery_answer_payload,
+    DecodedEmuleInfoProfile, ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED,
+    ED2K_SECURE_IDENT_SIGNATURE_NEEDED, Ed2kFileIdentifier, Ed2kHelloIdentity, Ed2kSecureIdent,
+    Ed2kTransport, OP_ACCEPTUPLOADREQ, OP_AICHANSWER, OP_AICHFILEHASHANS, OP_AICHREQUEST,
+    OP_ANSWERSOURCES, OP_ANSWERSOURCES2, OP_ASKSHAREDDENIEDANS, OP_ASKSHAREDDIRS,
+    OP_ASKSHAREDDIRSANS, OP_ASKSHAREDFILES, OP_ASKSHAREDFILESANSWER, OP_ASKSHAREDFILESDIR,
+    OP_ASKSHAREDFILESDIRANS, OP_BUDDYPING, OP_BUDDYPONG, OP_CALLBACK, OP_CHANGE_CLIENT_ID,
+    OP_CHANGE_SLOT, OP_CHATCAPTCHAREQ, OP_CHATCAPTCHARES, OP_COMPRESSEDPART, OP_COMPRESSEDPART_I64,
+    OP_EDONKEYPROT, OP_EMULEINFO, OP_EMULEINFOANSWER, OP_EMULEPROT, OP_END_OF_DOWNLOAD,
+    OP_FILEDESC, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_HASHSETANSWER, OP_HASHSETANSWER2, OP_HELLO,
+    OP_HELLOANSWER, OP_KAD_FWTCPCHECK_ACK, OP_MESSAGE, OP_MULTIPACKETANSWER,
+    OP_MULTIPACKETANSWER_EXT2, OP_OUTOFPARTREQS, OP_PORTTEST, OP_PREVIEWANSWER, OP_PUBLICIP_ANSWER,
+    OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_QUEUERANK, OP_QUEUERANKING, OP_REASKCALLBACKTCP,
+    OP_REQFILENAMEANSWER, OP_REQUESTPREVIEW, OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64,
+    OP_SETREQFILEID, OP_SIGNATURE, SourceExchangePeer, begin_secure_ident_probe,
+    build_hello_responses, decode_aich_file_hash_answer, decode_aich_recovery_answer_payload,
     decode_aich_recovery_request_payload, decode_answer_sources_payload,
     decode_answer_sources2_payload, decode_chat_captcha_request_payload,
     decode_chat_captcha_result_payload, decode_client_id_change_payload,
-    decode_client_message_payload, decode_edonkey_queue_rank_payload,
+    decode_client_message_payload, decode_edonkey_queue_rank_payload, decode_emule_info_profile,
     decode_emule_queue_ranking_payload, decode_exact_file_hash_payload,
     decode_file_description_payload, decode_file_status_payload, decode_hashset_answer,
     decode_hashset_answer2, decode_hello_profile, decode_kad_callback_payload,
@@ -55,6 +55,16 @@ mod state;
 use parts::{DownloadPartPacket, handle_download_part_packet};
 use startup::{DownloadStartupStep, HASHSET_STALL_UPLOAD_FALLBACK, advance_download_startup};
 use state::DownloadSessionState;
+
+fn apply_emule_info_profile(
+    session_state: &mut DownloadSessionState,
+    profile: DecodedEmuleInfoProfile,
+) {
+    session_state.remote_source_exchange_version = profile.source_exchange_version;
+    session_state.remote_supports_source_exchange = profile.supports_source_exchange;
+    session_state.remote_supports_source_exchange2 = false;
+}
+
 /// Outcome of one outbound ED2K peer download attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Ed2kPeerDownloadOutcome {
@@ -308,6 +318,8 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     session_state.queued_until = None;
                 }
                 (OP_EMULEPROT, OP_EMULEINFO) => {
+                    let emule_info_profile = decode_emule_info_profile(&packet.payload)?;
+                    apply_emule_info_profile(&mut session_state, emule_info_profile);
                     transport
                         .write_all(&encode_emule_info_answer(hello_identity.udp_port))
                         .await
@@ -315,7 +327,10 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                             format!("failed to send OP_EMULEINFOANSWER to {peer_addr}")
                         })?;
                 }
-                (OP_EMULEPROT, OP_EMULEINFOANSWER) => {}
+                (OP_EMULEPROT, OP_EMULEINFOANSWER) => {
+                    let emule_info_profile = decode_emule_info_profile(&packet.payload)?;
+                    apply_emule_info_profile(&mut session_state, emule_info_profile);
+                }
                 (OP_EMULEPROT, OP_SECIDENTSTATE) => {
                     let (state, challenge) = decode_secident_state(&packet.payload)?;
                     session_state.peer_secure_ident.peer_challenge_from = Some(challenge);

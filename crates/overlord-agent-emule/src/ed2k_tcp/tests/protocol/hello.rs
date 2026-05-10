@@ -267,6 +267,22 @@ fn emule_info_advertises_stock_comments_but_not_preview() {
 }
 
 #[test]
+fn emule_info_decode_preserves_stock_capability_tags() {
+    let packet = encode_emule_info_request(41000);
+    let profile = decode_emule_info_profile(&packet[6..]).unwrap();
+
+    assert_eq!(profile.data_compression_version, 1);
+    assert_eq!(profile.udp_version, 4);
+    assert_eq!(profile.udp_port, 41000);
+    assert_eq!(profile.source_exchange_version, 3);
+    assert!(profile.supports_source_exchange);
+    assert_eq!(profile.extended_requests_version, 2);
+    assert!(profile.accepts_comments);
+    assert!(profile.supports_secure_ident);
+    assert!(!profile.supports_preview);
+}
+
+#[test]
 fn emule_info_answer_uses_expected_protocol_and_tag_count() {
     let packet = encode_emule_info_answer(41000);
 

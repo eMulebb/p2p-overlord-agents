@@ -28,7 +28,7 @@ use super::{
     decode_aich_recovery_request_payload, decode_answer_sources_payload,
     decode_chat_captcha_request_payload, decode_chat_captcha_result_payload,
     decode_client_id_change_payload, decode_client_message_payload,
-    decode_compressed_part_fragment, decode_edonkey_queue_rank_payload,
+    decode_compressed_part_fragment, decode_edonkey_queue_rank_payload, decode_emule_info_profile,
     decode_emule_queue_ranking_payload, decode_exact_file_hash_payload,
     decode_file_description_payload, decode_file_hash_payload, decode_file_status_payload,
     decode_hashset_answer, decode_hashset_answer2, decode_hashset_request2, decode_hello_profile,

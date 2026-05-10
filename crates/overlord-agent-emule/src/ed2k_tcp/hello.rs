@@ -201,6 +201,19 @@ pub(super) fn encode_emule_info_answer(kad_udp_port: u16) -> Vec<u8> {
     )
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct DecodedEmuleInfoProfile {
+    pub(super) data_compression_version: u8,
+    pub(super) udp_version: u8,
+    pub(super) udp_port: u16,
+    pub(super) source_exchange_version: u8,
+    pub(super) supports_source_exchange: bool,
+    pub(super) extended_requests_version: u8,
+    pub(super) accepts_comments: bool,
+    pub(super) supports_secure_ident: bool,
+    pub(super) supports_preview: bool,
+}
+
 struct DecodedHelloTag<'a> {
     tag_name: Option<u8>,
     base_type: u8,
@@ -343,6 +356,51 @@ fn decode_hello_tag_u32(tag: &DecodedHelloTag<'_>) -> Option<u32> {
         TAGTYPE_UINT8 | TAGTYPE_BOOL => Some(u32::from(tag.value.first().copied()?)),
         _ => None,
     }
+}
+
+pub(super) fn decode_emule_info_profile(payload: &[u8]) -> Result<DecodedEmuleInfoProfile> {
+    if payload.len() < 2 + 4 {
+        anyhow::bail!("short eMule info payload {}", payload.len());
+    }
+    if payload[1] != EMULE_PROTOCOL_VERSION {
+        return Ok(DecodedEmuleInfoProfile::default());
+    }
+    let mut cursor = &payload[2..];
+    let tag_count = usize::try_from(u32::from_le_bytes(cursor[..4].try_into().unwrap()))
+        .context("eMule info tag count overflow")?;
+    cursor = &cursor[4..];
+
+    let mut profile = DecodedEmuleInfoProfile::default();
+    for _ in 0..tag_count {
+        let tag = decode_hello_tag(cursor)?;
+        if let Some(value) = decode_hello_tag_u32(&tag) {
+            match tag.tag_name {
+                Some(ET_COMPRESSION) => profile.data_compression_version = value as u8,
+                Some(ET_UDPVER) => profile.udp_version = value as u8,
+                Some(ET_UDPPORT) => profile.udp_port = value as u16,
+                Some(ET_SOURCEEXCHANGE) => {
+                    profile.source_exchange_version = value as u8;
+                    profile.supports_source_exchange = value != 0;
+                }
+                Some(ET_COMMENTS) => profile.accepts_comments = value != 0,
+                Some(ET_EXTENDEDREQUEST) => profile.extended_requests_version = value as u8,
+                Some(ET_FEATURES) => {
+                    profile.supports_secure_ident = (value & 0x03) != 0;
+                    profile.supports_preview = ((value >> 7) & 1) != 0;
+                }
+                _ => {}
+            }
+        }
+        cursor = tag.remaining;
+    }
+    if profile.data_compression_version == 0 {
+        profile.source_exchange_version = 0;
+        profile.supports_source_exchange = false;
+        profile.extended_requests_version = 0;
+        profile.accepts_comments = false;
+        profile.udp_port = 0;
+    }
+    Ok(profile)
 }
 
 fn decode_hello_profile_from_type_payload(type_payload: &[u8]) -> Result<DecodedHelloProfile> {
