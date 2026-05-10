@@ -15,10 +15,10 @@ use super::super::{
     OP_COMPRESSEDPART, OP_COMPRESSEDPART_I64, OP_EDONKEYPROT, OP_EMULEINFO, OP_EMULEINFOANSWER,
     OP_EMULEPROT, OP_END_OF_DOWNLOAD, OP_FILEDESC, OP_FILEREQANSNOFIL, OP_FILESTATUS,
     OP_HASHSETANSWER, OP_HASHSETANSWER2, OP_HELLO, OP_HELLOANSWER, OP_KAD_FWTCPCHECK_ACK,
-    OP_MULTIPACKETANSWER, OP_MULTIPACKETANSWER_EXT2, OP_PORTTEST, OP_PUBLICIP_ANSWER,
-    OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_QUEUERANK, OP_QUEUERANKING, OP_REQFILENAMEANSWER,
-    OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64, OP_SETREQFILEID, OP_SIGNATURE,
-    SourceExchangePeer, begin_secure_ident_probe, build_hello_responses,
+    OP_MULTIPACKETANSWER, OP_MULTIPACKETANSWER_EXT2, OP_OUTOFPARTREQS, OP_PORTTEST,
+    OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_QUEUERANK, OP_QUEUERANKING,
+    OP_REQFILENAMEANSWER, OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64, OP_SETREQFILEID,
+    OP_SIGNATURE, SourceExchangePeer, begin_secure_ident_probe, build_hello_responses,
     decode_aich_file_hash_answer, decode_answer_sources_payload, decode_answer_sources2_payload,
     decode_file_description_payload, decode_file_hash_payload, decode_file_status_payload,
     decode_hashset_answer, decode_hashset_answer2, decode_hello_profile,
@@ -645,6 +645,15 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     if ended_hash == file_hash {
                         return Ok(Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
                     }
+                }
+                (OP_EDONKEYPROT, OP_OUTOFPARTREQS) => {
+                    dump_ed2k_tcp_download_meta(
+                        peer_addr,
+                        Some(transport.mode),
+                        "out_of_part_requests",
+                        format!("file_hash={file_hash_hex}"),
+                    );
+                    return Ok(Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
                 }
                 (OP_EMULEPROT, OP_FILEDESC) => {
                     let file_desc = decode_file_description_payload(&packet.payload)?;
