@@ -262,6 +262,17 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
         .write_all(&super::encode_packet(OP_EDONKEYPROT, OP_OUTOFPARTREQS, &[]))
         .await
         .unwrap();
+    let mut client_id_change_payload = Vec::new();
+    client_id_change_payload.extend_from_slice(&0x1122_3344u32.to_le_bytes());
+    client_id_change_payload.extend_from_slice(&0x5566_7788u32.to_le_bytes());
+    stream
+        .write_all(&super::encode_packet(
+            OP_EDONKEYPROT,
+            OP_CHANGE_CLIENT_ID,
+            &client_id_change_payload,
+        ))
+        .await
+        .unwrap();
 
     stream
         .write_all(&super::encode_start_upload_req(&file_hash))

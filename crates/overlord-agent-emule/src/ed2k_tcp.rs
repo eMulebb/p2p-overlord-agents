@@ -42,9 +42,9 @@ mod obfuscation;
 mod transport;
 pub(in crate::ed2k_tcp) use codec::{
     PeerSourceExchangeRequest, SourceExchangePeer, decode_aich_file_hash_answer,
-    decode_answer_sources_payload, decode_answer_sources2_payload, decode_compressed_part_fragment,
-    decode_file_description_payload, decode_file_hash_payload, decode_file_status_payload,
-    decode_hashset_answer, decode_hashset_answer2, decode_peer_payload,
+    decode_answer_sources_payload, decode_answer_sources2_payload, decode_client_id_change_payload,
+    decode_compressed_part_fragment, decode_file_description_payload, decode_file_hash_payload,
+    decode_file_status_payload, decode_hashset_answer, decode_hashset_answer2, decode_peer_payload,
     decode_public_ip_answer_payload, decode_request_filename_answer,
     decode_request_filename_answer_body, decode_sending_part_payload,
     encode_aich_file_hash_request, encode_hashset_request, encode_hashset_request2,
@@ -122,6 +122,7 @@ const OP_SENDINGPART: u8 = 0x46;
 const OP_REQUESTPARTS: u8 = 0x47;
 const OP_FILEREQANSNOFIL: u8 = 0x48;
 const OP_END_OF_DOWNLOAD: u8 = 0x49;
+const OP_CHANGE_CLIENT_ID: u8 = 0x4D;
 const OP_SETREQFILEID: u8 = 0x4F;
 const OP_FILESTATUS: u8 = 0x50;
 const OP_HASHSETREQUEST: u8 = 0x51;

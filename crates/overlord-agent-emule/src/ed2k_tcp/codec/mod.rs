@@ -124,6 +124,24 @@ pub(super) fn encode_file_req_ans_nofil(file_hash: &Ed2kHash) -> Vec<u8> {
     encode_packet(OP_EDONKEYPROT, OP_FILEREQANSNOFIL, &file_hash.0)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ClientIdChange {
+    pub(super) new_user_id: u32,
+    pub(super) new_server_ip: u32,
+    pub(super) trailing_len: usize,
+}
+
+pub(super) fn decode_client_id_change_payload(payload: &[u8]) -> Result<ClientIdChange> {
+    if payload.len() < 8 {
+        anyhow::bail!("short OP_CHANGE_CLIENT_ID payload {}", payload.len());
+    }
+    Ok(ClientIdChange {
+        new_user_id: u32::from_le_bytes(payload[..4].try_into().unwrap()),
+        new_server_ip: u32::from_le_bytes(payload[4..8].try_into().unwrap()),
+        trailing_len: payload.len() - 8,
+    })
+}
+
 pub(super) fn encode_accept_upload_req() -> Vec<u8> {
     encode_packet(OP_EDONKEYPROT, OP_ACCEPTUPLOADREQ, &[])
 }

@@ -62,6 +62,21 @@ fn file_description_decodes_stock_rating_and_long_string() {
 }
 
 #[test]
+fn client_id_change_decodes_stock_two_u32_payload() {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&0x1122_3344u32.to_le_bytes());
+    payload.extend_from_slice(&0x5566_7788u32.to_le_bytes());
+    payload.extend_from_slice(&[0xAA, 0xBB]);
+
+    let decoded = decode_client_id_change_payload(&payload).unwrap();
+
+    assert_eq!(decoded.new_user_id, 0x1122_3344);
+    assert_eq!(decoded.new_server_ip, 0x5566_7788);
+    assert_eq!(decoded.trailing_len, 2);
+    assert!(decode_client_id_change_payload(&payload[..7]).is_err());
+}
+
+#[test]
 fn file_identifier_roundtrip_matches_stock_md4_plus_size_shape() {
     let identifier = super::Ed2kFileIdentifier {
         file_hash: Ed2kHash([0xAB; 16]),

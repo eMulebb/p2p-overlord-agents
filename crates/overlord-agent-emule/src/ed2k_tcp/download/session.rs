@@ -12,21 +12,21 @@ use super::super::{
     ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, ED2K_SECURE_IDENT_SIGNATURE_NEEDED,
     Ed2kFileIdentifier, Ed2kHelloIdentity, Ed2kSecureIdent, Ed2kTransport, OP_ACCEPTUPLOADREQ,
     OP_AICHFILEHASHANS, OP_ANSWERSOURCES, OP_ANSWERSOURCES2, OP_BUDDYPING, OP_BUDDYPONG,
-    OP_COMPRESSEDPART, OP_COMPRESSEDPART_I64, OP_EDONKEYPROT, OP_EMULEINFO, OP_EMULEINFOANSWER,
-    OP_EMULEPROT, OP_END_OF_DOWNLOAD, OP_FILEDESC, OP_FILEREQANSNOFIL, OP_FILESTATUS,
-    OP_HASHSETANSWER, OP_HASHSETANSWER2, OP_HELLO, OP_HELLOANSWER, OP_KAD_FWTCPCHECK_ACK,
-    OP_MULTIPACKETANSWER, OP_MULTIPACKETANSWER_EXT2, OP_OUTOFPARTREQS, OP_PORTTEST,
-    OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_QUEUERANK, OP_QUEUERANKING,
+    OP_CHANGE_CLIENT_ID, OP_COMPRESSEDPART, OP_COMPRESSEDPART_I64, OP_EDONKEYPROT, OP_EMULEINFO,
+    OP_EMULEINFOANSWER, OP_EMULEPROT, OP_END_OF_DOWNLOAD, OP_FILEDESC, OP_FILEREQANSNOFIL,
+    OP_FILESTATUS, OP_HASHSETANSWER, OP_HASHSETANSWER2, OP_HELLO, OP_HELLOANSWER,
+    OP_KAD_FWTCPCHECK_ACK, OP_MULTIPACKETANSWER, OP_MULTIPACKETANSWER_EXT2, OP_OUTOFPARTREQS,
+    OP_PORTTEST, OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_QUEUERANK, OP_QUEUERANKING,
     OP_REQFILENAMEANSWER, OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64, OP_SETREQFILEID,
     OP_SIGNATURE, SourceExchangePeer, begin_secure_ident_probe, build_hello_responses,
     decode_aich_file_hash_answer, decode_answer_sources_payload, decode_answer_sources2_payload,
-    decode_file_description_payload, decode_file_hash_payload, decode_file_status_payload,
-    decode_hashset_answer, decode_hashset_answer2, decode_hello_profile,
-    decode_public_ip_answer_payload, decode_public_key_payload, decode_request_filename_answer,
-    decode_request_filename_answer_body, decode_secident_state, dump_ed2k_tcp_download_meta,
-    dump_ed2k_tcp_download_recv, dump_ed2k_tcp_download_send, encode_emule_info_answer,
-    encode_packet, encode_port_test_answer, encode_public_ip_answer, is_connection_shutdown_error,
-    skip_file_status_body, try_send_secure_ident_signature,
+    decode_client_id_change_payload, decode_file_description_payload, decode_file_hash_payload,
+    decode_file_status_payload, decode_hashset_answer, decode_hashset_answer2,
+    decode_hello_profile, decode_public_ip_answer_payload, decode_public_key_payload,
+    decode_request_filename_answer, decode_request_filename_answer_body, decode_secident_state,
+    dump_ed2k_tcp_download_meta, dump_ed2k_tcp_download_recv, dump_ed2k_tcp_download_send,
+    encode_emule_info_answer, encode_packet, encode_port_test_answer, encode_public_ip_answer,
+    is_connection_shutdown_error, skip_file_status_body, try_send_secure_ident_signature,
 };
 use super::{
     ActiveDownloadPiece, DownloadRequestWindowState, PendingCompressedPart, PendingPartRequest,
@@ -654,6 +654,18 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                         format!("file_hash={file_hash_hex}"),
                     );
                     return Ok(Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
+                }
+                (OP_EDONKEYPROT, OP_CHANGE_CLIENT_ID) => {
+                    let change = decode_client_id_change_payload(&packet.payload)?;
+                    dump_ed2k_tcp_download_meta(
+                        peer_addr,
+                        Some(transport.mode),
+                        "change_client_id",
+                        format!(
+                            "new_user_id={} new_server_ip={} trailing_len={}",
+                            change.new_user_id, change.new_server_ip, change.trailing_len
+                        ),
+                    );
                 }
                 (OP_EMULEPROT, OP_FILEDESC) => {
                     let file_desc = decode_file_description_payload(&packet.payload)?;
