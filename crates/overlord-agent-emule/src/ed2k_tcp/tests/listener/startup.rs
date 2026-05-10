@@ -79,6 +79,14 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
         0
     );
 
+    let mut older_source_request = super::encode_request_sources2(&file_hash);
+    older_source_request[22] = 2;
+    stream.write_all(&older_source_request).await.unwrap();
+    let older_source_answer =
+        read_until_opcode(&mut stream, OP_EMULEPROT, super::OP_ANSWERSOURCES2).await;
+    assert_eq!(older_source_answer[6], 2);
+    assert_eq!(&older_source_answer[7..23], &file_hash.0);
+
     let modern_hashset_request = super::encode_hashset_request2(
         &super::Ed2kFileIdentifier::from_manifest(&manifest).unwrap(),
         super::Ed2kHashsetRequestOptions {

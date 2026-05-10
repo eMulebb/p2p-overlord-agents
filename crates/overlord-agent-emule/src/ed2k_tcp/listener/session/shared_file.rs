@@ -72,7 +72,7 @@ pub(in crate::ed2k_tcp) async fn handle_multipacket_ext2_request(
                 remaining = &remaining[3..];
                 let reply = encode_answer_sources2_empty(
                     &requested,
-                    requested_version.max(ED2K_SOURCE_EXCHANGE2_VERSION),
+                    requested_version.min(ED2K_SOURCE_EXCHANGE2_VERSION),
                 );
                 dump_ed2k_tcp_listener_send(peer_addr, transport.mode, "answer_sources", &reply);
                 transport.write_all(&reply).await.with_context(|| {
@@ -221,7 +221,7 @@ pub(in crate::ed2k_tcp) async fn handle_source_request(
         let reply = if opcode == OP_REQUESTSOURCES2 {
             encode_answer_sources2_empty(
                 &requested,
-                requested_version.max(ED2K_SOURCE_EXCHANGE2_VERSION),
+                requested_version.min(ED2K_SOURCE_EXCHANGE2_VERSION),
             )
         } else {
             encode_answer_sources_empty(&requested)
