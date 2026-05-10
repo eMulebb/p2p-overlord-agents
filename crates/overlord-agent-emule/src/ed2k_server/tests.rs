@@ -13,16 +13,16 @@ use super::{
     SERVER_TCP_FLAG_LARGEFILES, SERVER_TCP_FLAG_TCPOBFUSCATION, SERVER_UDP_FLAG_EXT_GETSOURCES2,
     SERVER_UDP_FLAG_UDPOBFUSCATION, SOURCE_OBFUSCATION_USER_HASH_PRESENT, ST_DESCRIPTION,
     ST_SERVERNAME, ServerSession, ServerUdpPacket, TAG_SHORT_NAME_MASK, TAGTYPE_STR1,
-    TAGTYPE_UINT32, TAGTYPE_UINT64, biguint_to_fixed_be, decode_found_sources,
-    decode_search_result_page, decode_search_results, decode_server_ident, decode_server_payload,
-    decode_server_udp_datagram, derive_server_cipher, derive_server_udp_cipher,
-    ed2k_string_tag_type, encode_login_request, encode_offer_files_payload, encode_packet,
-    encode_search_request, encode_server_udp_datagram, encode_source_request, format_server_flags,
-    handle_background_udp_packet, ipv4_from_client_id, login_identity_for_server_transport,
-    new_ed2k_server_search_channel, offer_files_catalog_fingerprint,
-    search_keyword_via_background_session, search_source_via_background_session,
-    server_capabilities, server_udp_endpoint, should_use_server_obfuscation, source_request_opcode,
-    validate_found_sources,
+    TAGTYPE_UINT32, TAGTYPE_UINT64, biguint_to_fixed_be, decode_callback_request,
+    decode_found_sources, decode_search_result_page, decode_search_results, decode_server_ident,
+    decode_server_payload, decode_server_udp_datagram, derive_server_cipher,
+    derive_server_udp_cipher, ed2k_string_tag_type, encode_login_request,
+    encode_offer_files_payload, encode_packet, encode_search_request, encode_server_udp_datagram,
+    encode_source_request, format_server_flags, handle_background_udp_packet, ipv4_from_client_id,
+    login_identity_for_server_transport, new_ed2k_server_search_channel,
+    offer_files_catalog_fingerprint, search_keyword_via_background_session,
+    search_source_via_background_session, server_capabilities, server_udp_endpoint,
+    should_use_server_obfuscation, source_request_opcode, validate_found_sources,
 };
 use crate::{
     ed2k_tcp::{Ed2kHelloIdentity, emule_connect_options},
@@ -76,6 +76,29 @@ fn test_udp_obfuscated_server() -> ResolvedServerEntry {
         },
         ip: Ipv4Addr::LOCALHOST,
     }
+}
+
+#[test]
+fn callback_request_only_trusts_crypt_profile_with_user_hash() {
+    let mut truncated = Vec::new();
+    truncated.extend_from_slice(&u32::from_le_bytes([127, 0, 0, 1]).to_le_bytes());
+    truncated.extend_from_slice(&4662u16.to_le_bytes());
+    truncated.push(emule_connect_options(true));
+
+    let callback = decode_callback_request(&truncated)
+        .unwrap()
+        .expect("callback");
+
+    assert_eq!(callback.peer_addr, "127.0.0.1:4662".parse().unwrap());
+    assert_eq!(callback.connect_options, None);
+    assert_eq!(callback.user_hash, None);
+
+    let mut full = truncated;
+    full.extend_from_slice(&[0x11; 16]);
+    let callback = decode_callback_request(&full).unwrap().expect("callback");
+
+    assert_eq!(callback.connect_options, Some(emule_connect_options(true)));
+    assert_eq!(callback.user_hash, Some([0x11; 16]));
 }
 
 mod background;

@@ -230,14 +230,15 @@ async fn maybe_send_probe_search(
     Ok(())
 }
 
-fn decode_callback_request(payload: &[u8]) -> Result<Option<CallbackRequest>> {
+pub(super) fn decode_callback_request(payload: &[u8]) -> Result<Option<CallbackRequest>> {
     if payload.len() < 6 {
         return Ok(None);
     }
     let ip = ipv4_from_client_id(u32::from_le_bytes(payload[..4].try_into().unwrap()));
     let port = u16::from_le_bytes(payload[4..6].try_into().unwrap());
-    let connect_options = payload.get(6).copied();
-    let user_hash = (payload.len() >= 23).then(|| {
+    let has_crypt_profile = payload.len() >= 23;
+    let connect_options = has_crypt_profile.then(|| payload[6]);
+    let user_hash = has_crypt_profile.then(|| {
         let mut hash = [0u8; 16];
         hash.copy_from_slice(&payload[7..23]);
         hash
