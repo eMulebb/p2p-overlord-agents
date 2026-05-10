@@ -98,12 +98,9 @@ pub(in crate::ed2k_tcp) fn decode_hashset_request2(
     payload: &[u8],
 ) -> Result<(Ed2kFileIdentifier, Ed2kHashsetRequestOptions)> {
     let (file_identifier, remaining) = Ed2kFileIdentifier::decode(payload)?;
-    let Some((&options, rest)) = remaining.split_first() else {
+    let Some((&options, _)) = remaining.split_first() else {
         anyhow::bail!("short OP_HASHSETREQUEST2 payload");
     };
-    if !rest.is_empty() {
-        anyhow::bail!("trailing OP_HASHSETREQUEST2 payload {}", rest.len());
-    }
     Ok((file_identifier, Ed2kHashsetRequestOptions::decode(options)))
 }
 

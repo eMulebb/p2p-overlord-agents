@@ -396,6 +396,14 @@ fn hashset_request2_roundtrip_preserves_file_identifier_and_request_bits() {
     assert_eq!(decoded_identifier, file_identifier);
     assert!(decoded_options.request_md4);
     assert!(decoded_options.request_aich);
+
+    let mut payload_with_trailing = packet[6..].to_vec();
+    payload_with_trailing.extend_from_slice(&[0xAA, 0xBB]);
+    let (decoded_identifier, decoded_options) =
+        super::decode_hashset_request2(&payload_with_trailing).unwrap();
+    assert_eq!(decoded_identifier, file_identifier);
+    assert!(decoded_options.request_md4);
+    assert!(decoded_options.request_aich);
 }
 
 #[test]
