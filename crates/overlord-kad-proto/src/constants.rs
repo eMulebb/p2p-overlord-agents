@@ -82,7 +82,9 @@ pub mod tag_name {
     pub const FILEFORMAT: u8 = 0x04;
     pub const DESCRIPTION: u8 = 0x0B;
     pub const SOURCES: u8 = 0x15;
+    pub const PUBLISHINFO: u8 = 0x33;
     pub const KADAICHHASHPUB: u8 = 0x36;
+    pub const KADAICHHASHRESULT: u8 = 0x37;
     pub const FILESIZE_HI: u8 = 0x3A;
     pub const MEDIA_ARTIST: u8 = 0xD0;
     pub const MEDIA_ALBUM: u8 = 0xD1;

@@ -246,7 +246,7 @@ impl KadLocalStore {
             .take(limit)
             .map(|entry| SearchResultEntry {
                 entry_id: entry.file_hash,
-                tags: entry.tags.clone(),
+                tags: keyword_result_tags(entry),
             })
             .collect::<Vec<_>>();
         search_response(sender_id, request.target, results)
@@ -367,6 +367,68 @@ fn search_response(
             results,
         })
     }
+}
+
+fn keyword_result_tags(entry: &StoredKeywordPublish) -> Vec<Tag> {
+    let mut tags = Vec::new();
+    if let Some(name) = stock_first_filename(&entry.tags) {
+        tags.push(Tag::filename(name));
+    }
+    if let Some(size) = stock_first_file_size(&entry.tags).filter(|size| *size > 0) {
+        tags.push(Tag::filesize(size));
+    }
+
+    let mut skipped_filename = false;
+    let mut skipped_filesize = false;
+    let mut aich_result_hash = None;
+    for tag in &entry.tags {
+        match tag.name {
+            TagName::Short(name) if name == tag_name::FILENAME && !skipped_filename => {
+                skipped_filename = true;
+            }
+            TagName::Short(name) if name == tag_name::FILESIZE && !skipped_filesize => {
+                skipped_filesize = true;
+            }
+            TagName::Short(name) if name == tag_name::KADAICHHASHPUB => {
+                if aich_result_hash.is_none() {
+                    aich_result_hash = stock_aich_publish_hash(tag);
+                }
+            }
+            TagName::Short(name)
+                if name == tag_name::PUBLISHINFO || name == tag_name::KADAICHHASHRESULT => {}
+            _ => tags.push(tag.clone()),
+        }
+    }
+
+    tags.push(keyword_publish_info_tag(entry));
+    if let Some(hash) = aich_result_hash {
+        tags.push(keyword_aich_result_tag(hash));
+    }
+    tags
+}
+
+fn keyword_publish_info_tag(_entry: &StoredKeywordPublish) -> Tag {
+    let trust_times_100 = 1000_u32;
+    let publishers = 1_u32;
+    let names = 1_u32;
+    let value = (names << 24) | (publishers << 16) | trust_times_100;
+    Tag::new_short(tag_name::PUBLISHINFO, TagValue::U32(value))
+}
+
+fn stock_aich_publish_hash(tag: &Tag) -> Option<[u8; 20]> {
+    let bytes = match &tag.value {
+        TagValue::Blob(bytes) | TagValue::SmallBlob(bytes) => bytes,
+        _ => return None,
+    };
+    bytes.as_slice().try_into().ok()
+}
+
+fn keyword_aich_result_tag(hash: [u8; 20]) -> Tag {
+    let mut payload = Vec::with_capacity(22);
+    payload.push(1);
+    payload.push(1);
+    payload.extend_from_slice(&hash);
+    Tag::new_short(tag_name::KADAICHHASHRESULT, TagValue::SmallBlob(payload))
 }
 
 fn source_result_tags(entry: &StoredSourcePublish) -> Vec<Tag> {
@@ -1000,6 +1062,62 @@ mod tests {
                     if *name == tag_name::SOURCES && *value == 9
             )
         }));
+    }
+
+    #[test]
+    fn keyword_search_materializes_stock_publish_info_and_aich_result_tags() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([1; 16]);
+        let file_hash = Ed2kHash::from_bytes([2; 16]);
+        let aich_hash = [0xAB; 20];
+        let entry = PublishEntry {
+            hash: file_hash,
+            tags: vec![
+                Tag::new_short(tag_name::SOURCES, TagValue::UInt(7)),
+                Tag::filesize(123),
+                Tag::filename("ubuntu linux.iso"),
+                Tag::kad_aich_hash_pub(aich_hash),
+                Tag::new_short(tag_name::PUBLISHINFO, TagValue::U32(0xFFFF_FFFF)),
+                Tag::new_short(tag_name::KADAICHHASHRESULT, TagValue::SmallBlob(vec![0])),
+            ],
+        };
+
+        assert_eq!(
+            store.record_keyword_publish_batch(target, std::slice::from_ref(&entry), ts(0)),
+            1
+        );
+        let response = store
+            .keyword_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchKeyReq {
+                    target,
+                    start_position: 0,
+                    restrictive_payload: Vec::new(),
+                },
+                10,
+                ts(1),
+            )
+            .expect("keyword response");
+        let result_tags = &response.results[0].tags;
+        assert_eq!(
+            short_tag_names(result_tags),
+            vec![
+                tag_name::FILENAME,
+                tag_name::FILESIZE,
+                tag_name::SOURCES,
+                tag_name::PUBLISHINFO,
+                tag_name::KADAICHHASHRESULT,
+            ]
+        );
+        assert!(matches!(
+            result_tags[3].value,
+            TagValue::U32(value) if value == 0x0101_03E8
+        ));
+        assert!(matches!(
+            &result_tags[4].value,
+            TagValue::SmallBlob(value)
+                if value.len() == 22 && value[0] == 1 && value[1] == 1 && value[2..] == aich_hash
+        ));
     }
 
     #[test]
