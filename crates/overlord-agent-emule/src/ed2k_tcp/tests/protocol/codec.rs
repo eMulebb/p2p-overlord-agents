@@ -15,6 +15,27 @@ fn firewall_check_udp_request_roundtrip() {
 }
 
 #[test]
+fn firewall_check_udp_request_tolerates_stock_trailing_bytes() {
+    let mut payload = [0u8; 10];
+    payload[0..2].copy_from_slice(&41000u16.to_le_bytes());
+    payload[2..4].copy_from_slice(&51000u16.to_le_bytes());
+    payload[4..8].copy_from_slice(&0x1122_3344u32.to_le_bytes());
+    payload[8..10].copy_from_slice(&[0xAA, 0xBB]);
+
+    let decoded = FirewallCheckUdpRequest::decode(&payload).expect("decode with trailing bytes");
+
+    assert_eq!(
+        decoded,
+        FirewallCheckUdpRequest {
+            internal_udp_port: 41000,
+            external_udp_port: 51000,
+            sender_udp_key: 0x1122_3344,
+        }
+    );
+    assert!(FirewallCheckUdpRequest::decode(&payload[..7]).is_err());
+}
+
+#[test]
 fn queue_ranking_matches_emule_twelve_byte_payload_shape() {
     let packet = super::encode_queue_ranking(7);
 

@@ -936,6 +936,10 @@ pub(crate) async fn reply_with_firewall_udp(
     peer_ip: IpAddr,
     request: FirewallCheckUdpRequest,
 ) -> Result<()> {
+    if request.internal_udp_port == 0 {
+        return Ok(());
+    }
+
     let ports = if request.external_udp_port != 0
         && request.external_udp_port != request.internal_udp_port
     {

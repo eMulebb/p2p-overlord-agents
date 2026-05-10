@@ -1,4 +1,5 @@
 use super::*;
+use crate::ed2k_tcp::reply_with_firewall_udp;
 
 #[tokio::test]
 async fn callback_connect_uses_plaintext_when_peer_has_no_crypt_metadata() {
@@ -338,4 +339,39 @@ async fn udp_firewall_check_request_skips_silent_helper_before_request() {
     );
 
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn firewall_udp_reply_ignores_zero_internal_port_like_stock() {
+    let dht = DhtNode::new(DhtConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        node_id: NodeId::from_bytes([0x44; 16]),
+        udp_key: 0x1122_3344,
+        ..DhtConfig::default()
+    })
+    .await
+    .unwrap();
+    let udp = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let external_udp_port = udp.local_addr().unwrap().port();
+
+    reply_with_firewall_udp(
+        &dht,
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        FirewallCheckUdpRequest {
+            internal_udp_port: 0,
+            external_udp_port,
+            sender_udp_key: 0xAABB_CCDD,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut buf = [0u8; 64];
+    let recv = tokio::time::timeout(Duration::from_millis(150), udp.recv_from(&mut buf)).await;
+    assert!(
+        recv.is_err(),
+        "zero internal port must suppress all UDP replies"
+    );
 }

@@ -281,8 +281,8 @@ impl FirewallCheckUdpRequest {
     }
 
     fn decode(payload: &[u8]) -> Result<Self> {
-        if payload.len() != 8 {
-            anyhow::bail!("invalid OP_FWCHECKUDPREQ payload size {}", payload.len());
+        if payload.len() < 8 {
+            anyhow::bail!("short OP_FWCHECKUDPREQ payload {}", payload.len());
         }
         Ok(Self {
             internal_udp_port: u16::from_le_bytes([payload[0], payload[1]]),
