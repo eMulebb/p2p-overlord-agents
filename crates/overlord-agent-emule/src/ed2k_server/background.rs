@@ -227,6 +227,7 @@ pub(super) fn handle_background_udp_packet(
             };
             let mut aggregated_results = Vec::new();
             for results in decode_udp_found_source_sets(&packet.payload)? {
+                let results = super::annotate_found_sources_server(results, server.base_endpoint());
                 validate_found_sources(&results, file_hash)?;
                 merge_found_sources(&mut aggregated_results, results);
             }

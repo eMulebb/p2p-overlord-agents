@@ -89,6 +89,41 @@ async fn background_source_search_channel_round_trips_results() {
 }
 
 #[tokio::test]
+async fn background_udp_source_search_preserves_responding_server() {
+    let server = test_udp_obfuscated_server();
+    let file_hash = Ed2kHash([0x73; 16]);
+    let source_ip = [10, 20, 30, 40];
+    let (response, receive_response) = tokio::sync::oneshot::channel();
+    let mut pending = Some(PendingBackgroundServerSearch::Source {
+        file_hash,
+        deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+        response,
+    });
+    let state = Arc::new(RwLock::new(Ed2kServerState::default()));
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&file_hash.0);
+    payload.push(1);
+    payload.extend_from_slice(&source_ip);
+    payload.extend_from_slice(&4662u16.to_le_bytes());
+
+    handle_background_udp_packet(
+        &server,
+        &ServerUdpPacket {
+            opcode: OP_GLOBFOUNDSOURCES,
+            payload,
+            from: SocketAddr::from((Ipv4Addr::LOCALHOST, server_udp_endpoint(&server).port())),
+        },
+        &mut pending,
+        &state,
+    )
+    .unwrap();
+
+    let sources = receive_response.await.unwrap().unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].source_server, Some(server.base_endpoint()));
+}
+
+#[tokio::test]
 async fn server_obfuscation_handshake_encrypts_login_request() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let endpoint = listener.local_addr().unwrap();
