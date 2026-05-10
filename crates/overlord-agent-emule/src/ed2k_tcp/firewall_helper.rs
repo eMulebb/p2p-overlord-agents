@@ -12,7 +12,7 @@ use overlord_kad_dht::DhtNode;
 use super::dump::{
     dump_ed2k_tcp_helper_meta, dump_ed2k_tcp_helper_recv, dump_ed2k_tcp_helper_send,
 };
-use super::hello::{encode_hello_answer, is_mule_hello, is_mule_hello_answer};
+use super::hello::{decode_hello_answer_profile, decode_hello_profile, encode_hello_answer};
 use super::{
     ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, ED2K_SECURE_IDENT_SIGNATURE_NEEDED,
     EMULE_CRYPT_REQUESTS, EMULE_CRYPT_SUPPORTS, Ed2kHelloIdentity, Ed2kPeerConnectMode,
@@ -123,13 +123,13 @@ async fn handle_firewall_helper_packet(
 
     match (packet.protocol, packet.opcode) {
         (OP_EDONKEYPROT, OP_HELLO) => {
-            let is_mule_hello = is_mule_hello(&packet.payload)?;
+            let hello_profile = decode_hello_profile(&packet.payload)?;
             let reply = encode_hello_answer(context.hello_identity);
             dump_ed2k_tcp_helper_send(context.helper_addr, transport.mode, "hello_answer", &reply);
             transport.write_all(&reply).await.with_context(|| {
                 format!("failed to send OP_HELLOANSWER to {}", context.helper_addr)
             })?;
-            if is_mule_hello && !peer_secure_ident.requested_peer_key {
+            if hello_profile.supports_secure_ident && !peer_secure_ident.requested_peer_key {
                 let request = begin_secure_ident_probe(peer_secure_ident);
                 dump_ed2k_tcp_helper_send(
                     context.helper_addr,
@@ -146,8 +146,8 @@ async fn handle_firewall_helper_packet(
             // Oracle behavior: a mule-style HELLOANSWER already satisfies the
             // "both info packets received" gate, so the helper immediately
             // starts secure-ident before it sends OP_FWCHECKUDPREQ.
-            let is_mule_hello = is_mule_hello_answer(&packet.payload)?;
-            if is_mule_hello && !peer_secure_ident.requested_peer_key {
+            let hello_profile = decode_hello_answer_profile(&packet.payload)?;
+            if hello_profile.supports_secure_ident && !peer_secure_ident.requested_peer_key {
                 let request = begin_secure_ident_probe(peer_secure_ident);
                 dump_ed2k_tcp_helper_send(
                     context.helper_addr,

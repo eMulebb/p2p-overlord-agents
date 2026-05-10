@@ -30,8 +30,8 @@ use super::super::{
     decode_client_message_payload, decode_edonkey_queue_rank_payload, decode_emule_info_profile,
     decode_emule_queue_ranking_payload, decode_exact_file_hash_payload,
     decode_file_description_payload, decode_file_status_payload, decode_hashset_answer,
-    decode_hashset_answer2, decode_hello_profile, decode_kad_callback_payload,
-    decode_optional_file_hash_payload, decode_preview_answer_payload,
+    decode_hashset_answer2, decode_hello_answer_profile, decode_hello_profile,
+    decode_kad_callback_payload, decode_optional_file_hash_payload, decode_preview_answer_payload,
     decode_preview_request_payload, decode_public_ip_answer_payload, decode_public_key_payload,
     decode_reask_callback_tcp_payload, decode_request_filename_answer,
     decode_request_filename_answer_body, decode_secident_state, decode_shared_dirs_answer_payload,
@@ -286,7 +286,7 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     }
                 }
                 (OP_EDONKEYPROT, OP_HELLOANSWER) => {
-                    let hello_profile = decode_hello_profile(&packet.payload)?;
+                    let hello_profile = decode_hello_answer_profile(&packet.payload)?;
                     session_state.hello_complete = true;
                     session_state.remote_supports_aich = hello_profile.supports_aich;
                     session_state.remote_supports_secure_ident =

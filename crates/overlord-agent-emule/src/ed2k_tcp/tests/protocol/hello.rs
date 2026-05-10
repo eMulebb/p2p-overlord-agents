@@ -160,6 +160,25 @@ fn hello_decode_preserves_multipacket_capabilities() {
 }
 
 #[test]
+fn hello_answer_decode_keeps_user_hash_leading_type_byte() {
+    let packet = encode_hello_answer(Ed2kHelloIdentity {
+        user_hash: [0x10; 16],
+        client_id: 0x521B_5895,
+        tcp_port: 41001,
+        udp_port: 41000,
+        server_ip: u32::from_le_bytes([176, 123, 2, 239]),
+        server_port: 4232,
+        connect_options: emule_connect_options(false),
+        direct_udp_callback: false,
+    });
+
+    let profile = decode_hello_answer_profile(&packet[6..]).unwrap();
+
+    assert_eq!(profile.identity.user_hash, [0x10; 16]);
+    assert!(profile.supports_secure_ident);
+}
+
+#[test]
 fn hello_misc_options2_does_not_advertise_unsupported_chat_captcha() {
     let misc_options2 = emule_misc_options2(emule_connect_options(false), false);
 

@@ -481,6 +481,10 @@ pub(super) fn decode_hello_profile(payload: &[u8]) -> Result<DecodedHelloProfile
     decode_hello_profile_from_type_payload(type_payload)
 }
 
+pub(super) fn decode_hello_answer_profile(payload: &[u8]) -> Result<DecodedHelloProfile> {
+    decode_hello_profile_from_type_payload(payload)
+}
+
 fn is_mule_hello_type_payload(payload: &[u8]) -> Result<bool> {
     Ok(decode_hello_profile_from_type_payload(payload)?.is_mule_hello)
 }
@@ -490,10 +494,6 @@ pub(super) fn is_mule_hello(payload: &[u8]) -> Result<bool> {
         anyhow::bail!("short eD2k OP_HELLO payload");
     }
     is_mule_hello_type_payload(&payload[1..])
-}
-
-pub(super) fn is_mule_hello_answer(payload: &[u8]) -> Result<bool> {
-    is_mule_hello_type_payload(payload)
 }
 
 pub(super) fn build_hello_responses(

@@ -91,11 +91,12 @@ pub(crate) use firewall_helper::{
 };
 pub(in crate::ed2k_tcp) use hello::{
     DecodedEmuleInfoProfile, build_hello_responses, decode_emule_info_profile,
-    decode_hello_profile, encode_emule_info_answer, encode_hello_request,
+    decode_hello_answer_profile, decode_hello_profile, encode_emule_info_answer,
+    encode_hello_request,
 };
 #[cfg(test)]
 #[allow(unused_imports)]
-use hello::{DecodedHelloIdentity, encode_hello_answer, is_mule_hello, is_mule_hello_answer};
+use hello::{DecodedHelloIdentity, encode_hello_answer, is_mule_hello};
 #[cfg(test)]
 use hello::{
     ed2k_string_tag_type, emule_misc_options1, emule_misc_options2, emule_version_tag,
