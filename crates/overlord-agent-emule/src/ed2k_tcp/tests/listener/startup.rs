@@ -110,6 +110,10 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
     );
     assert_eq!(&older_source_answer[25..29], &[10, 20, 30, 40]);
 
+    let mut invalid_source_request = super::encode_request_sources2(&file_hash);
+    invalid_source_request[22] = 0;
+    stream.write_all(&invalid_source_request).await.unwrap();
+
     let modern_hashset_request = super::encode_hashset_request2(
         &super::Ed2kFileIdentifier::from_manifest(&manifest).unwrap(),
         super::Ed2kHashsetRequestOptions {
@@ -119,8 +123,9 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
     )
     .unwrap();
     stream.write_all(&modern_hashset_request).await.unwrap();
-    let modern_hashset_answer =
-        read_until_opcode(&mut stream, OP_EMULEPROT, super::OP_HASHSETANSWER2).await;
+    let modern_hashset_answer = read_packet(&mut stream).await;
+    assert_eq!(modern_hashset_answer[0], OP_EMULEPROT);
+    assert_eq!(modern_hashset_answer[5], super::OP_HASHSETANSWER2);
     let returned = super::decode_hashset_answer2(&modern_hashset_answer[6..]).unwrap();
     assert_eq!(returned.file_identifier.file_hash, file_hash);
     assert_eq!(

@@ -72,6 +72,9 @@ pub(in crate::ed2k_tcp) async fn handle_multipacket_ext2_request(
                 }
                 let requested_version = remaining[0];
                 remaining = &remaining[3..];
+                if requested_version == 0 {
+                    continue;
+                }
                 let sources = source_exchange_peers(transfer_runtime, &requested).await?;
                 let reply = encode_answer_sources2(
                     &requested,
@@ -221,6 +224,9 @@ pub(in crate::ed2k_tcp) async fn handle_source_request(
     payload: &[u8],
 ) -> Result<Option<Ed2kHash>> {
     let (requested, requested_version) = decode_request_sources_payload(opcode, payload)?;
+    if opcode == OP_REQUESTSOURCES2 && requested_version == 0 {
+        return Ok(Some(requested));
+    }
     if transfer_runtime.local_entry(&requested).await?.is_some() {
         let sources = source_exchange_peers(transfer_runtime, &requested).await?;
         let reply = if opcode == OP_REQUESTSOURCES2 {
