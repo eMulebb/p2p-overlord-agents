@@ -136,6 +136,9 @@ impl KadLocalStore {
         if !is_stock_source_publish(tags) {
             return false;
         }
+        if stock_source_tcp_port(tags).is_none() {
+            return false;
+        }
         purge_expired(
             &mut self.source_entries,
             self.config.source_ttl,
@@ -293,6 +296,22 @@ impl KadLocalStore {
 fn is_stock_source_publish(tags: &[Tag]) -> bool {
     tags.iter()
         .any(|tag| matches!(tag.name, TagName::Short(tag_name::SOURCETYPE)))
+}
+
+fn stock_source_tcp_port(tags: &[Tag]) -> Option<u16> {
+    tags.iter().find_map(|tag| {
+        if !matches!(tag.name, TagName::Short(tag_name::SOURCEPORT)) {
+            return None;
+        }
+        match tag.value {
+            TagValue::UInt(value) => u16::try_from(value).ok().filter(|port| *port > 0),
+            TagValue::U64(value) => u16::try_from(value).ok().filter(|port| *port > 0),
+            TagValue::U32(value) => u16::try_from(value).ok().filter(|port| *port > 0),
+            TagValue::U16(value) => (value > 0).then_some(value),
+            TagValue::U8(value) => (value > 0).then_some(u16::from(value)),
+            _ => None,
+        }
+    })
 }
 
 fn search_response(
@@ -678,6 +697,28 @@ mod tests {
         let tags = vec![
             Tag::filesize(456),
             Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(4662)),
+        ];
+
+        assert!(!store.record_source_publish(
+            target,
+            publisher,
+            Ipv4Addr::new(1, 1, 1, 1),
+            4672,
+            &tags,
+            ts(1),
+        ));
+        assert_eq!(store.source_entry_count(), 0);
+    }
+
+    #[test]
+    fn source_publish_without_stock_tcp_port_is_rejected() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([3; 16]);
+        let publisher = NodeId::from_bytes([4; 16]);
+        let tags = vec![
+            Tag::new_short(tag_name::SOURCETYPE, TagValue::UInt(1)),
+            Tag::filesize(456),
+            Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(0)),
         ];
 
         assert!(!store.record_source_publish(
