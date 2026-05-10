@@ -9,7 +9,8 @@ use crate::{
         PeerSourceExchangeRequest, begin_secure_ident_probe, dump_ed2k_tcp_download_meta,
         dump_ed2k_tcp_download_send, encode_aich_file_hash_request, encode_hashset_request,
         encode_hashset_request2, encode_multipacket_ext2_request, encode_request_filename,
-        encode_request_sources2, encode_set_req_file_id, encode_start_upload_req,
+        encode_request_sources, encode_request_sources2, encode_set_req_file_id,
+        encode_start_upload_req,
     },
     ed2k_transfer::{ED2K_PART_SIZE, Ed2kResumeManifest, Ed2kTransferRuntime},
 };
@@ -123,9 +124,13 @@ pub(super) async fn advance_download_startup(step: DownloadStartupStep<'_>) -> R
         && !waiting_for_peer_secure_ident
         && !session_state.remote_supports_file_identifiers
         && session_state.source_exchange_allowed
-        && session_state.remote_supports_source_exchange2
+        && session_state.remote_supports_source_exchange
     {
-        let source_request = encode_request_sources2(file_hash);
+        let source_request = if session_state.remote_supports_source_exchange2 {
+            encode_request_sources2(file_hash)
+        } else {
+            encode_request_sources(file_hash)
+        };
         dump_ed2k_tcp_download_send(
             peer_addr,
             transport.mode,
@@ -247,6 +252,8 @@ fn source_exchange_request_for_peer(
         PeerSourceExchangeRequest::None
     } else if session_state.remote_supports_source_exchange2 {
         PeerSourceExchangeRequest::V2
+    } else if session_state.remote_supports_source_exchange {
+        PeerSourceExchangeRequest::V1
     } else {
         PeerSourceExchangeRequest::None
     }

@@ -130,11 +130,20 @@ fn multipacket_ext2_source_request_matches_peer_source_exchange_version() {
     assert_eq!(sx2[5], super::OP_MULTIPACKET_EXT2);
     assert!(sx2[6..].contains(&OP_REQUESTSOURCES2));
 
+    let sx1 = super::encode_multipacket_ext2_request(
+        &file_identifier,
+        &manifest,
+        PeerSourceExchangeRequest::V1,
+    );
+    assert!(sx1[6..].contains(&OP_REQUESTSOURCES));
+    assert!(!sx1[6..].contains(&OP_REQUESTSOURCES2));
+
     let no_sx = super::encode_multipacket_ext2_request(
         &file_identifier,
         &manifest,
         PeerSourceExchangeRequest::None,
     );
+    assert!(!no_sx[6..].contains(&OP_REQUESTSOURCES));
     assert!(!no_sx[6..].contains(&OP_REQUESTSOURCES2));
 }
 

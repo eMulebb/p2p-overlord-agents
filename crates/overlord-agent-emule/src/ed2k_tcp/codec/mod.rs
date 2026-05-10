@@ -22,10 +22,11 @@ pub(super) use upload::{encode_compressed_part_fragment, encode_sending_part};
 
 use super::{
     ED2K_SOURCE_EXCHANGE2_VERSION, Ed2kFileIdentifier, MAX_PEER_DECOMPRESSED_PACKET_LEN,
-    OP_ACCEPTUPLOADREQ, OP_AICHFILEHASHREQ, OP_ANSWERSOURCES2, OP_EDONKEYPROT, OP_EMULEPROT,
-    OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_MULTIPACKET_EXT2, OP_MULTIPACKETANSWER_EXT2,
-    OP_PACKEDPROT, OP_QUEUERANKING, OP_REQFILENAMEANSWER, OP_REQUESTFILENAME, OP_REQUESTSOURCES2,
-    OP_SETREQFILEID, OP_STARTUPLOADREQ, TCP_PACKET_HEADER_LEN,
+    OP_ACCEPTUPLOADREQ, OP_AICHFILEHASHREQ, OP_ANSWERSOURCES, OP_ANSWERSOURCES2, OP_EDONKEYPROT,
+    OP_EMULEPROT, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_MULTIPACKET_EXT2,
+    OP_MULTIPACKETANSWER_EXT2, OP_PACKEDPROT, OP_QUEUERANKING, OP_REQFILENAMEANSWER,
+    OP_REQUESTFILENAME, OP_REQUESTSOURCES, OP_REQUESTSOURCES2, OP_SETREQFILEID, OP_STARTUPLOADREQ,
+    TCP_PACKET_HEADER_LEN,
 };
 
 pub(super) fn decode_peer_payload(protocol: u8, payload: Vec<u8>) -> Result<(u8, Vec<u8>)> {
@@ -215,6 +216,10 @@ pub(super) fn encode_request_sources2(file_hash: &Ed2kHash) -> Vec<u8> {
     encode_packet(OP_EMULEPROT, OP_REQUESTSOURCES2, &payload)
 }
 
+pub(super) fn encode_request_sources(file_hash: &Ed2kHash) -> Vec<u8> {
+    encode_packet(OP_EMULEPROT, OP_REQUESTSOURCES, &file_hash.0)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SourceExchangePeer {
     pub(super) ip: [u8; 4],
@@ -223,6 +228,16 @@ pub(super) struct SourceExchangePeer {
     pub(super) server_port: u16,
     pub(super) user_hash: Option<[u8; 16]>,
     pub(super) connect_options: u8,
+}
+
+pub(super) fn encode_answer_sources(
+    file_hash: &Ed2kHash,
+    sources: &[SourceExchangePeer],
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(18 + sources.len() * 12);
+    payload.extend_from_slice(&file_hash.0);
+    encode_source_exchange_entries(&mut payload, 1, sources);
+    encode_packet(OP_EMULEPROT, OP_ANSWERSOURCES, &payload)
 }
 
 pub(super) fn encode_answer_sources2(
@@ -351,6 +366,7 @@ pub(super) fn skip_file_status_body(payload: &[u8]) -> Result<(u16, &[u8])> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PeerSourceExchangeRequest {
     None,
+    V1,
     V2,
 }
 
@@ -368,6 +384,7 @@ pub(super) fn encode_multipacket_ext2_request(
     }
     match source_exchange_request {
         PeerSourceExchangeRequest::None => {}
+        PeerSourceExchangeRequest::V1 => payload.push(OP_REQUESTSOURCES),
         PeerSourceExchangeRequest::V2 => {
             payload.push(OP_REQUESTSOURCES2);
             payload.extend_from_slice(&encode_request_sources2_subpayload());
@@ -414,11 +431,17 @@ pub(super) fn encode_request_filename_answer(
     ))
 }
 
-pub(super) fn decode_request_sources2_payload(payload: &[u8]) -> Result<(Ed2kHash, u8)> {
-    if payload.len() < 19 {
-        anyhow::bail!("short OP_REQUESTSOURCES2 payload {}", payload.len());
+pub(super) fn decode_request_sources_payload(opcode: u8, payload: &[u8]) -> Result<(Ed2kHash, u8)> {
+    match opcode {
+        OP_REQUESTSOURCES => Ok((decode_file_hash_payload(payload)?, 0)),
+        OP_REQUESTSOURCES2 => {
+            if payload.len() < 19 {
+                anyhow::bail!("short OP_REQUESTSOURCES2 payload {}", payload.len());
+            }
+            Ok((decode_file_hash_payload(payload)?, payload[16]))
+        }
+        _ => anyhow::bail!("unsupported source request opcode 0x{opcode:02X}"),
     }
-    Ok((decode_file_hash_payload(payload)?, payload[16]))
 }
 
 pub(super) fn decode_answer_sources2_payload(

@@ -11,9 +11,9 @@ use crate::ed2k_transfer::{Ed2kSourceHint, Ed2kTransferRuntime};
 use super::super::{
     ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, ED2K_SECURE_IDENT_SIGNATURE_NEEDED,
     Ed2kFileIdentifier, Ed2kHelloIdentity, Ed2kSecureIdent, Ed2kTransport, OP_ACCEPTUPLOADREQ,
-    OP_AICHFILEHASHANS, OP_ANSWERSOURCES2, OP_COMPRESSEDPART, OP_COMPRESSEDPART_I64,
-    OP_EDONKEYPROT, OP_EMULEINFO, OP_EMULEINFOANSWER, OP_EMULEPROT, OP_FILEDESC,
-    OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_HASHSETANSWER, OP_HASHSETANSWER2, OP_HELLO,
+    OP_AICHFILEHASHANS, OP_ANSWERSOURCES, OP_ANSWERSOURCES2, OP_COMPRESSEDPART,
+    OP_COMPRESSEDPART_I64, OP_EDONKEYPROT, OP_EMULEINFO, OP_EMULEINFOANSWER, OP_EMULEPROT,
+    OP_FILEDESC, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_HASHSETANSWER, OP_HASHSETANSWER2, OP_HELLO,
     OP_HELLOANSWER, OP_MULTIPACKETANSWER_EXT2, OP_PUBLICKEY, OP_QUEUERANKING, OP_REQFILENAMEANSWER,
     OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64, OP_SETREQFILEID, OP_SIGNATURE,
     begin_secure_ident_probe, build_hello_responses, decode_aich_file_hash_answer,
@@ -226,6 +226,7 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     }
                     session_state.hello_complete = true;
                     session_state.remote_supports_file_identifiers = hello_profile.supports_file_identifiers;
+                    session_state.remote_supports_source_exchange = hello_profile.supports_source_exchange;
                     session_state.remote_supports_source_exchange2 = hello_profile.supports_source_exchange2;
                     if hello_profile.is_mule_hello && !session_state.peer_secure_ident.requested_peer_key {
                         let secure_ident_probe = begin_secure_ident_probe(&mut session_state.peer_secure_ident);
@@ -248,6 +249,7 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     let hello_profile = decode_hello_profile(&packet.payload)?;
                     session_state.hello_complete = true;
                     session_state.remote_supports_file_identifiers = hello_profile.supports_file_identifiers;
+                    session_state.remote_supports_source_exchange = hello_profile.supports_source_exchange;
                     session_state.remote_supports_source_exchange2 = hello_profile.supports_source_exchange2;
                     if send_initial_requests
                         && hello_profile.is_mule_hello
@@ -492,6 +494,10 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                                 .await?;
                         }
                     }
+                }
+                (OP_EMULEPROT, OP_ANSWERSOURCES) => {
+                    // Legacy SX1 replies need the peer's SX1 version to decode safely.
+                    // SX2 replies carry their version in-band and are consumed above.
                 }
                 (OP_EMULEPROT, OP_QUEUERANKING) => {
                     session_state.queued_until = Some(tokio::time::Instant::now() + QUEUE_RANK_GRACE);
