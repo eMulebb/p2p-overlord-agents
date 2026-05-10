@@ -74,7 +74,8 @@ async fn large_file_download_falls_back_to_upload_request_when_hashset_stalls() 
         assert_eq!(signature[0], OP_EMULEPROT);
         assert_eq!(signature[5], super::OP_SIGNATURE);
 
-        let peer_signature = encode_packet(OP_EMULEPROT, super::OP_SIGNATURE, &[0xAA; 49]);
+        let peer_signature =
+            encode_packet(OP_EMULEPROT, super::OP_SIGNATURE, &peer_signature_payload());
         stream.write_all(&peer_signature).await.unwrap();
 
         let startup_request = read_packet(&mut stream).await;

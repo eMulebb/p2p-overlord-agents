@@ -71,7 +71,7 @@ async fn small_file_download_rejects_wrong_payload_and_keeps_manifest_incomplete
             .write_all(&encode_packet(
                 OP_EMULEPROT,
                 super::OP_SIGNATURE,
-                &[0xAA; 49],
+                &peer_signature_payload(),
             ))
             .await
             .unwrap();

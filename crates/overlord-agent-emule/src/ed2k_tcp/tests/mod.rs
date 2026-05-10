@@ -37,13 +37,13 @@ use super::{
     decode_request_parts_payload, decode_secident_state, decode_sending_part_payload,
     decode_shared_dirs_answer_payload, decode_shared_files_answer_payload,
     decode_shared_files_dir_answer_payload, decode_shared_files_dir_request_payload,
-    derive_obfuscation_key, download_file_from_peer, drive_download_session, ed2k_string_tag_type,
-    emule_connect_options, emule_misc_options1, emule_misc_options2, emule_version_tag,
-    encode_accept_upload_req, encode_aich_file_hash_answer, encode_aich_file_hash_request,
-    encode_aich_recovery_failure_answer, encode_answer_sources, encode_answer_sources2,
-    encode_compressed_part_fragment, encode_empty_shared_files_answer, encode_emule_info_answer,
-    encode_emule_info_request, encode_file_req_ans_nofil, encode_hashset_answer2,
-    encode_hashset_request2, encode_hello_answer, encode_hello_request,
+    decode_signature_payload, derive_obfuscation_key, download_file_from_peer,
+    drive_download_session, ed2k_string_tag_type, emule_connect_options, emule_misc_options1,
+    emule_misc_options2, emule_version_tag, encode_accept_upload_req, encode_aich_file_hash_answer,
+    encode_aich_file_hash_request, encode_aich_recovery_failure_answer, encode_answer_sources,
+    encode_answer_sources2, encode_compressed_part_fragment, encode_empty_shared_files_answer,
+    encode_emule_info_answer, encode_emule_info_request, encode_file_req_ans_nofil,
+    encode_hashset_answer2, encode_hashset_request2, encode_hello_answer, encode_hello_request,
     encode_incoming_obfuscation_response, encode_multipacket_answer,
     encode_multipacket_ext2_request, encode_multipacket_request, encode_packed_packet,
     encode_packet, encode_port_test_answer, encode_public_ip_answer, encode_queue_ranking,
@@ -87,6 +87,12 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::{Mutex, RwLock},
 };
+
+fn peer_signature_payload() -> Vec<u8> {
+    let mut payload = vec![0xAA; 49];
+    payload[0] = 48;
+    payload
+}
 
 macro_rules! download_file_from_peer_test {
     (

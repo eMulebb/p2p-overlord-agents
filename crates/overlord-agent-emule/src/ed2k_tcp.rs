@@ -102,7 +102,7 @@ use hello::{
 pub use identity::Ed2kSecureIdent;
 pub(in crate::ed2k_tcp) use identity::{
     Ed2kPeerSecureIdentState, begin_secure_ident_probe, decode_public_key_payload,
-    decode_secident_state, encode_secident_state, random_nonzero_u32,
+    decode_secident_state, decode_signature_payload, encode_secident_state, random_nonzero_u32,
     try_send_secure_ident_signature,
 };
 pub(crate) use listener::reply_with_firewall_udp;

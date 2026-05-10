@@ -66,7 +66,7 @@ async fn small_file_download_resumes_partial_piece_after_reconnect() {
             .write_all(&encode_packet(
                 OP_EMULEPROT,
                 super::OP_SIGNATURE,
-                &[0xAA; 49],
+                &peer_signature_payload(),
             ))
             .await
             .unwrap();
@@ -151,7 +151,7 @@ async fn small_file_download_resumes_partial_piece_after_reconnect() {
             .write_all(&encode_packet(
                 OP_EMULEPROT,
                 super::OP_SIGNATURE,
-                &[0xAA; 49],
+                &peer_signature_payload(),
             ))
             .await
             .unwrap();

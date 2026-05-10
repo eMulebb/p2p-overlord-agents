@@ -51,33 +51,28 @@ async fn callback_session_with_completed_hello_starts_upload_flow() {
             .unwrap();
         assert_eq!(signature[0], OP_EMULEPROT);
         assert_eq!(signature[5], super::OP_SIGNATURE);
+        stream
+            .write_all(&encode_packet(
+                OP_EMULEPROT,
+                super::OP_SIGNATURE,
+                &peer_signature_payload(),
+            ))
+            .await
+            .unwrap();
 
-        let request_filename =
-            tokio::time::timeout(Duration::from_secs(3), read_packet(&mut stream))
-                .await
-                .unwrap();
-        assert_eq!(request_filename[0], OP_EDONKEYPROT);
-        assert_eq!(request_filename[5], super::OP_REQUESTFILENAME);
-        assert_eq!(&request_filename[6..22], &file_hash.0);
+        let multipacket_request = tokio::time::timeout(
+            Duration::from_secs(3),
+            read_until_opcode(&mut stream, OP_EMULEPROT, super::OP_MULTIPACKET_EXT),
+        )
+        .await
+        .unwrap();
+        assert_eq!(multipacket_request[0], OP_EMULEPROT);
+        assert_eq!(multipacket_request[5], super::OP_MULTIPACKET_EXT);
+        assert_eq!(&multipacket_request[6..22], &file_hash.0);
 
-        let request_sources =
-            tokio::time::timeout(Duration::from_secs(3), read_packet(&mut stream))
-                .await
-                .unwrap();
-        assert_eq!(request_sources[0], OP_EMULEPROT);
-        assert_eq!(request_sources[5], super::OP_REQUESTSOURCES2);
-
-        let aich_file_hash_request =
-            tokio::time::timeout(Duration::from_secs(3), read_packet(&mut stream))
-                .await
-                .unwrap();
-        assert_eq!(aich_file_hash_request[0], OP_EMULEPROT);
-        assert_eq!(aich_file_hash_request[5], super::OP_AICHFILEHASHREQ);
-        assert_eq!(&aich_file_hash_request[6..22], &file_hash.0);
-
-        let filename_answer =
-            super::encode_request_filename_answer(&file_hash, "callback.epub").unwrap();
-        stream.write_all(&filename_answer).await.unwrap();
+        let startup_answer =
+            encode_multipacket_answer(&file_hash, "callback.epub", true, true, None).unwrap();
+        stream.write_all(&startup_answer).await.unwrap();
 
         let start_upload = tokio::time::timeout(Duration::from_secs(3), read_packet(&mut stream))
             .await

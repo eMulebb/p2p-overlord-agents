@@ -61,7 +61,7 @@ async fn small_file_download_ignores_malformed_range_and_releases_pending_piece(
             .write_all(&encode_packet(
                 OP_EMULEPROT,
                 super::OP_SIGNATURE,
-                &[0xAA; 49],
+                &peer_signature_payload(),
             ))
             .await
             .unwrap();

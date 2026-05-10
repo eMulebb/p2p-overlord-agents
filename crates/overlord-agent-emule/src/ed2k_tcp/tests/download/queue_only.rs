@@ -169,7 +169,7 @@ async fn queued_peer_waits_past_read_timeout_for_late_accept_upload() {
             .write_all(&encode_packet(
                 OP_EMULEPROT,
                 super::OP_SIGNATURE,
-                &[0xAA; 49],
+                &peer_signature_payload(),
             ))
             .await
             .unwrap();
@@ -336,7 +336,8 @@ async fn obfuscated_queued_peer_waits_for_late_accept_upload() {
         let signature = transport.read_packet().await.unwrap().unwrap();
         assert_eq!(signature.protocol, OP_EMULEPROT);
         assert_eq!(signature.opcode, super::OP_SIGNATURE);
-        let peer_signature = encode_packed_packet(super::OP_SIGNATURE, &[0xAA; 49]).unwrap();
+        let peer_signature =
+            encode_packed_packet(super::OP_SIGNATURE, &peer_signature_payload()).unwrap();
         transport.write_all(&peer_signature).await.unwrap();
 
         let startup_request = transport.read_packet().await.unwrap().unwrap();

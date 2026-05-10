@@ -63,7 +63,7 @@ async fn small_file_download_completes_after_out_of_order_multi_range_compressed
             .write_all(&encode_packet(
                 OP_EMULEPROT,
                 super::OP_SIGNATURE,
-                &[0xAA; 49],
+                &peer_signature_payload(),
             ))
             .await
             .unwrap();

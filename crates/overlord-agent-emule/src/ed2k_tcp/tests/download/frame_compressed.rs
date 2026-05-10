@@ -172,7 +172,8 @@ async fn small_file_download_accepts_obfuscated_packed_startup_and_compressed_pa
         assert_eq!(signature.protocol, OP_EMULEPROT);
         assert_eq!(signature.opcode, super::OP_SIGNATURE);
 
-        let peer_signature = encode_packed_packet(super::OP_SIGNATURE, &[0xAA; 49]).unwrap();
+        let peer_signature =
+            encode_packed_packet(super::OP_SIGNATURE, &peer_signature_payload()).unwrap();
         transport.write_all(&peer_signature).await.unwrap();
 
         let startup_request = transport.read_packet().await.unwrap().unwrap();

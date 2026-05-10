@@ -18,6 +18,22 @@ fn public_key_payload_rejects_mismatched_length_prefix() {
 }
 
 #[test]
+fn signature_payload_rejects_non_stock_length_prefixes() {
+    let signature = decode_signature_payload(&peer_signature_payload()).unwrap();
+    assert_eq!(signature.signature_len, 48);
+    assert_eq!(signature.challenge_ip_kind, None);
+
+    let mut v2_signature = peer_signature_payload();
+    v2_signature.push(2);
+    let signature = decode_signature_payload(&v2_signature).unwrap();
+    assert_eq!(signature.signature_len, 48);
+    assert_eq!(signature.challenge_ip_kind, Some(2));
+
+    assert!(decode_signature_payload(&[]).is_err());
+    assert!(decode_signature_payload(&[0xAA; 49]).is_err());
+}
+
+#[test]
 fn secure_ident_probe_requests_key_and_signature() {
     let mut state = Ed2kPeerSecureIdentState::default();
     let packet = begin_secure_ident_probe(&mut state);

@@ -132,6 +132,34 @@ pub(super) fn decode_public_key_payload(payload: &[u8]) -> Result<Vec<u8>> {
     Ok(key_bytes.to_vec())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SecureIdentSignature {
+    pub(super) signature_len: u8,
+    pub(super) challenge_ip_kind: Option<u8>,
+}
+
+pub(super) fn decode_signature_payload(payload: &[u8]) -> Result<SecureIdentSignature> {
+    if !(10..=250).contains(&payload.len()) {
+        anyhow::bail!("invalid OP_SIGNATURE payload size {}", payload.len());
+    }
+    let signature_len = payload[0];
+    let challenge_ip_kind = if usize::from(signature_len) == payload.len() - 1 {
+        None
+    } else if usize::from(signature_len) == payload.len() - 2 {
+        payload.last().copied()
+    } else {
+        anyhow::bail!(
+            "invalid OP_SIGNATURE length prefix {} for payload size {}",
+            signature_len,
+            payload.len()
+        );
+    };
+    Ok(SecureIdentSignature {
+        signature_len,
+        challenge_ip_kind,
+    })
+}
+
 pub(super) fn random_nonzero_u32() -> u32 {
     loop {
         let value: u32 = rand::random();

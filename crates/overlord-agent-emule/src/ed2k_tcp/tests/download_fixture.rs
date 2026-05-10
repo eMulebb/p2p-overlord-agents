@@ -67,7 +67,7 @@ pub(super) async fn complete_plain_secure_ident_exchange(
         .write_all(&encode_packet(
             OP_EMULEPROT,
             super::OP_SIGNATURE,
-            &[0xAA; 49],
+            &peer_signature_payload(),
         ))
         .await
         .unwrap();
@@ -120,7 +120,7 @@ pub(super) async fn complete_obfuscated_secure_ident_exchange(
     assert_eq!(signature.protocol, OP_EMULEPROT);
     assert_eq!(signature.opcode, super::OP_SIGNATURE);
     transport
-        .write_all(&encode_packed_packet(super::OP_SIGNATURE, &[0xAA; 49]).unwrap())
+        .write_all(&encode_packed_packet(super::OP_SIGNATURE, &peer_signature_payload()).unwrap())
         .await
         .unwrap();
 }
