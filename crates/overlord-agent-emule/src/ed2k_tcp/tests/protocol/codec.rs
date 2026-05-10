@@ -231,6 +231,37 @@ fn legacy_multipacket_answer_uses_hash_prefixed_subpackets() {
 }
 
 #[test]
+fn legacy_multipacket_request_uses_ext_envelope_for_sized_peer() {
+    let file_hash = Ed2kHash([0x47; 16]);
+    let job = new_transfer_job(
+        file_hash,
+        "legacy-download.avi".to_string(),
+        ED2K_PART_SIZE + 1,
+    );
+    let manifest = Ed2kResumeManifest::new(&job);
+
+    let packet = encode_multipacket_request(
+        &file_hash,
+        &manifest,
+        true,
+        PeerSourceExchangeRequest::V2,
+        true,
+    );
+
+    assert_eq!(packet[0], OP_EMULEPROT);
+    assert_eq!(packet[5], OP_MULTIPACKET_EXT);
+    assert_eq!(&packet[6..22], &file_hash.0);
+    assert_eq!(
+        u64::from_le_bytes(packet[22..30].try_into().unwrap()),
+        ED2K_PART_SIZE + 1
+    );
+    assert!(packet[30..].contains(&OP_REQUESTFILENAME));
+    assert!(packet[30..].contains(&OP_SETREQFILEID));
+    assert!(packet[30..].contains(&OP_REQUESTSOURCES2));
+    assert!(packet[30..].contains(&OP_AICHFILEHASHREQ));
+}
+
+#[test]
 fn request_filename_answer_uses_stock_u16_string_length_prefix() {
     let packet =
         super::encode_request_filename_answer(&Ed2kHash([0x55; 16]), "captured.epub").unwrap();

@@ -46,10 +46,10 @@ pub(in crate::ed2k_tcp) use codec::{
     decode_hashset_answer2, decode_peer_payload, decode_request_filename_answer,
     decode_request_filename_answer_body, decode_sending_part_payload,
     encode_aich_file_hash_request, encode_hashset_request, encode_hashset_request2,
-    encode_multipacket_ext2_request, encode_packet, encode_request_filename,
-    encode_request_parts_batch, encode_request_sources, encode_request_sources2,
-    encode_set_req_file_id, encode_start_upload_req, inflate_compressed_part_fragment,
-    skip_file_status_body,
+    encode_multipacket_ext2_request, encode_multipacket_request, encode_packet,
+    encode_request_filename, encode_request_parts_batch, encode_request_sources,
+    encode_request_sources2, encode_set_req_file_id, encode_start_upload_req,
+    inflate_compressed_part_fragment, skip_file_status_body,
 };
 #[cfg(test)]
 #[allow(unused_imports)]

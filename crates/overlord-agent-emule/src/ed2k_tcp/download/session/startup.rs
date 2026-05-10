@@ -8,9 +8,9 @@ use crate::{
         Ed2kFileIdentifier, Ed2kHashsetRequestOptions, Ed2kSecureIdent, Ed2kTransport,
         PeerSourceExchangeRequest, begin_secure_ident_probe, dump_ed2k_tcp_download_meta,
         dump_ed2k_tcp_download_send, encode_aich_file_hash_request, encode_hashset_request,
-        encode_hashset_request2, encode_multipacket_ext2_request, encode_request_filename,
-        encode_request_sources, encode_request_sources2, encode_set_req_file_id,
-        encode_start_upload_req,
+        encode_hashset_request2, encode_multipacket_ext2_request, encode_multipacket_request,
+        encode_request_filename, encode_request_sources, encode_request_sources2,
+        encode_set_req_file_id, encode_start_upload_req,
     },
     ed2k_transfer::{ED2K_PART_SIZE, Ed2kResumeManifest, Ed2kTransferRuntime},
 };
@@ -85,6 +85,28 @@ pub(super) async fn advance_download_startup(step: DownloadStartupStep<'_>) -> R
                 .write_all(&multipacket_ext2)
                 .await
                 .with_context(|| format!("failed to send OP_MULTIPACKET_EXT2 to {peer_addr}"))?;
+            session_state.source_request_sent =
+                source_exchange_request != PeerSourceExchangeRequest::None;
+            session_state.aich_file_hash_requested = true;
+        } else if session_state.remote_supports_multipacket {
+            let source_exchange_request = source_exchange_request_for_peer(session_state);
+            let multipacket = encode_multipacket_request(
+                file_hash,
+                manifest,
+                session_state.remote_supports_ext_multipacket,
+                source_exchange_request,
+                true,
+            );
+            let label = if session_state.remote_supports_ext_multipacket {
+                "multipacket_ext_request"
+            } else {
+                "multipacket_request"
+            };
+            dump_ed2k_tcp_download_send(peer_addr, transport.mode, label, &multipacket);
+            transport
+                .write_all(&multipacket)
+                .await
+                .with_context(|| format!("failed to send legacy multipacket to {peer_addr}"))?;
             session_state.source_request_sent =
                 source_exchange_request != PeerSourceExchangeRequest::None;
             session_state.aich_file_hash_requested = true;
