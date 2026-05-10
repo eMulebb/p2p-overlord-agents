@@ -12,7 +12,7 @@ use overlord_kad_proto::{
     SearchSourceReq, Tag, TagName, TagValue, tag_name,
 };
 
-use crate::config::KadConfig;
+use crate::{config::KadConfig, kad_search_expr::matches_restrictive_keyword_payload};
 
 const STOCK_MAX_SOURCES_PER_FILE: usize = 1000;
 const STOCK_MAX_NOTES_PER_FILE: usize = 150;
@@ -232,16 +232,19 @@ impl KadLocalStore {
         limit: usize,
         now: DateTime<Utc>,
     ) -> Option<SearchRes> {
-        if !self.config.enabled || !request.restrictive_payload.is_empty() || limit == 0 {
+        if !self.config.enabled || limit == 0 {
             return None;
         }
 
+        let restrictive_payload = ((request.start_position & 0x8000) != 0)
+            .then_some(request.restrictive_payload.as_slice());
         purge_expired(&mut self.keyword_entries, self.config.keyword_ttl, now);
         let offset = usize::from(request.start_position & 0x7FFF);
         let results = self
             .keyword_entries
             .iter()
             .filter(|entry| entry.target == request.target)
+            .filter(|entry| keyword_entry_matches_restrictive_payload(entry, restrictive_payload))
             .skip(offset)
             .take(limit)
             .map(|entry| SearchResultEntry {
@@ -330,6 +333,19 @@ impl KadLocalStore {
     fn notes_entry_count(&self) -> usize {
         self.notes_entries.len()
     }
+}
+
+fn keyword_entry_matches_restrictive_payload(
+    entry: &StoredKeywordPublish,
+    restrictive_payload: Option<&[u8]>,
+) -> bool {
+    let Some(payload) = restrictive_payload else {
+        return true;
+    };
+    let Some(filename) = stock_first_filename(&entry.tags) else {
+        return false;
+    };
+    matches_restrictive_keyword_payload(&filename, &entry.tags, payload)
 }
 
 fn is_stock_source_publish(tags: &[Tag]) -> bool {
@@ -1667,7 +1683,77 @@ mod tests {
     }
 
     #[test]
-    fn restrictive_keyword_searches_do_not_emit_local_results() {
+    fn restrictive_keyword_searches_filter_local_results_like_stock() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([1; 16]);
+        store.record_keyword_publish_batch(
+            target,
+            &[
+                PublishEntry {
+                    hash: Ed2kHash::from_bytes([2; 16]),
+                    tags: vec![Tag::filename("ubuntu linux.iso"), Tag::filesize(123)],
+                },
+                PublishEntry {
+                    hash: Ed2kHash::from_bytes([3; 16]),
+                    tags: vec![Tag::filename("fedora workstation.iso"), Tag::filesize(456)],
+                },
+            ],
+            ts(1),
+        );
+
+        let response = store
+            .keyword_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchKeyReq {
+                    target,
+                    start_position: 0x8000,
+                    restrictive_payload: restrictive_string_payload("linux"),
+                },
+                10,
+                ts(2),
+            )
+            .expect("restrictive keyword response");
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].entry_id, Ed2kHash::from_bytes([2; 16]));
+    }
+
+    #[test]
+    fn restrictive_keyword_searches_apply_stock_offset_after_filtering() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([1; 16]);
+        store.record_keyword_publish_batch(
+            target,
+            &[
+                PublishEntry {
+                    hash: Ed2kHash::from_bytes([2; 16]),
+                    tags: vec![Tag::filename("ubuntu linux.iso"), Tag::filesize(123)],
+                },
+                PublishEntry {
+                    hash: Ed2kHash::from_bytes([3; 16]),
+                    tags: vec![Tag::filename("debian linux.iso"), Tag::filesize(456)],
+                },
+            ],
+            ts(1),
+        );
+
+        let response = store
+            .keyword_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchKeyReq {
+                    target,
+                    start_position: 0x8001,
+                    restrictive_payload: restrictive_string_payload("linux"),
+                },
+                10,
+                ts(2),
+            )
+            .expect("restrictive keyword response");
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].entry_id, Ed2kHash::from_bytes([3; 16]));
+    }
+
+    #[test]
+    fn invalid_restrictive_keyword_payload_does_not_emit_local_results() {
         let mut store = KadLocalStore::new(config());
         let target = NodeId::from_bytes([1; 16]);
         store.record_keyword_publish_batch(
@@ -1717,6 +1803,13 @@ mod tests {
             Tag::filesize(456),
             Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(source_tcp_port)),
         ]
+    }
+
+    fn restrictive_string_payload(value: &str) -> Vec<u8> {
+        let mut payload = vec![0x01];
+        payload.extend(u16::try_from(value.len()).unwrap().to_le_bytes());
+        payload.extend(value.as_bytes());
+        payload
     }
 
     fn short_tag_names(tags: &[Tag]) -> Vec<u8> {

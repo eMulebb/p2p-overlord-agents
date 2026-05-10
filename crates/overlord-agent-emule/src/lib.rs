@@ -4,6 +4,7 @@ mod ed2k_server;
 mod ed2k_tcp;
 mod ed2k_transfer;
 mod kad_firewall;
+mod kad_search_expr;
 mod kad_store;
 pub mod logging;
 mod paths;
