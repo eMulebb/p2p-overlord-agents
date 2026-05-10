@@ -196,11 +196,11 @@ fn hashset_answer2_rejects_mismatched_aich_section_root() {
 fn aich_file_hash_answer_carries_file_hash_then_sha1_root() {
     let file_hash = Ed2kHash([0x42; 16]);
     let aich_root = [0x7A; 20];
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&file_hash.0);
-    payload.extend_from_slice(&aich_root);
+    let packet = encode_aich_file_hash_answer(&file_hash, aich_root);
 
-    let (decoded_hash, decoded_root) = decode_aich_file_hash_answer(&payload).unwrap();
+    assert_eq!(packet[0], OP_EMULEPROT);
+    assert_eq!(packet[5], OP_AICHFILEHASHANS);
+    let (decoded_hash, decoded_root) = decode_aich_file_hash_answer(&packet[6..]).unwrap();
 
     assert_eq!(decoded_hash, file_hash);
     assert_eq!(decoded_root, aich_root);

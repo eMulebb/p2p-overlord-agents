@@ -22,11 +22,11 @@ pub(super) use upload::{encode_compressed_part_fragment, encode_sending_part};
 
 use super::{
     ED2K_SOURCE_EXCHANGE2_VERSION, Ed2kFileIdentifier, MAX_PEER_DECOMPRESSED_PACKET_LEN,
-    OP_ACCEPTUPLOADREQ, OP_AICHFILEHASHREQ, OP_ANSWERSOURCES, OP_ANSWERSOURCES2, OP_EDONKEYPROT,
-    OP_EMULEPROT, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_MULTIPACKET_EXT2,
-    OP_MULTIPACKETANSWER_EXT2, OP_PACKEDPROT, OP_QUEUERANKING, OP_REQFILENAMEANSWER,
-    OP_REQUESTFILENAME, OP_REQUESTSOURCES, OP_REQUESTSOURCES2, OP_SETREQFILEID, OP_STARTUPLOADREQ,
-    TCP_PACKET_HEADER_LEN,
+    OP_ACCEPTUPLOADREQ, OP_AICHFILEHASHANS, OP_AICHFILEHASHREQ, OP_ANSWERSOURCES,
+    OP_ANSWERSOURCES2, OP_EDONKEYPROT, OP_EMULEPROT, OP_FILEREQANSNOFIL, OP_FILESTATUS,
+    OP_MULTIPACKET_EXT2, OP_MULTIPACKETANSWER_EXT2, OP_PACKEDPROT, OP_QUEUERANKING,
+    OP_REQFILENAMEANSWER, OP_REQUESTFILENAME, OP_REQUESTSOURCES, OP_REQUESTSOURCES2,
+    OP_SETREQFILEID, OP_STARTUPLOADREQ, TCP_PACKET_HEADER_LEN,
 };
 
 pub(super) fn decode_peer_payload(protocol: u8, payload: Vec<u8>) -> Result<(u8, Vec<u8>)> {
@@ -299,6 +299,13 @@ fn encode_source_exchange_entries(
 
 pub(super) fn encode_aich_file_hash_request(file_hash: &Ed2kHash) -> Vec<u8> {
     encode_packet(OP_EMULEPROT, OP_AICHFILEHASHREQ, &file_hash.0)
+}
+
+pub(super) fn encode_aich_file_hash_answer(file_hash: &Ed2kHash, aich_root: [u8; 20]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(36);
+    payload.extend_from_slice(&file_hash.0);
+    payload.extend_from_slice(&aich_root);
+    encode_packet(OP_EMULEPROT, OP_AICHFILEHASHANS, &payload)
 }
 
 pub(super) fn encode_set_req_file_id(file_hash: &Ed2kHash) -> Vec<u8> {

@@ -317,8 +317,13 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
                 .await?;
             }
             (OP_EMULEPROT, OP_AICHFILEHASHREQ) => {
-                requested_file_hash =
-                    handle_aich_file_hash_request(transfer_runtime, &packet.payload).await?;
+                requested_file_hash = handle_aich_file_hash_request(
+                    transfer_runtime,
+                    &mut transport,
+                    peer_addr,
+                    &packet.payload,
+                )
+                .await?;
             }
             (OP_EDONKEYPROT, OP_REQUESTPARTS) | (OP_EMULEPROT, OP_REQUESTPARTS_I64) => {
                 match serve_upload_payload(UploadPayloadRequest {

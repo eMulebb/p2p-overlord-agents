@@ -22,6 +22,11 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
         .store_md4_hashset(&file_hash_hex, Vec::new())
         .await
         .unwrap();
+    let aich_root = [0x7B; 20];
+    transfer_runtime
+        .reconcile_aich_root(&file_hash_hex, Some(aich_root))
+        .await
+        .unwrap();
     transfer_runtime
         .store_md4_hashset(&no_sources_hash_hex, Vec::new())
         .await
@@ -175,6 +180,14 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
         .write_all(&super::encode_aich_file_hash_request(&file_hash))
         .await
         .unwrap();
+    let aich_answer = read_packet(&mut stream).await;
+    assert_eq!(aich_answer[0], OP_EMULEPROT);
+    assert_eq!(aich_answer[5], super::OP_AICHFILEHASHANS);
+    let (returned_hash, returned_aich_root) =
+        super::decode_aich_file_hash_answer(&aich_answer[6..]).unwrap();
+    assert_eq!(returned_hash, file_hash);
+    assert_eq!(returned_aich_root, aich_root);
+
     stream
         .write_all(&super::encode_start_upload_req(&file_hash))
         .await
