@@ -1,9 +1,12 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use overlord_kad_proto::Ed2kHash;
 
-use crate::ed2k_transfer::Ed2kTransferRuntime;
+use crate::ed2k_transfer::{Ed2kSourceHint, Ed2kTransferRuntime};
 
 use super::super::{
     ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, ED2K_SECURE_IDENT_SIGNATURE_NEEDED,
@@ -14,11 +17,11 @@ use super::super::{
     OP_HELLOANSWER, OP_MULTIPACKETANSWER_EXT2, OP_PUBLICKEY, OP_QUEUERANKING, OP_REQFILENAMEANSWER,
     OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64, OP_SETREQFILEID, OP_SIGNATURE,
     begin_secure_ident_probe, build_hello_responses, decode_aich_file_hash_answer,
-    decode_file_status_payload, decode_hashset_answer, decode_hashset_answer2,
-    decode_hello_profile, decode_public_key_payload, decode_request_filename_answer,
-    decode_request_filename_answer_body, decode_secident_state, dump_ed2k_tcp_download_meta,
-    dump_ed2k_tcp_download_recv, dump_ed2k_tcp_download_send, encode_emule_info_answer,
-    encode_packet, is_connection_shutdown_error, skip_file_status_body,
+    decode_answer_sources2_payload, decode_file_status_payload, decode_hashset_answer,
+    decode_hashset_answer2, decode_hello_profile, decode_public_key_payload,
+    decode_request_filename_answer, decode_request_filename_answer_body, decode_secident_state,
+    dump_ed2k_tcp_download_meta, dump_ed2k_tcp_download_recv, dump_ed2k_tcp_download_send,
+    encode_emule_info_answer, encode_packet, is_connection_shutdown_error, skip_file_status_body,
     try_send_secure_ident_signature,
 };
 use super::{
@@ -472,10 +475,29 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     // the expected file-status payload. Stay tolerant, but do not
                     // treat it as the startup gate that oracle-like peers rely on.
                 }
-                (OP_EMULEPROT, OP_ANSWERSOURCES) | (OP_EMULEPROT, OP_ANSWERSOURCES2) => {
-                    // Source-exchange replies are opportunistic parity traffic. The
-                    // direct downloader does not consume them yet, but the oracle does
-                    // emit the request during startup, so stay tolerant here.
+                (OP_EMULEPROT, OP_ANSWERSOURCES2) => {
+                    let (answer_hash, sources) = decode_answer_sources2_payload(&packet.payload)?;
+                    if answer_hash == file_hash {
+                        for source in sources {
+                            if source.tcp_port == 0 || source.ip == [0, 0, 0, 0] {
+                                continue;
+                            }
+                            transfer_runtime
+                                .remember_source(
+                                    file_hash_hex,
+                                    Ed2kSourceHint {
+                                        ip: Ipv4Addr::from(source.ip).to_string(),
+                                        tcp_port: source.tcp_port,
+                                        user_hash: source.user_hash.map(hex::encode),
+                                    },
+                                )
+                                .await?;
+                        }
+                    }
+                }
+                (OP_EMULEPROT, OP_ANSWERSOURCES) => {
+                    // Legacy SX1 replies need the peer's SX1 version to decode safely.
+                    // SX2 replies carry their version in-band and are consumed above.
                 }
                 (OP_EMULEPROT, OP_QUEUERANKING) => {
                     session_state.queued_until = Some(tokio::time::Instant::now() + QUEUE_RANK_GRACE);

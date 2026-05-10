@@ -444,6 +444,70 @@ pub(super) fn decode_request_sources_payload(opcode: u8, payload: &[u8]) -> Resu
     }
 }
 
+pub(super) fn decode_answer_sources2_payload(
+    payload: &[u8],
+) -> Result<(Ed2kHash, Vec<SourceExchangePeer>)> {
+    if payload.len() < 1 + 16 + 2 {
+        anyhow::bail!("short OP_ANSWERSOURCES2 payload {}", payload.len());
+    }
+    let version = payload[0];
+    if !(1..=ED2K_SOURCE_EXCHANGE2_VERSION).contains(&version) {
+        anyhow::bail!("unsupported OP_ANSWERSOURCES2 version {version}");
+    }
+
+    let file_hash = Ed2kHash(payload[1..17].try_into().unwrap());
+    let count = usize::from(u16::from_le_bytes([payload[17], payload[18]]));
+    let entry_size = source_exchange_entry_size(version);
+    let sources_payload = &payload[19..];
+    let expected_size = count
+        .checked_mul(entry_size)
+        .context("OP_ANSWERSOURCES2 source count overflow")?;
+    if sources_payload.len() != expected_size {
+        anyhow::bail!(
+            "corrupt OP_ANSWERSOURCES2 payload version={} count={} size={}",
+            version,
+            count,
+            sources_payload.len()
+        );
+    }
+
+    let mut sources = Vec::with_capacity(count);
+    for entry in sources_payload.chunks_exact(entry_size) {
+        let ip = if version < 3 {
+            entry[..4].try_into().unwrap()
+        } else {
+            u32::from_le_bytes(entry[..4].try_into().unwrap()).to_be_bytes()
+        };
+        let tcp_port = u16::from_le_bytes(entry[4..6].try_into().unwrap());
+        let server_ip = u32::from_le_bytes(entry[6..10].try_into().unwrap());
+        let server_port = u16::from_le_bytes(entry[10..12].try_into().unwrap());
+        let user_hash = if version >= 2 {
+            Some(entry[12..28].try_into().unwrap())
+        } else {
+            None
+        };
+        let connect_options = if version >= 4 { entry[28] } else { 0 };
+        sources.push(SourceExchangePeer {
+            ip,
+            tcp_port,
+            server_ip,
+            server_port,
+            user_hash,
+            connect_options,
+        });
+    }
+
+    Ok((file_hash, sources))
+}
+
+const fn source_exchange_entry_size(version: u8) -> usize {
+    match version {
+        1 => 4 + 2 + 4 + 2,
+        2 | 3 => 4 + 2 + 4 + 2 + 16,
+        _ => 4 + 2 + 4 + 2 + 16 + 1,
+    }
+}
+
 pub(super) fn decode_aich_file_hash_answer(payload: &[u8]) -> Result<Ed2kHash> {
     if payload.len() < 16 {
         anyhow::bail!("short OP_AICHFILEHASHANS payload {}", payload.len());

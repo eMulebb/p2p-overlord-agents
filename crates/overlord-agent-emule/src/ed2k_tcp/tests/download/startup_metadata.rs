@@ -26,6 +26,19 @@ async fn hash_only_small_file_download_learns_metadata_from_startup_answer() {
             false,
         )
         .await;
+        let source_exchange_answer = encode_answer_sources2(
+            &file_hash,
+            ED2K_SOURCE_EXCHANGE2_VERSION,
+            &[SourceExchangePeer {
+                ip: [127, 0, 0, 2],
+                tcp_port: 4662,
+                server_ip: 0,
+                server_port: 0,
+                user_hash: Some([0x77; 16]),
+                connect_options: 0,
+            }],
+        );
+        stream.write_all(&source_exchange_answer).await.unwrap();
         let (requested_hash, ranges) =
             accept_upload_and_read_parts_request(&mut stream, false).await;
         assert_eq!(requested_hash, file_hash);
@@ -82,5 +95,10 @@ async fn hash_only_small_file_download_learns_metadata_from_startup_answer() {
     assert!(manifest.completed);
     assert_eq!(manifest.canonical_name, "captured.epub");
     assert_eq!(manifest.file_size, payload.len() as u64);
+    assert!(manifest.sources.contains(&Ed2kSourceHint {
+        ip: "127.0.0.2".to_string(),
+        tcp_port: 4662,
+        user_hash: Some(hex::encode([0x77; 16])),
+    }));
     server.await.unwrap();
 }
