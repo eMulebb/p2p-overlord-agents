@@ -199,6 +199,7 @@ impl KadPacket {
                 KadPacket::FirewalledAckRes
             }
             opcode::FIREWALLUDP => {
+                require_min_body_len(op, body, 3)?;
                 let p = cursor.read_le::<FirewallUdp>()?;
                 KadPacket::FirewallUdp(p)
             }

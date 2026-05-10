@@ -391,6 +391,28 @@ fn firewalled_response_and_legacy_ack_reject_stock_exact_size_trailing_bytes() {
 }
 
 #[test]
+fn firewall_udp_uses_stock_min_size_and_ignores_trailing_bytes() {
+    let short = vec![OP_KADEMLIAHEADER, opcode::FIREWALLUDP, 0, 0];
+    assert!(matches!(
+        KadPacket::decode(&short),
+        Err(ProtoError::InvalidPacketSize {
+            expected: 3,
+            actual: 2,
+            ..
+        })
+    ));
+
+    let with_trailing = vec![OP_KADEMLIAHEADER, opcode::FIREWALLUDP, 0, 0x40, 0x12, 0xAA];
+    assert!(matches!(
+        KadPacket::decode(&with_trailing).unwrap(),
+        KadPacket::FirewallUdp(FirewallUdp {
+            error_code: 0,
+            udp_port: 4672
+        })
+    ));
+}
+
+#[test]
 fn test_find_buddy_req_roundtrip() {
     let pkt = KadPacket::FindBuddyReq(FindBuddyReq {
         buddy_id: NodeId::from_bytes([0x21; 16]),
