@@ -142,6 +142,11 @@ fn file_description_decodes_stock_rating_and_long_string() {
     assert_eq!(decoded.rating, 4);
     assert_eq!(decoded.comment, "clean");
     assert!(decode_file_description_payload(&payload[..4]).is_err());
+
+    payload.extend_from_slice(b"ignored");
+    let decoded = decode_file_description_payload(&payload).unwrap();
+    assert_eq!(decoded.rating, 4);
+    assert_eq!(decoded.comment, "clean");
 }
 
 #[test]

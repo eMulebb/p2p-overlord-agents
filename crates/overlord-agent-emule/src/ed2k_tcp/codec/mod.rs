@@ -730,13 +730,7 @@ pub(super) fn decode_file_description_payload(payload: &[u8]) -> Result<FileDesc
             comment_len
         );
     }
-    if payload.len() > 5 + comment_len {
-        anyhow::bail!(
-            "unexpected trailing OP_FILEDESC payload of {} bytes",
-            payload.len() - 5 - comment_len
-        );
-    }
-    let comment = String::from_utf8_lossy(&payload[5..]).into_owned();
+    let comment = String::from_utf8_lossy(&payload[5..5 + comment_len]).into_owned();
     Ok(FileDescription { rating, comment })
 }
 
