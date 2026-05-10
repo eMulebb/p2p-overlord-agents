@@ -4,9 +4,6 @@
   `../p2p-overlord-tooling/docs/WORKSPACE_POLICY.md`.
 - Use `docs/README.md` as the canonical agents docs home.
 - Use `../p2p-overlord-be/BACKLOG.md` as the canonical active backlog.
-- Implement only latest/current Kad and ED2K protocol behavior by default.
-  Do not add legacy variants, obsolete fallbacks, or compatibility branches
-  unless explicitly re-scoped by the user.
 - Before finishing Rust changes, run:
   - `cargo fmt --all --check`
   - `cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::all -W clippy::too_many_arguments -W clippy::type_complexity -W clippy::cognitive_complexity`
