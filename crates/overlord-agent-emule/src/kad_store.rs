@@ -452,7 +452,7 @@ fn source_result_tags(entry: &StoredSourcePublish) -> Vec<Tag> {
 
     let mut saw_source_type = false;
     let mut saw_source_tcp_port = false;
-    let mut should_backfill_udp_port = true;
+    let mut saw_source_udp_port = false;
     for tag in &entry.tags {
         match tag.name {
             TagName::Short(name) if name == tag_name::SOURCETYPE => {
@@ -470,19 +470,13 @@ fn source_result_tags(entry: &StoredSourcePublish) -> Vec<Tag> {
                 }
             }
             TagName::Short(name) if name == tag_name::SOURCEUPORT => {
-                if should_backfill_udp_port && let Some(tag) = normalized_source_udp_port_tag(tag) {
+                if !saw_source_udp_port && let Some(tag) = normalized_source_udp_port_tag(tag) {
                     tags.push(tag);
-                    should_backfill_udp_port = false;
+                    saw_source_udp_port = true;
                 }
             }
             _ => tags.push(tag.clone()),
         }
-    }
-    if should_backfill_udp_port {
-        tags.push(Tag::new_short(
-            tag_name::SOURCEUPORT,
-            TagValue::U16(entry.source_udp_port),
-        ));
     }
     tags
 }
@@ -1376,14 +1370,6 @@ mod tests {
                 .iter()
                 .any(|tag| matches!(&tag.name, TagName::Short(name) if *name == tag_name::SOURCEIP))
         }));
-        assert!(response.results.iter().all(|entry| {
-            entry.tags.iter().any(|tag| {
-                matches!(
-                    (&tag.name, &tag.value),
-                    (TagName::Short(name), TagValue::U16(_)) if *name == tag_name::SOURCEUPORT
-                )
-            })
-        }));
     }
 
     #[test]
@@ -1593,6 +1579,40 @@ mod tests {
             result_tags[5].value,
             TagValue::U16(value) if value == 4672
         ));
+    }
+
+    #[test]
+    fn source_search_does_not_backfill_missing_udp_port_tag_like_stock() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([3; 16]);
+        let tags = vec![
+            Tag::new_short(tag_name::SOURCETYPE, TagValue::UInt(1)),
+            Tag::new_short(tag_name::SOURCEPORT, TagValue::UInt(4662)),
+            Tag::filesize(456),
+        ];
+
+        store.record_source_publish(
+            target,
+            NodeId::from_bytes([4; 16]),
+            Ipv4Addr::new(1, 1, 1, 1),
+            4672,
+            &tags,
+            ts(1),
+        );
+        let response = store
+            .source_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchSourceReq {
+                    target,
+                    start_position: 0,
+                    size: 456,
+                },
+                10,
+                ts(1),
+            )
+            .expect("source response");
+
+        assert!(!short_tag_names(&response.results[0].tags).contains(&tag_name::SOURCEUPORT));
     }
 
     #[test]
