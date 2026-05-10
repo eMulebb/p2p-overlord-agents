@@ -43,12 +43,12 @@ mod transport;
 pub(in crate::ed2k_tcp) use codec::{
     PeerSourceExchangeRequest, SourceExchangePeer, decode_aich_file_hash_answer,
     decode_answer_sources_payload, decode_answer_sources2_payload, decode_compressed_part_fragment,
-    decode_file_status_payload, decode_hashset_answer, decode_hashset_answer2, decode_peer_payload,
-    decode_public_ip_answer_payload, decode_request_filename_answer,
-    decode_request_filename_answer_body, decode_sending_part_payload,
-    encode_aich_file_hash_request, encode_hashset_request, encode_hashset_request2,
-    encode_multipacket_ext2_request, encode_multipacket_request, encode_packet,
-    encode_port_test_answer, encode_public_ip_answer, encode_request_filename,
+    decode_file_hash_payload, decode_file_status_payload, decode_hashset_answer,
+    decode_hashset_answer2, decode_peer_payload, decode_public_ip_answer_payload,
+    decode_request_filename_answer, decode_request_filename_answer_body,
+    decode_sending_part_payload, encode_aich_file_hash_request, encode_hashset_request,
+    encode_hashset_request2, encode_multipacket_ext2_request, encode_multipacket_request,
+    encode_packet, encode_port_test_answer, encode_public_ip_answer, encode_request_filename,
     encode_request_parts_batch, encode_request_sources, encode_request_sources2,
     encode_set_req_file_id, encode_start_upload_req, inflate_compressed_part_fragment,
     skip_file_status_body,
@@ -56,14 +56,13 @@ pub(in crate::ed2k_tcp) use codec::{
 #[cfg(test)]
 #[allow(unused_imports)]
 use codec::{
-    build_upload_part_packets, decode_file_hash_payload, decode_hashset_request2,
-    decode_request_parts_payload, decode_request_sources_payload, encode_accept_upload_req,
-    encode_aich_file_hash_answer, encode_answer_sources, encode_answer_sources2,
-    encode_compressed_part_fragment, encode_file_req_ans_nofil, encode_file_status_complete,
-    encode_hashset_answer, encode_hashset_answer2, encode_multipacket_answer,
-    encode_multipacket_ext2_answer, encode_packed_packet, encode_queue_ranking,
-    encode_request_filename_answer, encode_request_sources2_subpayload, encode_sending_part,
-    skip_request_filename_ext_info,
+    build_upload_part_packets, decode_hashset_request2, decode_request_parts_payload,
+    decode_request_sources_payload, encode_accept_upload_req, encode_aich_file_hash_answer,
+    encode_answer_sources, encode_answer_sources2, encode_compressed_part_fragment,
+    encode_file_req_ans_nofil, encode_file_status_complete, encode_hashset_answer,
+    encode_hashset_answer2, encode_multipacket_answer, encode_multipacket_ext2_answer,
+    encode_packed_packet, encode_queue_ranking, encode_request_filename_answer,
+    encode_request_sources2_subpayload, encode_sending_part, skip_request_filename_ext_info,
 };
 pub(in crate::ed2k_tcp) use download::PendingCompressedPart;
 #[cfg(test)]
@@ -121,6 +120,7 @@ const OP_COMPRESSEDPART: u8 = 0x40;
 const OP_SENDINGPART: u8 = 0x46;
 const OP_REQUESTPARTS: u8 = 0x47;
 const OP_FILEREQANSNOFIL: u8 = 0x48;
+const OP_END_OF_DOWNLOAD: u8 = 0x49;
 const OP_SETREQFILEID: u8 = 0x4F;
 const OP_FILESTATUS: u8 = 0x50;
 const OP_HASHSETREQUEST: u8 = 0x51;
@@ -130,6 +130,7 @@ const OP_ACCEPTUPLOADREQ: u8 = 0x55;
 const OP_CANCELTRANSFER: u8 = 0x56;
 const OP_REQUESTFILENAME: u8 = 0x58;
 const OP_REQFILENAMEANSWER: u8 = 0x59;
+const OP_QUEUERANK: u8 = 0x5C;
 const OP_QUEUERANKING: u8 = 0x60;
 const OP_FILEDESC: u8 = 0x61;
 const OP_REQUESTSOURCES: u8 = 0x81;

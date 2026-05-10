@@ -13,12 +13,13 @@ use super::super::{
     Ed2kFileIdentifier, Ed2kHelloIdentity, Ed2kSecureIdent, Ed2kTransport, OP_ACCEPTUPLOADREQ,
     OP_AICHFILEHASHANS, OP_ANSWERSOURCES, OP_ANSWERSOURCES2, OP_COMPRESSEDPART,
     OP_COMPRESSEDPART_I64, OP_EDONKEYPROT, OP_EMULEINFO, OP_EMULEINFOANSWER, OP_EMULEPROT,
-    OP_FILEDESC, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_HASHSETANSWER, OP_HASHSETANSWER2, OP_HELLO,
-    OP_HELLOANSWER, OP_KAD_FWTCPCHECK_ACK, OP_MULTIPACKETANSWER, OP_MULTIPACKETANSWER_EXT2,
-    OP_PORTTEST, OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_QUEUERANKING,
-    OP_REQFILENAMEANSWER, OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64, OP_SETREQFILEID,
-    OP_SIGNATURE, SourceExchangePeer, begin_secure_ident_probe, build_hello_responses,
-    decode_aich_file_hash_answer, decode_answer_sources_payload, decode_answer_sources2_payload,
+    OP_END_OF_DOWNLOAD, OP_FILEDESC, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_HASHSETANSWER,
+    OP_HASHSETANSWER2, OP_HELLO, OP_HELLOANSWER, OP_KAD_FWTCPCHECK_ACK, OP_MULTIPACKETANSWER,
+    OP_MULTIPACKETANSWER_EXT2, OP_PORTTEST, OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ, OP_PUBLICKEY,
+    OP_QUEUERANK, OP_QUEUERANKING, OP_REQFILENAMEANSWER, OP_SECIDENTSTATE, OP_SENDINGPART,
+    OP_SENDINGPART_I64, OP_SETREQFILEID, OP_SIGNATURE, SourceExchangePeer,
+    begin_secure_ident_probe, build_hello_responses, decode_aich_file_hash_answer,
+    decode_answer_sources_payload, decode_answer_sources2_payload, decode_file_hash_payload,
     decode_file_status_payload, decode_hashset_answer, decode_hashset_answer2,
     decode_hello_profile, decode_public_ip_answer_payload, decode_public_key_payload,
     decode_request_filename_answer, decode_request_filename_answer_body, decode_secident_state,
@@ -615,7 +616,7 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     )
                     .await?;
                 }
-                (OP_EMULEPROT, OP_QUEUERANKING) => {
+                (OP_EDONKEYPROT, OP_QUEUERANK) | (OP_EMULEPROT, OP_QUEUERANKING) => {
                     session_state.queued_until = Some(tokio::time::Instant::now() + QUEUE_RANK_GRACE);
                     dump_ed2k_tcp_download_meta(
                         peer_addr,
@@ -623,6 +624,18 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                         "queue_ranking",
                         format!("file_hash={file_hash_hex}"),
                     );
+                }
+                (OP_EDONKEYPROT, OP_END_OF_DOWNLOAD) => {
+                    let ended_hash = decode_file_hash_payload(&packet.payload)?;
+                    dump_ed2k_tcp_download_meta(
+                        peer_addr,
+                        Some(transport.mode),
+                        "end_of_download",
+                        format!("file_hash={ended_hash}"),
+                    );
+                    if ended_hash == file_hash {
+                        return Ok(Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
+                    }
                 }
                 (OP_EMULEPROT, OP_FILEDESC) => {
                     dump_ed2k_tcp_download_meta(

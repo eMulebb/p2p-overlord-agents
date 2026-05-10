@@ -42,10 +42,10 @@ use super::super::{
     ED2K_CONNECTION_IDLE_TIMEOUT, ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED,
     ED2K_SECURE_IDENT_SIGNATURE_NEEDED, Ed2kHelloIdentity, Ed2kSecureIdent, Ed2kTransport,
     FirewallCheckUdpRequest, OP_AICHFILEHASHREQ, OP_CANCELTRANSFER, OP_EDONKEYPROT, OP_EMULEINFO,
-    OP_EMULEINFOANSWER, OP_EMULEPROT, OP_FWCHECKUDPREQ, OP_HASHSETREQUEST, OP_HASHSETREQUEST2,
-    OP_HELLO, OP_HELLOANSWER, OP_KAD_FWTCPCHECK_ACK, OP_MULTIPACKET, OP_MULTIPACKET_EXT,
-    OP_MULTIPACKET_EXT2, OP_PORTTEST, OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ, OP_PUBLICKEY,
-    OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_REQUESTSOURCES,
+    OP_EMULEINFOANSWER, OP_EMULEPROT, OP_END_OF_DOWNLOAD, OP_FWCHECKUDPREQ, OP_HASHSETREQUEST,
+    OP_HASHSETREQUEST2, OP_HELLO, OP_HELLOANSWER, OP_KAD_FWTCPCHECK_ACK, OP_MULTIPACKET,
+    OP_MULTIPACKET_EXT, OP_MULTIPACKET_EXT2, OP_PORTTEST, OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ,
+    OP_PUBLICKEY, OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_REQUESTSOURCES,
     OP_REQUESTSOURCES2, OP_SECIDENTSTATE, OP_SETREQFILEID, OP_SIGNATURE, OP_STARTUPLOADREQ,
     apply_server_state,
 };
@@ -302,6 +302,19 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
             (OP_EDONKEYPROT, OP_CANCELTRANSFER) => {
                 upload_queue.release(transfer_runtime).await;
                 break Ok(());
+            }
+            (OP_EDONKEYPROT, OP_END_OF_DOWNLOAD) => {
+                let ended_hash = decode_file_hash_payload(&packet.payload)?;
+                dump_ed2k_tcp_listener_meta(
+                    peer_addr,
+                    Some(transport.mode),
+                    "end_of_download",
+                    format!("file_hash={ended_hash}"),
+                );
+                if requested_file_hash == Some(ended_hash) {
+                    upload_queue.release(transfer_runtime).await;
+                    break Ok(());
+                }
             }
             (OP_EDONKEYPROT, OP_HASHSETREQUEST) => {
                 requested_file_hash = handle_hashset_request(

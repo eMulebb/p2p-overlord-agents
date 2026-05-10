@@ -259,6 +259,17 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
         read_until_opcode(&mut stream, OP_EDONKEYPROT, super::OP_ACCEPTUPLOADREQ).await;
     assert_eq!(accept_upload.len(), 6);
 
-    drop(stream);
-    server.await.unwrap();
+    stream
+        .write_all(&super::encode_packet(
+            OP_EDONKEYPROT,
+            OP_END_OF_DOWNLOAD,
+            &file_hash.0,
+        ))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
