@@ -56,6 +56,7 @@ struct StoredSourcePublish {
     target: NodeId,
     publisher_id: NodeId,
     source_ip: Ipv4Addr,
+    source_tcp_port: u16,
     source_udp_port: u16,
     tags: Vec<Tag>,
     dedup_key: String,
@@ -136,24 +137,27 @@ impl KadLocalStore {
         if !is_stock_source_publish(tags) {
             return false;
         }
-        if stock_source_tcp_port(tags).is_none() {
+        if source_ip.octets() == [0, 0, 0, 0] || source_udp_port == 0 {
             return false;
         }
+        let Some(source_tcp_port) = stock_source_tcp_port(tags) else {
+            return false;
+        };
         purge_expired(
             &mut self.source_entries,
             self.config.source_ttl,
             observed_at,
         );
-        let dedup_key = source_dedup_key(target, publisher_id, source_ip, tags);
-        upsert_entry(
+        let dedup_key = source_dedup_key(target, source_ip, source_tcp_port, source_udp_port);
+        upsert_source_entry(
             &mut self.source_entries,
             self.config.source_capacity,
-            dedup_key.clone(),
             StoredSourcePublish {
                 observed_at,
                 target,
                 publisher_id,
                 source_ip,
+                source_tcp_port,
                 source_udp_port,
                 tags: tags.to_vec(),
                 dedup_key,
@@ -450,6 +454,32 @@ where
     entries.push(entry);
 }
 
+fn upsert_source_entry(
+    entries: &mut Vec<StoredSourcePublish>,
+    capacity: usize,
+    entry: StoredSourcePublish,
+) {
+    if let Some(existing) = entries.iter_mut().find(|candidate| {
+        candidate.target == entry.target
+            && candidate.source_ip == entry.source_ip
+            && (candidate.source_tcp_port == entry.source_tcp_port
+                || candidate.source_udp_port == entry.source_udp_port)
+    }) {
+        *existing = entry;
+        return;
+    }
+
+    if entries.len() >= capacity
+        && let Some((oldest_index, _)) = entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, candidate)| candidate.observed_at())
+    {
+        entries.remove(oldest_index);
+    }
+    entries.push(entry);
+}
+
 trait TimedEntry {
     fn observed_at(&self) -> DateTime<Utc>;
 }
@@ -500,14 +530,11 @@ fn keyword_dedup_key(target: NodeId, file_hash: Ed2kHash, tags: &[Tag]) -> Strin
 
 fn source_dedup_key(
     target: NodeId,
-    publisher_id: NodeId,
     source_ip: Ipv4Addr,
-    tags: &[Tag],
+    source_tcp_port: u16,
+    source_udp_port: u16,
 ) -> String {
-    format!(
-        "source:{target}:{publisher_id}:{source_ip}:{}",
-        tag_fingerprint(tags)
-    )
+    format!("source:{target}:{source_ip}:{source_tcp_port}:{source_udp_port}")
 }
 
 fn notes_dedup_key(target: NodeId, publisher_id: NodeId, tags: &[Tag]) -> String {
@@ -730,6 +757,85 @@ mod tests {
             ts(1),
         ));
         assert_eq!(store.source_entry_count(), 0);
+    }
+
+    #[test]
+    fn source_publish_without_stock_ip_or_udp_port_is_rejected() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([3; 16]);
+        let publisher = NodeId::from_bytes([4; 16]);
+        let tags = vec![
+            Tag::new_short(tag_name::SOURCETYPE, TagValue::UInt(1)),
+            Tag::filesize(456),
+            Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(4662)),
+        ];
+
+        assert!(!store.record_source_publish(
+            target,
+            publisher,
+            Ipv4Addr::new(0, 0, 0, 0),
+            4672,
+            &tags,
+            ts(1),
+        ));
+        assert!(!store.record_source_publish(
+            target,
+            publisher,
+            Ipv4Addr::new(1, 1, 1, 1),
+            0,
+            &tags,
+            ts(1),
+        ));
+        assert_eq!(store.source_entry_count(), 0);
+    }
+
+    #[test]
+    fn source_publish_replaces_same_ip_and_tcp_or_udp_port_like_stock() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([3; 16]);
+        let first_publisher = NodeId::from_bytes([4; 16]);
+        let second_publisher = NodeId::from_bytes([5; 16]);
+        let tags = vec![
+            Tag::new_short(tag_name::SOURCETYPE, TagValue::UInt(1)),
+            Tag::filesize(456),
+            Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(4662)),
+        ];
+
+        assert!(store.record_source_publish(
+            target,
+            first_publisher,
+            Ipv4Addr::new(1, 1, 1, 1),
+            4672,
+            &tags,
+            ts(1),
+        ));
+        assert!(store.record_source_publish(
+            target,
+            second_publisher,
+            Ipv4Addr::new(1, 1, 1, 1),
+            4673,
+            &tags,
+            ts(2),
+        ));
+
+        assert_eq!(store.source_entry_count(), 1);
+        let response = store
+            .source_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchSourceReq {
+                    target,
+                    start_position: 0,
+                    size: 456,
+                },
+                10,
+                ts(2),
+            )
+            .expect("source response");
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(
+            response.results[0].entry_id,
+            source_entry_id(second_publisher)
+        );
     }
 
     #[test]
