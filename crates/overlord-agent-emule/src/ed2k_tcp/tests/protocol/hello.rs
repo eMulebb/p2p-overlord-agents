@@ -180,7 +180,7 @@ fn hello_misc_options2_does_not_advertise_unsupported_chat_captcha() {
 }
 
 #[test]
-fn hello_misc_options1_does_not_advertise_unsupported_comments_or_preview() {
+fn hello_misc_options1_advertises_stock_comments_but_not_preview() {
     let misc_options1 = emule_misc_options1();
 
     assert_eq!((misc_options1 >> 29) & 0x7, 1, "AICH is implemented");
@@ -191,8 +191,8 @@ fn hello_misc_options1_does_not_advertise_unsupported_comments_or_preview() {
     );
     assert_eq!(
         (misc_options1 >> 4) & 0x0F,
-        0,
-        "comments are not implemented"
+        1,
+        "stock comment/rating acceptance is advertised"
     );
     assert_eq!(
         (misc_options1 >> 3) & 1,
@@ -224,7 +224,7 @@ fn hello_answer_matches_truthful_plaintext_profile() {
     });
 
     let expected = decode(
-            "e3520000004c73bec566140e7e6083c450c9af026f8395581b524fb60600000015010001654d756c65030100113c000000030100f951b651b6030100fa06421334030100fe3a240000030100fb00200100b07b02ef8810",
+            "e3520000004c73bec566140e7e6083c450c9af026f8395581b524fb60600000015010001654d756c65030100113c000000030100f951b651b6030100fa16421334030100fe3a240000030100fb00200100b07b02ef8810",
         )
         .unwrap();
 
@@ -246,10 +246,10 @@ fn emule_info_request_uses_expected_protocol_and_tag_count() {
 }
 
 #[test]
-fn emule_info_does_not_advertise_unsupported_comments_or_preview() {
+fn emule_info_advertises_stock_comments_but_not_preview() {
     let packet = encode_emule_info_answer(41000);
 
-    assert_eq!(emule_info_u32_tag(&packet, ET_COMMENTS), Some(0));
+    assert_eq!(emule_info_u32_tag(&packet, ET_COMMENTS), Some(1));
     assert_eq!(
         emule_info_u32_tag(&packet, ET_FEATURES),
         Some(EMULE_INFO_FEATURES)
