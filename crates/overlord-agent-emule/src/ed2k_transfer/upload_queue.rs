@@ -124,6 +124,26 @@ struct Ed2kUploadSessionEntry {
     waiting_sequence: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UploadScoreInputs {
+    waiting_seconds: i128,
+    friend_slot: bool,
+    low_id: bool,
+    file_priority_score: i128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UploadScorePolicy;
+
+impl UploadScorePolicy {
+    fn waiting_score(inputs: UploadScoreInputs) -> i128 {
+        inputs.waiting_seconds * WAITING_SECONDS_WEIGHT
+            + friend_slot_score(inputs.friend_slot)
+            + low_id_score(inputs.low_id)
+            + inputs.file_priority_score
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct Ed2kUploadQueueState {
     config: Ed2kUploadQueueConfig,
@@ -398,12 +418,12 @@ impl Ed2kUploadQueueState {
         session: &Ed2kUploadSessionEntry,
         now: Instant,
     ) -> i128 {
-        let waiting_age = now.saturating_duration_since(session.queued_at).as_secs() as i128
-            * WAITING_SECONDS_WEIGHT;
-        waiting_age
-            + friend_slot_score(&key.peer)
-            + low_id_score(&key.peer)
-            + file_priority_score(key)
+        UploadScorePolicy::waiting_score(UploadScoreInputs {
+            waiting_seconds: now.saturating_duration_since(session.queued_at).as_secs() as i128,
+            friend_slot: key.peer.friend_slot,
+            low_id: key.peer.client_id.is_some_and(is_low_id_client_id),
+            file_priority_score: file_priority_score(key),
+        })
     }
 
     fn take_waiting_sequence(&mut self) -> u64 {
@@ -413,20 +433,16 @@ impl Ed2kUploadQueueState {
     }
 }
 
-fn friend_slot_score(peer: &Ed2kUploadPeerIdentity) -> i128 {
-    if peer.friend_slot {
+fn friend_slot_score(friend_slot: bool) -> i128 {
+    if friend_slot {
         FRIEND_SLOT_SCORE_BONUS
     } else {
         0
     }
 }
 
-fn low_id_score(peer: &Ed2kUploadPeerIdentity) -> i128 {
-    if peer.client_id.is_some_and(is_low_id_client_id) {
-        -LOW_ID_SCORE_PENALTY
-    } else {
-        0
-    }
+fn low_id_score(low_id: bool) -> i128 {
+    if low_id { -LOW_ID_SCORE_PENALTY } else { 0 }
 }
 
 fn file_priority_score(_key: &Ed2kUploadSessionKey) -> i128 {
