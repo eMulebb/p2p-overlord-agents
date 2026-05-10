@@ -271,7 +271,7 @@ impl KadLocalStore {
             .rev()
             .filter(|entry| entry.target == request.target)
             .filter(|entry| {
-                stored_file_size(&entry.tags)
+                stock_first_file_size(&entry.tags)
                     .map(|size| size == request.size)
                     .unwrap_or(true)
             })
@@ -303,14 +303,14 @@ impl KadLocalStore {
             .rev()
             .filter(|entry| entry.target == request.target)
             .filter(|entry| {
-                stored_file_size(&entry.tags)
+                stock_first_file_size(&entry.tags)
                     .map(|size| size == request.size)
                     .unwrap_or(true)
             })
             .take(limit)
             .map(|entry| SearchResultEntry {
                 entry_id: Ed2kHash::from_bytes(entry.publisher_id.to_be_bytes()),
-                tags: entry.tags.clone(),
+                tags: notes_result_tags(entry),
             })
             .collect::<Vec<_>>();
         search_response(sender_id, request.target, results)
@@ -410,6 +410,52 @@ fn source_result_tags(entry: &StoredSourcePublish) -> Vec<Tag> {
         ));
     }
     tags
+}
+
+fn notes_result_tags(entry: &StoredNotesPublish) -> Vec<Tag> {
+    let mut tags = Vec::new();
+    if let Some(name) = stock_first_filename(&entry.tags) {
+        tags.push(Tag::filename(name));
+    }
+    if let Some(size) = stock_first_file_size(&entry.tags).filter(|size| *size > 0) {
+        tags.push(Tag::filesize(size));
+    }
+
+    let mut skipped_filename = false;
+    let mut skipped_filesize = false;
+    for tag in &entry.tags {
+        match tag.name {
+            TagName::Short(name) if name == tag_name::FILENAME && !skipped_filename => {
+                skipped_filename = true;
+            }
+            TagName::Short(name) if name == tag_name::FILESIZE && !skipped_filesize => {
+                skipped_filesize = true;
+            }
+            _ => tags.push(tag.clone()),
+        }
+    }
+    tags
+}
+
+fn stock_first_filename(tags: &[Tag]) -> Option<String> {
+    tags.iter().find_map(|tag| {
+        if !matches!(tag.name, TagName::Short(tag_name::FILENAME)) {
+            return None;
+        }
+        match &tag.value {
+            TagValue::String(value) if !value.is_empty() => Some(value.clone()),
+            _ => None,
+        }
+    })
+}
+
+fn stock_first_file_size(tags: &[Tag]) -> Option<u64> {
+    tags.iter().find_map(|tag| {
+        if !matches!(tag.name, TagName::Short(tag_name::FILESIZE)) {
+            return None;
+        }
+        stored_file_size(std::slice::from_ref(tag))
+    })
 }
 
 fn source_ip_tag(source_ip: Ipv4Addr) -> Tag {
@@ -785,7 +831,7 @@ fn has_stock_note_tags(tags: &[Tag]) -> bool {
             !value.is_empty()
         }
         (TagName::Short(name), _) if *name == tag_name::FILESIZE => {
-            stored_file_size(std::slice::from_ref(tag))
+            stock_first_file_size(std::slice::from_ref(tag))
                 .map(|size| size > 0)
                 .unwrap_or(false)
         }
@@ -1446,6 +1492,60 @@ mod tests {
                     if *name == tag_name::DESCRIPTION && value == "second"
             )
         }));
+    }
+
+    #[test]
+    fn notes_search_materializes_stock_tag_shape() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([7; 16]);
+        let publisher_id = NodeId::from_bytes([8; 16]);
+        let tags = vec![
+            Tag::new_short(tag_name::DESCRIPTION, TagValue::String("good".into())),
+            Tag::filesize(900),
+            Tag::filename("ubuntu linux.iso"),
+            Tag::new_short(tag_name::DESCRIPTION, TagValue::String("better".into())),
+            Tag::filesize(901),
+            Tag::filename("ignored.iso"),
+        ];
+
+        assert_eq!(
+            store.record_notes_publish(
+                target,
+                publisher_id,
+                Ipv4Addr::new(1, 1, 1, 1),
+                &tags,
+                ts(1),
+            ),
+            Some(1)
+        );
+        let response = store
+            .notes_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchNotesReq { target, size: 900 },
+                10,
+                ts(2),
+            )
+            .expect("notes response");
+        let result_tags = &response.results[0].tags;
+        assert_eq!(
+            short_tag_names(result_tags),
+            vec![
+                tag_name::FILENAME,
+                tag_name::FILESIZE,
+                tag_name::DESCRIPTION,
+                tag_name::DESCRIPTION,
+                tag_name::FILESIZE,
+                tag_name::FILENAME,
+            ]
+        );
+        assert!(matches!(
+            &result_tags[0].value,
+            TagValue::String(value) if value == "ubuntu linux.iso"
+        ));
+        assert!(matches!(
+            result_tags[1].value,
+            TagValue::UInt(value) if value == 900
+        ));
     }
 
     #[test]
