@@ -4,7 +4,7 @@
 //! keyword publishes are indexed by file hash, source publishes by publisher
 //! identity and IP, and notes publishes by publisher identity plus note tags.
 
-use std::{net::Ipv4Addr, time::Duration};
+use std::{collections::HashSet, net::Ipv4Addr, time::Duration};
 
 use chrono::{DateTime, Utc};
 use overlord_kad_proto::{
@@ -15,6 +15,9 @@ use overlord_kad_proto::{
 use crate::config::KadConfig;
 
 const STOCK_MAX_SOURCES_PER_FILE: usize = 1000;
+const STOCK_MAX_KEYWORD_INDEX: usize = 50_000;
+const STOCK_MAX_KEYWORD_ENTRIES: usize = 60_000;
+const STOCK_HOT_KEYWORD_REPUBLISH_MARGIN: usize = 5_000;
 
 /// Runtime policy for the local Kad publish cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,9 +101,10 @@ impl KadLocalStore {
         target: NodeId,
         entries: &[PublishEntry],
         observed_at: DateTime<Utc>,
-    ) {
+    ) -> u8 {
+        let mut load = 0;
         if !self.config.enabled {
-            return;
+            return load;
         }
         purge_expired(
             &mut self.keyword_entries,
@@ -108,7 +112,19 @@ impl KadLocalStore {
             observed_at,
         );
         for entry in entries {
-            let dedup_key = keyword_dedup_key(target, entry.hash, &entry.tags);
+            let Some(size) = stock_keyword_file_size(&entry.tags) else {
+                continue;
+            };
+            if !has_stock_keyword_filename(&entry.tags) {
+                continue;
+            }
+            let (entry_load, should_store) =
+                stock_keyword_publish_decision(&self.keyword_entries, target, entry.hash);
+            load = entry_load;
+            if !should_store {
+                continue;
+            }
+            let dedup_key = keyword_dedup_key(target, entry.hash, size);
             upsert_entry(
                 &mut self.keyword_entries,
                 self.config.keyword_capacity,
@@ -122,6 +138,7 @@ impl KadLocalStore {
                 },
             );
         }
+        load
     }
 
     pub(crate) fn record_source_publish(
@@ -608,8 +625,67 @@ impl DedupEntry for StoredNotesPublish {
     }
 }
 
-fn keyword_dedup_key(target: NodeId, file_hash: Ed2kHash, tags: &[Tag]) -> String {
-    format!("keyword:{target}:{file_hash}:{}", tag_fingerprint(tags))
+fn stock_keyword_file_size(tags: &[Tag]) -> Option<u64> {
+    stored_file_size(tags).filter(|size| *size > 0)
+}
+
+fn has_stock_keyword_filename(tags: &[Tag]) -> bool {
+    tags.iter().any(|tag| {
+        matches!(
+            (&tag.name, &tag.value),
+            (TagName::Short(name), TagValue::String(value))
+                if *name == tag_name::FILENAME && !value.is_empty()
+        )
+    })
+}
+
+fn stock_keyword_publish_decision(
+    entries: &[StoredKeywordPublish],
+    target: NodeId,
+    file_hash: Ed2kHash,
+) -> (u8, bool) {
+    if entries.len() > STOCK_MAX_KEYWORD_ENTRIES {
+        return (100, false);
+    }
+
+    let source_count = keyword_source_count(entries, target);
+    if source_count == 0 {
+        return (1, true);
+    }
+    if source_count > STOCK_MAX_KEYWORD_INDEX {
+        return (100, false);
+    }
+    if keyword_source_exists(entries, target, file_hash)
+        && source_count > STOCK_MAX_KEYWORD_INDEX - STOCK_HOT_KEYWORD_REPUBLISH_MARGIN
+    {
+        return (100, false);
+    }
+
+    let load = (source_count * 100 / STOCK_MAX_KEYWORD_INDEX) as u8;
+    (load, true)
+}
+
+fn keyword_source_count(entries: &[StoredKeywordPublish], target: NodeId) -> usize {
+    entries
+        .iter()
+        .filter(|entry| entry.target == target)
+        .map(|entry| entry.file_hash)
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn keyword_source_exists(
+    entries: &[StoredKeywordPublish],
+    target: NodeId,
+    file_hash: Ed2kHash,
+) -> bool {
+    entries
+        .iter()
+        .any(|entry| entry.target == target && entry.file_hash == file_hash)
+}
+
+fn keyword_dedup_key(target: NodeId, file_hash: Ed2kHash, size: u64) -> String {
+    format!("keyword:{target}:{file_hash}:{size}")
 }
 
 fn source_dedup_key(
@@ -686,8 +762,14 @@ mod tests {
             tags: vec![Tag::filename("ubuntu linux.iso"), Tag::filesize(123)],
         };
 
-        store.record_keyword_publish_batch(target, std::slice::from_ref(&entry), ts(0));
-        store.record_keyword_publish_batch(target, std::slice::from_ref(&entry), ts(5));
+        assert_eq!(
+            store.record_keyword_publish_batch(target, std::slice::from_ref(&entry), ts(0)),
+            1
+        );
+        assert_eq!(
+            store.record_keyword_publish_batch(target, std::slice::from_ref(&entry), ts(5)),
+            0
+        );
         assert_eq!(store.keyword_entry_count(), 1);
 
         let response = store
@@ -716,6 +798,91 @@ mod tests {
         );
         assert!(expired.is_none());
         assert_eq!(store.keyword_entry_count(), 0);
+    }
+
+    #[test]
+    fn keyword_publish_rejects_entries_without_stock_name_or_size() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([1; 16]);
+        let missing_name = PublishEntry {
+            hash: Ed2kHash::from_bytes([2; 16]),
+            tags: vec![Tag::filesize(123)],
+        };
+        let missing_size = PublishEntry {
+            hash: Ed2kHash::from_bytes([3; 16]),
+            tags: vec![Tag::filename("ubuntu linux.iso")],
+        };
+        let zero_size = PublishEntry {
+            hash: Ed2kHash::from_bytes([4; 16]),
+            tags: vec![Tag::filename("ubuntu linux.iso"), Tag::filesize(0)],
+        };
+        let empty_name = PublishEntry {
+            hash: Ed2kHash::from_bytes([5; 16]),
+            tags: vec![Tag::filename(""), Tag::filesize(123)],
+        };
+
+        assert_eq!(
+            store.record_keyword_publish_batch(
+                target,
+                &[missing_name, missing_size, zero_size, empty_name],
+                ts(0),
+            ),
+            0
+        );
+        assert_eq!(store.keyword_entry_count(), 0);
+    }
+
+    #[test]
+    fn keyword_publish_replaces_same_file_size_like_stock() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([1; 16]);
+        let file_hash = Ed2kHash::from_bytes([2; 16]);
+        let first = PublishEntry {
+            hash: file_hash,
+            tags: vec![
+                Tag::filename("ubuntu linux.iso"),
+                Tag::filesize(123),
+                Tag::sources(1),
+            ],
+        };
+        let replacement = PublishEntry {
+            hash: file_hash,
+            tags: vec![
+                Tag::filename("ubuntu linux.iso"),
+                Tag::filesize(123),
+                Tag::sources(9),
+            ],
+        };
+
+        assert_eq!(
+            store.record_keyword_publish_batch(target, std::slice::from_ref(&first), ts(0)),
+            1
+        );
+        assert_eq!(
+            store.record_keyword_publish_batch(target, std::slice::from_ref(&replacement), ts(5)),
+            0
+        );
+        assert_eq!(store.keyword_entry_count(), 1);
+        let response = store
+            .keyword_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchKeyReq {
+                    target,
+                    start_position: 0,
+                    restrictive_payload: Vec::new(),
+                },
+                10,
+                ts(10),
+            )
+            .expect("keyword response");
+        assert_eq!(response.results.len(), 1);
+        assert!(response.results[0].tags.iter().any(|tag| {
+            matches!(
+                (&tag.name, &tag.value),
+                (TagName::Short(name), TagValue::UInt(value))
+                    if *name == tag_name::SOURCES && *value == 9
+            )
+        }));
     }
 
     #[test]

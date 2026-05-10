@@ -354,16 +354,16 @@ pub(super) async fn handle_unsolicited_packet(
         }
         KadPacket::PublishKeyReq(req) => {
             let observed_at = Utc::now();
-            {
+            let load = {
                 let mut store = context.local_store.lock().await;
-                store.record_keyword_publish_batch(req.target, &req.entries, observed_at);
-            }
+                store.record_keyword_publish_batch(req.target, &req.entries, observed_at)
+            };
             let _ = dht
                 .send_packet(
                     from,
                     &KadPacket::PublishRes(overlord_kad_proto::PublishRes {
                         target: req.target,
-                        load: 0,
+                        load,
                         options: None,
                     }),
                 )
