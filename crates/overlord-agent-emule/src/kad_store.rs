@@ -342,53 +342,78 @@ fn search_response(
 }
 
 fn source_result_tags(entry: &StoredSourcePublish) -> Vec<Tag> {
-    let mut saw_source_ip = false;
-    let mut saw_source_udp_port = false;
-    let mut tags = entry
-        .tags
-        .iter()
-        .cloned()
-        .map(|mut tag| {
-            match (&tag.name, &tag.value) {
-                (TagName::Short(name), TagValue::UInt(value))
-                    if *name == tag_name::SOURCEPORT && u32::try_from(*value).is_ok() =>
-                {
-                    tag.value = TagValue::U32(*value as u32);
-                }
-                (TagName::Short(name), TagValue::UInt(value))
-                    if *name == tag_name::SOURCEUPORT
-                        && *value > 0
-                        && u16::try_from(*value).is_ok() =>
-                {
-                    tag.value = TagValue::U16(*value as u16);
-                    saw_source_udp_port = true;
-                }
-                (TagName::Short(name), TagValue::U16(value))
-                    if *name == tag_name::SOURCEUPORT && *value > 0 =>
-                {
-                    saw_source_udp_port = true;
-                }
-                (TagName::Short(name), _) if *name == tag_name::SOURCEIP => {
-                    saw_source_ip = true;
-                }
-                _ => {}
-            }
-            tag
-        })
-        .collect::<Vec<_>>();
-    if !saw_source_ip {
-        tags.push(Tag::new_short(
-            tag_name::SOURCEIP,
-            TagValue::U32(u32::from_be_bytes(entry.source_ip.octets())),
-        ));
+    let mut tags = Vec::new();
+    if let Some(size) = stored_file_size(&entry.tags) {
+        tags.push(Tag::filesize(size));
     }
-    if !saw_source_udp_port {
+
+    let mut saw_source_type = false;
+    let mut saw_source_tcp_port = false;
+    let mut should_backfill_udp_port = true;
+    for tag in &entry.tags {
+        match tag.name {
+            TagName::Short(name) if name == tag_name::SOURCETYPE => {
+                if !saw_source_type {
+                    tags.push(source_ip_tag(entry.source_ip));
+                    tags.push(tag.clone());
+                    saw_source_type = true;
+                }
+            }
+            TagName::Short(name) if name == tag_name::FILESIZE => {}
+            TagName::Short(name) if name == tag_name::SOURCEPORT => {
+                if !saw_source_tcp_port {
+                    tags.push(normalized_source_port_tag(tag));
+                    saw_source_tcp_port = true;
+                }
+            }
+            TagName::Short(name) if name == tag_name::SOURCEUPORT => {
+                if should_backfill_udp_port && let Some(tag) = normalized_source_udp_port_tag(tag) {
+                    tags.push(tag);
+                    should_backfill_udp_port = false;
+                }
+            }
+            _ => tags.push(tag.clone()),
+        }
+    }
+    if should_backfill_udp_port {
         tags.push(Tag::new_short(
             tag_name::SOURCEUPORT,
             TagValue::U16(entry.source_udp_port),
         ));
     }
     tags
+}
+
+fn source_ip_tag(source_ip: Ipv4Addr) -> Tag {
+    Tag::new_short(
+        tag_name::SOURCEIP,
+        TagValue::U32(u32::from_be_bytes(source_ip.octets())),
+    )
+}
+
+fn normalized_source_port_tag(tag: &Tag) -> Tag {
+    let mut tag = tag.clone();
+    if let TagValue::UInt(value) = tag.value
+        && u32::try_from(value).is_ok()
+    {
+        tag.value = TagValue::U32(value as u32);
+    }
+    tag
+}
+
+fn normalized_source_udp_port_tag(tag: &Tag) -> Option<Tag> {
+    let port = match tag.value {
+        TagValue::UInt(value) => u16::try_from(value).ok()?,
+        TagValue::U64(value) => u16::try_from(value).ok()?,
+        TagValue::U32(value) => u16::try_from(value).ok()?,
+        TagValue::U16(value) => value,
+        TagValue::U8(value) => u16::from(value),
+        _ => return None,
+    };
+    if port == 0 {
+        return None;
+    }
+    Some(Tag::new_short(tag_name::SOURCEUPORT, TagValue::U16(port)))
 }
 
 fn source_entry_id(publisher_id: NodeId) -> Ed2kHash {
@@ -924,6 +949,75 @@ mod tests {
     }
 
     #[test]
+    fn source_search_materializes_stock_source_tag_shape() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([3; 16]);
+        let publisher = NodeId::from_bytes([4; 16]);
+        let tags = vec![
+            Tag::new_short(tag_name::SOURCETYPE, TagValue::UInt(1)),
+            Tag::new_short(tag_name::SOURCEPORT, TagValue::UInt(4662)),
+            Tag::new_short(tag_name::SOURCEIP, TagValue::U32(0x0202_0202)),
+            Tag::new_short(tag_name::SOURCEUPORT, TagValue::UInt(4672)),
+            Tag::filesize(456),
+            Tag::new_short(tag_name::SOURCEPORT, TagValue::UInt(9999)),
+            Tag::new_short(tag_name::SOURCEUPORT, TagValue::UInt(9999)),
+            Tag::new_short(tag_name::SOURCETYPE, TagValue::UInt(2)),
+        ];
+
+        assert_eq!(
+            store.record_source_publish(
+                target,
+                publisher,
+                Ipv4Addr::new(1, 1, 1, 1),
+                4672,
+                &tags,
+                ts(1),
+            ),
+            Some(1)
+        );
+        let response = store
+            .source_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchSourceReq {
+                    target,
+                    start_position: 0,
+                    size: 456,
+                },
+                10,
+                ts(1),
+            )
+            .expect("source response");
+        let result_tags = &response.results[0].tags;
+        assert_eq!(
+            short_tag_names(result_tags),
+            vec![
+                tag_name::FILESIZE,
+                tag_name::SOURCEIP,
+                tag_name::SOURCETYPE,
+                tag_name::SOURCEPORT,
+                tag_name::SOURCEIP,
+                tag_name::SOURCEUPORT,
+            ]
+        );
+        assert!(matches!(
+            result_tags[1].value,
+            TagValue::U32(value) if value == 0x0101_0101
+        ));
+        assert!(matches!(
+            result_tags[3].value,
+            TagValue::U32(value) if value == 4662
+        ));
+        assert!(matches!(
+            result_tags[4].value,
+            TagValue::U32(value) if value == 0x0202_0202
+        ));
+        assert!(matches!(
+            result_tags[5].value,
+            TagValue::U16(value) if value == 4672
+        ));
+    }
+
+    #[test]
     fn source_publish_load_matches_stock_source_count_percentage() {
         let mut config = config();
         config.source_capacity = super::STOCK_MAX_SOURCES_PER_FILE + 2;
@@ -1074,5 +1168,14 @@ mod tests {
             Tag::filesize(456),
             Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(source_tcp_port)),
         ]
+    }
+
+    fn short_tag_names(tags: &[Tag]) -> Vec<u8> {
+        tags.iter()
+            .filter_map(|tag| match tag.name {
+                TagName::Short(name) => Some(name),
+                _ => None,
+            })
+            .collect()
     }
 }
