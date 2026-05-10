@@ -598,8 +598,8 @@ fn legacy_source_answer_rejects_v4_shape_from_v3_peer() {
 
 #[test]
 fn request_filename_answer_uses_stock_u16_string_length_prefix() {
-    let packet =
-        super::encode_request_filename_answer(&Ed2kHash([0x55; 16]), "captured.epub").unwrap();
+    let file_hash = Ed2kHash([0x55; 16]);
+    let packet = super::encode_request_filename_answer(&file_hash, "captured.epub").unwrap();
 
     assert_eq!(packet[0], OP_EDONKEYPROT);
     assert_eq!(packet[5], OP_REQFILENAMEANSWER);
@@ -609,6 +609,13 @@ fn request_filename_answer_uses_stock_u16_string_length_prefix() {
         "captured.epub".len()
     );
     assert_eq!(&packet[24..], b"captured.epub");
+
+    let mut payload_with_trailing = packet[6..].to_vec();
+    payload_with_trailing.extend_from_slice(&[0xAA, 0xBB]);
+    assert_eq!(
+        decode_request_filename_answer(&payload_with_trailing).unwrap(),
+        (file_hash, "captured.epub".to_string())
+    );
 }
 
 #[test]

@@ -742,13 +742,7 @@ pub(super) fn decode_file_description_payload(payload: &[u8]) -> Result<FileDesc
 
 pub(super) fn decode_request_filename_answer(payload: &[u8]) -> Result<(Ed2kHash, String)> {
     let file_hash = decode_file_hash_payload(payload)?;
-    let (file_name, remaining) = decode_request_filename_answer_body(&payload[16..])?;
-    if !remaining.is_empty() {
-        anyhow::bail!(
-            "unexpected trailing OP_REQFILENAMEANSWER payload of {} bytes",
-            remaining.len()
-        );
-    }
+    let (file_name, _) = decode_request_filename_answer_body(&payload[16..])?;
     Ok((file_hash, file_name))
 }
 
