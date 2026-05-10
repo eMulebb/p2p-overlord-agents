@@ -171,6 +171,11 @@ fn hello_misc_options1_does_not_advertise_unsupported_comments_or_preview() {
         "comments are not implemented"
     );
     assert_eq!(
+        (misc_options1 >> 3) & 1,
+        0,
+        "defunct PeerCache is not advertised"
+    );
+    assert_eq!(
         (misc_options1 >> 2) & 1,
         1,
         "shared-file browsing is disabled"
