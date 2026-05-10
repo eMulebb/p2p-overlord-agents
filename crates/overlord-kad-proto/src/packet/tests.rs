@@ -655,16 +655,32 @@ fn test_publish_key_req_entry_uses_u8_tag_count_on_wire() {
 fn test_search_source_req_roundtrip() {
     let pkt = KadPacket::SearchSourceReq(SearchSourceReq {
         target: NodeId::from_bytes([0x66; 16]),
-        start_position: 0,
+        start_position: 7,
         size: 99_999_999,
     });
     let pkt2 = roundtrip(&pkt);
     if let KadPacket::SearchSourceReq(req) = pkt2 {
-        assert_eq!(req.start_position, 0);
+        assert_eq!(req.start_position, 7);
         assert_eq!(req.size, 99_999_999);
     } else {
         panic!("wrong type");
     }
+}
+
+#[test]
+fn test_search_source_req_decode_masks_stock_start_position_high_bit() {
+    let mut encoded = vec![OP_KADEMLIAHEADER, opcode::SEARCH_SOURCE_REQ];
+    encoded.extend([0x66; 16]);
+    encoded.extend(0x8007_u16.to_le_bytes());
+    encoded.extend(99_999_999_u64.to_le_bytes());
+
+    let decoded = KadPacket::decode(&encoded).expect("decode source search request");
+    let KadPacket::SearchSourceReq(req) = decoded else {
+        panic!("wrong type");
+    };
+    assert_eq!(req.target, NodeId::from_bytes([0x66; 16]));
+    assert_eq!(req.start_position, 7);
+    assert_eq!(req.size, 99_999_999);
 }
 
 #[test]

@@ -166,18 +166,18 @@ pub(super) fn read_search_source_req(
         .get_ref()
         .len()
         .saturating_sub(cursor.position() as usize);
-    let size = match remaining {
-        4 => u64::from(cursor.read_le::<u32>()?),
-        8 => cursor.read_le::<u64>()?,
+    let (start_position, size) = match remaining {
+        4 => (0, u64::from(cursor.read_le::<u32>()?)),
+        8 => (0, cursor.read_le::<u64>()?),
         10 => {
-            let _legacy_start_position = cursor.read_le::<u16>()?;
-            cursor.read_le::<u64>()?
+            let start_position = cursor.read_le::<u16>()? & 0x7FFF;
+            (start_position, cursor.read_le::<u64>()?)
         }
         _ => return Err(ProtoError::BufferTooShort),
     };
     Ok(SearchSourceReq {
         target,
-        start_position: 0,
+        start_position,
         size,
     })
 }
