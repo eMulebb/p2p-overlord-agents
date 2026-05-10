@@ -20,13 +20,13 @@ use super::super::{
     OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64, OP_SETREQFILEID, OP_SIGNATURE,
     SourceExchangePeer, begin_secure_ident_probe, build_hello_responses,
     decode_aich_file_hash_answer, decode_answer_sources_payload, decode_answer_sources2_payload,
-    decode_file_hash_payload, decode_file_status_payload, decode_hashset_answer,
-    decode_hashset_answer2, decode_hello_profile, decode_public_ip_answer_payload,
-    decode_public_key_payload, decode_request_filename_answer, decode_request_filename_answer_body,
-    decode_secident_state, dump_ed2k_tcp_download_meta, dump_ed2k_tcp_download_recv,
-    dump_ed2k_tcp_download_send, encode_emule_info_answer, encode_packet, encode_port_test_answer,
-    encode_public_ip_answer, is_connection_shutdown_error, skip_file_status_body,
-    try_send_secure_ident_signature,
+    decode_file_description_payload, decode_file_hash_payload, decode_file_status_payload,
+    decode_hashset_answer, decode_hashset_answer2, decode_hello_profile,
+    decode_public_ip_answer_payload, decode_public_key_payload, decode_request_filename_answer,
+    decode_request_filename_answer_body, decode_secident_state, dump_ed2k_tcp_download_meta,
+    dump_ed2k_tcp_download_recv, dump_ed2k_tcp_download_send, encode_emule_info_answer,
+    encode_packet, encode_port_test_answer, encode_public_ip_answer, is_connection_shutdown_error,
+    skip_file_status_body, try_send_secure_ident_signature,
 };
 use super::{
     ActiveDownloadPiece, DownloadRequestWindowState, PendingCompressedPart, PendingPartRequest,
@@ -647,11 +647,16 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     }
                 }
                 (OP_EMULEPROT, OP_FILEDESC) => {
+                    let file_desc = decode_file_description_payload(&packet.payload)?;
                     dump_ed2k_tcp_download_meta(
                         peer_addr,
                         Some(transport.mode),
                         "file_desc",
-                        format!("file_hash={file_hash_hex}"),
+                        format!(
+                            "file_hash={file_hash_hex} rating={} comment_len={}",
+                            file_desc.rating,
+                            file_desc.comment.len()
+                        ),
                     );
                 }
                 (OP_EDONKEYPROT, OP_FILEREQANSNOFIL) => {

@@ -355,6 +355,36 @@ pub(super) fn decode_request_filename_answer_body(payload: &[u8]) -> Result<(Str
     ))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FileDescription {
+    pub(super) rating: u8,
+    pub(super) comment: String,
+}
+
+pub(super) fn decode_file_description_payload(payload: &[u8]) -> Result<FileDescription> {
+    if payload.len() < 5 {
+        anyhow::bail!("short OP_FILEDESC payload {}", payload.len());
+    }
+    let rating = payload[0];
+    let comment_len = usize::try_from(u32::from_le_bytes(payload[1..5].try_into().unwrap()))
+        .context("OP_FILEDESC comment length overflow")?;
+    if payload.len() < 5 + comment_len {
+        anyhow::bail!(
+            "short OP_FILEDESC comment {} expected {}",
+            payload.len() - 5,
+            comment_len
+        );
+    }
+    if payload.len() > 5 + comment_len {
+        anyhow::bail!(
+            "unexpected trailing OP_FILEDESC payload of {} bytes",
+            payload.len() - 5 - comment_len
+        );
+    }
+    let comment = String::from_utf8_lossy(&payload[5..]).into_owned();
+    Ok(FileDescription { rating, comment })
+}
+
 pub(super) fn decode_request_filename_answer(payload: &[u8]) -> Result<(Ed2kHash, String)> {
     let file_hash = decode_file_hash_payload(payload)?;
     let (file_name, remaining) = decode_request_filename_answer_body(&payload[16..])?;

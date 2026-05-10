@@ -197,7 +197,7 @@ async fn queued_peer_waits_past_read_timeout_for_late_accept_upload() {
         let file_desc = encode_packet(
             OP_EMULEPROT,
             super::OP_FILEDESC,
-            &[0x05, 0x00, b'q', b'u', b'e', b'u', b'e'],
+            &[0x05, 0x05, 0x00, 0x00, 0x00, b'q', b'u', b'e', b'u', b'e'],
         );
         stream.write_all(&file_desc).await.unwrap();
 
@@ -363,7 +363,7 @@ async fn obfuscated_queued_peer_waits_for_late_accept_upload() {
         let file_desc = encode_packet(
             OP_EMULEPROT,
             super::OP_FILEDESC,
-            &[0x05, 0x00, b'q', b'u', b'e', b'u', b'e'],
+            &[0x05, 0x05, 0x00, 0x00, 0x00, b'q', b'u', b'e', b'u', b'e'],
         );
         transport.write_all(&file_desc).await.unwrap();
         transport

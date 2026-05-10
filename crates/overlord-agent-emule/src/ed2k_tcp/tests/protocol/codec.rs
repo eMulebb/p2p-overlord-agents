@@ -49,6 +49,19 @@ fn port_test_answer_matches_stock_edonkey_ack_shape() {
 }
 
 #[test]
+fn file_description_decodes_stock_rating_and_long_string() {
+    let mut payload = vec![4];
+    payload.extend_from_slice(&5u32.to_le_bytes());
+    payload.extend_from_slice(b"clean");
+
+    let decoded = decode_file_description_payload(&payload).unwrap();
+
+    assert_eq!(decoded.rating, 4);
+    assert_eq!(decoded.comment, "clean");
+    assert!(decode_file_description_payload(&payload[..4]).is_err());
+}
+
+#[test]
 fn file_identifier_roundtrip_matches_stock_md4_plus_size_shape() {
     let identifier = super::Ed2kFileIdentifier {
         file_hash: Ed2kHash([0xAB; 16]),
