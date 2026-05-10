@@ -48,11 +48,11 @@ pub(in crate::ed2k_tcp) use codec::{
     decode_file_status_payload, decode_hashset_answer, decode_hashset_answer2,
     decode_kad_callback_payload, decode_peer_payload, decode_preview_answer_payload,
     decode_preview_request_payload, decode_public_ip_answer_payload,
-    decode_request_filename_answer, decode_request_filename_answer_body,
-    decode_sending_part_payload, encode_aich_file_hash_request,
-    encode_aich_recovery_failure_answer, encode_hashset_request, encode_hashset_request2,
-    encode_multipacket_ext2_request, encode_multipacket_request, encode_packet,
-    encode_port_test_answer, encode_public_ip_answer, encode_request_filename,
+    decode_reask_callback_tcp_payload, decode_request_filename_answer,
+    decode_request_filename_answer_body, decode_sending_part_payload,
+    encode_aich_file_hash_request, encode_aich_recovery_failure_answer, encode_hashset_request,
+    encode_hashset_request2, encode_multipacket_ext2_request, encode_multipacket_request,
+    encode_packet, encode_port_test_answer, encode_public_ip_answer, encode_request_filename,
     encode_request_parts_batch, encode_request_sources, encode_request_sources2,
     encode_set_req_file_id, encode_start_upload_req, inflate_compressed_part_fragment,
     skip_file_status_body,
@@ -150,6 +150,7 @@ const OP_MULTIPACKETANSWER: u8 = 0x93;
 const OP_PUBLICIP_REQ: u8 = 0x97;
 const OP_PUBLICIP_ANSWER: u8 = 0x98;
 const OP_CALLBACK: u8 = 0x99;
+const OP_REASKCALLBACKTCP: u8 = 0x9A;
 const OP_AICHREQUEST: u8 = 0x9B;
 const OP_AICHANSWER: u8 = 0x9C;
 const OP_AICHFILEHASHANS: u8 = 0x9D;

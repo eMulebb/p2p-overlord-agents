@@ -98,6 +98,24 @@ fn kad_callback_decodes_stock_buddy_forward_shape() {
 }
 
 #[test]
+fn reask_callback_tcp_decodes_buddy_forwarded_udp_reask_shape() {
+    let file_hash = Ed2kHash([0x46; 16]);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&u32::from_be_bytes([198, 51, 100, 8]).to_le_bytes());
+    payload.extend_from_slice(&4672u16.to_le_bytes());
+    payload.extend_from_slice(&file_hash.0);
+    payload.extend_from_slice(&9u16.to_le_bytes());
+
+    let reask = decode_reask_callback_tcp_payload(&payload).unwrap();
+
+    assert_eq!(reask.dest_ip, Ipv4Addr::new(198, 51, 100, 8));
+    assert_eq!(reask.dest_port, 4672);
+    assert_eq!(reask.file_hash, file_hash);
+    assert_eq!(reask.extended_info_len, 2);
+    assert!(decode_reask_callback_tcp_payload(&payload[..21]).is_err());
+}
+
+#[test]
 fn preview_packets_decode_stock_hash_and_frame_shape() {
     let file_hash = Ed2kHash([0x5E; 16]);
     let mut request_payload = file_hash.0.to_vec();

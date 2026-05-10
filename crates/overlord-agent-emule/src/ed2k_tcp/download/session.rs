@@ -17,20 +17,21 @@ use super::super::{
     OP_END_OF_DOWNLOAD, OP_FILEDESC, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_HASHSETANSWER,
     OP_HASHSETANSWER2, OP_HELLO, OP_HELLOANSWER, OP_KAD_FWTCPCHECK_ACK, OP_MULTIPACKETANSWER,
     OP_MULTIPACKETANSWER_EXT2, OP_OUTOFPARTREQS, OP_PORTTEST, OP_PREVIEWANSWER, OP_PUBLICIP_ANSWER,
-    OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_QUEUERANK, OP_QUEUERANKING, OP_REQFILENAMEANSWER,
-    OP_REQUESTPREVIEW, OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64, OP_SETREQFILEID,
-    OP_SIGNATURE, SourceExchangePeer, begin_secure_ident_probe, build_hello_responses,
-    decode_aich_file_hash_answer, decode_aich_recovery_answer_payload,
+    OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_QUEUERANK, OP_QUEUERANKING, OP_REASKCALLBACKTCP,
+    OP_REQFILENAMEANSWER, OP_REQUESTPREVIEW, OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64,
+    OP_SETREQFILEID, OP_SIGNATURE, SourceExchangePeer, begin_secure_ident_probe,
+    build_hello_responses, decode_aich_file_hash_answer, decode_aich_recovery_answer_payload,
     decode_aich_recovery_request_payload, decode_answer_sources_payload,
     decode_answer_sources2_payload, decode_client_id_change_payload,
     decode_file_description_payload, decode_file_hash_payload, decode_file_status_payload,
     decode_hashset_answer, decode_hashset_answer2, decode_hello_profile,
     decode_kad_callback_payload, decode_preview_answer_payload, decode_preview_request_payload,
-    decode_public_ip_answer_payload, decode_public_key_payload, decode_request_filename_answer,
-    decode_request_filename_answer_body, decode_secident_state, dump_ed2k_tcp_download_meta,
-    dump_ed2k_tcp_download_recv, dump_ed2k_tcp_download_send, encode_aich_recovery_failure_answer,
-    encode_emule_info_answer, encode_packet, encode_port_test_answer, encode_public_ip_answer,
-    is_connection_shutdown_error, skip_file_status_body, try_send_secure_ident_signature,
+    decode_public_ip_answer_payload, decode_public_key_payload, decode_reask_callback_tcp_payload,
+    decode_request_filename_answer, decode_request_filename_answer_body, decode_secident_state,
+    dump_ed2k_tcp_download_meta, dump_ed2k_tcp_download_recv, dump_ed2k_tcp_download_send,
+    encode_aich_recovery_failure_answer, encode_emule_info_answer, encode_packet,
+    encode_port_test_answer, encode_public_ip_answer, is_connection_shutdown_error,
+    skip_file_status_body, try_send_secure_ident_signature,
 };
 use super::{
     ActiveDownloadPiece, DownloadRequestWindowState, PendingCompressedPart, PendingPartRequest,
@@ -401,6 +402,18 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                             callback.peer_tcp_port,
                             hex::encode(callback.buddy_check),
                             callback.trailing_len
+                        ),
+                    );
+                }
+                (OP_EMULEPROT, OP_REASKCALLBACKTCP) => {
+                    let reask = decode_reask_callback_tcp_payload(&packet.payload)?;
+                    dump_ed2k_tcp_download_meta(
+                        peer_addr,
+                        Some(transport.mode),
+                        "reask_callback_tcp",
+                        format!(
+                            "file_hash={} dest={}:{} extended_info_len={}",
+                            reask.file_hash, reask.dest_ip, reask.dest_port, reask.extended_info_len
                         ),
                     );
                 }

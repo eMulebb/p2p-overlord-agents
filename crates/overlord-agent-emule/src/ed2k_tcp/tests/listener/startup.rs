@@ -326,6 +326,19 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
         ))
         .await
         .unwrap();
+    let mut reask_callback_payload = Vec::new();
+    reask_callback_payload.extend_from_slice(&u32::from_be_bytes([127, 0, 0, 1]).to_le_bytes());
+    reask_callback_payload.extend_from_slice(&4672u16.to_le_bytes());
+    reask_callback_payload.extend_from_slice(&file_hash.0);
+    reask_callback_payload.extend_from_slice(&1u16.to_le_bytes());
+    stream
+        .write_all(&super::encode_packet(
+            OP_EMULEPROT,
+            OP_REASKCALLBACKTCP,
+            &reask_callback_payload,
+        ))
+        .await
+        .unwrap();
 
     stream
         .write_all(&super::encode_start_upload_req(&file_hash))

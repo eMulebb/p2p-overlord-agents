@@ -166,6 +166,27 @@ pub(super) fn decode_kad_callback_payload(payload: &[u8]) -> Result<KadCallbackR
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReaskCallbackTcp {
+    pub(super) dest_ip: Ipv4Addr,
+    pub(super) dest_port: u16,
+    pub(super) file_hash: Ed2kHash,
+    pub(super) extended_info_len: usize,
+}
+
+pub(super) fn decode_reask_callback_tcp_payload(payload: &[u8]) -> Result<ReaskCallbackTcp> {
+    if payload.len() < 22 {
+        anyhow::bail!("short OP_REASKCALLBACKTCP payload {}", payload.len());
+    }
+    let raw_dest_ip = u32::from_le_bytes(payload[..4].try_into().unwrap());
+    Ok(ReaskCallbackTcp {
+        dest_ip: Ipv4Addr::from(raw_dest_ip.to_be_bytes()),
+        dest_port: u16::from_le_bytes(payload[4..6].try_into().unwrap()),
+        file_hash: Ed2kHash(payload[6..22].try_into().unwrap()),
+        extended_info_len: payload.len() - 22,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PreviewRequest {
     pub(super) file_hash: Ed2kHash,
     pub(super) trailing_len: usize,
