@@ -96,6 +96,7 @@ pub mod tag_name {
     pub const KADMISCOPTIONS: u8 = 0xF2;
     pub const ENCRYPTION: u8 = 0xF3;
     pub const FILERATING: u8 = 0xF7;
+    pub const SERVERIP: u8 = 0xFB;
     pub const SOURCEUPORT: u8 = 0xFC;
     pub const SOURCEPORT: u8 = 0xFD;
     pub const SOURCEIP: u8 = 0xFE;

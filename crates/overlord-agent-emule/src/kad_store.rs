@@ -185,7 +185,7 @@ impl KadLocalStore {
                 source_ip,
                 source_tcp_port,
                 source_udp_port,
-                tags: stock_stored_publish_tags(tags),
+                tags: stock_stored_source_publish_tags(tags),
                 dedup_key,
             },
         );
@@ -350,6 +350,30 @@ fn stock_stored_publish_tags(tags: &[Tag]) -> Vec<Tag> {
         })
         .cloned()
         .collect()
+}
+
+fn stock_stored_source_publish_tags(tags: &[Tag]) -> Vec<Tag> {
+    stock_stored_publish_tags(tags)
+        .into_iter()
+        .filter(|tag| {
+            !matches!(
+                (&tag.name, &tag.value),
+                (TagName::Short(name), value)
+                    if *name == tag_name::SERVERIP && !is_integer_tag_value(value)
+            )
+        })
+        .collect()
+}
+
+fn is_integer_tag_value(value: &TagValue) -> bool {
+    matches!(
+        value,
+        TagValue::UInt(_)
+            | TagValue::U64(_)
+            | TagValue::U32(_)
+            | TagValue::U16(_)
+            | TagValue::U8(_)
+    )
 }
 
 fn is_stock_source_publish(tags: &[Tag]) -> bool {
@@ -1613,6 +1637,51 @@ mod tests {
             .expect("source response");
 
         assert!(!short_tag_names(&response.results[0].tags).contains(&tag_name::SOURCEUPORT));
+    }
+
+    #[test]
+    fn source_publish_drops_non_integer_server_ip_tag_like_stock() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([3; 16]);
+        let tags = vec![
+            Tag::new_short(tag_name::SOURCETYPE, TagValue::UInt(1)),
+            Tag::new_short(tag_name::SOURCEPORT, TagValue::UInt(4662)),
+            Tag::new_short(tag_name::SERVERIP, TagValue::String("bad".into())),
+            Tag::new_short(tag_name::SERVERIP, TagValue::U32(0x0202_0202)),
+            Tag::filesize(456),
+        ];
+
+        store.record_source_publish(
+            target,
+            NodeId::from_bytes([4; 16]),
+            Ipv4Addr::new(1, 1, 1, 1),
+            4672,
+            &tags,
+            ts(1),
+        );
+        let response = store
+            .source_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchSourceReq {
+                    target,
+                    start_position: 0,
+                    size: 456,
+                },
+                10,
+                ts(1),
+            )
+            .expect("source response");
+
+        let server_ip_tags = response.results[0]
+            .tags
+            .iter()
+            .filter(|tag| matches!(&tag.name, TagName::Short(name) if *name == tag_name::SERVERIP))
+            .collect::<Vec<_>>();
+        assert_eq!(server_ip_tags.len(), 1);
+        assert!(matches!(
+            &server_ip_tags[0].value,
+            TagValue::U32(value) if *value == 0x0202_0202
+        ));
     }
 
     #[test]
