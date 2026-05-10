@@ -370,6 +370,44 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
         ))
         .await
         .unwrap();
+    stream
+        .write_all(&super::encode_packet(
+            OP_EDONKEYPROT,
+            OP_ASKSHAREDFILES,
+            &[],
+        ))
+        .await
+        .unwrap();
+    let shared_files_answer = read_packet(&mut stream).await;
+    assert_eq!(shared_files_answer[0], OP_EDONKEYPROT);
+    assert_eq!(shared_files_answer[5], OP_ASKSHAREDFILESANSWER);
+    let shared_files =
+        super::decode_shared_files_answer_payload(&shared_files_answer[6..]).unwrap();
+    assert_eq!(shared_files.file_count, 0);
+    assert_eq!(shared_files.entry_bytes, 0);
+
+    stream
+        .write_all(&super::encode_packet(OP_EDONKEYPROT, OP_ASKSHAREDDIRS, &[]))
+        .await
+        .unwrap();
+    let shared_dirs_denied = read_packet(&mut stream).await;
+    assert_eq!(shared_dirs_denied[0], OP_EDONKEYPROT);
+    assert_eq!(shared_dirs_denied[5], OP_ASKSHAREDDENIEDANS);
+
+    let mut dir_request = Vec::new();
+    dir_request.extend_from_slice(&5u16.to_le_bytes());
+    dir_request.extend_from_slice(b"Music");
+    stream
+        .write_all(&super::encode_packet(
+            OP_EDONKEYPROT,
+            OP_ASKSHAREDFILESDIR,
+            &dir_request,
+        ))
+        .await
+        .unwrap();
+    let shared_dir_denied = read_packet(&mut stream).await;
+    assert_eq!(shared_dir_denied[0], OP_EDONKEYPROT);
+    assert_eq!(shared_dir_denied[5], OP_ASKSHAREDDENIEDANS);
 
     stream
         .write_all(&super::encode_start_upload_req(&file_hash))

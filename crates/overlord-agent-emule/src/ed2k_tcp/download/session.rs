@@ -12,16 +12,18 @@ use super::super::{
     ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED, ED2K_SECURE_IDENT_SIGNATURE_NEEDED,
     Ed2kFileIdentifier, Ed2kHelloIdentity, Ed2kSecureIdent, Ed2kTransport, OP_ACCEPTUPLOADREQ,
     OP_AICHANSWER, OP_AICHFILEHASHANS, OP_AICHREQUEST, OP_ANSWERSOURCES, OP_ANSWERSOURCES2,
-    OP_BUDDYPING, OP_BUDDYPONG, OP_CALLBACK, OP_CHANGE_CLIENT_ID, OP_CHANGE_SLOT,
-    OP_CHATCAPTCHAREQ, OP_CHATCAPTCHARES, OP_COMPRESSEDPART, OP_COMPRESSEDPART_I64, OP_EDONKEYPROT,
-    OP_EMULEINFO, OP_EMULEINFOANSWER, OP_EMULEPROT, OP_END_OF_DOWNLOAD, OP_FILEDESC,
-    OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_HASHSETANSWER, OP_HASHSETANSWER2, OP_HELLO,
-    OP_HELLOANSWER, OP_KAD_FWTCPCHECK_ACK, OP_MESSAGE, OP_MULTIPACKETANSWER,
-    OP_MULTIPACKETANSWER_EXT2, OP_OUTOFPARTREQS, OP_PORTTEST, OP_PREVIEWANSWER, OP_PUBLICIP_ANSWER,
-    OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_QUEUERANK, OP_QUEUERANKING, OP_REASKCALLBACKTCP,
-    OP_REQFILENAMEANSWER, OP_REQUESTPREVIEW, OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64,
-    OP_SETREQFILEID, OP_SIGNATURE, SourceExchangePeer, begin_secure_ident_probe,
-    build_hello_responses, decode_aich_file_hash_answer, decode_aich_recovery_answer_payload,
+    OP_ASKSHAREDDENIEDANS, OP_ASKSHAREDDIRS, OP_ASKSHAREDDIRSANS, OP_ASKSHAREDFILES,
+    OP_ASKSHAREDFILESANSWER, OP_ASKSHAREDFILESDIR, OP_ASKSHAREDFILESDIRANS, OP_BUDDYPING,
+    OP_BUDDYPONG, OP_CALLBACK, OP_CHANGE_CLIENT_ID, OP_CHANGE_SLOT, OP_CHATCAPTCHAREQ,
+    OP_CHATCAPTCHARES, OP_COMPRESSEDPART, OP_COMPRESSEDPART_I64, OP_EDONKEYPROT, OP_EMULEINFO,
+    OP_EMULEINFOANSWER, OP_EMULEPROT, OP_END_OF_DOWNLOAD, OP_FILEDESC, OP_FILEREQANSNOFIL,
+    OP_FILESTATUS, OP_HASHSETANSWER, OP_HASHSETANSWER2, OP_HELLO, OP_HELLOANSWER,
+    OP_KAD_FWTCPCHECK_ACK, OP_MESSAGE, OP_MULTIPACKETANSWER, OP_MULTIPACKETANSWER_EXT2,
+    OP_OUTOFPARTREQS, OP_PORTTEST, OP_PREVIEWANSWER, OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ,
+    OP_PUBLICKEY, OP_QUEUERANK, OP_QUEUERANKING, OP_REASKCALLBACKTCP, OP_REQFILENAMEANSWER,
+    OP_REQUESTPREVIEW, OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64, OP_SETREQFILEID,
+    OP_SIGNATURE, SourceExchangePeer, begin_secure_ident_probe, build_hello_responses,
+    decode_aich_file_hash_answer, decode_aich_recovery_answer_payload,
     decode_aich_recovery_request_payload, decode_answer_sources_payload,
     decode_answer_sources2_payload, decode_chat_captcha_request_payload,
     decode_chat_captcha_result_payload, decode_client_id_change_payload,
@@ -30,9 +32,12 @@ use super::super::{
     decode_hello_profile, decode_kad_callback_payload, decode_preview_answer_payload,
     decode_preview_request_payload, decode_public_ip_answer_payload, decode_public_key_payload,
     decode_reask_callback_tcp_payload, decode_request_filename_answer,
-    decode_request_filename_answer_body, decode_secident_state, dump_ed2k_tcp_download_meta,
+    decode_request_filename_answer_body, decode_secident_state, decode_shared_dirs_answer_payload,
+    decode_shared_files_answer_payload, decode_shared_files_dir_answer_payload,
+    decode_shared_files_dir_request_payload, dump_ed2k_tcp_download_meta,
     dump_ed2k_tcp_download_recv, dump_ed2k_tcp_download_send, encode_aich_recovery_failure_answer,
-    encode_emule_info_answer, encode_packet, encode_port_test_answer, encode_public_ip_answer,
+    encode_empty_shared_files_answer, encode_emule_info_answer, encode_packet,
+    encode_port_test_answer, encode_public_ip_answer, encode_shared_browse_denied_answer,
     is_connection_shutdown_error, skip_file_status_body, try_send_secure_ident_signature,
 };
 use super::{
@@ -742,6 +747,102 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                             "message_len={} accepted_len={}",
                             message.message_len, message.accepted_len
                         ),
+                    );
+                }
+                (OP_EDONKEYPROT, OP_ASKSHAREDFILES) => {
+                    dump_ed2k_tcp_download_meta(
+                        peer_addr,
+                        Some(transport.mode),
+                        "ask_shared_files",
+                        format!("payload_len={}", packet.payload.len()),
+                    );
+                    let reply = encode_empty_shared_files_answer();
+                    dump_ed2k_tcp_download_send(
+                        peer_addr,
+                        transport.mode,
+                        "shared_files_answer",
+                        &reply,
+                    );
+                    transport.write_all(&reply).await.with_context(|| {
+                        format!("failed to send OP_ASKSHAREDFILESANSWER to {peer_addr}")
+                    })?;
+                }
+                (OP_EDONKEYPROT, OP_ASKSHAREDDIRS) => {
+                    dump_ed2k_tcp_download_meta(
+                        peer_addr,
+                        Some(transport.mode),
+                        "ask_shared_dirs",
+                        format!("payload_len={}", packet.payload.len()),
+                    );
+                    let reply = encode_shared_browse_denied_answer();
+                    dump_ed2k_tcp_download_send(
+                        peer_addr,
+                        transport.mode,
+                        "shared_browse_denied",
+                        &reply,
+                    );
+                    transport.write_all(&reply).await.with_context(|| {
+                        format!("failed to send OP_ASKSHAREDDENIEDANS to {peer_addr}")
+                    })?;
+                }
+                (OP_EDONKEYPROT, OP_ASKSHAREDFILESDIR) => {
+                    let dir = decode_shared_files_dir_request_payload(&packet.payload)?;
+                    dump_ed2k_tcp_download_meta(
+                        peer_addr,
+                        Some(transport.mode),
+                        "ask_shared_files_dir",
+                        format!("dir={dir}"),
+                    );
+                    let reply = encode_shared_browse_denied_answer();
+                    dump_ed2k_tcp_download_send(
+                        peer_addr,
+                        transport.mode,
+                        "shared_browse_denied",
+                        &reply,
+                    );
+                    transport.write_all(&reply).await.with_context(|| {
+                        format!("failed to send OP_ASKSHAREDDENIEDANS to {peer_addr}")
+                    })?;
+                }
+                (OP_EDONKEYPROT, OP_ASKSHAREDFILESANSWER) => {
+                    let answer = decode_shared_files_answer_payload(&packet.payload)?;
+                    dump_ed2k_tcp_download_meta(
+                        peer_addr,
+                        Some(transport.mode),
+                        "shared_files_answer",
+                        format!(
+                            "file_count={} entry_bytes={}",
+                            answer.file_count, answer.entry_bytes
+                        ),
+                    );
+                }
+                (OP_EDONKEYPROT, OP_ASKSHAREDDIRSANS) => {
+                    let answer = decode_shared_dirs_answer_payload(&packet.payload)?;
+                    dump_ed2k_tcp_download_meta(
+                        peer_addr,
+                        Some(transport.mode),
+                        "shared_dirs_answer",
+                        format!("dir_count={} dirs={}", answer.dir_count, answer.dirs.len()),
+                    );
+                }
+                (OP_EDONKEYPROT, OP_ASKSHAREDFILESDIRANS) => {
+                    let answer = decode_shared_files_dir_answer_payload(&packet.payload)?;
+                    dump_ed2k_tcp_download_meta(
+                        peer_addr,
+                        Some(transport.mode),
+                        "shared_files_dir_answer",
+                        format!(
+                            "dir={} file_count={} entry_bytes={}",
+                            answer.dir, answer.file_count, answer.entry_bytes
+                        ),
+                    );
+                }
+                (OP_EDONKEYPROT, OP_ASKSHAREDDENIEDANS) => {
+                    dump_ed2k_tcp_download_meta(
+                        peer_addr,
+                        Some(transport.mode),
+                        "shared_browse_denied",
+                        format!("payload_len={}", packet.payload.len()),
                     );
                 }
                 (OP_EMULEPROT, OP_FILEDESC) => {

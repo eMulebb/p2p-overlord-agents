@@ -25,11 +25,12 @@ pub(super) use upload::{encode_compressed_part_fragment, encode_sending_part};
 use super::{
     ED2K_SOURCE_EXCHANGE2_VERSION, Ed2kFileIdentifier, MAX_PEER_DECOMPRESSED_PACKET_LEN,
     OP_ACCEPTUPLOADREQ, OP_AICHANSWER, OP_AICHFILEHASHANS, OP_AICHFILEHASHREQ, OP_ANSWERSOURCES,
-    OP_ANSWERSOURCES2, OP_EDONKEYPROT, OP_EMULEPROT, OP_FILEREQANSNOFIL, OP_FILESTATUS,
-    OP_MULTIPACKET, OP_MULTIPACKET_EXT, OP_MULTIPACKET_EXT2, OP_MULTIPACKETANSWER,
-    OP_MULTIPACKETANSWER_EXT2, OP_PACKEDPROT, OP_PORTTEST, OP_PUBLICIP_ANSWER, OP_QUEUERANKING,
-    OP_REQFILENAMEANSWER, OP_REQUESTFILENAME, OP_REQUESTSOURCES, OP_REQUESTSOURCES2,
-    OP_SETREQFILEID, OP_STARTUPLOADREQ, TCP_PACKET_HEADER_LEN,
+    OP_ANSWERSOURCES2, OP_ASKSHAREDDENIEDANS, OP_ASKSHAREDFILESANSWER, OP_EDONKEYPROT,
+    OP_EMULEPROT, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_MULTIPACKET, OP_MULTIPACKET_EXT,
+    OP_MULTIPACKET_EXT2, OP_MULTIPACKETANSWER, OP_MULTIPACKETANSWER_EXT2, OP_PACKEDPROT,
+    OP_PORTTEST, OP_PUBLICIP_ANSWER, OP_QUEUERANKING, OP_REQFILENAMEANSWER, OP_REQUESTFILENAME,
+    OP_REQUESTSOURCES, OP_REQUESTSOURCES2, OP_SETREQFILEID, OP_STARTUPLOADREQ,
+    TCP_PACKET_HEADER_LEN,
 };
 
 pub(super) fn decode_peer_payload(protocol: u8, payload: Vec<u8>) -> Result<(u8, Vec<u8>)> {
@@ -553,28 +554,117 @@ pub(super) fn encode_set_req_file_id(file_hash: &Ed2kHash) -> Vec<u8> {
 }
 
 pub(super) fn encode_request_filename_answer_body(file_name: &str) -> Result<Vec<u8>> {
-    let file_name = file_name.as_bytes();
-    let mut payload = Vec::with_capacity(2 + file_name.len());
+    encode_ed2k_string_body(file_name, "ED2K string")
+}
+
+fn encode_ed2k_string_body(value: &str, context: &str) -> Result<Vec<u8>> {
+    let value = value.as_bytes();
+    let mut payload = Vec::with_capacity(2 + value.len());
     payload.extend_from_slice(
-        &(u16::try_from(file_name.len()).context("file name too large for ED2K filename reply")?)
+        &(u16::try_from(value.len()).with_context(|| format!("{context} too large"))?)
             .to_le_bytes(),
     );
-    payload.extend_from_slice(file_name);
+    payload.extend_from_slice(value);
     Ok(payload)
 }
 
 pub(super) fn decode_request_filename_answer_body(payload: &[u8]) -> Result<(String, &[u8])> {
+    decode_ed2k_string_body(payload, "OP_REQFILENAMEANSWER")
+}
+
+fn decode_ed2k_string_body<'a>(payload: &'a [u8], context: &str) -> Result<(String, &'a [u8])> {
     if payload.len() < 2 {
-        anyhow::bail!("short OP_REQFILENAMEANSWER body");
+        anyhow::bail!("short {context} string body");
     }
     let len = usize::from(u16::from_le_bytes([payload[0], payload[1]]));
     if payload.len() < 2 + len {
-        anyhow::bail!("short OP_REQFILENAMEANSWER string");
+        anyhow::bail!("short {context} string");
     }
     Ok((
         String::from_utf8_lossy(&payload[2..2 + len]).into_owned(),
         &payload[2 + len..],
     ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SharedFilesAnswer {
+    pub(super) file_count: u32,
+    pub(super) entry_bytes: usize,
+}
+
+pub(super) fn encode_empty_shared_files_answer() -> Vec<u8> {
+    encode_packet(OP_EDONKEYPROT, OP_ASKSHAREDFILESANSWER, &0u32.to_le_bytes())
+}
+
+pub(super) fn encode_shared_browse_denied_answer() -> Vec<u8> {
+    encode_packet(OP_EDONKEYPROT, OP_ASKSHAREDDENIEDANS, &[])
+}
+
+pub(super) fn decode_shared_files_answer_payload(payload: &[u8]) -> Result<SharedFilesAnswer> {
+    if payload.len() < 4 {
+        anyhow::bail!("short OP_ASKSHAREDFILESANSWER payload {}", payload.len());
+    }
+    Ok(SharedFilesAnswer {
+        file_count: u32::from_le_bytes(payload[..4].try_into().unwrap()),
+        entry_bytes: payload.len() - 4,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SharedDirsAnswer {
+    pub(super) dir_count: u32,
+    pub(super) dirs: Vec<String>,
+}
+
+pub(super) fn decode_shared_dirs_answer_payload(payload: &[u8]) -> Result<SharedDirsAnswer> {
+    if payload.len() < 4 {
+        anyhow::bail!("short OP_ASKSHAREDDIRSANS payload {}", payload.len());
+    }
+    let dir_count = u32::from_le_bytes(payload[..4].try_into().unwrap());
+    let mut remaining = &payload[4..];
+    let mut dirs = Vec::new();
+    for _ in 0..dir_count {
+        let (dir, rest) = decode_ed2k_string_body(remaining, "OP_ASKSHAREDDIRSANS")?;
+        dirs.push(dir);
+        remaining = rest;
+    }
+    if !remaining.is_empty() {
+        anyhow::bail!(
+            "unexpected trailing OP_ASKSHAREDDIRSANS payload of {} bytes",
+            remaining.len()
+        );
+    }
+    Ok(SharedDirsAnswer { dir_count, dirs })
+}
+
+pub(super) fn decode_shared_files_dir_request_payload(payload: &[u8]) -> Result<String> {
+    let (dir, remaining) = decode_ed2k_string_body(payload, "OP_ASKSHAREDFILESDIR")?;
+    if !remaining.is_empty() {
+        anyhow::bail!(
+            "unexpected trailing OP_ASKSHAREDFILESDIR payload of {} bytes",
+            remaining.len()
+        );
+    }
+    Ok(dir)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SharedFilesDirAnswer {
+    pub(super) dir: String,
+    pub(super) file_count: u32,
+    pub(super) entry_bytes: usize,
+}
+
+pub(super) fn decode_shared_files_dir_answer_payload(
+    payload: &[u8],
+) -> Result<SharedFilesDirAnswer> {
+    let (dir, remaining) = decode_ed2k_string_body(payload, "OP_ASKSHAREDFILESDIRANS")?;
+    let files = decode_shared_files_answer_payload(remaining)?;
+    Ok(SharedFilesDirAnswer {
+        dir,
+        file_count: files.file_count,
+        entry_bytes: files.entry_bytes,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

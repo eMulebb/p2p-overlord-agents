@@ -52,12 +52,15 @@ pub(in crate::ed2k_tcp) use codec::{
     decode_preview_request_payload, decode_public_ip_answer_payload,
     decode_reask_callback_tcp_payload, decode_request_filename_answer,
     decode_request_filename_answer_body, decode_sending_part_payload,
-    encode_aich_file_hash_request, encode_aich_recovery_failure_answer, encode_hashset_request,
-    encode_hashset_request2, encode_multipacket_ext2_request, encode_multipacket_request,
-    encode_packet, encode_port_test_answer, encode_public_ip_answer, encode_request_filename,
+    decode_shared_dirs_answer_payload, decode_shared_files_answer_payload,
+    decode_shared_files_dir_answer_payload, decode_shared_files_dir_request_payload,
+    encode_aich_file_hash_request, encode_aich_recovery_failure_answer,
+    encode_empty_shared_files_answer, encode_hashset_request, encode_hashset_request2,
+    encode_multipacket_ext2_request, encode_multipacket_request, encode_packet,
+    encode_port_test_answer, encode_public_ip_answer, encode_request_filename,
     encode_request_parts_batch, encode_request_sources, encode_request_sources2,
-    encode_set_req_file_id, encode_start_upload_req, inflate_compressed_part_fragment,
-    skip_file_status_body,
+    encode_set_req_file_id, encode_shared_browse_denied_answer, encode_start_upload_req,
+    inflate_compressed_part_fragment, skip_file_status_body,
 };
 #[cfg(test)]
 #[allow(unused_imports)]
@@ -127,6 +130,8 @@ const OP_SENDINGPART: u8 = 0x46;
 const OP_REQUESTPARTS: u8 = 0x47;
 const OP_FILEREQANSNOFIL: u8 = 0x48;
 const OP_END_OF_DOWNLOAD: u8 = 0x49;
+const OP_ASKSHAREDFILES: u8 = 0x4A;
+const OP_ASKSHAREDFILESANSWER: u8 = 0x4B;
 const OP_CHANGE_CLIENT_ID: u8 = 0x4D;
 const OP_MESSAGE: u8 = 0x4E;
 const OP_SETREQFILEID: u8 = 0x4F;
@@ -141,6 +146,11 @@ const OP_REQUESTFILENAME: u8 = 0x58;
 const OP_REQFILENAMEANSWER: u8 = 0x59;
 const OP_CHANGE_SLOT: u8 = 0x5B;
 const OP_QUEUERANK: u8 = 0x5C;
+const OP_ASKSHAREDDIRS: u8 = 0x5D;
+const OP_ASKSHAREDFILESDIR: u8 = 0x5E;
+const OP_ASKSHAREDDIRSANS: u8 = 0x5F;
+const OP_ASKSHAREDFILESDIRANS: u8 = 0x60;
+const OP_ASKSHAREDDENIEDANS: u8 = 0x61;
 const OP_QUEUERANKING: u8 = 0x60;
 const OP_FILEDESC: u8 = 0x61;
 const OP_REQUESTSOURCES: u8 = 0x81;

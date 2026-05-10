@@ -140,6 +140,43 @@ fn client_message_decodes_stock_length_prefix_and_truncation_limit() {
 }
 
 #[test]
+fn shared_browse_packets_use_stock_empty_and_denied_shapes() {
+    let empty_answer = encode_empty_shared_files_answer();
+    assert_eq!(empty_answer[0], OP_EDONKEYPROT);
+    assert_eq!(empty_answer[5], OP_ASKSHAREDFILESANSWER);
+    let shared_files = decode_shared_files_answer_payload(&empty_answer[6..]).unwrap();
+    assert_eq!(shared_files.file_count, 0);
+    assert_eq!(shared_files.entry_bytes, 0);
+
+    let denied = encode_shared_browse_denied_answer();
+    assert_eq!(denied[0], OP_EDONKEYPROT);
+    assert_eq!(denied[5], OP_ASKSHAREDDENIEDANS);
+    assert_eq!(denied.len(), 6);
+
+    let mut dir_request = Vec::new();
+    dir_request.extend_from_slice(&5u16.to_le_bytes());
+    dir_request.extend_from_slice(b"Music");
+    assert_eq!(
+        decode_shared_files_dir_request_payload(&dir_request).unwrap(),
+        "Music"
+    );
+
+    let mut dirs_answer = Vec::new();
+    dirs_answer.extend_from_slice(&1u32.to_le_bytes());
+    dirs_answer.extend_from_slice(&dir_request);
+    let decoded_dirs = decode_shared_dirs_answer_payload(&dirs_answer).unwrap();
+    assert_eq!(decoded_dirs.dir_count, 1);
+    assert_eq!(decoded_dirs.dirs, vec!["Music"]);
+
+    let mut dir_files_answer = dir_request;
+    dir_files_answer.extend_from_slice(&0u32.to_le_bytes());
+    let decoded_dir_files = decode_shared_files_dir_answer_payload(&dir_files_answer).unwrap();
+    assert_eq!(decoded_dir_files.dir, "Music");
+    assert_eq!(decoded_dir_files.file_count, 0);
+    assert_eq!(decoded_dir_files.entry_bytes, 0);
+}
+
+#[test]
 fn preview_packets_decode_stock_hash_and_frame_shape() {
     let file_hash = Ed2kHash([0x5E; 16]);
     let mut request_payload = file_hash.0.to_vec();
