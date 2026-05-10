@@ -4,7 +4,9 @@ use anyhow::Result;
 use chrono::Utc;
 use overlord_agent_common::{KadHarvestObservability, SnoopObservation};
 use overlord_kad_dht::{DhtNode, ReceivedKadPacket};
-use overlord_kad_proto::{Ed2kHash, KadPacket, constants::K, packet::ContactEntry};
+use overlord_kad_proto::{
+    Ed2kHash, KadPacket, SearchRes, SearchResultEntry, constants::K, packet::ContactEntry,
+};
 use overlord_kad_routing::Contact;
 use tokio::{
     net::TcpListener,
@@ -13,7 +15,8 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use super::{
-    LOCAL_SEARCH_RESPONSE_LIMIT,
+    LOCAL_KEYWORD_SEARCH_RESPONSE_LIMIT, LOCAL_NOTES_SEARCH_RESPONSE_LIMIT,
+    LOCAL_SEARCH_RESPONSE_MAX_PACKET_BYTES, LOCAL_SOURCE_SEARCH_RESPONSE_LIMIT,
     kad_firewall_runtime::{
         KadFirewalledCheckContext, spawn_firewalled_response, spawn_kad_firewalled_check,
         spawn_modern_firewalled_response,
@@ -298,12 +301,16 @@ pub(super) async fn handle_unsolicited_packet(
                 store.keyword_search_response(
                     dht.own_id(),
                     &req,
-                    LOCAL_SEARCH_RESPONSE_LIMIT,
+                    LOCAL_KEYWORD_SEARCH_RESPONSE_LIMIT,
                     observed_at,
                 )
             };
             if let Some(response) = response {
-                let _ = dht.send_packet(from, &KadPacket::SearchRes(response)).await;
+                for response in
+                    split_stock_search_responses(response, LOCAL_SEARCH_RESPONSE_MAX_PACKET_BYTES)
+                {
+                    let _ = dht.send_packet(from, &KadPacket::SearchRes(response)).await;
+                }
             }
         }
         KadPacket::SearchSourceReq(req) => {
@@ -321,12 +328,16 @@ pub(super) async fn handle_unsolicited_packet(
                 store.source_search_response(
                     dht.own_id(),
                     &req,
-                    LOCAL_SEARCH_RESPONSE_LIMIT,
+                    LOCAL_SOURCE_SEARCH_RESPONSE_LIMIT,
                     observed_at,
                 )
             };
             if let Some(response) = response {
-                let _ = dht.send_packet(from, &KadPacket::SearchRes(response)).await;
+                for response in
+                    split_stock_search_responses(response, LOCAL_SEARCH_RESPONSE_MAX_PACKET_BYTES)
+                {
+                    let _ = dht.send_packet(from, &KadPacket::SearchRes(response)).await;
+                }
             }
         }
         KadPacket::SearchNotesReq(req) => {
@@ -344,12 +355,16 @@ pub(super) async fn handle_unsolicited_packet(
                 store.notes_search_response(
                     dht.own_id(),
                     &req,
-                    LOCAL_SEARCH_RESPONSE_LIMIT,
+                    LOCAL_NOTES_SEARCH_RESPONSE_LIMIT,
                     observed_at,
                 )
             };
             if let Some(response) = response {
-                let _ = dht.send_packet(from, &KadPacket::SearchRes(response)).await;
+                for response in
+                    split_stock_search_responses(response, LOCAL_SEARCH_RESPONSE_MAX_PACKET_BYTES)
+                {
+                    let _ = dht.send_packet(from, &KadPacket::SearchRes(response)).await;
+                }
             }
         }
         KadPacket::PublishKeyReq(req) => {
@@ -426,6 +441,65 @@ pub(super) async fn handle_unsolicited_packet(
     Ok(())
 }
 
+fn split_stock_search_responses(response: SearchRes, max_packet_bytes: usize) -> Vec<SearchRes> {
+    if max_packet_bytes == 0 || response.results.len() <= 1 {
+        return vec![response];
+    }
+
+    let SearchRes {
+        sender_id,
+        target,
+        results,
+    } = response;
+    let mut pages = Vec::new();
+    let mut current = Vec::new();
+
+    for result in results {
+        if current.is_empty() {
+            current.push(result);
+            continue;
+        }
+
+        let mut candidate = current.clone();
+        candidate.push(result.clone());
+        if encoded_search_response_len(sender_id, target, &candidate) > max_packet_bytes {
+            pages.push(SearchRes {
+                sender_id,
+                target,
+                results: current,
+            });
+            current = vec![result];
+        } else {
+            current = candidate;
+        }
+    }
+
+    if !current.is_empty() {
+        pages.push(SearchRes {
+            sender_id,
+            target,
+            results: current,
+        });
+    }
+
+    pages
+}
+
+fn encoded_search_response_len(
+    sender_id: overlord_kad_proto::NodeId,
+    target: overlord_kad_proto::NodeId,
+    results: &[SearchResultEntry],
+) -> usize {
+    KadPacket::SearchRes(SearchRes {
+        sender_id,
+        target,
+        results: results.to_vec(),
+    })
+    .encode()
+    .map(|packet| packet.len())
+    .unwrap_or(usize::MAX)
+}
+
 fn contact_to_entry(contact: Contact) -> ContactEntry {
     ContactEntry {
         node_id: contact.id,
@@ -433,5 +507,82 @@ fn contact_to_entry(contact: Contact) -> ContactEntry {
         udp_port: contact.udp_port,
         tcp_port: contact.tcp_port,
         version: contact.kad_version,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use overlord_kad_proto::{NodeId, Tag};
+
+    use super::*;
+
+    #[test]
+    fn split_stock_search_responses_keeps_pages_under_fragment_limit() {
+        let sender_id = NodeId::from_bytes([1; 16]);
+        let target = NodeId::from_bytes([2; 16]);
+        let results = (0..12)
+            .map(|index| SearchResultEntry {
+                entry_id: Ed2kHash::from_bytes([index; 16]),
+                tags: vec![Tag::filename(format!(
+                    "ubuntu-linux-parity-result-{index:02}-{}",
+                    "x".repeat(220)
+                ))],
+            })
+            .collect::<Vec<_>>();
+        let response = SearchRes {
+            sender_id,
+            target,
+            results: results.clone(),
+        };
+
+        let pages = split_stock_search_responses(response, 1420);
+
+        assert!(pages.len() > 1);
+        assert_eq!(
+            pages.iter().map(|page| page.results.len()).sum::<usize>(),
+            results.len()
+        );
+        assert!(
+            pages
+                .iter()
+                .all(|page| { KadPacket::SearchRes(page.clone()).encode().unwrap().len() <= 1420 })
+        );
+        assert_eq!(
+            pages
+                .into_iter()
+                .flat_map(|page| page.results)
+                .map(|result| result.entry_id)
+                .collect::<Vec<_>>(),
+            results
+                .into_iter()
+                .map(|result| result.entry_id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn split_stock_search_responses_keeps_single_oversized_result_like_stock() {
+        let sender_id = NodeId::from_bytes([1; 16]);
+        let target = NodeId::from_bytes([2; 16]);
+        let response = SearchRes {
+            sender_id,
+            target,
+            results: vec![SearchResultEntry {
+                entry_id: Ed2kHash::from_bytes([3; 16]),
+                tags: vec![Tag::filename("x".repeat(1600))],
+            }],
+        };
+
+        let pages = split_stock_search_responses(response, 1420);
+
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].results.len(), 1);
+        assert!(
+            KadPacket::SearchRes(pages[0].clone())
+                .encode()
+                .unwrap()
+                .len()
+                > 1420
+        );
     }
 }
