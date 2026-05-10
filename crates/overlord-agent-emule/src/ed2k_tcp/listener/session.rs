@@ -41,8 +41,8 @@ use super::super::{
     FirewallCheckUdpRequest, OP_AICHFILEHASHREQ, OP_CANCELTRANSFER, OP_EDONKEYPROT, OP_EMULEINFO,
     OP_EMULEINFOANSWER, OP_EMULEPROT, OP_FWCHECKUDPREQ, OP_HASHSETREQUEST, OP_HASHSETREQUEST2,
     OP_HELLO, OP_HELLOANSWER, OP_MULTIPACKET_EXT2, OP_PUBLICKEY, OP_REQUESTFILENAME,
-    OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_REQUESTSOURCES, OP_REQUESTSOURCES2, OP_SECIDENTSTATE,
-    OP_SETREQFILEID, OP_SIGNATURE, OP_STARTUPLOADREQ, apply_server_state,
+    OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_REQUESTSOURCES2, OP_SECIDENTSTATE, OP_SETREQFILEID,
+    OP_SIGNATURE, OP_STARTUPLOADREQ, apply_server_state,
 };
 
 mod shared_file;
@@ -306,12 +306,11 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
                 )
                 .await?;
             }
-            (OP_EMULEPROT, OP_REQUESTSOURCES) | (OP_EMULEPROT, OP_REQUESTSOURCES2) => {
+            (OP_EMULEPROT, OP_REQUESTSOURCES2) => {
                 requested_file_hash = handle_source_request(
                     transfer_runtime,
                     &mut transport,
                     peer_addr,
-                    packet.opcode,
                     &packet.payload,
                 )
                 .await?;
