@@ -135,6 +135,26 @@ fn hello_answer_advertises_emule_style_tags() {
 }
 
 #[test]
+fn hello_decode_preserves_multipacket_capabilities() {
+    let packet = encode_hello_answer(Ed2kHelloIdentity {
+        user_hash: [0x22; 16],
+        client_id: 0x521B_5895,
+        tcp_port: 41001,
+        udp_port: 41000,
+        server_ip: u32::from_le_bytes([176, 123, 2, 239]),
+        server_port: 4232,
+        connect_options: emule_connect_options(true),
+        direct_udp_callback: false,
+    });
+
+    let profile = decode_hello_profile(&packet[6..]).unwrap();
+
+    assert!(profile.supports_multipacket);
+    assert!(profile.supports_ext_multipacket);
+    assert!(profile.supports_file_identifiers);
+}
+
+#[test]
 fn hello_misc_options2_does_not_advertise_unsupported_chat_captcha() {
     let misc_options2 = emule_misc_options2(emule_connect_options(false), false);
 

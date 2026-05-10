@@ -226,6 +226,9 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     }
                     session_state.hello_complete = true;
                     session_state.remote_supports_file_identifiers = hello_profile.supports_file_identifiers;
+                    session_state.remote_supports_multipacket = hello_profile.supports_multipacket;
+                    session_state.remote_supports_ext_multipacket =
+                        hello_profile.supports_ext_multipacket;
                     session_state.remote_supports_source_exchange = hello_profile.supports_source_exchange;
                     session_state.remote_supports_source_exchange2 = hello_profile.supports_source_exchange2;
                     if hello_profile.is_mule_hello && !session_state.peer_secure_ident.requested_peer_key {
@@ -249,6 +252,9 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     let hello_profile = decode_hello_profile(&packet.payload)?;
                     session_state.hello_complete = true;
                     session_state.remote_supports_file_identifiers = hello_profile.supports_file_identifiers;
+                    session_state.remote_supports_multipacket = hello_profile.supports_multipacket;
+                    session_state.remote_supports_ext_multipacket =
+                        hello_profile.supports_ext_multipacket;
                     session_state.remote_supports_source_exchange = hello_profile.supports_source_exchange;
                     session_state.remote_supports_source_exchange2 = hello_profile.supports_source_exchange2;
                     if send_initial_requests
