@@ -658,11 +658,7 @@ fn upsert_source_entry(
         .filter(|candidate| candidate.target == entry.target)
         .count()
         > STOCK_MAX_SOURCES_PER_FILE
-        && let Some((oldest_index, _)) = entries
-            .iter()
-            .enumerate()
-            .filter(|(_, candidate)| candidate.target == entry.target)
-            .min_by_key(|(_, candidate)| candidate.observed_at())
+        && let Some(oldest_index) = oldest_target_entry_index(entries, entry.target)
     {
         entries.remove(oldest_index);
     }
@@ -697,11 +693,7 @@ fn upsert_notes_entry(
         .filter(|candidate| candidate.target == entry.target)
         .count()
         > STOCK_MAX_NOTES_PER_FILE
-        && let Some((oldest_index, _)) = entries
-            .iter()
-            .enumerate()
-            .filter(|(_, candidate)| candidate.target == entry.target)
-            .min_by_key(|(_, candidate)| candidate.observed_at())
+        && let Some(oldest_index) = oldest_target_entry_index(entries, entry.target)
     {
         entries.remove(oldest_index);
     }
@@ -715,6 +707,15 @@ fn upsert_notes_entry(
         entries.remove(oldest_index);
     }
     entries.push(entry);
+}
+
+fn oldest_target_entry_index<T>(entries: &[T], target: NodeId) -> Option<usize>
+where
+    T: TargetedEntry,
+{
+    entries
+        .iter()
+        .position(|candidate| candidate.target() == target)
 }
 
 fn stock_source_publish_load(
@@ -795,6 +796,10 @@ trait DedupEntry {
     fn dedup_key(&self) -> &str;
 }
 
+trait TargetedEntry {
+    fn target(&self) -> NodeId;
+}
+
 impl TimedEntry for StoredKeywordPublish {
     fn observed_at(&self) -> DateTime<Utc> {
         self.observed_at
@@ -813,6 +818,12 @@ impl TimedEntry for StoredSourcePublish {
     }
 }
 
+impl TargetedEntry for StoredSourcePublish {
+    fn target(&self) -> NodeId {
+        self.target
+    }
+}
+
 impl DedupEntry for StoredSourcePublish {
     fn dedup_key(&self) -> &str {
         &self.dedup_key
@@ -822,6 +833,12 @@ impl DedupEntry for StoredSourcePublish {
 impl TimedEntry for StoredNotesPublish {
     fn observed_at(&self) -> DateTime<Utc> {
         self.observed_at
+    }
+}
+
+impl TargetedEntry for StoredNotesPublish {
+    fn target(&self) -> NodeId {
+        self.target
     }
 }
 
@@ -1501,6 +1518,64 @@ mod tests {
     }
 
     #[test]
+    fn source_overflow_evicts_tail_position_not_refreshed_timestamp_like_stock() {
+        let mut config = config();
+        config.source_capacity = super::STOCK_MAX_SOURCES_PER_FILE + 2;
+        config.source_ttl = std::time::Duration::from_secs(10_000);
+        let mut store = KadLocalStore::new(config);
+        let target = NodeId::from_bytes([3; 16]);
+
+        for index in 0..=super::STOCK_MAX_SOURCES_PER_FILE {
+            store.record_source_publish(
+                target,
+                numbered_node_id(index),
+                numbered_ipv4(index),
+                5000 + index as u16,
+                &source_publish_tags(4000 + index as u16),
+                ts(index as i64),
+            );
+        }
+
+        let refreshed_first_publisher = NodeId::from_bytes([0xEE; 16]);
+        store.record_source_publish(
+            target,
+            refreshed_first_publisher,
+            numbered_ipv4(0),
+            5000,
+            &source_publish_tags(4000),
+            ts(2_000),
+        );
+        store.record_source_publish(
+            target,
+            numbered_node_id(super::STOCK_MAX_SOURCES_PER_FILE + 1),
+            numbered_ipv4(super::STOCK_MAX_SOURCES_PER_FILE + 1),
+            5000 + (super::STOCK_MAX_SOURCES_PER_FILE + 1) as u16,
+            &source_publish_tags(4000 + (super::STOCK_MAX_SOURCES_PER_FILE + 1) as u16),
+            ts(2_001),
+        );
+
+        let response = store
+            .source_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchSourceReq {
+                    target,
+                    start_position: 0,
+                    size: 456,
+                },
+                super::STOCK_MAX_SOURCES_PER_FILE + 2,
+                ts(2_002),
+            )
+            .expect("source response");
+        let result_ids = response
+            .results
+            .iter()
+            .map(|entry| entry.entry_id)
+            .collect::<Vec<_>>();
+        assert!(!result_ids.contains(&source_entry_id(refreshed_first_publisher)));
+        assert!(result_ids.contains(&source_entry_id(numbered_node_id(1))));
+    }
+
+    #[test]
     fn notes_store_filters_by_size_when_available() {
         let mut store = KadLocalStore::new(config());
         let target = NodeId::from_bytes([7; 16]);
@@ -1680,6 +1755,63 @@ mod tests {
             result_tags[1].value,
             TagValue::UInt(value) if value == 900
         ));
+    }
+
+    #[test]
+    fn notes_overflow_evicts_tail_position_not_refreshed_timestamp_like_stock() {
+        let mut config = config();
+        config.notes_capacity = super::STOCK_MAX_NOTES_PER_FILE + 2;
+        config.notes_ttl = std::time::Duration::from_secs(10_000);
+        let mut store = KadLocalStore::new(config);
+        let target = NodeId::from_bytes([7; 16]);
+        let tags = vec![
+            Tag::filesize(900),
+            Tag::new_short(tag_name::DESCRIPTION, TagValue::String("good".into())),
+        ];
+
+        for index in 0..=super::STOCK_MAX_NOTES_PER_FILE {
+            store.record_notes_publish(
+                target,
+                numbered_node_id(index),
+                numbered_ipv4(index),
+                &tags,
+                ts(index as i64),
+            );
+        }
+
+        let refreshed_first_publisher = NodeId::from_bytes([0xEE; 16]);
+        store.record_notes_publish(
+            target,
+            refreshed_first_publisher,
+            numbered_ipv4(0),
+            &tags,
+            ts(2_000),
+        );
+        store.record_notes_publish(
+            target,
+            numbered_node_id(super::STOCK_MAX_NOTES_PER_FILE + 1),
+            numbered_ipv4(super::STOCK_MAX_NOTES_PER_FILE + 1),
+            &tags,
+            ts(2_001),
+        );
+
+        let response = store
+            .notes_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchNotesReq { target, size: 900 },
+                super::STOCK_MAX_NOTES_PER_FILE + 2,
+                ts(2_002),
+            )
+            .expect("notes response");
+        let result_ids = response
+            .results
+            .iter()
+            .map(|entry| entry.entry_id)
+            .collect::<Vec<_>>();
+        assert!(!result_ids.contains(&Ed2kHash::from_bytes(
+            refreshed_first_publisher.to_be_bytes()
+        )));
+        assert!(result_ids.contains(&Ed2kHash::from_bytes(numbered_node_id(1).to_be_bytes())));
     }
 
     #[test]
