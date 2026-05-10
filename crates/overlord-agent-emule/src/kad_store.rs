@@ -242,6 +242,7 @@ impl KadLocalStore {
         let results = self
             .source_entries
             .iter()
+            .rev()
             .filter(|entry| entry.target == request.target)
             .filter(|entry| {
                 stored_file_size(&entry.tags)
@@ -787,11 +788,11 @@ mod tests {
             )
             .expect("source response");
         assert_eq!(response.results.len(), 2);
-        assert_eq!(response.results[0].entry_id, source_entry_id(publisher_two));
         assert_eq!(
-            response.results[1].entry_id,
+            response.results[0].entry_id,
             source_entry_id(publisher_three)
         );
+        assert_eq!(response.results[1].entry_id, source_entry_id(publisher_two));
         assert!(response.results.iter().all(|entry| {
             entry
                 .tags
