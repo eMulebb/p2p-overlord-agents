@@ -341,6 +341,7 @@ pub(super) struct DecodedHelloProfile {
     pub(super) identity: DecodedHelloIdentity,
     pub(super) is_mule_hello: bool,
     pub(super) supports_aich: bool,
+    pub(super) supports_secure_ident: bool,
     pub(super) supports_multipacket: bool,
     pub(super) supports_ext_multipacket: bool,
     pub(super) source_exchange_version: u8,
@@ -427,6 +428,7 @@ fn decode_hello_profile_from_type_payload(type_payload: &[u8]) -> Result<Decoded
 
     let mut is_mule_hello = false;
     let mut supports_aich = false;
+    let mut supports_secure_ident = false;
     let mut supports_multipacket = false;
     let mut supports_ext_multipacket = false;
     let mut source_exchange_version = 0;
@@ -449,6 +451,7 @@ fn decode_hello_profile_from_type_payload(type_payload: &[u8]) -> Result<Decoded
             && let Some(misc_options1) = decode_hello_tag_u32(&tag)
         {
             supports_aich = ((misc_options1 >> 29) & 0x07) & 0x01 != 0;
+            supports_secure_ident = ((misc_options1 >> 16) & 0x0F) != 0;
             source_exchange_version = ((misc_options1 >> 12) & 0x0F) as u8;
             supports_source_exchange = source_exchange_version != 0;
             supports_multipacket = ((misc_options1 >> 1) & 1) != 0;
@@ -460,6 +463,7 @@ fn decode_hello_profile_from_type_payload(type_payload: &[u8]) -> Result<Decoded
         identity,
         is_mule_hello,
         supports_aich,
+        supports_secure_ident,
         supports_multipacket,
         supports_ext_multipacket,
         source_exchange_version,

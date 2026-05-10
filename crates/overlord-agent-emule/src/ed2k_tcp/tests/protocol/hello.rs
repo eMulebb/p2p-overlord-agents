@@ -150,6 +150,7 @@ fn hello_decode_preserves_multipacket_capabilities() {
     let profile = decode_hello_profile(&packet[6..]).unwrap();
 
     assert!(profile.supports_aich);
+    assert!(profile.supports_secure_ident);
     assert!(profile.supports_multipacket);
     assert!(profile.supports_ext_multipacket);
     assert_eq!(profile.source_exchange_version, 4);

@@ -47,7 +47,10 @@ pub(super) async fn advance_download_startup(step: DownloadStartupStep<'_>) -> R
     } = step;
     let waiting_for_peer_secure_ident = session_state.waiting_for_peer_secure_ident();
 
-    if send_initial_requests && session_state.hello_complete && !session_state.secure_ident_started
+    if send_initial_requests
+        && session_state.hello_complete
+        && !session_state.secure_ident_started
+        && session_state.remote_supports_secure_ident
     {
         let secure_ident_probe = begin_secure_ident_probe(&mut session_state.peer_secure_ident);
         dump_ed2k_tcp_download_send(
