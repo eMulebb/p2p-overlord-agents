@@ -399,6 +399,41 @@ fn direct_download_candidates_deduplicate_same_endpoint_in_one_round() {
 }
 
 #[test]
+fn merge_download_sources_preserves_later_server_provenance() {
+    let file_hash = Ed2kHash::from_bytes([0x46; 16]);
+    let source_server = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 10), 4661));
+    let mut sources = vec![Ed2kFoundSource {
+        file_hash,
+        ip: Ipv4Addr::new(10, 0, 0, 1),
+        tcp_port: 41001,
+        client_id: 1,
+        low_id: false,
+        obfuscated: false,
+        obfuscation_options: None,
+        user_hash: None,
+        source_server: None,
+    }];
+
+    merge_download_sources(
+        &mut sources,
+        vec![Ed2kFoundSource {
+            file_hash,
+            ip: Ipv4Addr::new(10, 0, 0, 1),
+            tcp_port: 41001,
+            client_id: 1,
+            low_id: false,
+            obfuscated: false,
+            obfuscation_options: None,
+            user_hash: None,
+            source_server: Some(source_server),
+        }],
+    );
+
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].source_server, Some(source_server));
+}
+
+#[test]
 fn no_progress_source_requery_skips_exhausted_direct_endpoints() {
     assert!(!should_skip_no_progress_source_requery(true, false, 0, 0));
     assert!(should_skip_no_progress_source_requery(true, false, 0, 1));

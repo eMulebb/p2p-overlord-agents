@@ -43,5 +43,5 @@ pub(super) use super::snoop::{
 };
 pub(super) use super::{
     COORDINATOR_RECONNECT_SECS, EMULE_LARGE_FILE_SIZE_THRESHOLD, OverlordAgentEmule,
-    PASSIVE_REPLAY_CONCURRENCY, keyword_target, significant_keyword_words,
+    PASSIVE_REPLAY_CONCURRENCY, keyword_target, merge_download_sources, significant_keyword_words,
 };
