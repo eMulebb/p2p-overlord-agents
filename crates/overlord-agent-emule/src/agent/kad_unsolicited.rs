@@ -364,6 +364,7 @@ pub(super) async fn handle_unsolicited_packet(
                     &KadPacket::PublishRes(overlord_kad_proto::PublishRes {
                         target: req.target,
                         load: 0,
+                        options: None,
                     }),
                 )
                 .await;
@@ -385,6 +386,7 @@ pub(super) async fn handle_unsolicited_packet(
                     &KadPacket::PublishRes(overlord_kad_proto::PublishRes {
                         target: req.target,
                         load: 0,
+                        options: None,
                     }),
                 )
                 .await;
@@ -400,6 +402,7 @@ pub(super) async fn handle_unsolicited_packet(
                     &KadPacket::PublishRes(overlord_kad_proto::PublishRes {
                         target: req.target,
                         load: 0,
+                        options: None,
                     }),
                 )
                 .await;

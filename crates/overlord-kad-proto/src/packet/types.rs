@@ -302,11 +302,13 @@ pub struct PublishNotesReq {
 
 // ── PublishRes ───────────────────────────────────────────────────────────────
 
-#[derive(BinRead, BinWrite, Debug, Clone, PartialEq)]
-#[brw(little)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PublishRes {
     pub target: NodeId,
     pub load: u8,
+    /// Optional future-use byte. eMule currently treats bit 0 as a request for
+    /// an empty `KADEMLIA2_PUBLISH_RES_ACK` when the response used a UDP key.
+    pub options: Option<u8>,
 }
 
 // ── PublishResAck ────────────────────────────────────────────────────────────

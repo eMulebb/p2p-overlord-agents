@@ -6,7 +6,9 @@ use crate::hash::Ed2kHash;
 use crate::node_id::NodeId;
 use crate::tag::{StringDecodeMode, Tag};
 
-use super::types::{FindBuddyRes, SearchKeyReq, SearchRes, SearchResultEntry, SearchSourceReq};
+use super::types::{
+    FindBuddyRes, PublishRes, SearchKeyReq, SearchRes, SearchResultEntry, SearchSourceReq,
+};
 
 fn read_kad_search_entry_id(cursor: &mut Cursor<&[u8]>) -> Result<Ed2kHash, ProtoError> {
     let entry_id = cursor.read_le::<NodeId>()?;
@@ -99,6 +101,34 @@ pub(super) fn write_find_buddy_res(
     cursor.write_le(&packet.tcp_port)?;
     if let Some(connect_options) = packet.connect_options {
         cursor.write_le(&connect_options)?;
+    }
+    Ok(())
+}
+
+pub(super) fn read_publish_res(cursor: &mut Cursor<&[u8]>) -> Result<PublishRes, ProtoError> {
+    let target = cursor.read_le::<NodeId>()?;
+    let load = cursor.read_le::<u8>()?;
+    let options = if cursor.position() < cursor.get_ref().len() as u64 {
+        Some(cursor.read_le::<u8>()?)
+    } else {
+        None
+    };
+
+    Ok(PublishRes {
+        target,
+        load,
+        options,
+    })
+}
+
+pub(super) fn write_publish_res(
+    cursor: &mut Cursor<Vec<u8>>,
+    packet: &PublishRes,
+) -> Result<(), ProtoError> {
+    cursor.write_le(&packet.target)?;
+    cursor.write_le(&packet.load)?;
+    if let Some(options) = packet.options {
+        cursor.write_le(&options)?;
     }
     Ok(())
 }

@@ -25,8 +25,9 @@ use crate::hash::Ed2kHash;
 #[cfg(test)]
 use crate::node_id::NodeId;
 use codec::{
-    read_find_buddy_res, read_search_key_req, read_search_res, read_search_source_req,
-    write_find_buddy_res, write_search_key_req, write_search_res, write_search_source_req,
+    read_find_buddy_res, read_publish_res, read_search_key_req, read_search_res,
+    read_search_source_req, write_find_buddy_res, write_publish_res, write_search_key_req,
+    write_search_res, write_search_source_req,
 };
 
 fn require_body_len(opcode: u8, body: &[u8], expected: usize) -> Result<(), ProtoError> {
@@ -163,7 +164,7 @@ impl KadPacket {
                 KadPacket::PublishNotesReq(p)
             }
             opcode::PUBLISH_RES => {
-                let p = cursor.read_le::<PublishRes>()?;
+                let p = read_publish_res(&mut cursor)?;
                 KadPacket::PublishRes(p)
             }
             opcode::PUBLISH_RES_ACK => KadPacket::PublishResAck,
@@ -240,7 +241,7 @@ impl KadPacket {
             KadPacket::PublishKeyReq(p) => buf.write_le(p)?,
             KadPacket::PublishSourceReq(p) => buf.write_le(p)?,
             KadPacket::PublishNotesReq(p) => buf.write_le(p)?,
-            KadPacket::PublishRes(p) => buf.write_le(p)?,
+            KadPacket::PublishRes(p) => write_publish_res(&mut buf, p)?,
             KadPacket::FirewalledReq(p) => buf.write_le(p)?,
             KadPacket::Firewalled2Req(p) => buf.write_le(p)?,
             KadPacket::FirewalledRes(p) => buf.write_le(p)?,

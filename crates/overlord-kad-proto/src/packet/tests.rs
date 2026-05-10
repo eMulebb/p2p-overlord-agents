@@ -277,6 +277,32 @@ fn test_unknown_opcode_preserved() {
 }
 
 #[test]
+fn publish_response_preserves_optional_stock_ack_request_byte() {
+    let mut bytes = vec![0xE4, opcode::PUBLISH_RES];
+    bytes.extend_from_slice(&[0x22; 16]);
+    bytes.push(7);
+    bytes.push(1);
+    bytes.push(0xAA);
+
+    let decoded = KadPacket::decode(&bytes).unwrap();
+    let KadPacket::PublishRes(response) = decoded else {
+        panic!("wrong type");
+    };
+    assert_eq!(response.target, NodeId::from_bytes([0x22; 16]));
+    assert_eq!(response.load, 7);
+    assert_eq!(response.options, Some(1));
+
+    let encoded = KadPacket::PublishRes(PublishRes {
+        target: response.target,
+        load: response.load,
+        options: response.options,
+    })
+    .encode()
+    .unwrap();
+    assert_eq!(encoded, bytes[..20]);
+}
+
+#[test]
 fn test_invalid_protocol_byte() {
     let buf = vec![0xE3, 0x60]; // wrong header
     let err = KadPacket::decode(&buf);
