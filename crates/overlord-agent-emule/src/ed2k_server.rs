@@ -65,7 +65,7 @@ use obfuscation::{
 use packet_codec::{decode_server_payload, encode_packet};
 use packet_handler::handle_server_packet;
 #[cfg(test)]
-use packet_handler::{decode_callback_request, decode_server_ident};
+use packet_handler::{decode_callback_request, decode_id_change_payload, decode_server_ident};
 use result_decoder::{
     decode_found_sources, decode_search_result_page, decode_udp_found_source_sets,
     decode_udp_search_result_pages,

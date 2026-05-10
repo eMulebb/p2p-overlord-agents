@@ -1,4 +1,4 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use anyhow::Result;
 use tracing::{debug, info};
@@ -23,34 +23,41 @@ pub(super) async fn handle_server_packet(
 ) -> Result<()> {
     match packet.opcode {
         OP_IDCHANGE => {
-            if packet.payload.len() < 4 {
-                anyhow::bail!("short OP_IDCHANGE payload from {}", session.endpoint);
+            let id_change = decode_id_change_payload(&packet.payload)?;
+            if id_change.client_id == 0 {
+                {
+                    let mut guard = session.state.write().await;
+                    guard.connected = false;
+                    guard.client_id = None;
+                    guard.server_flags = id_change.server_flags;
+                }
+                session.assigned_client_id = None;
+                session.server_flags = id_change.server_flags;
+                session.login_accepted = false;
+                info!(
+                    "ED2K server {} returned zero client_id in OP_IDCHANGE; login not accepted",
+                    session.endpoint
+                );
+                return Ok(());
             }
-            let client_id = u32::from_le_bytes(packet.payload[..4].try_into().unwrap());
-            let server_flags = (packet.payload.len() >= 8)
-                .then(|| u32::from_le_bytes(packet.payload[4..8].try_into().unwrap()));
-            let reported_client_ip = (packet.payload.len() >= 16).then(|| {
-                ipv4_from_client_id(u32::from_le_bytes(
-                    packet.payload[12..16].try_into().unwrap(),
-                ))
-            });
             {
                 let mut guard = session.state.write().await;
                 guard.connected = true;
-                guard.client_id = Some(client_id);
-                guard.server_flags = server_flags;
+                guard.client_id = Some(id_change.client_id);
+                guard.server_flags = id_change.server_flags;
             }
             info!(
                 "ED2K server assigned client_id={} high_id={} server_flags={} reported_client_ip={}",
-                client_id,
-                !is_low_id(client_id),
-                format_server_flags(server_flags.unwrap_or_default()),
-                reported_client_ip
+                id_change.client_id,
+                !is_low_id(id_change.client_id),
+                format_server_flags(id_change.server_flags.unwrap_or_default()),
+                id_change
+                    .reported_client_ip
                     .map(|ip| ip.to_string())
                     .unwrap_or_else(|| "unknown".to_string())
             );
-            session.assigned_client_id = Some(client_id);
-            session.server_flags = server_flags;
+            session.assigned_client_id = Some(id_change.client_id);
+            session.server_flags = id_change.server_flags;
             session.login_accepted = true;
             send_connected_server_startup(
                 session,
@@ -198,6 +205,32 @@ pub(super) async fn handle_server_packet(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct IdChangePayload {
+    pub(super) client_id: u32,
+    pub(super) server_flags: Option<u32>,
+    pub(super) reported_client_ip: Option<Ipv4Addr>,
+}
+
+pub(super) fn decode_id_change_payload(payload: &[u8]) -> Result<IdChangePayload> {
+    if payload.len() < 4 {
+        anyhow::bail!("short OP_IDCHANGE payload");
+    }
+    let client_id = u32::from_le_bytes(payload[..4].try_into().unwrap());
+    let server_flags =
+        (payload.len() >= 8).then(|| u32::from_le_bytes(payload[4..8].try_into().unwrap()));
+    let reported_client_ip = (payload.len() >= 16)
+        .then(|| u32::from_le_bytes(payload[12..16].try_into().unwrap()))
+        .filter(|client_id| !is_low_id(*client_id))
+        .map(ipv4_from_client_id);
+
+    Ok(IdChangePayload {
+        client_id,
+        server_flags,
+        reported_client_ip,
+    })
 }
 
 async fn maybe_send_probe_search(

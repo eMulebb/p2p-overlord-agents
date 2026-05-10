@@ -11,6 +11,7 @@ use tracing::{info, warn};
 
 use crate::{config::Ed2kConfig, ed2k_tcp::Ed2kHelloIdentity, ed2k_transfer::Ed2kSharedEntry};
 
+use super::packet_handler::decode_id_change_payload;
 use super::{
     Ed2kSearchFile, Ed2kServerState, OP_IDCHANGE, OP_LOGINREQUEST, OP_QUERY_MORE_RESULT, OP_REJECT,
     OP_SEARCHREQUEST, OP_SEARCHRESULT, ResolvedServerEntry, ServerSession, ServerSessionPhase,
@@ -215,13 +216,15 @@ async fn search_keyword_on_server(
 
         match packet.opcode {
             OP_IDCHANGE => {
-                if packet.payload.len() < 4 {
-                    anyhow::bail!("short OP_IDCHANGE payload from {transport_endpoint}");
+                let id_change = decode_id_change_payload(&packet.payload)
+                    .with_context(|| format!("invalid OP_IDCHANGE from {transport_endpoint}"))?;
+                session.server_flags = id_change.server_flags;
+                if id_change.client_id == 0 {
+                    anyhow::bail!(
+                        "ED2K server {transport_endpoint} returned zero client_id in OP_IDCHANGE"
+                    );
                 }
-                session.assigned_client_id =
-                    Some(u32::from_le_bytes(packet.payload[..4].try_into().unwrap()));
-                session.server_flags = (packet.payload.len() >= 8)
-                    .then(|| u32::from_le_bytes(packet.payload[4..8].try_into().unwrap()));
+                session.assigned_client_id = Some(id_change.client_id);
                 let active_catalog = Arc::new(RwLock::new(shared_catalog.to_vec()));
                 send_connected_server_startup(
                     &mut session,
