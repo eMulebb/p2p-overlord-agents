@@ -221,11 +221,27 @@ async fn tcp_firewall_probe(addr: SocketAddr, timeout: Duration) -> Result<()> {
     Ok(())
 }
 
+async fn send_firewalled_response(dht: &DhtNode, from: SocketAddr) -> Result<()> {
+    let IpAddr::V4(ip) = from.ip() else {
+        return Ok(());
+    };
+    dht.send_packet(
+        from,
+        &KadPacket::FirewalledRes(overlord_kad_proto::FirewalledRes {
+            ip: u32::from_be_bytes(ip.octets()),
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
 pub(super) fn spawn_firewalled_response(dht: DhtNode, from: SocketAddr, tcp_port: u16) {
     tokio::spawn(async move {
         let IpAddr::V4(ip) = from.ip() else {
             return;
         };
+        let _ = send_firewalled_response(&dht, from).await;
+
         let target = SocketAddr::new(IpAddr::V4(ip), tcp_port);
         if tcp_firewall_probe(
             target,
@@ -237,14 +253,7 @@ pub(super) fn spawn_firewalled_response(dht: DhtNode, from: SocketAddr, tcp_port
             return;
         }
 
-        let _ = dht
-            .send_packet(
-                from,
-                &KadPacket::FirewalledRes(overlord_kad_proto::FirewalledRes {
-                    ip: u32::from_be_bytes(ip.octets()),
-                }),
-            )
-            .await;
+        let _ = dht.send_packet(from, &KadPacket::FirewalledAckRes).await;
     });
 }
 
@@ -269,14 +278,7 @@ pub(super) fn spawn_modern_firewalled_response(
             ed2k_obfuscation_enabled,
         } = context;
 
-        let _ = dht
-            .send_packet(
-                from,
-                &KadPacket::FirewalledRes(overlord_kad_proto::FirewalledRes {
-                    ip: u32::from_be_bytes(ip.octets()),
-                }),
-            )
-            .await;
+        let _ = send_firewalled_response(&dht, from).await;
 
         let local_tcp_port = match ed2k_listener.local_addr() {
             Ok(addr) => addr.port(),
