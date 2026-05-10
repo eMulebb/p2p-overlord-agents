@@ -43,10 +43,11 @@ use super::super::{
     ED2K_SECURE_IDENT_SIGNATURE_NEEDED, Ed2kHelloIdentity, Ed2kSecureIdent, Ed2kTransport,
     FirewallCheckUdpRequest, OP_AICHFILEHASHREQ, OP_CANCELTRANSFER, OP_EDONKEYPROT, OP_EMULEINFO,
     OP_EMULEINFOANSWER, OP_EMULEPROT, OP_FWCHECKUDPREQ, OP_HASHSETREQUEST, OP_HASHSETREQUEST2,
-    OP_HELLO, OP_HELLOANSWER, OP_MULTIPACKET, OP_MULTIPACKET_EXT, OP_MULTIPACKET_EXT2, OP_PORTTEST,
-    OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_REQUESTFILENAME, OP_REQUESTPARTS,
-    OP_REQUESTPARTS_I64, OP_REQUESTSOURCES, OP_REQUESTSOURCES2, OP_SECIDENTSTATE, OP_SETREQFILEID,
-    OP_SIGNATURE, OP_STARTUPLOADREQ, apply_server_state,
+    OP_HELLO, OP_HELLOANSWER, OP_KAD_FWTCPCHECK_ACK, OP_MULTIPACKET, OP_MULTIPACKET_EXT,
+    OP_MULTIPACKET_EXT2, OP_PORTTEST, OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ, OP_PUBLICKEY,
+    OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_REQUESTSOURCES,
+    OP_REQUESTSOURCES2, OP_SECIDENTSTATE, OP_SETREQFILEID, OP_SIGNATURE, OP_STARTUPLOADREQ,
+    apply_server_state,
 };
 
 mod shared_file;
@@ -517,6 +518,14 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
                     ),
                 );
                 reply_with_firewall_udp(dht, peer_addr.ip(), request).await?;
+            }
+            (OP_EMULEPROT, OP_KAD_FWTCPCHECK_ACK) => {
+                dump_ed2k_tcp_listener_meta(
+                    peer_addr,
+                    Some(transport.mode),
+                    "kad_firewall_tcp_ack",
+                    "received=true",
+                );
             }
             _ => {
                 if let Some(requested_file_hash) = requested_file_hash {

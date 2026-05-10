@@ -14,10 +14,10 @@ use super::super::{
     OP_AICHFILEHASHANS, OP_ANSWERSOURCES, OP_ANSWERSOURCES2, OP_COMPRESSEDPART,
     OP_COMPRESSEDPART_I64, OP_EDONKEYPROT, OP_EMULEINFO, OP_EMULEINFOANSWER, OP_EMULEPROT,
     OP_FILEDESC, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_HASHSETANSWER, OP_HASHSETANSWER2, OP_HELLO,
-    OP_HELLOANSWER, OP_MULTIPACKETANSWER, OP_MULTIPACKETANSWER_EXT2, OP_PORTTEST,
-    OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_QUEUERANKING, OP_REQFILENAMEANSWER,
-    OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64, OP_SETREQFILEID, OP_SIGNATURE,
-    SourceExchangePeer, begin_secure_ident_probe, build_hello_responses,
+    OP_HELLOANSWER, OP_KAD_FWTCPCHECK_ACK, OP_MULTIPACKETANSWER, OP_MULTIPACKETANSWER_EXT2,
+    OP_PORTTEST, OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_QUEUERANKING,
+    OP_REQFILENAMEANSWER, OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64, OP_SETREQFILEID,
+    OP_SIGNATURE, SourceExchangePeer, begin_secure_ident_probe, build_hello_responses,
     decode_aich_file_hash_answer, decode_answer_sources_payload, decode_answer_sources2_payload,
     decode_file_status_payload, decode_hashset_answer, decode_hashset_answer2,
     decode_hello_profile, decode_public_ip_answer_payload, decode_public_key_payload,
@@ -389,6 +389,14 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                         .write_all(&reply)
                         .await
                         .with_context(|| format!("failed to send OP_PORTTEST to {peer_addr}"))?;
+                }
+                (OP_EMULEPROT, OP_KAD_FWTCPCHECK_ACK) => {
+                    dump_ed2k_tcp_download_meta(
+                        peer_addr,
+                        Some(transport.mode),
+                        "kad_firewall_tcp_ack",
+                        "received=true",
+                    );
                 }
                 (OP_EDONKEYPROT, OP_HASHSETANSWER) => {
                     let (returned_hash, hashset) = decode_hashset_answer(&packet.payload)?;

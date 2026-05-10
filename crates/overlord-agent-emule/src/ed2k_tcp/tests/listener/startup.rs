@@ -243,6 +243,15 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
     assert_eq!(&port_test_answer[6..], &[0x12]);
 
     stream
+        .write_all(&super::encode_packet(
+            OP_EMULEPROT,
+            OP_KAD_FWTCPCHECK_ACK,
+            &[],
+        ))
+        .await
+        .unwrap();
+
+    stream
         .write_all(&super::encode_start_upload_req(&file_hash))
         .await
         .unwrap();
