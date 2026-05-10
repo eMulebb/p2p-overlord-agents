@@ -51,10 +51,11 @@ use super::{
     encode_multipacket_ext2_request, encode_multipacket_request, encode_packed_packet,
     encode_packet, encode_port_test_answer, encode_public_ip_answer, encode_queue_ranking,
     encode_request_filename, encode_request_filename_answer, encode_request_parts_batch,
-    encode_request_sources2, encode_secident_state, encode_sending_part,
-    encode_shared_browse_denied_answer, encode_start_upload_req, enrich_hello_identity,
-    handle_connection, inflate_compressed_part_fragment, is_mule_hello, next_download_read_timeout,
-    request_udp_firewall_check, select_download_window_limits, validate_file_status_part_count,
+    encode_request_sources2, encode_request_sources2_subpayload, encode_secident_state,
+    encode_sending_part, encode_shared_browse_denied_answer, encode_start_upload_req,
+    enrich_hello_identity, handle_connection, inflate_compressed_part_fragment, is_mule_hello,
+    next_download_read_timeout, request_udp_firewall_check, select_download_window_limits,
+    skip_request_filename_ext_info, validate_file_status_part_count,
 };
 use crate::{
     ed2k_server::{Ed2kFoundSource, Ed2kServerState},

@@ -168,3 +168,183 @@ async fn nofile_answer_for_requested_file_is_incomplete_not_error() {
     assert_eq!(result, Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn legacy_peer_without_aich_support_does_not_receive_aich_hash_request() {
+    let root = unique_test_dir("ed2k-download-legacy-peer-no-aich");
+    let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+    let file_hash = Ed2kHash::from_bytes([0x6B; 16]);
+    let file_size = ED2K_PART_SIZE * 2;
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let peer_addr = listener.local_addr().unwrap();
+    let peer_public_key = test_peer_secure_ident();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+
+        let hello = read_packet(&mut stream).await;
+        assert_eq!(hello[0], OP_EDONKEYPROT);
+        assert_eq!(hello[5], OP_HELLO);
+        stream
+            .write_all(&legacy_hello_answer_without_aich(peer_addr))
+            .await
+            .unwrap();
+
+        let secure_ident_probe = read_packet(&mut stream).await;
+        assert_eq!(secure_ident_probe[0], OP_EMULEPROT);
+        assert_eq!(secure_ident_probe[5], OP_SECIDENTSTATE);
+        stream
+            .write_all(&encode_secident_state(
+                ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED,
+                0x4436_EEAC,
+            ))
+            .await
+            .unwrap();
+
+        let public_key = read_packet(&mut stream).await;
+        assert_eq!(public_key[0], OP_EMULEPROT);
+        assert_eq!(public_key[5], super::OP_PUBLICKEY);
+        stream
+            .write_all(&encode_packet(
+                OP_EMULEPROT,
+                super::OP_PUBLICKEY,
+                &peer_public_key.public_key_payload().unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let signature = read_packet(&mut stream).await;
+        assert_eq!(signature[0], OP_EMULEPROT);
+        assert_eq!(signature[5], super::OP_SIGNATURE);
+        stream
+            .write_all(&encode_packet(
+                OP_EMULEPROT,
+                super::OP_SIGNATURE,
+                &peer_signature_payload(),
+            ))
+            .await
+            .unwrap();
+
+        let startup_request = read_packet(&mut stream).await;
+        assert_legacy_multipacket_omits_aich_request(&startup_request, &file_hash, file_size);
+        stream
+            .write_all(&encode_file_req_ans_nofil(&file_hash))
+            .await
+            .unwrap();
+    });
+
+    let result = download_file_from_peer_test!(
+        Ipv4Addr::LOCALHOST,
+        &Ed2kFoundSource {
+            file_hash,
+            ip: Ipv4Addr::LOCALHOST,
+            tcp_port: peer_addr.port(),
+            client_id: u32::from_le_bytes(Ipv4Addr::LOCALHOST.octets()),
+            low_id: false,
+            obfuscated: false,
+            obfuscation_options: None,
+            user_hash: None,
+            source_server: None,
+        },
+        Ed2kHelloIdentity {
+            user_hash: [0x13; 16],
+            client_id: 0,
+            tcp_port: 41001,
+            udp_port: 41000,
+            server_ip: 0,
+            server_port: 0,
+            connect_options: emule_connect_options(false),
+            direct_udp_callback: false,
+        },
+        &Arc::new(
+            Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+                .unwrap(),
+        ),
+        &transfer_runtime,
+        "legacy-no-aich.bin".to_string(),
+        file_size,
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result, Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
+    server.await.unwrap();
+}
+
+fn legacy_hello_answer_without_aich(peer_addr: SocketAddr) -> Vec<u8> {
+    let mut packet = encode_hello_answer(Ed2kHelloIdentity {
+        user_hash: [0x42; 16],
+        client_id: 0x5912_0559,
+        tcp_port: peer_addr.port(),
+        udp_port: 0,
+        server_ip: 0,
+        server_port: 0,
+        connect_options: emule_connect_options(false),
+        direct_udp_callback: false,
+    });
+    replace_short_u32_tag(
+        &mut packet,
+        CT_EMULE_MISCOPTIONS1,
+        emule_misc_options1() & !(0x07 << 29),
+    );
+    replace_short_u32_tag(
+        &mut packet,
+        CT_EMULE_MISCOPTIONS2,
+        emule_misc_options2(emule_connect_options(false), false) & !(1 << 13),
+    );
+    packet
+}
+
+fn replace_short_u32_tag(packet: &mut [u8], tag_name: u8, value: u32) {
+    let header = [TAGTYPE_UINT32, 0x01, 0x00, tag_name];
+    let offset = packet
+        .windows(header.len())
+        .position(|window| window == header)
+        .expect("short uint32 hello tag is present")
+        + header.len();
+    packet[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn assert_legacy_multipacket_omits_aich_request(
+    packet: &[u8],
+    file_hash: &Ed2kHash,
+    file_size: u64,
+) {
+    assert_eq!(packet[0], OP_EMULEPROT);
+    assert_eq!(packet[5], OP_MULTIPACKET_EXT);
+    let mut remaining = &packet[6..];
+    assert_eq!(&remaining[..16], &file_hash.0);
+    remaining = &remaining[16..];
+    assert_eq!(
+        u64::from_le_bytes(remaining[..8].try_into().unwrap()),
+        file_size
+    );
+    remaining = &remaining[8..];
+
+    let mut saw_request_filename = false;
+    let mut saw_set_req_file_id = false;
+    let mut saw_request_sources2 = false;
+    while let Some((&sub_opcode, rest)) = remaining.split_first() {
+        remaining = rest;
+        match sub_opcode {
+            OP_REQUESTFILENAME => {
+                remaining = skip_request_filename_ext_info(remaining, file_size).unwrap();
+                saw_request_filename = true;
+            }
+            OP_SETREQFILEID => {
+                saw_set_req_file_id = true;
+            }
+            OP_REQUESTSOURCES2 => {
+                assert_eq!(&remaining[..3], &encode_request_sources2_subpayload());
+                remaining = &remaining[3..];
+                saw_request_sources2 = true;
+            }
+            OP_AICHFILEHASHREQ => panic!("AICH hash request sent to non-AICH peer"),
+            unexpected => panic!("unexpected legacy startup sub-op 0x{unexpected:02X}"),
+        }
+    }
+    assert!(saw_request_filename);
+    assert!(saw_set_req_file_id);
+    assert!(saw_request_sources2);
+}

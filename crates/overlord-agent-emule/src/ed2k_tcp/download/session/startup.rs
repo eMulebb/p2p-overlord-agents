@@ -90,12 +90,13 @@ pub(super) async fn advance_download_startup(step: DownloadStartupStep<'_>) -> R
             session_state.aich_file_hash_requested = true;
         } else if session_state.remote_supports_multipacket {
             let source_exchange_request = source_exchange_request_for_peer(session_state);
+            let request_aich = session_state.remote_supports_aich;
             let multipacket = encode_multipacket_request(
                 file_hash,
                 manifest,
                 session_state.remote_supports_ext_multipacket,
                 source_exchange_request,
-                true,
+                request_aich,
             );
             let label = if session_state.remote_supports_ext_multipacket {
                 "multipacket_ext_request"
@@ -109,7 +110,7 @@ pub(super) async fn advance_download_startup(step: DownloadStartupStep<'_>) -> R
                 .with_context(|| format!("failed to send legacy multipacket to {peer_addr}"))?;
             session_state.source_request_sent =
                 source_exchange_request != PeerSourceExchangeRequest::None;
-            session_state.aich_file_hash_requested = true;
+            session_state.aich_file_hash_requested = request_aich;
         } else {
             let request_filename = encode_request_filename(file_hash, manifest);
             dump_ed2k_tcp_download_send(
@@ -171,6 +172,7 @@ pub(super) async fn advance_download_startup(step: DownloadStartupStep<'_>) -> R
         && !session_state.aich_file_hash_requested
         && !waiting_for_peer_secure_ident
         && !session_state.remote_supports_file_identifiers
+        && session_state.remote_supports_aich
     {
         let aich_file_hash_request = encode_aich_file_hash_request(file_hash);
         dump_ed2k_tcp_download_send(

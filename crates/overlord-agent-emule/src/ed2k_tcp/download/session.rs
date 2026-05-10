@@ -244,6 +244,7 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                         })?;
                     }
                     session_state.hello_complete = true;
+                    session_state.remote_supports_aich = hello_profile.supports_aich;
                     session_state.remote_supports_file_identifiers = hello_profile.supports_file_identifiers;
                     session_state.remote_supports_multipacket = hello_profile.supports_multipacket;
                     session_state.remote_supports_ext_multipacket =
@@ -272,6 +273,7 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                 (OP_EDONKEYPROT, OP_HELLOANSWER) => {
                     let hello_profile = decode_hello_profile(&packet.payload)?;
                     session_state.hello_complete = true;
+                    session_state.remote_supports_aich = hello_profile.supports_aich;
                     session_state.remote_supports_file_identifiers = hello_profile.supports_file_identifiers;
                     session_state.remote_supports_multipacket = hello_profile.supports_multipacket;
                     session_state.remote_supports_ext_multipacket =
