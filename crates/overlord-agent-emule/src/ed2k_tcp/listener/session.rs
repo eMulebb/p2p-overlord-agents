@@ -23,9 +23,9 @@ use crate::{
 use super::super::codec::{
     decode_aich_recovery_answer_payload, decode_aich_recovery_request_payload,
     decode_client_id_change_payload, decode_file_description_payload, decode_file_hash_payload,
-    decode_preview_answer_payload, decode_preview_request_payload, decode_public_ip_answer_payload,
-    encode_aich_recovery_failure_answer, encode_file_req_ans_nofil, encode_packet,
-    encode_port_test_answer, encode_public_ip_answer,
+    decode_kad_callback_payload, decode_preview_answer_payload, decode_preview_request_payload,
+    decode_public_ip_answer_payload, encode_aich_recovery_failure_answer,
+    encode_file_req_ans_nofil, encode_packet, encode_port_test_answer, encode_public_ip_answer,
 };
 use super::super::download::{
     DownloadSessionOptions, Ed2kPeerDownloadOutcome, drive_download_session,
@@ -45,13 +45,14 @@ use super::super::{
     ED2K_CONNECTION_IDLE_TIMEOUT, ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED,
     ED2K_SECURE_IDENT_SIGNATURE_NEEDED, Ed2kHelloIdentity, Ed2kSecureIdent, Ed2kTransport,
     FirewallCheckUdpRequest, OP_AICHANSWER, OP_AICHFILEHASHREQ, OP_AICHREQUEST, OP_BUDDYPING,
-    OP_BUDDYPONG, OP_CANCELTRANSFER, OP_CHANGE_CLIENT_ID, OP_EDONKEYPROT, OP_EMULEINFO,
-    OP_EMULEINFOANSWER, OP_EMULEPROT, OP_END_OF_DOWNLOAD, OP_FILEDESC, OP_FWCHECKUDPREQ,
-    OP_HASHSETREQUEST, OP_HASHSETREQUEST2, OP_HELLO, OP_HELLOANSWER, OP_KAD_FWTCPCHECK_ACK,
-    OP_MULTIPACKET, OP_MULTIPACKET_EXT, OP_MULTIPACKET_EXT2, OP_OUTOFPARTREQS, OP_PORTTEST,
-    OP_PREVIEWANSWER, OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_REQUESTFILENAME,
-    OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_REQUESTPREVIEW, OP_REQUESTSOURCES, OP_REQUESTSOURCES2,
-    OP_SECIDENTSTATE, OP_SETREQFILEID, OP_SIGNATURE, OP_STARTUPLOADREQ, apply_server_state,
+    OP_BUDDYPONG, OP_CALLBACK, OP_CANCELTRANSFER, OP_CHANGE_CLIENT_ID, OP_EDONKEYPROT,
+    OP_EMULEINFO, OP_EMULEINFOANSWER, OP_EMULEPROT, OP_END_OF_DOWNLOAD, OP_FILEDESC,
+    OP_FWCHECKUDPREQ, OP_HASHSETREQUEST, OP_HASHSETREQUEST2, OP_HELLO, OP_HELLOANSWER,
+    OP_KAD_FWTCPCHECK_ACK, OP_MULTIPACKET, OP_MULTIPACKET_EXT, OP_MULTIPACKET_EXT2,
+    OP_OUTOFPARTREQS, OP_PORTTEST, OP_PREVIEWANSWER, OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ,
+    OP_PUBLICKEY, OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_REQUESTPREVIEW,
+    OP_REQUESTSOURCES, OP_REQUESTSOURCES2, OP_SECIDENTSTATE, OP_SETREQFILEID, OP_SIGNATURE,
+    OP_STARTUPLOADREQ, apply_server_state,
 };
 
 mod shared_file;
@@ -523,6 +524,22 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
                     Some(transport.mode),
                     "public_ip_answer",
                     format!("public_ip={public_ip}"),
+                );
+            }
+            (OP_EMULEPROT, OP_CALLBACK) => {
+                let callback = decode_kad_callback_payload(&packet.payload)?;
+                dump_ed2k_tcp_listener_meta(
+                    peer_addr,
+                    Some(transport.mode),
+                    "kad_callback",
+                    format!(
+                        "file_hash={} callback_peer={}:{} buddy_check={} trailing_len={}",
+                        callback.file_hash,
+                        callback.peer_ip,
+                        callback.peer_tcp_port,
+                        hex::encode(callback.buddy_check),
+                        callback.trailing_len
+                    ),
                 );
             }
             (OP_EMULEPROT, OP_PORTTEST) => {

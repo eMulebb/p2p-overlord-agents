@@ -45,8 +45,9 @@ pub(in crate::ed2k_tcp) use codec::{
     decode_aich_recovery_answer_payload, decode_aich_recovery_request_payload,
     decode_answer_sources_payload, decode_answer_sources2_payload, decode_client_id_change_payload,
     decode_compressed_part_fragment, decode_file_description_payload, decode_file_hash_payload,
-    decode_file_status_payload, decode_hashset_answer, decode_hashset_answer2, decode_peer_payload,
-    decode_preview_answer_payload, decode_preview_request_payload, decode_public_ip_answer_payload,
+    decode_file_status_payload, decode_hashset_answer, decode_hashset_answer2,
+    decode_kad_callback_payload, decode_peer_payload, decode_preview_answer_payload,
+    decode_preview_request_payload, decode_public_ip_answer_payload,
     decode_request_filename_answer, decode_request_filename_answer_body,
     decode_sending_part_payload, encode_aich_file_hash_request,
     encode_aich_recovery_failure_answer, encode_hashset_request, encode_hashset_request2,
@@ -148,6 +149,7 @@ const OP_MULTIPACKET: u8 = 0x92;
 const OP_MULTIPACKETANSWER: u8 = 0x93;
 const OP_PUBLICIP_REQ: u8 = 0x97;
 const OP_PUBLICIP_ANSWER: u8 = 0x98;
+const OP_CALLBACK: u8 = 0x99;
 const OP_AICHREQUEST: u8 = 0x9B;
 const OP_AICHANSWER: u8 = 0x9C;
 const OP_AICHFILEHASHANS: u8 = 0x9D;

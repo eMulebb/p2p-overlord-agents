@@ -77,6 +77,27 @@ fn client_id_change_decodes_stock_two_u32_payload() {
 }
 
 #[test]
+fn kad_callback_decodes_stock_buddy_forward_shape() {
+    let buddy_check = [0x44; 16];
+    let file_hash = Ed2kHash([0x45; 16]);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&buddy_check);
+    payload.extend_from_slice(&file_hash.0);
+    payload.extend_from_slice(&u32::from_be_bytes([203, 0, 113, 77]).to_le_bytes());
+    payload.extend_from_slice(&4662u16.to_le_bytes());
+    payload.push(0xAA);
+
+    let callback = decode_kad_callback_payload(&payload).unwrap();
+
+    assert_eq!(callback.buddy_check, buddy_check);
+    assert_eq!(callback.file_hash, file_hash);
+    assert_eq!(callback.peer_ip, Ipv4Addr::new(203, 0, 113, 77));
+    assert_eq!(callback.peer_tcp_port, 4662);
+    assert_eq!(callback.trailing_len, 1);
+    assert!(decode_kad_callback_payload(&payload[..37]).is_err());
+}
+
+#[test]
 fn preview_packets_decode_stock_hash_and_frame_shape() {
     let file_hash = Ed2kHash([0x5E; 16]);
     let mut request_payload = file_hash.0.to_vec();

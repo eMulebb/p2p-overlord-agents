@@ -313,6 +313,19 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
         ))
         .await
         .unwrap();
+    let mut kad_callback_payload = Vec::new();
+    kad_callback_payload.extend_from_slice(&[0x45; 16]);
+    kad_callback_payload.extend_from_slice(&file_hash.0);
+    kad_callback_payload.extend_from_slice(&u32::from_be_bytes([127, 0, 0, 1]).to_le_bytes());
+    kad_callback_payload.extend_from_slice(&4662u16.to_le_bytes());
+    stream
+        .write_all(&super::encode_packet(
+            OP_EMULEPROT,
+            OP_CALLBACK,
+            &kad_callback_payload,
+        ))
+        .await
+        .unwrap();
 
     stream
         .write_all(&super::encode_start_upload_req(&file_hash))

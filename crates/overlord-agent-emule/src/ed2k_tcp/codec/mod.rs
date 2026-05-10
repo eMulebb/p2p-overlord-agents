@@ -143,6 +143,29 @@ pub(super) fn decode_client_id_change_payload(payload: &[u8]) -> Result<ClientId
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct KadCallbackRequest {
+    pub(super) buddy_check: [u8; 16],
+    pub(super) file_hash: Ed2kHash,
+    pub(super) peer_ip: Ipv4Addr,
+    pub(super) peer_tcp_port: u16,
+    pub(super) trailing_len: usize,
+}
+
+pub(super) fn decode_kad_callback_payload(payload: &[u8]) -> Result<KadCallbackRequest> {
+    if payload.len() < 38 {
+        anyhow::bail!("short OP_CALLBACK payload {}", payload.len());
+    }
+    let raw_peer_ip = u32::from_le_bytes(payload[32..36].try_into().unwrap());
+    Ok(KadCallbackRequest {
+        buddy_check: payload[..16].try_into().unwrap(),
+        file_hash: Ed2kHash(payload[16..32].try_into().unwrap()),
+        peer_ip: Ipv4Addr::from(raw_peer_ip.to_be_bytes()),
+        peer_tcp_port: u16::from_le_bytes(payload[36..38].try_into().unwrap()),
+        trailing_len: payload.len() - 38,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PreviewRequest {
     pub(super) file_hash: Ed2kHash,
     pub(super) trailing_len: usize,
