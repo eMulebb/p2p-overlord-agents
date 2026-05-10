@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 
 use anyhow::{Context, Result};
 use overlord_kad_proto::Ed2kHash;
@@ -12,10 +12,11 @@ use crate::{
 };
 
 use super::super::super::codec::{
-    decode_file_hash_payload, decode_hashset_request2, decode_request_sources_payload,
-    encode_answer_sources_empty, encode_answer_sources2_empty, encode_file_req_ans_nofil,
-    encode_file_status_complete, encode_hashset_answer, encode_hashset_answer2,
-    encode_multipacket_ext2_answer, encode_request_filename_answer, skip_request_filename_ext_info,
+    SourceExchangePeer, decode_file_hash_payload, decode_hashset_request2,
+    decode_request_sources_payload, encode_answer_sources, encode_answer_sources2,
+    encode_file_req_ans_nofil, encode_file_status_complete, encode_hashset_answer,
+    encode_hashset_answer2, encode_multipacket_ext2_answer, encode_request_filename_answer,
+    skip_request_filename_ext_info,
 };
 use super::super::super::dump::dump_ed2k_tcp_listener_send;
 
@@ -57,7 +58,8 @@ pub(in crate::ed2k_tcp) async fn handle_multipacket_ext2_request(
                 include_status = true;
             }
             OP_REQUESTSOURCES => {
-                let reply = encode_answer_sources_empty(&requested);
+                let sources = source_exchange_peers(transfer_runtime, &requested).await?;
+                let reply = encode_answer_sources(&requested, &sources);
                 dump_ed2k_tcp_listener_send(peer_addr, transport.mode, "answer_sources", &reply);
                 transport
                     .write_all(&reply)
@@ -70,9 +72,11 @@ pub(in crate::ed2k_tcp) async fn handle_multipacket_ext2_request(
                 }
                 let requested_version = remaining[0];
                 remaining = &remaining[3..];
-                let reply = encode_answer_sources2_empty(
+                let sources = source_exchange_peers(transfer_runtime, &requested).await?;
+                let reply = encode_answer_sources2(
                     &requested,
                     requested_version.min(ED2K_SOURCE_EXCHANGE2_VERSION),
+                    &sources,
                 );
                 dump_ed2k_tcp_listener_send(peer_addr, transport.mode, "answer_sources", &reply);
                 transport.write_all(&reply).await.with_context(|| {
@@ -218,13 +222,15 @@ pub(in crate::ed2k_tcp) async fn handle_source_request(
 ) -> Result<Option<Ed2kHash>> {
     let (requested, requested_version) = decode_request_sources_payload(opcode, payload)?;
     if transfer_runtime.local_entry(&requested).await?.is_some() {
+        let sources = source_exchange_peers(transfer_runtime, &requested).await?;
         let reply = if opcode == OP_REQUESTSOURCES2 {
-            encode_answer_sources2_empty(
+            encode_answer_sources2(
                 &requested,
                 requested_version.min(ED2K_SOURCE_EXCHANGE2_VERSION),
+                &sources,
             )
         } else {
-            encode_answer_sources_empty(&requested)
+            encode_answer_sources(&requested, &sources)
         };
         dump_ed2k_tcp_listener_send(peer_addr, transport.mode, "answer_sources", &reply);
         transport
@@ -233,6 +239,36 @@ pub(in crate::ed2k_tcp) async fn handle_source_request(
             .with_context(|| format!("failed to send source exchange response to {peer_addr}"))?;
     }
     Ok(Some(requested))
+}
+
+async fn source_exchange_peers(
+    transfer_runtime: &Ed2kTransferRuntime,
+    requested: &Ed2kHash,
+) -> Result<Vec<SourceExchangePeer>> {
+    let manifest = transfer_runtime.manifest(&requested.to_string()).await?;
+    Ok(manifest
+        .sources
+        .iter()
+        .filter_map(|source| {
+            let ip = source.ip.parse::<Ipv4Addr>().ok()?.octets();
+            if source.tcp_port == 0 {
+                return None;
+            }
+            let user_hash = source
+                .user_hash
+                .as_deref()
+                .and_then(|hash| hex::decode(hash).ok())
+                .and_then(|bytes| bytes.try_into().ok());
+            Some(SourceExchangePeer {
+                ip,
+                tcp_port: source.tcp_port,
+                server_ip: 0,
+                server_port: 0,
+                user_hash,
+                connect_options: 0,
+            })
+        })
+        .collect())
 }
 
 pub(in crate::ed2k_tcp) async fn handle_aich_file_hash_request(

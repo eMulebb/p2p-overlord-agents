@@ -55,11 +55,10 @@ pub(in crate::ed2k_tcp) use codec::{
 use codec::{
     build_upload_part_packets, decode_file_hash_payload, decode_hashset_request2,
     decode_request_parts_payload, decode_request_sources_payload, encode_accept_upload_req,
-    encode_answer_sources_empty, encode_answer_sources2_empty, encode_compressed_part_fragment,
-    encode_file_req_ans_nofil, encode_file_status_complete, encode_hashset_answer,
-    encode_hashset_answer2, encode_multipacket_ext2_answer, encode_packed_packet,
-    encode_queue_ranking, encode_request_filename_answer, encode_request_sources2_subpayload,
-    encode_sending_part, skip_request_filename_ext_info,
+    encode_compressed_part_fragment, encode_file_req_ans_nofil, encode_file_status_complete,
+    encode_hashset_answer, encode_hashset_answer2, encode_multipacket_ext2_answer,
+    encode_packed_packet, encode_queue_ranking, encode_request_filename_answer,
+    encode_request_sources2_subpayload, encode_sending_part, skip_request_filename_ext_info,
 };
 pub(in crate::ed2k_tcp) use download::PendingCompressedPart;
 #[cfg(test)]

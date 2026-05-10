@@ -35,8 +35,8 @@ use super::{
 use crate::{
     ed2k_server::{Ed2kFoundSource, Ed2kServerState},
     ed2k_transfer::{
-        ED2K_PART_SIZE, Ed2kResumeManifest, Ed2kTransferRuntime, Ed2kUploadQueueConfig,
-        new_transfer_job,
+        ED2K_PART_SIZE, Ed2kResumeManifest, Ed2kSourceHint, Ed2kTransferRuntime,
+        Ed2kUploadQueueConfig, new_transfer_job,
     },
     kad_firewall::KadFirewallState,
     paths::unique_test_dir,

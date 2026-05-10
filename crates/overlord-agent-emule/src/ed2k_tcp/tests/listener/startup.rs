@@ -17,6 +17,17 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
         .store_piece_data(&file_hash_hex, 0, &payload)
         .await
         .unwrap();
+    transfer_runtime
+        .remember_source(
+            &file_hash_hex,
+            Ed2kSourceHint {
+                ip: "10.20.30.40".to_string(),
+                tcp_port: 4662,
+                user_hash: Some(hex::encode([0x61; 16])),
+            },
+        )
+        .await
+        .unwrap();
 
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let peer_addr = listener.local_addr().unwrap();
@@ -76,8 +87,15 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
     assert_eq!(&source_answer[7..23], &file_hash.0);
     assert_eq!(
         u16::from_le_bytes([source_answer[23], source_answer[24]]),
-        0
+        1
     );
+    assert_eq!(&source_answer[25..29], &[40, 30, 20, 10]);
+    assert_eq!(
+        u16::from_le_bytes([source_answer[29], source_answer[30]]),
+        4662
+    );
+    assert_eq!(&source_answer[37..53], &[0x61; 16]);
+    assert_eq!(source_answer[53], 0);
 
     let mut older_source_request = super::encode_request_sources2(&file_hash);
     older_source_request[22] = 2;
@@ -86,6 +104,11 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
         read_until_opcode(&mut stream, OP_EMULEPROT, super::OP_ANSWERSOURCES2).await;
     assert_eq!(older_source_answer[6], 2);
     assert_eq!(&older_source_answer[7..23], &file_hash.0);
+    assert_eq!(
+        u16::from_le_bytes([older_source_answer[23], older_source_answer[24]]),
+        1
+    );
+    assert_eq!(&older_source_answer[25..29], &[10, 20, 30, 40]);
 
     let modern_hashset_request = super::encode_hashset_request2(
         &super::Ed2kFileIdentifier::from_manifest(&manifest).unwrap(),

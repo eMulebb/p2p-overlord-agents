@@ -220,19 +220,76 @@ pub(super) fn encode_request_sources(file_hash: &Ed2kHash) -> Vec<u8> {
     encode_packet(OP_EMULEPROT, OP_REQUESTSOURCES, &file_hash.0)
 }
 
-pub(super) fn encode_answer_sources_empty(file_hash: &Ed2kHash) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(18);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SourceExchangePeer {
+    pub(super) ip: [u8; 4],
+    pub(super) tcp_port: u16,
+    pub(super) server_ip: u32,
+    pub(super) server_port: u16,
+    pub(super) user_hash: Option<[u8; 16]>,
+    pub(super) connect_options: u8,
+}
+
+pub(super) fn encode_answer_sources(
+    file_hash: &Ed2kHash,
+    sources: &[SourceExchangePeer],
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(18 + sources.len() * 12);
     payload.extend_from_slice(&file_hash.0);
-    payload.extend_from_slice(&0u16.to_le_bytes());
+    encode_source_exchange_entries(&mut payload, 1, sources);
     encode_packet(OP_EMULEPROT, OP_ANSWERSOURCES, &payload)
 }
 
-pub(super) fn encode_answer_sources2_empty(file_hash: &Ed2kHash, version: u8) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(19);
+pub(super) fn encode_answer_sources2(
+    file_hash: &Ed2kHash,
+    version: u8,
+    sources: &[SourceExchangePeer],
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(19 + sources.len() * 29);
     payload.push(version);
     payload.extend_from_slice(&file_hash.0);
-    payload.extend_from_slice(&0u16.to_le_bytes());
+    encode_source_exchange_entries(&mut payload, version, sources);
     encode_packet(OP_EMULEPROT, OP_ANSWERSOURCES2, &payload)
+}
+
+fn encode_source_exchange_entries(
+    payload: &mut Vec<u8>,
+    version: u8,
+    sources: &[SourceExchangePeer],
+) {
+    let include_user_hash = version >= 2;
+    let include_connect_options = version >= 4;
+    let max_sources = sources
+        .iter()
+        .filter(|source| !include_user_hash || source.user_hash.is_some())
+        .take(501)
+        .count();
+    payload.extend_from_slice(
+        &u16::try_from(max_sources)
+            .expect("source exchange count is capped")
+            .to_le_bytes(),
+    );
+    for source in sources
+        .iter()
+        .filter(|source| !include_user_hash || source.user_hash.is_some())
+        .take(501)
+    {
+        let client_id = if version < 3 {
+            u32::from_le_bytes(source.ip)
+        } else {
+            u32::from_be_bytes(source.ip)
+        };
+        payload.extend_from_slice(&client_id.to_le_bytes());
+        payload.extend_from_slice(&source.tcp_port.to_le_bytes());
+        payload.extend_from_slice(&source.server_ip.to_le_bytes());
+        payload.extend_from_slice(&source.server_port.to_le_bytes());
+        if include_user_hash {
+            payload.extend_from_slice(&source.user_hash.expect("filtered sources have user hash"));
+        }
+        if include_connect_options {
+            payload.push(source.connect_options);
+        }
+    }
 }
 
 pub(super) fn encode_aich_file_hash_request(file_hash: &Ed2kHash) -> Vec<u8> {
