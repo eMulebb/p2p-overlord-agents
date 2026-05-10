@@ -274,7 +274,7 @@ impl KadLocalStore {
             .rev()
             .filter(|entry| entry.target == request.target)
             .skip(offset)
-            .filter(|entry| stock_file_size_matches_request(&entry.tags, request.size))
+            .filter(|entry| stock_source_file_size_matches_request(&entry.tags, request.size))
             .take(limit)
             .map(|entry| SearchResultEntry {
                 entry_id: source_entry_id(entry.publisher_id),
@@ -301,7 +301,7 @@ impl KadLocalStore {
             .iter()
             .rev()
             .filter(|entry| entry.target == request.target)
-            .filter(|entry| stock_file_size_matches_request(&entry.tags, request.size))
+            .filter(|entry| stock_notes_file_size_matches_request(&entry.tags, request.size))
             .take(limit)
             .map(|entry| SearchResultEntry {
                 entry_id: Ed2kHash::from_bytes(entry.publisher_id.to_be_bytes()),
@@ -394,7 +394,7 @@ fn keyword_result_tags(entry: &StoredKeywordPublish) -> Vec<Tag> {
     if let Some(name) = stock_first_filename(&entry.tags) {
         tags.push(Tag::filename(name));
     }
-    if let Some(size) = stock_first_file_size(&entry.tags).filter(|size| *size > 0) {
+    if let Some(size) = stock_first_keyword_source_file_size(&entry.tags).filter(|size| *size > 0) {
         tags.push(Tag::filesize(size));
     }
 
@@ -446,7 +446,7 @@ fn keyword_aich_result_tag(hash: [u8; 20]) -> Tag {
 
 fn source_result_tags(entry: &StoredSourcePublish) -> Vec<Tag> {
     let mut tags = Vec::new();
-    if let Some(size) = stock_first_file_size(&entry.tags) {
+    if let Some(size) = stock_first_keyword_source_file_size(&entry.tags) {
         tags.push(Tag::filesize(size));
     }
 
@@ -518,6 +518,14 @@ fn stock_first_filename(tags: &[Tag]) -> Option<String> {
 }
 
 fn stock_first_file_size(tags: &[Tag]) -> Option<u64> {
+    stock_first_file_size_impl(tags, false)
+}
+
+fn stock_first_keyword_source_file_size(tags: &[Tag]) -> Option<u64> {
+    stock_first_file_size_impl(tags, true)
+}
+
+fn stock_first_file_size_impl(tags: &[Tag], accept_bsob_file_size: bool) -> Option<u64> {
     let mut size = None;
     let mut size_low = None;
     let mut size_high = None;
@@ -542,6 +550,11 @@ fn stock_first_file_size(tags: &[Tag]) -> Option<u64> {
             }
             (TagName::Short(name), TagValue::U8(value)) if *name == tag_name::FILESIZE => {
                 size_low.get_or_insert(u32::from(*value));
+            }
+            (TagName::Short(name), TagValue::Blob(bytes) | TagValue::SmallBlob(bytes))
+                if *name == tag_name::FILESIZE && accept_bsob_file_size && bytes.len() == 8 =>
+            {
+                size.get_or_insert(u64::from_le_bytes(bytes.as_slice().try_into().ok()?));
             }
             (TagName::Short(name), TagValue::UInt(value))
                 if *name == tag_name::FILESIZE_HI && u32::try_from(*value).is_ok() =>
@@ -569,9 +582,21 @@ fn stock_first_file_size(tags: &[Tag]) -> Option<u64> {
     })
 }
 
-fn stock_file_size_matches_request(tags: &[Tag], request_size: u64) -> bool {
+fn stock_source_file_size_matches_request(tags: &[Tag], request_size: u64) -> bool {
+    stock_file_size_matches_request(tags, request_size, true)
+}
+
+fn stock_notes_file_size_matches_request(tags: &[Tag], request_size: u64) -> bool {
+    stock_file_size_matches_request(tags, request_size, false)
+}
+
+fn stock_file_size_matches_request(
+    tags: &[Tag],
+    request_size: u64,
+    accept_bsob_file_size: bool,
+) -> bool {
     request_size == 0
-        || stock_first_file_size(tags)
+        || stock_first_file_size_impl(tags, accept_bsob_file_size)
             .map(|size| size == request_size)
             .unwrap_or(true)
 }
@@ -853,7 +878,7 @@ impl DedupEntry for StoredNotesPublish {
 }
 
 fn stock_keyword_file_size(tags: &[Tag]) -> Option<u64> {
-    stock_first_file_size(tags).filter(|size| *size > 0)
+    stock_first_keyword_source_file_size(tags).filter(|size| *size > 0)
 }
 
 fn has_stock_keyword_filename(tags: &[Tag]) -> bool {
@@ -1134,6 +1159,44 @@ mod tests {
         assert!(matches!(
             response.results[0].tags[1].value,
             TagValue::UInt(value) if value == 123
+        ));
+    }
+
+    #[test]
+    fn keyword_publish_accepts_bsob_file_size_like_stock() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([1; 16]);
+        let size = (2_u64 << 32) | 1;
+        let entry = PublishEntry {
+            hash: Ed2kHash::from_bytes([2; 16]),
+            tags: vec![
+                Tag::filename("large.bin"),
+                Tag::new_short(
+                    tag_name::FILESIZE,
+                    TagValue::SmallBlob(size.to_le_bytes().into()),
+                ),
+            ],
+        };
+
+        assert_eq!(
+            store.record_keyword_publish_batch(target, std::slice::from_ref(&entry), ts(0)),
+            1
+        );
+        let response = store
+            .keyword_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchKeyReq {
+                    target,
+                    start_position: 0,
+                    restrictive_payload: Vec::new(),
+                },
+                10,
+                ts(1),
+            )
+            .expect("keyword response");
+        assert!(matches!(
+            response.results[0].tags[1].value,
+            TagValue::UInt(value) if value == size
         ));
     }
 
@@ -1642,6 +1705,49 @@ mod tests {
     }
 
     #[test]
+    fn source_search_matches_bsob_file_size_like_stock() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([3; 16]);
+        let publisher = NodeId::from_bytes([4; 16]);
+        let size = (2_u64 << 32) | 1;
+        let tags = vec![
+            Tag::new_short(tag_name::SOURCETYPE, TagValue::UInt(1)),
+            Tag::new_short(
+                tag_name::FILESIZE,
+                TagValue::SmallBlob(size.to_le_bytes().into()),
+            ),
+            Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(4662)),
+        ];
+
+        store.record_source_publish(
+            target,
+            publisher,
+            Ipv4Addr::new(1, 1, 1, 1),
+            4672,
+            &tags,
+            ts(1),
+        );
+
+        let response = store
+            .source_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchSourceReq {
+                    target,
+                    start_position: 0,
+                    size,
+                },
+                10,
+                ts(2),
+            )
+            .expect("source response");
+        assert_eq!(response.results.len(), 1);
+        assert!(matches!(
+            response.results[0].tags[0].value,
+            TagValue::UInt(value) if value == size
+        ));
+    }
+
+    #[test]
     fn source_search_offset_applies_before_size_filter_like_stock() {
         let mut config = config();
         config.source_capacity = 3;
@@ -1980,6 +2086,40 @@ mod tests {
             response.results[0].tags[0].value,
             TagValue::UInt(value) if value == size
         ));
+    }
+
+    #[test]
+    fn notes_publish_ignores_bsob_file_size_like_stock() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([7; 16]);
+        let publisher_id = NodeId::from_bytes([8; 16]);
+        let size = (2_u64 << 32) | 1;
+        let tags = vec![
+            Tag::new_short(
+                tag_name::FILESIZE,
+                TagValue::SmallBlob(size.to_le_bytes().into()),
+            ),
+            Tag::new_short(tag_name::DESCRIPTION, TagValue::String("good".into())),
+        ];
+
+        store.record_notes_publish(
+            target,
+            publisher_id,
+            Ipv4Addr::new(1, 1, 1, 1),
+            &tags,
+            ts(1),
+        );
+
+        let response = store
+            .notes_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchNotesReq { target, size },
+                10,
+                ts(2),
+            )
+            .expect("notes response");
+        assert_eq!(response.results.len(), 1);
+        assert!(!short_tag_names(&response.results[0].tags).contains(&tag_name::FILESIZE));
     }
 
     #[test]

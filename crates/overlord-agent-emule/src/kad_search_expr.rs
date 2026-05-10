@@ -194,36 +194,41 @@ fn file_size_tag_value(tags: &[Tag]) -> Option<u64> {
             (TagName::Short(name), TagValue::UInt(value))
                 if *name == tag_name::FILESIZE && u32::try_from(*value).is_ok() =>
             {
-                size_low = Some(*value as u32);
+                size_low.get_or_insert(*value as u32);
             }
             (TagName::Short(name), TagValue::UInt(value)) if *name == tag_name::FILESIZE => {
-                size = Some(*value);
+                size.get_or_insert(*value);
             }
             (TagName::Short(name), TagValue::U64(value)) if *name == tag_name::FILESIZE => {
-                size = Some(*value);
+                size.get_or_insert(*value);
             }
             (TagName::Short(name), TagValue::U32(value)) if *name == tag_name::FILESIZE => {
-                size_low = Some(*value);
+                size_low.get_or_insert(*value);
             }
             (TagName::Short(name), TagValue::U16(value)) if *name == tag_name::FILESIZE => {
-                size_low = Some(u32::from(*value));
+                size_low.get_or_insert(u32::from(*value));
             }
             (TagName::Short(name), TagValue::U8(value)) if *name == tag_name::FILESIZE => {
-                size_low = Some(u32::from(*value));
+                size_low.get_or_insert(u32::from(*value));
+            }
+            (TagName::Short(name), TagValue::Blob(bytes) | TagValue::SmallBlob(bytes))
+                if *name == tag_name::FILESIZE && bytes.len() == 8 =>
+            {
+                size.get_or_insert(u64::from_le_bytes(bytes.as_slice().try_into().ok()?));
             }
             (TagName::Short(name), TagValue::UInt(value))
                 if *name == tag_name::FILESIZE_HI && u32::try_from(*value).is_ok() =>
             {
-                size_high = Some(*value as u32);
+                size_high.get_or_insert(*value as u32);
             }
             (TagName::Short(name), TagValue::U32(value)) if *name == tag_name::FILESIZE_HI => {
-                size_high = Some(*value);
+                size_high.get_or_insert(*value);
             }
             (TagName::Short(name), TagValue::U16(value)) if *name == tag_name::FILESIZE_HI => {
-                size_high = Some(u32::from(*value));
+                size_high.get_or_insert(u32::from(*value));
             }
             (TagName::Short(name), TagValue::U8(value)) if *name == tag_name::FILESIZE_HI => {
-                size_high = Some(u32::from(*value));
+                size_high.get_or_insert(u32::from(*value));
             }
             _ => {}
         }
@@ -411,6 +416,20 @@ mod tests {
                 Tag::new_short(tag_name::FILESIZE, TagValue::U32(1)),
                 Tag::new_short(tag_name::FILESIZE_HI, TagValue::U32(2)),
             ],
+            &payload
+        ));
+    }
+
+    #[test]
+    fn numeric_filesize_terms_compare_bsob_file_size_like_stock() {
+        let size = (2_u64 << 32) | 1;
+        let payload = numeric_u64_term(tag_name::FILESIZE, 0x00, size);
+        assert!(matches_restrictive_keyword_payload(
+            "large.bin",
+            &[Tag::new_short(
+                tag_name::FILESIZE,
+                TagValue::SmallBlob(size.to_le_bytes().into()),
+            )],
             &payload
         ));
     }
