@@ -193,6 +193,20 @@ fn hashset_answer2_rejects_mismatched_aich_section_root() {
 }
 
 #[test]
+fn aich_file_hash_answer_carries_file_hash_then_sha1_root() {
+    let file_hash = Ed2kHash([0x42; 16]);
+    let aich_root = [0x7A; 20];
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&file_hash.0);
+    payload.extend_from_slice(&aich_root);
+
+    let (decoded_hash, decoded_root) = decode_aich_file_hash_answer(&payload).unwrap();
+
+    assert_eq!(decoded_hash, file_hash);
+    assert_eq!(decoded_root, aich_root);
+}
+
+#[test]
 fn request_filename_answer_uses_stock_u16_string_length_prefix() {
     let packet =
         super::encode_request_filename_answer(&Ed2kHash([0x55; 16]), "captured.epub").unwrap();

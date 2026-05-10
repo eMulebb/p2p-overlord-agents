@@ -462,13 +462,17 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     session_state.startup_file_response_received = true;
                 }
                 (OP_EMULEPROT, OP_AICHFILEHASHANS) => {
-                    let returned_hash = decode_aich_file_hash_answer(&packet.payload)?;
+                    let (returned_hash, aich_root) = decode_aich_file_hash_answer(&packet.payload)?;
                     if returned_hash != file_hash {
                         anyhow::bail!(
                             "peer {peer_addr} returned AICH file hash for unexpected file {}",
                             returned_hash
                         );
                     }
+                    manifest = transfer_runtime
+                        .reconcile_aich_root(file_hash_hex, Some(aich_root))
+                        .await?;
+                    request_file_identifier = Ed2kFileIdentifier::from_manifest(&manifest)?;
                 }
                 (OP_EDONKEYPROT, OP_SETREQFILEID) => {
                     // Non-oracle peers sometimes echo the file id again instead of

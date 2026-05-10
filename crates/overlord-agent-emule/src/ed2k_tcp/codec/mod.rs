@@ -508,9 +508,12 @@ const fn source_exchange_entry_size(version: u8) -> usize {
     }
 }
 
-pub(super) fn decode_aich_file_hash_answer(payload: &[u8]) -> Result<Ed2kHash> {
-    if payload.len() < 16 {
+pub(super) fn decode_aich_file_hash_answer(payload: &[u8]) -> Result<(Ed2kHash, [u8; 20])> {
+    if payload.len() < 36 {
         anyhow::bail!("short OP_AICHFILEHASHANS payload {}", payload.len());
     }
-    Ok(Ed2kHash::from_bytes(payload[..16].try_into()?))
+    Ok((
+        Ed2kHash::from_bytes(payload[..16].try_into()?),
+        payload[16..36].try_into()?,
+    ))
 }
