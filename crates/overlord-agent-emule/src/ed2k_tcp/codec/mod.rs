@@ -671,23 +671,11 @@ pub(super) fn decode_shared_dirs_answer_payload(payload: &[u8]) -> Result<Shared
         dirs.push(dir);
         remaining = rest;
     }
-    if !remaining.is_empty() {
-        anyhow::bail!(
-            "unexpected trailing OP_ASKSHAREDDIRSANS payload of {} bytes",
-            remaining.len()
-        );
-    }
     Ok(SharedDirsAnswer { dir_count, dirs })
 }
 
 pub(super) fn decode_shared_files_dir_request_payload(payload: &[u8]) -> Result<String> {
-    let (dir, remaining) = decode_ed2k_string_body(payload, "OP_ASKSHAREDFILESDIR")?;
-    if !remaining.is_empty() {
-        anyhow::bail!(
-            "unexpected trailing OP_ASKSHAREDFILESDIR payload of {} bytes",
-            remaining.len()
-        );
-    }
+    let (dir, _) = decode_ed2k_string_body(payload, "OP_ASKSHAREDFILESDIR")?;
     Ok(dir)
 }
 

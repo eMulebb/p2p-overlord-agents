@@ -248,10 +248,17 @@ fn shared_browse_packets_use_stock_empty_and_denied_shapes() {
         decode_shared_files_dir_request_payload(&dir_request).unwrap(),
         "Music"
     );
+    let mut dir_request_with_trailing = dir_request.clone();
+    dir_request_with_trailing.extend_from_slice(&[0xAA, 0xBB]);
+    assert_eq!(
+        decode_shared_files_dir_request_payload(&dir_request_with_trailing).unwrap(),
+        "Music"
+    );
 
     let mut dirs_answer = Vec::new();
     dirs_answer.extend_from_slice(&1u32.to_le_bytes());
     dirs_answer.extend_from_slice(&dir_request);
+    dirs_answer.extend_from_slice(&[0xAA, 0xBB]);
     let decoded_dirs = decode_shared_dirs_answer_payload(&dirs_answer).unwrap();
     assert_eq!(decoded_dirs.dir_count, 1);
     assert_eq!(decoded_dirs.dirs, vec!["Music"]);
