@@ -273,11 +273,7 @@ impl KadLocalStore {
             .iter()
             .rev()
             .filter(|entry| entry.target == request.target)
-            .filter(|entry| {
-                stock_first_file_size(&entry.tags)
-                    .map(|size| size == request.size)
-                    .unwrap_or(true)
-            })
+            .filter(|entry| stock_file_size_matches_request(&entry.tags, request.size))
             .skip(offset)
             .take(limit)
             .map(|entry| SearchResultEntry {
@@ -305,11 +301,7 @@ impl KadLocalStore {
             .iter()
             .rev()
             .filter(|entry| entry.target == request.target)
-            .filter(|entry| {
-                stock_first_file_size(&entry.tags)
-                    .map(|size| size == request.size)
-                    .unwrap_or(true)
-            })
+            .filter(|entry| stock_file_size_matches_request(&entry.tags, request.size))
             .take(limit)
             .map(|entry| SearchResultEntry {
                 entry_id: Ed2kHash::from_bytes(entry.publisher_id.to_be_bytes()),
@@ -534,6 +526,13 @@ fn stock_first_file_size(tags: &[Tag]) -> Option<u64> {
         }
         stored_file_size(std::slice::from_ref(tag))
     })
+}
+
+fn stock_file_size_matches_request(tags: &[Tag], request_size: u64) -> bool {
+    request_size == 0
+        || stock_first_file_size(tags)
+            .map(|size| size == request_size)
+            .unwrap_or(true)
 }
 
 fn source_ip_tag(source_ip: Ipv4Addr) -> Tag {
@@ -1454,6 +1453,37 @@ mod tests {
     }
 
     #[test]
+    fn source_search_zero_size_matches_known_size_like_stock() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([3; 16]);
+        let publisher = NodeId::from_bytes([4; 16]);
+
+        store.record_source_publish(
+            target,
+            publisher,
+            Ipv4Addr::new(1, 1, 1, 1),
+            4672,
+            &source_publish_tags(4662),
+            ts(1),
+        );
+
+        let response = store
+            .source_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchSourceReq {
+                    target,
+                    start_position: 0,
+                    size: 0,
+                },
+                10,
+                ts(2),
+            )
+            .expect("source response");
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].entry_id, source_entry_id(publisher));
+    }
+
+    #[test]
     fn source_publish_load_matches_stock_source_count_percentage() {
         let mut config = config();
         config.source_capacity = super::STOCK_MAX_SOURCES_PER_FILE + 2;
@@ -1618,6 +1648,39 @@ mod tests {
             ts(10),
         );
         assert!(missing.is_none());
+    }
+
+    #[test]
+    fn notes_search_zero_size_matches_known_size_like_stock() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([7; 16]);
+        let publisher_id = NodeId::from_bytes([8; 16]);
+        let tags = vec![
+            Tag::filesize(900),
+            Tag::new_short(tag_name::DESCRIPTION, TagValue::String("good".into())),
+        ];
+
+        store.record_notes_publish(
+            target,
+            publisher_id,
+            Ipv4Addr::new(1, 1, 1, 1),
+            &tags,
+            ts(1),
+        );
+
+        let response = store
+            .notes_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchNotesReq { target, size: 0 },
+                10,
+                ts(2),
+            )
+            .expect("notes response");
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(
+            response.results[0].entry_id,
+            Ed2kHash::from_bytes(publisher_id.to_be_bytes())
+        );
     }
 
     #[test]
