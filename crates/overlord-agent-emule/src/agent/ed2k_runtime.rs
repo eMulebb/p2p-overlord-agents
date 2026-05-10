@@ -80,8 +80,12 @@ pub(super) fn should_skip_no_progress_source_requery(
     had_direct_sources: bool,
     manifest_has_progress: bool,
     new_direct_source_count: usize,
+    completed_source_requery_rounds: usize,
 ) -> bool {
-    had_direct_sources && !manifest_has_progress && new_direct_source_count == 0
+    had_direct_sources
+        && !manifest_has_progress
+        && new_direct_source_count == 0
+        && completed_source_requery_rounds != 0
 }
 
 pub(super) fn plaintext_fallback_for_obfuscated_source(

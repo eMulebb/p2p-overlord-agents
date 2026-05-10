@@ -507,6 +507,7 @@ pub(super) async fn start_native_ed2k_download(
                 had_direct_sources,
                 manifest_has_ed2k_transfer_progress(&manifest),
                 known_new_direct_source_count,
+                source_requery_round,
             ) {
                 info!(
                     "native ED2K download skipping source refresh file_hash={} reason=no_progress_repeated_endpoints attempted_direct_endpoints={} known_new_direct_source_count={} md4_hashset_acquired={} verified_ranges={}",

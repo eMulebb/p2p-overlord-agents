@@ -400,10 +400,11 @@ fn direct_download_candidates_deduplicate_same_endpoint_in_one_round() {
 
 #[test]
 fn no_progress_source_requery_skips_exhausted_direct_endpoints() {
-    assert!(should_skip_no_progress_source_requery(true, false, 0));
-    assert!(!should_skip_no_progress_source_requery(true, true, 0));
-    assert!(!should_skip_no_progress_source_requery(true, false, 1));
-    assert!(!should_skip_no_progress_source_requery(false, false, 0));
+    assert!(!should_skip_no_progress_source_requery(true, false, 0, 0));
+    assert!(should_skip_no_progress_source_requery(true, false, 0, 1));
+    assert!(!should_skip_no_progress_source_requery(true, true, 0, 1));
+    assert!(!should_skip_no_progress_source_requery(true, false, 1, 1));
+    assert!(!should_skip_no_progress_source_requery(false, false, 0, 1));
 }
 
 #[test]
