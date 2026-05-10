@@ -102,3 +102,61 @@ async fn hash_only_small_file_download_learns_metadata_from_startup_answer() {
     }));
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn nofile_answer_for_requested_file_is_incomplete_not_error() {
+    let root = unique_test_dir("ed2k-download-nofile-answer");
+    let transfer_runtime = Ed2kTransferRuntime::load_or_create(&root).unwrap();
+    let file_hash = Ed2kHash::from_bytes([0x6A; 16]);
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let peer_addr = listener.local_addr().unwrap();
+    let peer_public_key = test_peer_secure_ident();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+
+        complete_plain_secure_ident_exchange(&mut stream, peer_addr, &peer_public_key).await;
+        stream
+            .write_all(&encode_file_req_ans_nofil(&file_hash))
+            .await
+            .unwrap();
+    });
+
+    let result = download_file_from_peer_test!(
+        Ipv4Addr::LOCALHOST,
+        &Ed2kFoundSource {
+            file_hash,
+            ip: Ipv4Addr::LOCALHOST,
+            tcp_port: peer_addr.port(),
+            client_id: u32::from_le_bytes(Ipv4Addr::LOCALHOST.octets()),
+            low_id: false,
+            obfuscated: false,
+            obfuscation_options: None,
+            user_hash: None,
+            source_server: None,
+        },
+        Ed2kHelloIdentity {
+            user_hash: [0x12; 16],
+            client_id: 0,
+            tcp_port: 41001,
+            udp_port: 41000,
+            server_ip: 0,
+            server_port: 0,
+            connect_options: emule_connect_options(false),
+            direct_udp_callback: false,
+        },
+        &Arc::new(
+            Ed2kSecureIdent::from_private_key(RsaPrivateKey::new(&mut OsRng, 384).unwrap())
+                .unwrap(),
+        ),
+        &transfer_runtime,
+        "missing.bin".to_string(),
+        ED2K_PART_SIZE,
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result, Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
+    server.await.unwrap();
+}

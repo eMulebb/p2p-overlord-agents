@@ -944,7 +944,20 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     );
                 }
                 (OP_EDONKEYPROT, OP_FILEREQANSNOFIL) => {
-                    anyhow::bail!("peer {peer_addr} does not serve requested file {file_hash_hex}");
+                    let missing_hash = decode_file_hash_payload(&packet.payload)?;
+                    if missing_hash != file_hash {
+                        anyhow::bail!(
+                            "peer {peer_addr} returned OP_FILEREQANSNOFIL for unexpected file {}",
+                            missing_hash
+                        );
+                    }
+                    dump_ed2k_tcp_download_meta(
+                        peer_addr,
+                        Some(transport.mode),
+                        "file_req_ans_nofil",
+                        format!("file_hash={file_hash_hex}"),
+                    );
+                    return Ok(Ed2kPeerDownloadOutcome::AcceptedButIncomplete);
                 }
                 (OP_EDONKEYPROT, OP_SENDINGPART)
                 | (OP_EMULEPROT, OP_SENDINGPART_I64)
