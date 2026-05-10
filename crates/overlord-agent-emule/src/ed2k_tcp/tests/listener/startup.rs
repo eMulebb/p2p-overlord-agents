@@ -273,6 +273,26 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
         ))
         .await
         .unwrap();
+    stream
+        .write_all(&super::encode_packet(
+            OP_EMULEPROT,
+            OP_REQUESTPREVIEW,
+            &file_hash.0,
+        ))
+        .await
+        .unwrap();
+    let mut preview_answer_payload = file_hash.0.to_vec();
+    preview_answer_payload.push(1);
+    preview_answer_payload.extend_from_slice(&3u32.to_le_bytes());
+    preview_answer_payload.extend_from_slice(b"png");
+    stream
+        .write_all(&super::encode_packet(
+            OP_EMULEPROT,
+            OP_PREVIEWANSWER,
+            &preview_answer_payload,
+        ))
+        .await
+        .unwrap();
 
     stream
         .write_all(&super::encode_start_upload_req(&file_hash))

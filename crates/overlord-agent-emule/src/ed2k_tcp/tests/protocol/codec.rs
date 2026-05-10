@@ -77,6 +77,31 @@ fn client_id_change_decodes_stock_two_u32_payload() {
 }
 
 #[test]
+fn preview_packets_decode_stock_hash_and_frame_shape() {
+    let file_hash = Ed2kHash([0x5E; 16]);
+    let mut request_payload = file_hash.0.to_vec();
+    request_payload.push(0xAA);
+    let request = decode_preview_request_payload(&request_payload).unwrap();
+    assert_eq!(request.file_hash, file_hash);
+    assert_eq!(request.trailing_len, 1);
+
+    let mut answer_payload = file_hash.0.to_vec();
+    answer_payload.push(2);
+    answer_payload.extend_from_slice(&3u32.to_le_bytes());
+    answer_payload.extend_from_slice(b"one");
+    answer_payload.extend_from_slice(&4u32.to_le_bytes());
+    answer_payload.extend_from_slice(b"two!");
+    let answer = decode_preview_answer_payload(&answer_payload).unwrap();
+
+    assert_eq!(answer.file_hash, file_hash);
+    assert_eq!(answer.frame_count, 2);
+    assert_eq!(answer.frame_payload_bytes, 7);
+    assert_eq!(answer.trailing_len, 0);
+    assert!(decode_preview_request_payload(&request_payload[..15]).is_err());
+    assert!(decode_preview_answer_payload(&answer_payload[..20]).is_err());
+}
+
+#[test]
 fn file_identifier_roundtrip_matches_stock_md4_plus_size_shape() {
     let identifier = super::Ed2kFileIdentifier {
         file_hash: Ed2kHash([0xAB; 16]),

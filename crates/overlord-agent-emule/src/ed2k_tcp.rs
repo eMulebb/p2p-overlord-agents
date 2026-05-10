@@ -45,11 +45,11 @@ pub(in crate::ed2k_tcp) use codec::{
     decode_answer_sources_payload, decode_answer_sources2_payload, decode_client_id_change_payload,
     decode_compressed_part_fragment, decode_file_description_payload, decode_file_hash_payload,
     decode_file_status_payload, decode_hashset_answer, decode_hashset_answer2, decode_peer_payload,
-    decode_public_ip_answer_payload, decode_request_filename_answer,
-    decode_request_filename_answer_body, decode_sending_part_payload,
-    encode_aich_file_hash_request, encode_hashset_request, encode_hashset_request2,
-    encode_multipacket_ext2_request, encode_multipacket_request, encode_packet,
-    encode_port_test_answer, encode_public_ip_answer, encode_request_filename,
+    decode_preview_answer_payload, decode_preview_request_payload, decode_public_ip_answer_payload,
+    decode_request_filename_answer, decode_request_filename_answer_body,
+    decode_sending_part_payload, encode_aich_file_hash_request, encode_hashset_request,
+    encode_hashset_request2, encode_multipacket_ext2_request, encode_multipacket_request,
+    encode_packet, encode_port_test_answer, encode_public_ip_answer, encode_request_filename,
     encode_request_parts_batch, encode_request_sources, encode_request_sources2,
     encode_set_req_file_id, encode_start_upload_req, inflate_compressed_part_fragment,
     skip_file_status_body,
@@ -140,6 +140,8 @@ const OP_REQUESTSOURCES: u8 = 0x81;
 const OP_ANSWERSOURCES: u8 = 0x82;
 const OP_REQUESTSOURCES2: u8 = 0x83;
 const OP_ANSWERSOURCES2: u8 = 0x84;
+const OP_REQUESTPREVIEW: u8 = 0x90;
+const OP_PREVIEWANSWER: u8 = 0x91;
 const OP_MULTIPACKET: u8 = 0x92;
 const OP_MULTIPACKETANSWER: u8 = 0x93;
 const OP_PUBLICIP_REQ: u8 = 0x97;

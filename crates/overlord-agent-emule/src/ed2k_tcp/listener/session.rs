@@ -22,8 +22,8 @@ use crate::{
 
 use super::super::codec::{
     decode_client_id_change_payload, decode_file_description_payload, decode_file_hash_payload,
-    decode_public_ip_answer_payload, encode_file_req_ans_nofil, encode_packet,
-    encode_port_test_answer, encode_public_ip_answer,
+    decode_preview_answer_payload, decode_preview_request_payload, decode_public_ip_answer_payload,
+    encode_file_req_ans_nofil, encode_packet, encode_port_test_answer, encode_public_ip_answer,
 };
 use super::super::download::{
     DownloadSessionOptions, Ed2kPeerDownloadOutcome, drive_download_session,
@@ -46,10 +46,10 @@ use super::super::{
     OP_CHANGE_CLIENT_ID, OP_EDONKEYPROT, OP_EMULEINFO, OP_EMULEINFOANSWER, OP_EMULEPROT,
     OP_END_OF_DOWNLOAD, OP_FILEDESC, OP_FWCHECKUDPREQ, OP_HASHSETREQUEST, OP_HASHSETREQUEST2,
     OP_HELLO, OP_HELLOANSWER, OP_KAD_FWTCPCHECK_ACK, OP_MULTIPACKET, OP_MULTIPACKET_EXT,
-    OP_MULTIPACKET_EXT2, OP_OUTOFPARTREQS, OP_PORTTEST, OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ,
-    OP_PUBLICKEY, OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_REQUESTSOURCES,
-    OP_REQUESTSOURCES2, OP_SECIDENTSTATE, OP_SETREQFILEID, OP_SIGNATURE, OP_STARTUPLOADREQ,
-    apply_server_state,
+    OP_MULTIPACKET_EXT2, OP_OUTOFPARTREQS, OP_PORTTEST, OP_PREVIEWANSWER, OP_PUBLICIP_ANSWER,
+    OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64,
+    OP_REQUESTPREVIEW, OP_REQUESTSOURCES, OP_REQUESTSOURCES2, OP_SECIDENTSTATE, OP_SETREQFILEID,
+    OP_SIGNATURE, OP_STARTUPLOADREQ, apply_server_state,
 };
 
 mod shared_file;
@@ -580,6 +580,33 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
                         "rating={} comment_len={}",
                         file_desc.rating,
                         file_desc.comment.len()
+                    ),
+                );
+            }
+            (OP_EMULEPROT, OP_REQUESTPREVIEW) => {
+                let preview_request = decode_preview_request_payload(&packet.payload)?;
+                dump_ed2k_tcp_listener_meta(
+                    peer_addr,
+                    Some(transport.mode),
+                    "preview_request",
+                    format!(
+                        "file_hash={} trailing_len={}",
+                        preview_request.file_hash, preview_request.trailing_len
+                    ),
+                );
+            }
+            (OP_EMULEPROT, OP_PREVIEWANSWER) => {
+                let preview_answer = decode_preview_answer_payload(&packet.payload)?;
+                dump_ed2k_tcp_listener_meta(
+                    peer_addr,
+                    Some(transport.mode),
+                    "preview_answer",
+                    format!(
+                        "file_hash={} frame_count={} frame_payload_bytes={} trailing_len={}",
+                        preview_answer.file_hash,
+                        preview_answer.frame_count,
+                        preview_answer.frame_payload_bytes,
+                        preview_answer.trailing_len
                     ),
                 );
             }

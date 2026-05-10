@@ -142,6 +142,67 @@ pub(super) fn decode_client_id_change_payload(payload: &[u8]) -> Result<ClientId
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PreviewRequest {
+    pub(super) file_hash: Ed2kHash,
+    pub(super) trailing_len: usize,
+}
+
+pub(super) fn decode_preview_request_payload(payload: &[u8]) -> Result<PreviewRequest> {
+    if payload.len() < 16 {
+        anyhow::bail!("short OP_REQUESTPREVIEW payload {}", payload.len());
+    }
+    Ok(PreviewRequest {
+        file_hash: Ed2kHash(payload[..16].try_into().unwrap()),
+        trailing_len: payload.len() - 16,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PreviewAnswer {
+    pub(super) file_hash: Ed2kHash,
+    pub(super) frame_count: u8,
+    pub(super) frame_payload_bytes: usize,
+    pub(super) trailing_len: usize,
+}
+
+pub(super) fn decode_preview_answer_payload(payload: &[u8]) -> Result<PreviewAnswer> {
+    if payload.len() < 17 {
+        anyhow::bail!("short OP_PREVIEWANSWER payload {}", payload.len());
+    }
+    let file_hash = Ed2kHash(payload[..16].try_into().unwrap());
+    let frame_count = payload[16];
+    let mut offset = 17usize;
+    let mut frame_payload_bytes = 0usize;
+    for _ in 0..frame_count {
+        if payload.len() < offset + 4 {
+            anyhow::bail!("short OP_PREVIEWANSWER frame length");
+        }
+        let frame_len = usize::try_from(u32::from_le_bytes(
+            payload[offset..offset + 4].try_into().unwrap(),
+        ))
+        .context("OP_PREVIEWANSWER frame length overflow")?;
+        offset += 4;
+        if frame_len > payload.len() || payload.len() < offset + frame_len {
+            anyhow::bail!(
+                "short OP_PREVIEWANSWER frame {} expected {}",
+                payload.len().saturating_sub(offset),
+                frame_len
+            );
+        }
+        frame_payload_bytes = frame_payload_bytes
+            .checked_add(frame_len)
+            .context("OP_PREVIEWANSWER frame bytes overflow")?;
+        offset += frame_len;
+    }
+    Ok(PreviewAnswer {
+        file_hash,
+        frame_count,
+        frame_payload_bytes,
+        trailing_len: payload.len() - offset,
+    })
+}
+
 pub(super) fn encode_accept_upload_req() -> Vec<u8> {
     encode_packet(OP_EDONKEYPROT, OP_ACCEPTUPLOADREQ, &[])
 }
