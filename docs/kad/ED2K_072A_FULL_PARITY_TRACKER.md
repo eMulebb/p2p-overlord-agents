@@ -121,25 +121,29 @@ explicitly synthetic fixtures instead of committing live-network vectors.
 
 The active next milestone is:
 
-1. keep the network-learned AICH identity authoritative wherever the active
+1. fix same-server live source discovery for harness-exported large files so
+   `ed2k.cell.modern-aich.plaintext.server-roundtrip.large.realnet.v1` can
+   acquire usable sources, bytes, and MD4/AICH hashset evidence
+2. keep the network-learned AICH identity authoritative wherever the active
    path has already validated it
-2. keep the local AICH builder aligned with the stock tracing harness fixture
+3. keep the local AICH builder aligned with the stock tracing harness fixture
    so completed payloads generate the same root and part-hash set without
    peer-supplied AICH
-3. keep the deterministic private large-file loopback gates green on the direct
+4. keep the deterministic private large-file loopback gates green on the direct
    ED2K and Kad-discovered paths while the builder changes land
-4. rerun the dedicated large-file realnet scenario until the stock-truthful
+5. rerun the dedicated large-file realnet scenario until the stock-truthful
    local generation path also stays green outside the local harness matrix
-5. extend the same truthfulness rule to every still-advertised non-obsolete
+6. extend the same truthfulness rule to every still-advertised non-obsolete
    ED2K feature that remains unimplemented; chat-captcha remains in the backlog
    and file comments remain in the backlog, but unsupported captcha and
    comments are no longer advertised in the hello / eMuleInfo profiles
 
 This remains the highest-leverage next step because the downloader and listener
 now use the modern `FileIdentifier` + `EXT2` + `HASHSETREQUEST2` transport and
-the active-path verifier already accepts truthful AICH there, so the largest
-remaining truth gap is local generation matching stock `v0.72a` for the same
-payload.
+the active-path verifier already accepts truthful AICH there. The current
+blocker is not AICH transport or local-generation logic by itself; it is getting
+the live same-server source-discovery stage to return the harness-exported large
+file so the real-network closure can exercise that logic.
 
 ## Current Evidence
 

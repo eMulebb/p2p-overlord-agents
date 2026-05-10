@@ -35,8 +35,9 @@ And across the main live-mode dimensions:
   startup, queue-rank handling, callback-session reuse, and verified upload
   serving.
 - `crates/overlord-agent-emule/src/ed2k_transfer.rs` currently owns resume
-  manifests, verified-piece bookkeeping, and the upload queue, but that queue is
-  still FIFO and fixed-slot rather than stock-eMule scoring.
+  manifests, verified-piece bookkeeping, and the upload queue. The first
+  score-ranked queue slice is implemented, but durable credit weighting,
+  stock-like file priority, and live queue parity evidence remain open.
 
 ## Verified Differences Vs Stock eMule `community-0.60`
 
@@ -45,9 +46,10 @@ And across the main live-mode dimensions:
   `TryToConnect` callback matrix from `BaseClient.cpp` is not implemented end to
   end yet.
 - upload queue behavior still diverges materially from `UploadQueue.cpp`: the
-  Rust runtime grants fixed slots in FIFO order and reports queue rank as queue
-  position, while stock eMule scores by credits, file priority, friend-slot and
-  LowID handling, duplicate rejection, and session rotation.
+  Rust runtime now has a deterministic score-ranked queue slice with friend-slot
+  boost, LowID penalty, duplicate reconnect refresh, and a file-priority hook,
+  but durable credits, real file-priority policy, harness/live queue evidence,
+  and stock-like session rotation remain open.
 - part scheduling still diverges materially from `DownloadClient.cpp`: the Rust
   downloader now keeps an adaptive pending-block window with rolling refills and
   safe teardown for malformed or out-of-order replies, but stock eMule couples
@@ -341,17 +343,19 @@ Do not collapse these buckets:
 
 ## Current Priorities
 
-1. close `ITEM_031` by rerunning the large-file realnet AICH gate while keeping
-   the local stock-fixture AICH tests green
-2. make every still-advertised non-obsolete ED2K feature truthful, starting
-   with chat/captcha capability adverts
-3. replace FIFO upload queue behavior with stock-eMule-like queue scoring,
-   credit weighting, LowID handling, and slot rotation
+1. close `ITEM_031` by fixing same-server live source discovery for the
+   large-file realnet AICH closure while keeping the local stock-fixture AICH
+   tests green
+2. keep every still-advertised non-obsolete ED2K feature truthful, de-advertising
+   unsupported surfaces until implementation catches up
+3. finish stock-eMule-like queue scoring with durable credit weighting, real
+   file priority, LowID handling, slot rotation, and harness/live evidence
 4. extend callback parity across direct UDP, server callback, Kad callback,
    buddy setup, and firewalled buddy tags
-5. add preview, shared-files/shared-directories browsing, active ED2K notes
-   search, fuller downloader scheduling, and broader `ServerSocket.cpp`
-   behavior in that order
+5. tighten downloader scheduling and broader `ServerSocket.cpp` behavior
+6. add preview and shared-files/shared-directories browsing after the core
+   transfer and LowID path is truthful; active ED2K notes search already has its
+   first passing parity slice
 
 ## Code Ownership
 
