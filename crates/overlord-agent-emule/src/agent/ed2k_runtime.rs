@@ -1,4 +1,7 @@
-use std::{collections::HashSet, net::Ipv4Addr};
+use std::{
+    collections::HashSet,
+    net::{Ipv4Addr, SocketAddr},
+};
 
 use crate::{
     config::EmuleAgentConfig,
@@ -11,6 +14,12 @@ use super::ED2K_SOURCE_OBFUSCATION_REQUIRES_CRYPT;
 
 pub(super) type Ed2kSourceAttemptKey = (Ipv4Addr, u16, Option<[u8; 16]>, Option<u8>);
 pub(super) type Ed2kSourceEndpointKey = (Ipv4Addr, u16);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Ed2kServerCallbackRoute {
+    BackgroundSession,
+    SourceServer(SocketAddr),
+}
 
 /// Callback-driven ED2K downloads can continue after the initial server-side
 /// callback request completes. Treat persisted piece/hashset progress as proof
@@ -45,6 +54,19 @@ pub(super) fn is_retryable_direct_download_error(error: &anyhow::Error) -> bool 
             .downcast_ref::<std::io::Error>()
             .is_some_and(|inner| inner.kind() == std::io::ErrorKind::ConnectionRefused)
     })
+}
+
+pub(super) fn ed2k_server_callback_route(
+    source_server: Option<SocketAddr>,
+    connected_server: Option<SocketAddr>,
+) -> Ed2kServerCallbackRoute {
+    match (source_server, connected_server) {
+        (Some(source_server), Some(connected_server)) if source_server == connected_server => {
+            Ed2kServerCallbackRoute::BackgroundSession
+        }
+        (Some(source_server), _) => Ed2kServerCallbackRoute::SourceServer(source_server),
+        (None, _) => Ed2kServerCallbackRoute::BackgroundSession,
+    }
 }
 
 pub(super) fn ed2k_source_attempt_key(source: &Ed2kFoundSource) -> Ed2kSourceAttemptKey {

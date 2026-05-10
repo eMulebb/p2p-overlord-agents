@@ -5,8 +5,9 @@ pub(super) use super::ed2k_download::{
 };
 pub(super) use super::ed2k_enrich::{EnrichEd2kDownloadRequest, EnrichEd2kDownloadSource};
 pub(super) use super::ed2k_runtime::{
-    direct_download_candidate_sources, manifest_has_ed2k_transfer_progress,
-    plaintext_fallback_for_obfuscated_source, should_skip_no_progress_source_requery,
+    Ed2kServerCallbackRoute, direct_download_candidate_sources, ed2k_server_callback_route,
+    manifest_has_ed2k_transfer_progress, plaintext_fallback_for_obfuscated_source,
+    should_skip_no_progress_source_requery,
 };
 pub(super) use super::ed2k_search::{
     ed2k_download_source_server_attempt_budget, ed2k_keyword_server_attempt_budget,

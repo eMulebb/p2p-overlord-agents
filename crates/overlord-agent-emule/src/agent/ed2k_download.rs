@@ -24,8 +24,9 @@ use super::{
     },
     ed2k_enrich::{EnrichEd2kDownloadRequest, is_hash_only_ed2k_placeholder_name},
     ed2k_runtime::{
-        Ed2kSourceEndpointKey, direct_download_candidate_sources, ed2k_hello_identity_from_config,
-        ed2k_source_attempt_key, ed2k_source_endpoint_key, manifest_has_ed2k_transfer_progress,
+        Ed2kServerCallbackRoute, Ed2kSourceEndpointKey, direct_download_candidate_sources,
+        ed2k_hello_identity_from_config, ed2k_server_callback_route, ed2k_source_attempt_key,
+        ed2k_source_endpoint_key, manifest_has_ed2k_transfer_progress,
         new_direct_ed2k_source_count, should_skip_no_progress_source_requery,
         sort_native_ed2k_download_sources,
     },
@@ -282,6 +283,13 @@ pub(super) async fn start_native_ed2k_download(
     let mut accepted_incomplete_peers = 0u32;
     let mut last_direct_error: Option<anyhow::Error> = None;
     let mut source_requery_round = 0usize;
+    let connected_server_endpoint = {
+        let server_state = runtime.ed2k_server_state.read().await;
+        server_state
+            .connected
+            .then_some(server_state.endpoint)
+            .flatten()
+    };
 
     loop {
         sort_native_ed2k_download_sources(&mut sources);
@@ -342,26 +350,32 @@ pub(super) async fn start_native_ed2k_download(
                         .map_or_else(|| "-".to_string(), |endpoint| endpoint.to_string()),
                     source_requery_round
                 );
-                let callback_result = if let Some(source_server) = source.source_server {
-                    request_callback_on_server(Ed2kCallbackRequestOptions {
-                        bind_ip: runtime.bind_ip,
-                        config: &config.p2p.ed2k,
-                        hello_identity,
-                        shared_catalog: &shared_catalog,
-                        server_endpoint: source_server,
-                        client_id: source.client_id,
-                        timeout: callback_timeout,
-                        cancel: &cancel,
-                    })
-                    .await
-                } else {
-                    request_callback_via_background_session(
-                        &runtime.ed2k_server_search,
-                        source.client_id,
-                        callback_timeout,
-                        &cancel,
-                    )
-                    .await
+                let callback_result = match ed2k_server_callback_route(
+                    source.source_server,
+                    connected_server_endpoint,
+                ) {
+                    Ed2kServerCallbackRoute::BackgroundSession => {
+                        request_callback_via_background_session(
+                            &runtime.ed2k_server_search,
+                            source.client_id,
+                            callback_timeout,
+                            &cancel,
+                        )
+                        .await
+                    }
+                    Ed2kServerCallbackRoute::SourceServer(source_server) => {
+                        request_callback_on_server(Ed2kCallbackRequestOptions {
+                            bind_ip: runtime.bind_ip,
+                            config: &config.p2p.ed2k,
+                            hello_identity,
+                            shared_catalog: &shared_catalog,
+                            server_endpoint: source_server,
+                            client_id: source.client_id,
+                            timeout: callback_timeout,
+                            cancel: &cancel,
+                        })
+                        .await
+                    }
                 };
                 match callback_result {
                     Ok(()) => {}

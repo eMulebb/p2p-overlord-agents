@@ -434,6 +434,25 @@ fn merge_download_sources_preserves_later_server_provenance() {
 }
 
 #[test]
+fn callback_route_reuses_background_session_for_connected_server() {
+    let connected_server = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 10), 4661));
+    let other_server = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 11), 4661));
+
+    assert_eq!(
+        ed2k_server_callback_route(Some(connected_server), Some(connected_server)),
+        Ed2kServerCallbackRoute::BackgroundSession
+    );
+    assert_eq!(
+        ed2k_server_callback_route(Some(other_server), Some(connected_server)),
+        Ed2kServerCallbackRoute::SourceServer(other_server)
+    );
+    assert_eq!(
+        ed2k_server_callback_route(None, Some(connected_server)),
+        Ed2kServerCallbackRoute::BackgroundSession
+    );
+}
+
+#[test]
 fn no_progress_source_requery_skips_exhausted_direct_endpoints() {
     assert!(!should_skip_no_progress_source_requery(true, false, 0, 0));
     assert!(should_skip_no_progress_source_requery(true, false, 0, 1));
