@@ -1,6 +1,8 @@
 pub(super) use crate::config::EmuleAgentConfig;
 
-pub(super) use super::ed2k_download::NativeDirectDownloadOptions;
+pub(super) use super::ed2k_download::{
+    NativeDirectDownloadOptions, should_exclude_background_endpoint,
+};
 pub(super) use super::ed2k_enrich::{EnrichEd2kDownloadRequest, EnrichEd2kDownloadSource};
 pub(super) use super::ed2k_runtime::{
     direct_download_candidate_sources, manifest_has_ed2k_transfer_progress,

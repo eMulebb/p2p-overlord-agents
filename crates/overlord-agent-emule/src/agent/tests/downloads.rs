@@ -406,6 +406,13 @@ fn no_progress_source_requery_skips_exhausted_direct_endpoints() {
     assert!(!should_skip_no_progress_source_requery(false, false, 0));
 }
 
+#[test]
+fn zero_source_background_lookup_keeps_connected_server_eligible() {
+    assert!(!should_exclude_background_endpoint(false, 0));
+    assert!(!should_exclude_background_endpoint(true, 0));
+    assert!(should_exclude_background_endpoint(true, 1));
+}
+
 #[tokio::test]
 async fn native_direct_download_tracks_accepted_incomplete_peer_separately_from_failure() {
     let temp_root = unique_test_dir("overlord-agent-emule-direct-download-accepted-incomplete");

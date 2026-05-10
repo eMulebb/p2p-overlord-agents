@@ -29,7 +29,6 @@ struct ServerSourceSearchContext<'a> {
     runtime: &'a AgentNetworkRuntime,
     config: &'a EmuleAgentConfig,
     preferred_endpoint: Option<SocketAddr>,
-    has_background_search: bool,
     active_source_attempts: usize,
     file_hash: Ed2kHash,
     file_size: u64,
@@ -84,17 +83,19 @@ pub(super) async fn native_ed2k_download_sources(
         runtime,
         config,
         preferred_endpoint,
-        has_background_search,
         active_source_attempts,
         file_hash,
         file_size,
         cancel: &cancel,
     };
+    let exclude_preferred_endpoint =
+        should_exclude_background_endpoint(has_background_search, sources.len());
     collect_active_server_sources(
         &mut sources,
         server_source_context,
         hello_identity,
         &shared_catalog,
+        exclude_preferred_endpoint,
     )
     .await;
     if sources.is_empty() {
@@ -172,6 +173,7 @@ async fn collect_active_server_sources(
     context: ServerSourceSearchContext<'_>,
     hello_identity: Ed2kHelloIdentity,
     shared_catalog: &[Ed2kSharedEntry],
+    exclude_preferred_endpoint: bool,
 ) {
     match search_source_servers(Ed2kSourceSearchOptions {
         bind_ip: context.runtime.bind_ip,
@@ -179,8 +181,7 @@ async fn collect_active_server_sources(
         hello_identity,
         shared_catalog,
         preferred_endpoint: context.preferred_endpoint,
-        excluded_endpoint: context
-            .has_background_search
+        excluded_endpoint: exclude_preferred_endpoint
             .then_some(context.preferred_endpoint)
             .flatten(),
         max_attempts: context.active_source_attempts,
@@ -218,10 +219,7 @@ async fn collect_udp_server_sources(
         bind_ip: context.runtime.bind_ip,
         config: &context.config.p2p.ed2k,
         preferred_endpoint: context.preferred_endpoint,
-        excluded_endpoint: context
-            .has_background_search
-            .then_some(context.preferred_endpoint)
-            .flatten(),
+        excluded_endpoint: None,
         max_attempts: context.active_source_attempts,
         file_hash: context.file_hash,
         file_size: context.file_size,
@@ -247,6 +245,13 @@ async fn collect_udp_server_sources(
             );
         }
     }
+}
+
+pub(in crate::agent) fn should_exclude_background_endpoint(
+    has_background_search: bool,
+    aggregated_source_count: usize,
+) -> bool {
+    has_background_search && aggregated_source_count != 0
 }
 
 async fn collect_kad_source_supplement(

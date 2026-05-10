@@ -60,6 +60,8 @@ mod sources;
 pub(super) use direct::NativeDirectDownloadOutcome;
 pub(super) use direct::{NativeDirectDownloadOptions, run_native_ed2k_direct_downloads};
 use sources::native_ed2k_download_sources;
+#[cfg(test)]
+pub(super) use sources::should_exclude_background_endpoint;
 
 impl OverlordAgentEmule {
     #[cfg(test)]
