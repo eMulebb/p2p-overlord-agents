@@ -26,6 +26,23 @@ fn queue_ranking_matches_emule_twelve_byte_payload_shape() {
 }
 
 #[test]
+fn queue_rank_payloads_decode_stock_shapes() {
+    let edonkey_rank = 1234u32.to_le_bytes();
+    assert_eq!(
+        decode_edonkey_queue_rank_payload(&edonkey_rank).unwrap(),
+        1234
+    );
+    assert!(decode_edonkey_queue_rank_payload(&edonkey_rank[..3]).is_err());
+
+    let emule_packet = super::encode_queue_ranking(7);
+    assert_eq!(
+        decode_emule_queue_ranking_payload(&emule_packet[6..]).unwrap(),
+        7
+    );
+    assert!(decode_emule_queue_ranking_payload(&emule_packet[6..8]).is_err());
+}
+
+#[test]
 fn public_ip_answer_uses_stock_four_byte_ipv4_payload() {
     let packet = encode_public_ip_answer(Ipv4Addr::new(203, 0, 113, 99));
 

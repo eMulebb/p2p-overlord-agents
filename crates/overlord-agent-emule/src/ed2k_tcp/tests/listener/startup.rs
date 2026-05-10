@@ -410,6 +410,19 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
     assert_eq!(shared_dir_denied[5], OP_ASKSHAREDDENIEDANS);
 
     stream
+        .write_all(&super::encode_packet(
+            OP_EDONKEYPROT,
+            OP_QUEUERANK,
+            &123u32.to_le_bytes(),
+        ))
+        .await
+        .unwrap();
+    stream
+        .write_all(&super::encode_queue_ranking(7))
+        .await
+        .unwrap();
+
+    stream
         .write_all(&super::encode_start_upload_req(&file_hash))
         .await
         .unwrap();

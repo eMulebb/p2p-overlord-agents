@@ -27,7 +27,8 @@ use super::super::{
     decode_aich_recovery_request_payload, decode_answer_sources_payload,
     decode_answer_sources2_payload, decode_chat_captcha_request_payload,
     decode_chat_captcha_result_payload, decode_client_id_change_payload,
-    decode_client_message_payload, decode_file_description_payload, decode_file_hash_payload,
+    decode_client_message_payload, decode_edonkey_queue_rank_payload,
+    decode_emule_queue_ranking_payload, decode_file_description_payload, decode_file_hash_payload,
     decode_file_status_payload, decode_hashset_answer, decode_hashset_answer2,
     decode_hello_profile, decode_kad_callback_payload, decode_preview_answer_payload,
     decode_preview_request_payload, decode_public_ip_answer_payload, decode_public_key_payload,
@@ -686,13 +687,24 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                     )
                     .await?;
                 }
-                (OP_EDONKEYPROT, OP_QUEUERANK) | (OP_EMULEPROT, OP_QUEUERANKING) => {
+                (OP_EDONKEYPROT, OP_QUEUERANK) => {
+                    let rank = decode_edonkey_queue_rank_payload(&packet.payload)?;
                     session_state.queued_until = Some(tokio::time::Instant::now() + QUEUE_RANK_GRACE);
                     dump_ed2k_tcp_download_meta(
                         peer_addr,
                         Some(transport.mode),
                         "queue_ranking",
-                        format!("file_hash={file_hash_hex}"),
+                        format!("file_hash={file_hash_hex} rank={rank} protocol=edonkey"),
+                    );
+                }
+                (OP_EMULEPROT, OP_QUEUERANKING) => {
+                    let rank = decode_emule_queue_ranking_payload(&packet.payload)?;
+                    session_state.queued_until = Some(tokio::time::Instant::now() + QUEUE_RANK_GRACE);
+                    dump_ed2k_tcp_download_meta(
+                        peer_addr,
+                        Some(transport.mode),
+                        "queue_ranking",
+                        format!("file_hash={file_hash_hex} rank={rank} protocol=emule"),
                     );
                 }
                 (OP_EDONKEYPROT, OP_END_OF_DOWNLOAD) => {

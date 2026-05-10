@@ -357,6 +357,20 @@ pub(super) fn encode_queue_ranking(rank: u16) -> Vec<u8> {
     encode_packet(OP_EMULEPROT, OP_QUEUERANKING, &payload)
 }
 
+pub(super) fn decode_edonkey_queue_rank_payload(payload: &[u8]) -> Result<u32> {
+    if payload.len() < 4 {
+        anyhow::bail!("short OP_QUEUERANK payload {}", payload.len());
+    }
+    Ok(u32::from_le_bytes(payload[..4].try_into().unwrap()))
+}
+
+pub(super) fn decode_emule_queue_ranking_payload(payload: &[u8]) -> Result<u16> {
+    if payload.len() != 12 {
+        anyhow::bail!("invalid OP_QUEUERANKING payload size {}", payload.len());
+    }
+    Ok(u16::from_le_bytes(payload[..2].try_into().unwrap()))
+}
+
 pub(super) fn encode_public_ip_answer(ip: Ipv4Addr) -> Vec<u8> {
     encode_packet(OP_EMULEPROT, OP_PUBLICIP_ANSWER, &ip.octets())
 }

@@ -24,6 +24,7 @@ use super::super::codec::{
     decode_aich_recovery_answer_payload, decode_aich_recovery_request_payload,
     decode_chat_captcha_request_payload, decode_chat_captcha_result_payload,
     decode_client_id_change_payload, decode_client_message_payload,
+    decode_edonkey_queue_rank_payload, decode_emule_queue_ranking_payload,
     decode_file_description_payload, decode_file_hash_payload, decode_kad_callback_payload,
     decode_preview_answer_payload, decode_preview_request_payload, decode_public_ip_answer_payload,
     decode_reask_callback_tcp_payload, decode_shared_dirs_answer_payload,
@@ -57,10 +58,10 @@ use super::super::{
     OP_EMULEPROT, OP_END_OF_DOWNLOAD, OP_FILEDESC, OP_FWCHECKUDPREQ, OP_HASHSETREQUEST,
     OP_HASHSETREQUEST2, OP_HELLO, OP_HELLOANSWER, OP_KAD_FWTCPCHECK_ACK, OP_MESSAGE,
     OP_MULTIPACKET, OP_MULTIPACKET_EXT, OP_MULTIPACKET_EXT2, OP_OUTOFPARTREQS, OP_PORTTEST,
-    OP_PREVIEWANSWER, OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_REASKCALLBACKTCP,
-    OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_REQUESTPREVIEW, OP_REQUESTSOURCES,
-    OP_REQUESTSOURCES2, OP_SECIDENTSTATE, OP_SETREQFILEID, OP_SIGNATURE, OP_STARTUPLOADREQ,
-    apply_server_state,
+    OP_PREVIEWANSWER, OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_QUEUERANK,
+    OP_QUEUERANKING, OP_REASKCALLBACKTCP, OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64,
+    OP_REQUESTPREVIEW, OP_REQUESTSOURCES, OP_REQUESTSOURCES2, OP_SECIDENTSTATE, OP_SETREQFILEID,
+    OP_SIGNATURE, OP_STARTUPLOADREQ, apply_server_state,
 };
 
 mod shared_file;
@@ -464,6 +465,24 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
                     Some(transport.mode),
                     "shared_browse_denied",
                     format!("payload_len={}", packet.payload.len()),
+                );
+            }
+            (OP_EDONKEYPROT, OP_QUEUERANK) => {
+                let rank = decode_edonkey_queue_rank_payload(&packet.payload)?;
+                dump_ed2k_tcp_listener_meta(
+                    peer_addr,
+                    Some(transport.mode),
+                    "queue_ranking",
+                    format!("rank={rank} protocol=edonkey"),
+                );
+            }
+            (OP_EMULEPROT, OP_QUEUERANKING) => {
+                let rank = decode_emule_queue_ranking_payload(&packet.payload)?;
+                dump_ed2k_tcp_listener_meta(
+                    peer_addr,
+                    Some(transport.mode),
+                    "queue_ranking",
+                    format!("rank={rank} protocol=emule"),
                 );
             }
             (OP_EDONKEYPROT, OP_HASHSETREQUEST) => {
