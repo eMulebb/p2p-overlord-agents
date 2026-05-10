@@ -520,11 +520,54 @@ fn stock_first_filename(tags: &[Tag]) -> Option<String> {
 }
 
 fn stock_first_file_size(tags: &[Tag]) -> Option<u64> {
-    tags.iter().find_map(|tag| {
-        if !matches!(tag.name, TagName::Short(tag_name::FILESIZE)) {
-            return None;
+    let mut size = None;
+    let mut size_low = None;
+    let mut size_high = None;
+
+    for tag in tags {
+        match (&tag.name, &tag.value) {
+            (TagName::Short(name), TagValue::UInt(value)) if *name == tag_name::FILESIZE => {
+                if u32::try_from(*value).is_ok() {
+                    size_low.get_or_insert(*value as u32);
+                } else {
+                    size.get_or_insert(*value);
+                }
+            }
+            (TagName::Short(name), TagValue::U64(value)) if *name == tag_name::FILESIZE => {
+                size.get_or_insert(*value);
+            }
+            (TagName::Short(name), TagValue::U32(value)) if *name == tag_name::FILESIZE => {
+                size_low.get_or_insert(*value);
+            }
+            (TagName::Short(name), TagValue::U16(value)) if *name == tag_name::FILESIZE => {
+                size_low.get_or_insert(u32::from(*value));
+            }
+            (TagName::Short(name), TagValue::U8(value)) if *name == tag_name::FILESIZE => {
+                size_low.get_or_insert(u32::from(*value));
+            }
+            (TagName::Short(name), TagValue::UInt(value))
+                if *name == tag_name::FILESIZE_HI && u32::try_from(*value).is_ok() =>
+            {
+                size_high.get_or_insert(*value as u32);
+            }
+            (TagName::Short(name), TagValue::U32(value)) if *name == tag_name::FILESIZE_HI => {
+                size_high.get_or_insert(*value);
+            }
+            (TagName::Short(name), TagValue::U16(value)) if *name == tag_name::FILESIZE_HI => {
+                size_high.get_or_insert(u32::from(*value));
+            }
+            (TagName::Short(name), TagValue::U8(value)) if *name == tag_name::FILESIZE_HI => {
+                size_high.get_or_insert(u32::from(*value));
+            }
+            _ => {}
         }
-        stored_file_size(std::slice::from_ref(tag))
+    }
+
+    size.or_else(|| {
+        size_low.map(|low| {
+            let high = size_high.unwrap_or(0);
+            (u64::from(high) << 32) | u64::from(low)
+        })
     })
 }
 
@@ -1484,6 +1527,47 @@ mod tests {
     }
 
     #[test]
+    fn source_search_matches_split_large_file_size_like_stock() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([3; 16]);
+        let publisher = NodeId::from_bytes([4; 16]);
+        let size = (2_u64 << 32) | 1;
+        let tags = vec![
+            Tag::new_short(tag_name::SOURCETYPE, TagValue::UInt(1)),
+            Tag::new_short(tag_name::FILESIZE, TagValue::U32(1)),
+            Tag::new_short(tag_name::FILESIZE_HI, TagValue::U32(2)),
+            Tag::new_short(tag_name::SOURCEPORT, TagValue::U16(4662)),
+        ];
+
+        store.record_source_publish(
+            target,
+            publisher,
+            Ipv4Addr::new(1, 1, 1, 1),
+            4672,
+            &tags,
+            ts(1),
+        );
+
+        let response = store
+            .source_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchSourceReq {
+                    target,
+                    start_position: 0,
+                    size,
+                },
+                10,
+                ts(2),
+            )
+            .expect("source response");
+        assert_eq!(response.results.len(), 1);
+        assert!(matches!(
+            response.results[0].tags[0].value,
+            TagValue::UInt(value) if value == size
+        ));
+    }
+
+    #[test]
     fn source_publish_load_matches_stock_source_count_percentage() {
         let mut config = config();
         config.source_capacity = super::STOCK_MAX_SOURCES_PER_FILE + 2;
@@ -1681,6 +1765,41 @@ mod tests {
             response.results[0].entry_id,
             Ed2kHash::from_bytes(publisher_id.to_be_bytes())
         );
+    }
+
+    #[test]
+    fn notes_search_matches_split_large_file_size_like_stock() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([7; 16]);
+        let publisher_id = NodeId::from_bytes([8; 16]);
+        let size = (2_u64 << 32) | 1;
+        let tags = vec![
+            Tag::new_short(tag_name::FILESIZE, TagValue::U32(1)),
+            Tag::new_short(tag_name::FILESIZE_HI, TagValue::U32(2)),
+            Tag::new_short(tag_name::DESCRIPTION, TagValue::String("good".into())),
+        ];
+
+        store.record_notes_publish(
+            target,
+            publisher_id,
+            Ipv4Addr::new(1, 1, 1, 1),
+            &tags,
+            ts(1),
+        );
+
+        let response = store
+            .notes_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchNotesReq { target, size },
+                10,
+                ts(2),
+            )
+            .expect("notes response");
+        assert_eq!(response.results.len(), 1);
+        assert!(matches!(
+            response.results[0].tags[0].value,
+            TagValue::UInt(value) if value == size
+        ));
     }
 
     #[test]
@@ -1978,6 +2097,17 @@ mod tests {
         let size = stored_file_size(&[
             Tag::new_short(tag_name::FILESIZE, TagValue::U32(1)),
             Tag::new_short(tag_name::FILESIZE_HI, TagValue::U32(2)),
+        ]);
+        assert_eq!(size, Some((2_u64 << 32) | 1));
+    }
+
+    #[test]
+    fn stock_first_file_size_uses_primary_size_and_first_high_part() {
+        let size = super::stock_first_file_size(&[
+            Tag::new_short(tag_name::FILESIZE, TagValue::U32(1)),
+            Tag::new_short(tag_name::FILESIZE, TagValue::U32(999)),
+            Tag::new_short(tag_name::FILESIZE_HI, TagValue::U32(2)),
+            Tag::new_short(tag_name::FILESIZE_HI, TagValue::U32(9)),
         ]);
         assert_eq!(size, Some((2_u64 << 32) | 1));
     }
