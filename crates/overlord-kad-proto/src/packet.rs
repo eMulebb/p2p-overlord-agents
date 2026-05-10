@@ -42,6 +42,18 @@ fn require_body_len(opcode: u8, body: &[u8], expected: usize) -> Result<(), Prot
     }
 }
 
+fn require_min_body_len(opcode: u8, body: &[u8], expected_min: usize) -> Result<(), ProtoError> {
+    if body.len() >= expected_min {
+        Ok(())
+    } else {
+        Err(ProtoError::InvalidPacketSize {
+            opcode,
+            expected: expected_min,
+            actual: body.len(),
+        })
+    }
+}
+
 // ── KadPacket ────────────────────────────────────────────────────────────────
 
 /// The top-level Kad2 packet enum.
@@ -191,19 +203,23 @@ impl KadPacket {
                 KadPacket::FirewallUdp(p)
             }
             opcode::FINDBUDDY_REQ => {
+                require_min_body_len(op, body, 34)?;
                 let p = cursor.read_le::<FindBuddyReq>()?;
                 KadPacket::FindBuddyReq(p)
             }
             opcode::FINDBUDDY_RES => {
+                require_min_body_len(op, body, 34)?;
                 let p = read_find_buddy_res(&mut cursor)?;
                 KadPacket::FindBuddyRes(p)
             }
             opcode::CALLBACK_REQ => {
+                require_min_body_len(op, body, 34)?;
                 let p = cursor.read_le::<CallbackReq>()?;
                 KadPacket::CallbackReq(p)
             }
             opcode::PING => KadPacket::Ping,
             opcode::PONG => {
+                require_min_body_len(op, body, 2)?;
                 let p = cursor.read_le::<Pong>()?;
                 KadPacket::Pong(p)
             }

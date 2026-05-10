@@ -463,6 +463,61 @@ fn test_callback_req_roundtrip() {
 }
 
 #[test]
+fn stock_buddy_packets_reject_short_bodies() {
+    for (opcode_value, expected_min) in [
+        (opcode::FINDBUDDY_REQ, 34),
+        (opcode::FINDBUDDY_RES, 34),
+        (opcode::CALLBACK_REQ, 34),
+        (opcode::PONG, 2),
+    ] {
+        let mut bytes = vec![OP_KADEMLIAHEADER, opcode_value];
+        bytes.resize(2 + expected_min - 1, 0);
+
+        assert!(matches!(
+            KadPacket::decode(&bytes),
+            Err(ProtoError::InvalidPacketSize {
+                expected,
+                actual,
+                ..
+            }) if expected == expected_min && actual == expected_min - 1
+        ));
+    }
+}
+
+#[test]
+fn stock_buddy_packets_ignore_trailing_bytes() {
+    let mut find_buddy_req = vec![OP_KADEMLIAHEADER, opcode::FINDBUDDY_REQ];
+    find_buddy_req.resize(2 + 34, 0);
+    find_buddy_req.push(0xAA);
+    assert!(matches!(
+        KadPacket::decode(&find_buddy_req).unwrap(),
+        KadPacket::FindBuddyReq(_)
+    ));
+
+    let mut find_buddy_res = vec![OP_KADEMLIAHEADER, opcode::FINDBUDDY_RES];
+    find_buddy_res.resize(2 + 34, 0);
+    find_buddy_res.extend_from_slice(&[0x07, 0xAA]);
+    match KadPacket::decode(&find_buddy_res).unwrap() {
+        KadPacket::FindBuddyRes(res) => assert_eq!(res.connect_options, Some(0x07)),
+        other => panic!("wrong packet type: {other:?}"),
+    }
+
+    let mut callback_req = vec![OP_KADEMLIAHEADER, opcode::CALLBACK_REQ];
+    callback_req.resize(2 + 34, 0);
+    callback_req.push(0xAA);
+    assert!(matches!(
+        KadPacket::decode(&callback_req).unwrap(),
+        KadPacket::CallbackReq(_)
+    ));
+
+    let pong = vec![OP_KADEMLIAHEADER, opcode::PONG, 0x40, 0x12, 0xAA];
+    assert!(matches!(
+        KadPacket::decode(&pong).unwrap(),
+        KadPacket::Pong(Pong { udp_port: 4672 })
+    ));
+}
+
+#[test]
 fn test_publish_source_req_roundtrip() {
     let pkt = KadPacket::PublishSourceReq(PublishSourceReq {
         target: NodeId::from_bytes([0x44; 16]),
