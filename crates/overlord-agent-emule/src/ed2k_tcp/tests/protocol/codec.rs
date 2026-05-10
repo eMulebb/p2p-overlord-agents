@@ -207,6 +207,30 @@ fn aich_file_hash_answer_carries_file_hash_then_sha1_root() {
 }
 
 #[test]
+fn legacy_multipacket_answer_uses_hash_prefixed_subpackets() {
+    let file_hash = Ed2kHash([0x45; 16]);
+    let aich_root = [0x6D; 20];
+
+    let packet =
+        encode_multipacket_answer(&file_hash, "legacy.avi", true, true, Some(aich_root)).unwrap();
+
+    assert_eq!(packet[0], OP_EMULEPROT);
+    assert_eq!(packet[5], OP_MULTIPACKETANSWER);
+    assert_eq!(&packet[6..22], &file_hash.0);
+    let mut remaining = &packet[22..];
+    assert_eq!(remaining[0], OP_REQFILENAMEANSWER);
+    let name_len = usize::from(u16::from_le_bytes([remaining[1], remaining[2]]));
+    assert_eq!(&remaining[3..3 + name_len], b"legacy.avi");
+    remaining = &remaining[3 + name_len..];
+    assert_eq!(remaining[0], OP_FILESTATUS);
+    assert_eq!(&remaining[1..3], &0u16.to_le_bytes());
+    remaining = &remaining[3..];
+    assert_eq!(remaining[0], OP_AICHFILEHASHANS);
+    assert_eq!(&remaining[1..21], &aich_root);
+    assert_eq!(remaining.len(), 21);
+}
+
+#[test]
 fn request_filename_answer_uses_stock_u16_string_length_prefix() {
     let packet =
         super::encode_request_filename_answer(&Ed2kHash([0x55; 16]), "captured.epub").unwrap();

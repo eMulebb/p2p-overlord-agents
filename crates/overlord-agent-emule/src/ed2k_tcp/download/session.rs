@@ -14,9 +14,9 @@ use super::super::{
     OP_AICHFILEHASHANS, OP_ANSWERSOURCES, OP_ANSWERSOURCES2, OP_COMPRESSEDPART,
     OP_COMPRESSEDPART_I64, OP_EDONKEYPROT, OP_EMULEINFO, OP_EMULEINFOANSWER, OP_EMULEPROT,
     OP_FILEDESC, OP_FILEREQANSNOFIL, OP_FILESTATUS, OP_HASHSETANSWER, OP_HASHSETANSWER2, OP_HELLO,
-    OP_HELLOANSWER, OP_MULTIPACKETANSWER_EXT2, OP_PUBLICKEY, OP_QUEUERANKING, OP_REQFILENAMEANSWER,
-    OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64, OP_SETREQFILEID, OP_SIGNATURE,
-    begin_secure_ident_probe, build_hello_responses, decode_aich_file_hash_answer,
+    OP_HELLOANSWER, OP_MULTIPACKETANSWER, OP_MULTIPACKETANSWER_EXT2, OP_PUBLICKEY, OP_QUEUERANKING,
+    OP_REQFILENAMEANSWER, OP_SECIDENTSTATE, OP_SENDINGPART, OP_SENDINGPART_I64, OP_SETREQFILEID,
+    OP_SIGNATURE, begin_secure_ident_probe, build_hello_responses, decode_aich_file_hash_answer,
     decode_answer_sources2_payload, decode_file_status_payload, decode_hashset_answer,
     decode_hashset_answer2, decode_hello_profile, decode_public_key_payload,
     decode_request_filename_answer, decode_request_filename_answer_body, decode_secident_state,
@@ -418,6 +418,66 @@ pub(in crate::ed2k_tcp) async fn drive_download_session(
                             returned_hash
                         );
                     }
+                    session_state.startup_file_response_received = true;
+                }
+                (OP_EMULEPROT, OP_MULTIPACKETANSWER) => {
+                    let returned_hash = Ed2kHash::from_bytes(
+                        packet
+                            .payload
+                            .get(..16)
+                            .context("short OP_MULTIPACKETANSWER file hash")?
+                            .try_into()?,
+                    );
+                    if returned_hash != file_hash {
+                        anyhow::bail!(
+                            "peer {peer_addr} returned OP_MULTIPACKETANSWER for unexpected file {}",
+                            returned_hash
+                        );
+                    }
+                    let mut remaining = &packet.payload[16..];
+                    let mut returned_file_name = None;
+                    let mut returned_aich_root = None;
+                    while let Some((&sub_opcode, rest)) = remaining.split_first() {
+                        remaining = rest;
+                        match sub_opcode {
+                            OP_REQFILENAMEANSWER => {
+                                let (file_name, rest) =
+                                    decode_request_filename_answer_body(remaining)?;
+                                remaining = rest;
+                                returned_file_name = Some(file_name);
+                            }
+                            OP_FILESTATUS => {
+                                let (_part_count, rest) = skip_file_status_body(remaining)?;
+                                remaining = rest;
+                            }
+                            OP_AICHFILEHASHANS => {
+                                if remaining.len() < 20 {
+                                    anyhow::bail!(
+                                        "short OP_MULTIPACKETANSWER AICH root {}",
+                                        remaining.len()
+                                    );
+                                }
+                                returned_aich_root = Some(remaining[..20].try_into()?);
+                                remaining = &remaining[20..];
+                            }
+                            _ => {
+                                anyhow::bail!(
+                                    "unsupported OP_MULTIPACKETANSWER sub-op 0x{sub_opcode:02X}"
+                                );
+                            }
+                        }
+                    }
+                    manifest = transfer_runtime
+                        .reconcile_aich_root(file_hash_hex, returned_aich_root)
+                        .await?;
+                    manifest = transfer_runtime
+                        .reconcile_job_metadata(
+                            file_hash_hex,
+                            returned_file_name.as_deref(),
+                            None,
+                        )
+                        .await?;
+                    request_file_identifier = Ed2kFileIdentifier::from_manifest(&manifest)?;
                     session_state.startup_file_response_received = true;
                 }
                 (OP_EMULEPROT, OP_MULTIPACKETANSWER_EXT2) => {
