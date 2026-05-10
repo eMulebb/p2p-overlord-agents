@@ -166,6 +166,10 @@ fn numeric_matches(tags: &[Tag], name: &TagName, op: NumericOp, expected: u64) -
 }
 
 fn int_tag_value(tags: &[Tag], name: &TagName) -> Option<u64> {
+    if matches!(name, TagName::Short(name) if *name == tag_name::FILESIZE) {
+        return file_size_tag_value(tags);
+    }
+
     tags.iter().find_map(|tag| {
         if tag.name != *name {
             return None;
@@ -177,6 +181,59 @@ fn int_tag_value(tags: &[Tag], name: &TagName) -> Option<u64> {
             TagValue::U8(value) => Some(u64::from(value)),
             _ => None,
         }
+    })
+}
+
+fn file_size_tag_value(tags: &[Tag]) -> Option<u64> {
+    let mut size = None;
+    let mut size_low = None;
+    let mut size_high = None;
+
+    for tag in tags {
+        match (&tag.name, &tag.value) {
+            (TagName::Short(name), TagValue::UInt(value))
+                if *name == tag_name::FILESIZE && u32::try_from(*value).is_ok() =>
+            {
+                size_low = Some(*value as u32);
+            }
+            (TagName::Short(name), TagValue::UInt(value)) if *name == tag_name::FILESIZE => {
+                size = Some(*value);
+            }
+            (TagName::Short(name), TagValue::U64(value)) if *name == tag_name::FILESIZE => {
+                size = Some(*value);
+            }
+            (TagName::Short(name), TagValue::U32(value)) if *name == tag_name::FILESIZE => {
+                size_low = Some(*value);
+            }
+            (TagName::Short(name), TagValue::U16(value)) if *name == tag_name::FILESIZE => {
+                size_low = Some(u32::from(*value));
+            }
+            (TagName::Short(name), TagValue::U8(value)) if *name == tag_name::FILESIZE => {
+                size_low = Some(u32::from(*value));
+            }
+            (TagName::Short(name), TagValue::UInt(value))
+                if *name == tag_name::FILESIZE_HI && u32::try_from(*value).is_ok() =>
+            {
+                size_high = Some(*value as u32);
+            }
+            (TagName::Short(name), TagValue::U32(value)) if *name == tag_name::FILESIZE_HI => {
+                size_high = Some(*value);
+            }
+            (TagName::Short(name), TagValue::U16(value)) if *name == tag_name::FILESIZE_HI => {
+                size_high = Some(u32::from(*value));
+            }
+            (TagName::Short(name), TagValue::U8(value)) if *name == tag_name::FILESIZE_HI => {
+                size_high = Some(u32::from(*value));
+            }
+            _ => {}
+        }
+    }
+
+    size.or_else(|| {
+        size_low.map(|low| {
+            let high = size_high.unwrap_or(0);
+            (u64::from(high) << 32) | u64::from(low)
+        })
     })
 }
 
@@ -340,6 +397,20 @@ mod tests {
         assert!(!matches_restrictive_keyword_payload(
             "ubuntu.iso",
             &[Tag::filesize(899)],
+            &payload
+        ));
+    }
+
+    #[test]
+    fn numeric_filesize_terms_compare_split_large_file_size() {
+        let size = (2_u64 << 32) | 1;
+        let payload = numeric_u64_term(tag_name::FILESIZE, 0x00, size);
+        assert!(matches_restrictive_keyword_payload(
+            "large.bin",
+            &[
+                Tag::new_short(tag_name::FILESIZE, TagValue::U32(1)),
+                Tag::new_short(tag_name::FILESIZE_HI, TagValue::U32(2)),
+            ],
             &payload
         ));
     }
