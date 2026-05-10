@@ -8,10 +8,10 @@ where it materially improves live-network acceptance, reachability, or harvest
 yield:
 
 The canonical target statement now lives in
-[ED2K 0.72a Full Parity Tracker](./ED2K_072A_FULL_PARITY_TRACKER.md): **full
-stock eMule `v0.72a` parity, excluding obsolete protocol features only**.
-Treat older `community-0.60` comparisons in this doc set as historical context,
-not as the current end target.
+[ED2K 0.72a Current Protocol Tracker](./ED2K_072A_FULL_PARITY_TRACKER.md):
+**latest/current live-network ED2K behavior only**. Treat older
+`community-0.60` comparisons and legacy eMule branches as historical context,
+not as implementation targets.
 
 - downloader and search consumer
 - listener and upload server
@@ -346,8 +346,8 @@ Do not collapse these buckets:
 1. close `ITEM_031` by fixing same-server live source discovery for the
    large-file realnet AICH closure while keeping the local stock-fixture AICH
    tests green
-2. keep every still-advertised non-obsolete ED2K feature truthful, de-advertising
-   unsupported surfaces until implementation catches up
+2. keep every current advertised ED2K feature truthful, de-advertising
+   unsupported or legacy-only surfaces until implementation catches up
 3. finish stock-eMule-like queue scoring with durable credit weighting, real
    file priority, LowID handling, slot rotation, and harness/live evidence
 4. extend callback parity across direct UDP, server callback, Kad callback,

@@ -1,28 +1,32 @@
-# ED2K 0.72a Full Parity Tracker
+# ED2K 0.72a Current Protocol Tracker
 
-Canonical tracker for the current ED2K parity target in `overlord-agent-emule`.
+Canonical tracker for the current ED2K protocol target in
+`overlord-agent-emule`.
 
 ## Target
 
-The ED2K target for this repo is **full stock eMule `v0.72a` parity, excluding
-obsolete protocol features only**.
+The ED2K target for this repo is **latest/current live-network ED2K behavior
+only**. Stock eMule `v0.72a` is the main oracle for currently advertised
+behavior, but legacy protocol variants and obsolete fallback paths are
+out of scope unless the user explicitly re-scopes the work.
 
 This is an explicit hard-scope statement:
 
-- not "good enough interoperability"
-- not "hello/login parity only"
-- not "download-only parity"
-- not "community-0.60 parity"
-- not "firewalled bootstrap parity only"
+- not full historical eMule behavior parity
+- not legacy variation coverage
+- not old-client compatibility for its own sake
+- not community-0.60 parity
+- not obsolete fallback implementation
 
-If stock eMule `v0.72a` still exposes a non-obsolete ED2K behavior on the live
-network, this repo should treat that behavior as in scope until parity is
-reached or the feature is explicitly reclassified as obsolete.
+If stock eMule `v0.72a` exposes a current advertised ED2K behavior on the live
+network, this repo should treat that behavior as in scope until equivalent
+current behavior is reached. If the behavior is a legacy variant, compatibility
+fallback, or obsolete surface, it is out of scope by default.
 
-## Only Accepted Exclusions
+## Out Of Scope By Default
 
-The only ED2K protocol surfaces currently treated as obsolete for this target
-are:
+The following ED2K protocol surfaces are legacy or obsolete for the current
+target:
 
 - legacy outbound `OP_MULTIPACKET`
 - legacy outbound `OP_MULTIPACKETANSWER`
@@ -31,12 +35,14 @@ are:
   active path once `FileIdentifier` + modern AICH tree parity is implemented
 - peer-cache advertisement
 
-Deprecated packets may still be parsed inbound where practical for tolerance,
-but they are not the target active behavior for "full parity".
+Do not add inbound or outbound implementations for deprecated packets unless
+the user explicitly re-scopes the work and live-network evidence justifies the
+exception.
 
-## Non-Obsolete Scope That Remains In Scope
+## Current Scope
 
-The following remain in scope for "full parity":
+The following remain in scope when they use the latest/current live-network
+ED2K behavior:
 
 - peer hello and hello-answer behavior
 - server login and server-session behavior
@@ -88,26 +94,27 @@ The following remain in scope for "full parity":
       credit inputs and harness/live parity evidence remain open
 - [ ] Full buddy / callback matrix and buddy-tag parity for firewalled mode
 - [ ] Preview request / answer parity
-- [ ] Shared-files and shared-directories browsing parity
-- [ ] Chat and chat-captcha parity
-- [x] Active ED2K notes search parity
+- [ ] Shared-files and shared-directories browsing if current live peers still
+      expose it
+- [ ] Chat and chat-captcha if current live peers still expose it
+- [x] Active ED2K notes search
 - [ ] Broader downloader scheduler parity where stock `v0.72a` behavior depends
       on A4AF / global scheduling decisions
 - [ ] Broader `ServerSocket.cpp` parity beyond the current focused subset
 
 ## Strong Completion Rule
 
-Do **not** call the ED2K work "done" while any still-advertised non-obsolete
-feature remains unsupported.
+Do **not** call the ED2K work "done" while any current advertised feature
+remains unsupported.
 
 Current example:
 
-- chat and captcha remain part of the parity backlog because stock `v0.72a`
-  exposes them, but the hello profile must not advertise unsupported captcha
+- chat and captcha remain backlog candidates only if current live peers still
+  expose them, and the hello profile must not advertise unsupported captcha
   support until a truthful challenge/response implementation exists.
-- file comments remain part of the parity backlog because stock `v0.72a`
-  exposes them, but `CT_EMULE_MISCOPTIONS1` and `OP_EMULEINFO` must not
-  advertise comment support until comment exchange and persistence exist.
+- file comments remain backlog candidates only if current live peers still
+  expose them, and `CT_EMULE_MISCOPTIONS1` and `OP_EMULEINFO` must not
+  advertise comment support until comment exchange and persistence exists.
 
 ## Vector Hygiene
 
@@ -133,10 +140,10 @@ The active next milestone is:
    ED2K and Kad-discovered paths while the builder changes land
 5. rerun the dedicated large-file realnet scenario until the stock-truthful
    local generation path also stays green outside the local harness matrix
-6. extend the same truthfulness rule to every still-advertised non-obsolete
-   ED2K feature that remains unimplemented; chat-captcha remains in the backlog
-   and file comments remain in the backlog, but unsupported captcha and
-   comments are no longer advertised in the hello / eMuleInfo profiles
+6. extend the same truthfulness rule to every current advertised ED2K feature
+   that remains unimplemented; chat-captcha and file comments remain backlog
+   candidates only if they are current live-network behavior, and unsupported
+   captcha/comments are no longer advertised in the hello / eMuleInfo profiles
 
 This remains the highest-leverage next step because the downloader and listener
 now use the modern `FileIdentifier` + `EXT2` + `HASHSETREQUEST2` transport and
