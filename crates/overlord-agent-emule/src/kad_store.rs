@@ -398,17 +398,10 @@ fn keyword_result_tags(entry: &StoredKeywordPublish) -> Vec<Tag> {
         tags.push(Tag::filesize(size));
     }
 
-    let mut skipped_filename = false;
-    let mut skipped_filesize = false;
     let mut aich_result_hash = None;
     for tag in &entry.tags {
         match tag.name {
-            TagName::Short(name) if name == tag_name::FILENAME && !skipped_filename => {
-                skipped_filename = true;
-            }
-            TagName::Short(name) if name == tag_name::FILESIZE && !skipped_filesize => {
-                skipped_filesize = true;
-            }
+            TagName::Short(name) if name == tag_name::FILENAME || name == tag_name::FILESIZE => {}
             TagName::Short(name) if name == tag_name::KADAICHHASHPUB => {
                 if aich_result_hash.is_none() {
                     aich_result_hash = stock_aich_publish_hash(tag);
@@ -503,16 +496,9 @@ fn notes_result_tags(entry: &StoredNotesPublish) -> Vec<Tag> {
         tags.push(Tag::filesize(size));
     }
 
-    let mut skipped_filename = false;
-    let mut skipped_filesize = false;
     for tag in &entry.tags {
         match tag.name {
-            TagName::Short(name) if name == tag_name::FILENAME && !skipped_filename => {
-                skipped_filename = true;
-            }
-            TagName::Short(name) if name == tag_name::FILESIZE && !skipped_filesize => {
-                skipped_filesize = true;
-            }
+            TagName::Short(name) if name == tag_name::FILENAME || name == tag_name::FILESIZE => {}
             _ => tags.push(tag.clone()),
         }
     }
@@ -1149,6 +1135,45 @@ mod tests {
             response.results[0].tags[1].value,
             TagValue::UInt(value) if value == 123
         ));
+    }
+
+    #[test]
+    fn keyword_publish_drops_duplicate_name_and_size_tags_like_stock() {
+        let mut store = KadLocalStore::new(config());
+        let target = NodeId::from_bytes([1; 16]);
+        let file_hash = Ed2kHash::from_bytes([2; 16]);
+        let entry = PublishEntry {
+            hash: file_hash,
+            tags: vec![
+                Tag::filename("ubuntu linux.iso"),
+                Tag::filesize(123),
+                Tag::filename("ignored.iso"),
+                Tag::filesize(999),
+            ],
+        };
+
+        store.record_keyword_publish_batch(target, std::slice::from_ref(&entry), ts(0));
+        let response = store
+            .keyword_search_response(
+                NodeId::from_bytes([9; 16]),
+                &SearchKeyReq {
+                    target,
+                    start_position: 0,
+                    restrictive_payload: Vec::new(),
+                },
+                10,
+                ts(1),
+            )
+            .expect("keyword response");
+
+        assert_eq!(
+            short_tag_names(&response.results[0].tags),
+            vec![
+                tag_name::FILENAME,
+                tag_name::FILESIZE,
+                tag_name::PUBLISHINFO,
+            ]
+        );
     }
 
     #[test]
@@ -2080,8 +2105,6 @@ mod tests {
                 tag_name::FILESIZE,
                 tag_name::DESCRIPTION,
                 tag_name::DESCRIPTION,
-                tag_name::FILESIZE,
-                tag_name::FILENAME,
             ]
         );
         assert!(matches!(
