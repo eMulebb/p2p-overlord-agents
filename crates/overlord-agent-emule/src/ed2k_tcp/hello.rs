@@ -75,7 +75,9 @@ pub(super) fn emule_misc_options1() -> u32 {
     let udp_version = 4u32;
     let data_compression_version = 1u32;
     let secure_ident_version = EMULE_SECURE_IDENT_VERSION;
-    let source_exchange_version = 4u32;
+    // SX1 is deprecated in the stock opcode table and is not implemented.
+    // SX2 support is advertised truthfully in MISCOPTIONS2.
+    let source_exchange_version = 0u32;
     let extended_requests_version = 2u32;
     // File-description packets are tolerated, but the stock comments surface
     // is not implemented yet, so do not advertise comment exchange support.
@@ -83,9 +85,9 @@ pub(super) fn emule_misc_options1() -> u32 {
     // Recent stock eMule no longer advertises peer cache support.
     let peer_cache = 0u32;
     let no_view_shared_files = 1u32;
-    // Recent live-network captures and the local 0.72a source both advertise
-    // the packed/multipacket startup profile on the peer hello path.
-    let multipacket = 1u32;
+    // Legacy OP_MULTIPACKET/OP_MULTIPACKET_EXT are out of scope. The current
+    // FileIdentifier path advertises EXT2 support in MISCOPTIONS2 instead.
+    let multipacket = 0u32;
     let preview_supported = 0u32;
     (supports_aich << 29)
         | (supports_unicode << 28)

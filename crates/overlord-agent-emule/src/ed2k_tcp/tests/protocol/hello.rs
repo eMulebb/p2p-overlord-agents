@@ -156,14 +156,19 @@ fn hello_misc_options2_does_not_advertise_unsupported_chat_captcha() {
 }
 
 #[test]
-fn hello_misc_options1_does_not_advertise_unsupported_comments_or_preview() {
+fn hello_misc_options1_does_not_advertise_unsupported_legacy_surfaces() {
     let misc_options1 = emule_misc_options1();
 
     assert_eq!((misc_options1 >> 29) & 0x7, 1, "AICH is implemented");
     assert_eq!(
         (misc_options1 >> 12) & 0x0F,
-        4,
-        "source exchange is implemented"
+        0,
+        "legacy source exchange is not implemented"
+    );
+    assert_eq!(
+        (misc_options1 >> 1) & 1,
+        0,
+        "legacy multipacket is not implemented"
     );
     assert_eq!(
         (misc_options1 >> 4) & 0x0F,
@@ -195,7 +200,7 @@ fn hello_answer_matches_truthful_plaintext_profile() {
     });
 
     let expected = decode(
-            "e3520000004c73bec566140e7e6083c450c9af026f8395581b524fb60600000015010001654d756c65030100113c000000030100f951b651b6030100fa06421334030100fe3a240000030100fb00200100b07b02ef8810",
+            "e3520000004c73bec566140e7e6083c450c9af026f8395581b524fb60600000015010001654d756c65030100113c000000030100f951b651b6030100fa04021334030100fe3a240000030100fb00200100b07b02ef8810",
         )
         .unwrap();
 
