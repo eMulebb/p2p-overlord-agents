@@ -89,6 +89,16 @@ fn exact_file_hash_payload_rejects_stock_exact_context_trailing_bytes() {
 }
 
 #[test]
+fn optional_file_hash_payload_matches_stock_debug_prefix_handling() {
+    let file_hash = Ed2kHash([0x5B; 16]);
+    let mut payload = file_hash.0.to_vec();
+    payload.extend_from_slice(&[0xAA, 0xBB]);
+
+    assert_eq!(decode_optional_file_hash_payload(&payload), Some(file_hash));
+    assert_eq!(decode_optional_file_hash_payload(&payload[..15]), None);
+}
+
+#[test]
 fn port_test_answer_matches_stock_edonkey_ack_shape() {
     let packet = encode_port_test_answer();
 

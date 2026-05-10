@@ -352,11 +352,7 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
         .await
         .unwrap();
     stream
-        .write_all(&super::encode_packet(
-            OP_EDONKEYPROT,
-            OP_CHANGE_SLOT,
-            &file_hash.0,
-        ))
+        .write_all(&super::encode_packet(OP_EDONKEYPROT, OP_CHANGE_SLOT, &[]))
         .await
         .unwrap();
     let mut message_payload = Vec::new();
@@ -430,6 +426,14 @@ async fn listener_upload_startup_tolerates_source_exchange_and_aich_probe() {
         read_until_opcode(&mut stream, OP_EDONKEYPROT, super::OP_ACCEPTUPLOADREQ).await;
     assert_eq!(accept_upload.len(), 6);
 
+    stream
+        .write_all(&super::encode_packet(
+            OP_EDONKEYPROT,
+            OP_END_OF_DOWNLOAD,
+            &[],
+        ))
+        .await
+        .unwrap();
     stream
         .write_all(&super::encode_packet(
             OP_EDONKEYPROT,

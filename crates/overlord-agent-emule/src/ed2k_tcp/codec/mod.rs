@@ -139,6 +139,12 @@ pub(super) fn decode_file_hash_payload(payload: &[u8]) -> Result<Ed2kHash> {
     Ok(Ed2kHash::from_bytes(hash))
 }
 
+pub(super) fn decode_optional_file_hash_payload(payload: &[u8]) -> Option<Ed2kHash> {
+    let mut hash = [0u8; 16];
+    hash.copy_from_slice(payload.get(..16)?);
+    Some(Ed2kHash::from_bytes(hash))
+}
+
 pub(super) fn decode_exact_file_hash_payload(payload: &[u8], context: &str) -> Result<Ed2kHash> {
     if payload.len() != 16 {
         anyhow::bail!("invalid {context} payload size {}", payload.len());

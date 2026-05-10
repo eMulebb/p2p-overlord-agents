@@ -117,6 +117,14 @@ async fn nofile_answer_for_requested_file_is_incomplete_not_error() {
 
         complete_plain_secure_ident_exchange(&mut stream, peer_addr, &peer_public_key).await;
         stream
+            .write_all(&encode_packet(OP_EDONKEYPROT, OP_CHANGE_SLOT, &[]))
+            .await
+            .unwrap();
+        stream
+            .write_all(&encode_packet(OP_EDONKEYPROT, OP_END_OF_DOWNLOAD, &[]))
+            .await
+            .unwrap();
+        stream
             .write_all(&encode_file_req_ans_nofil(&file_hash))
             .await
             .unwrap();

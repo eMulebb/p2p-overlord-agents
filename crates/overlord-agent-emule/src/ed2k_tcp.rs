@@ -48,8 +48,8 @@ pub(in crate::ed2k_tcp) use codec::{
     decode_client_id_change_payload, decode_client_message_payload,
     decode_compressed_part_fragment, decode_edonkey_queue_rank_payload,
     decode_emule_queue_ranking_payload, decode_exact_file_hash_payload,
-    decode_file_description_payload, decode_file_hash_payload, decode_file_status_payload,
-    decode_hashset_answer, decode_hashset_answer2, decode_kad_callback_payload,
+    decode_file_description_payload, decode_file_status_payload, decode_hashset_answer,
+    decode_hashset_answer2, decode_kad_callback_payload, decode_optional_file_hash_payload,
     decode_peer_payload, decode_preview_answer_payload, decode_preview_request_payload,
     decode_public_ip_answer_payload, decode_reask_callback_tcp_payload,
     decode_request_filename_answer, decode_request_filename_answer_body,
@@ -66,13 +66,14 @@ pub(in crate::ed2k_tcp) use codec::{
 #[cfg(test)]
 #[allow(unused_imports)]
 use codec::{
-    build_upload_part_packets, decode_hashset_request2, decode_request_parts_payload,
-    decode_request_sources_payload, encode_accept_upload_req, encode_aich_file_hash_answer,
-    encode_answer_sources, encode_answer_sources2, encode_compressed_part_fragment,
-    encode_file_req_ans_nofil, encode_file_status_complete, encode_hashset_answer,
-    encode_hashset_answer2, encode_multipacket_answer, encode_multipacket_ext2_answer,
-    encode_packed_packet, encode_queue_ranking, encode_request_filename_answer,
-    encode_request_sources2_subpayload, encode_sending_part, skip_request_filename_ext_info,
+    build_upload_part_packets, decode_file_hash_payload, decode_hashset_request2,
+    decode_request_parts_payload, decode_request_sources_payload, encode_accept_upload_req,
+    encode_aich_file_hash_answer, encode_answer_sources, encode_answer_sources2,
+    encode_compressed_part_fragment, encode_file_req_ans_nofil, encode_file_status_complete,
+    encode_hashset_answer, encode_hashset_answer2, encode_multipacket_answer,
+    encode_multipacket_ext2_answer, encode_packed_packet, encode_queue_ranking,
+    encode_request_filename_answer, encode_request_sources2_subpayload, encode_sending_part,
+    skip_request_filename_ext_info,
 };
 pub(in crate::ed2k_tcp) use download::PendingCompressedPart;
 #[cfg(test)]
