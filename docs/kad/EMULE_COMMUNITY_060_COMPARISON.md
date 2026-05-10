@@ -28,8 +28,8 @@ Reference anchors used for this review:
 | Kad passive replay shape | Better than previous docs claimed | The snoop queue now preserves `start_position`, restrictive keyword payloads, and source or notes `size`; the old target-only doc claim was stale. |
 | ED2K server session | Partial but credible | Login, keepalive, HighID or LowID handling, keyword search, source search, and callback-aware source decoding are implemented. |
 | ED2K downloader | Partially aligned | Startup ordering is much closer to stock eMule, and the Rust runtime now keeps an adaptive rolling block window, but scheduler scope is still materially simpler. |
-| ED2K listener or upload queue | Materially different | Verified-range serving and queue ranks exist, but the queue policy is FIFO and fixed-slot instead of score driven. |
-| ED2K notes | Missing active path | Kad notes search is wired; ED2K notes search is still rejected in agent dispatch. |
+| ED2K listener or upload queue | Materially different | Verified-range serving and queue ranks exist, and the first score-ranked queue slice is implemented, but durable credits, real file priority, slot rotation, and harness/live queue evidence remain open. |
+| ED2K notes | First active slice wired | ED2K-labeled notes search now reuses the stock-aligned Kad notes transport; richer note-author result modeling remains separate backlog work. |
 
 ## Kad Protocol And State Machine
 
@@ -83,11 +83,11 @@ Areas that are currently credible against stock eMule:
 
 Verified differences against stock eMule:
 
-- `overlord-agent-emule/src/ed2k_transfer.rs` uses a FIFO waiting queue with
-  fixed active slots and timeout classes, though it now preserves one queue
-  entry per peer across reconnects and requested-file switches. Stock eMule
-  `UploadQueue.cpp` calculates queue worth with `FindBestClientInQueue`,
-  applies duplicate and IP suppression in `AddClientToQueue`, and rotates slots with
+- `overlord-agent-emule/src/ed2k_transfer.rs` now has a deterministic
+  score-ranked queue slice with friend-slot boost, LowID penalty, duplicate
+  reconnect refresh, and a file-priority hook. Stock eMule `UploadQueue.cpp`
+  still goes further with durable credit inputs, real file priority, duplicate
+  and IP suppression in `AddClientToQueue`, and slot rotation with
   `CheckForTimeOver`.
 - `overlord-agent-emule/src/ed2k_tcp.rs` now keeps an adaptive pending-block
   window with rolling refills and safe teardown for malformed or out-of-order
@@ -97,7 +97,8 @@ Verified differences against stock eMule:
 - `overlord-agent-emule/src/ed2k_server.rs` is intentionally narrower than the
   full `ServerSocket.cpp` feature surface. It does not claim full stock eMule
   coverage outside the targeted login, search, and source-search flow.
-- `overlord-agent-emule/src/agent.rs` still rejects active ED2K notes searches.
+- active ED2K notes search is wired through the Kad notes transport, but
+  note-author result modeling remains file-centric.
 - callback coverage remains narrower than stock `BaseClient.cpp TryToConnect`,
   which spans direct TCP, direct UDP callback, server callback, Kad callback,
   and wait or abort branches.
@@ -108,8 +109,9 @@ Verified differences against stock eMule:
   differences are deliberate repo policy or live-acceptance tuning.
 - The biggest stock-eMule delta is now ED2K peer behavior, not Kad wire
   encoding.
-- The two highest-value ED2K parity upgrades are replacing FIFO upload queue
-  behavior with score and credit aware queueing and carrying the new adaptive
-  downloader window through fuller eMule-style A4AF and file-selection parity.
+- The highest-value ED2K parity upgrade is closing the same-server large-file
+  source-discovery blocker for the AICH realnet gate. After that, finish credit
+  aware queueing and carry the adaptive downloader window through fuller
+  eMule-style A4AF and file-selection parity.
 - The doc set previously understated passive Kad replay fidelity. That has been
   corrected in the current tracked docs.
