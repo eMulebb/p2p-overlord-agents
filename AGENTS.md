@@ -4,6 +4,9 @@
   `../p2p-overlord-tooling/docs/WORKSPACE_POLICY.md`.
 - Use `docs/README.md` as the canonical agents docs home.
 - Use `../p2p-overlord-be/BACKLOG.md` as the canonical active backlog.
+- Target full stock eMule `v0.72a` Kad and ED2K parity, including deprecated
+  legacy compatibility behavior. The only standing protocol exception is
+  defunct ED2K PeerCache support.
 - Before finishing Rust changes, run:
   - `cargo fmt --all --check`
   - `cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::all -W clippy::too_many_arguments -W clippy::type_complexity -W clippy::cognitive_complexity`

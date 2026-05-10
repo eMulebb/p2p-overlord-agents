@@ -8,7 +8,8 @@ transfer-parity work. The long-term repo target is full native Kad and ED2K
 parity, including searching, sharing, upload, and download behavior.
 
 The current canonical ED2K target is **full stock eMule `v0.72a` parity,
-excluding obsolete protocol features only**.
+including deprecated legacy compatibility behavior**. The only standing
+protocol exception is defunct ED2K PeerCache support.
 
 ## Core Reference
 

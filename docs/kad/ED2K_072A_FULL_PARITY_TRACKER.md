@@ -4,8 +4,9 @@ Canonical tracker for the current ED2K parity target in `overlord-agent-emule`.
 
 ## Target
 
-The ED2K target for this repo is **full stock eMule `v0.72a` parity, excluding
-obsolete protocol features only**.
+The ED2K target for this repo is **full stock eMule `v0.72a` parity, including
+deprecated legacy compatibility behavior**. The only standing protocol
+exception is defunct ED2K PeerCache support.
 
 This is an explicit hard-scope statement:
 
@@ -15,24 +16,21 @@ This is an explicit hard-scope statement:
 - not "community-0.60 parity"
 - not "firewalled bootstrap parity only"
 
-If stock eMule `v0.72a` still exposes a non-obsolete ED2K behavior on the live
-network, this repo should treat that behavior as in scope until parity is
-reached or the feature is explicitly reclassified as obsolete.
+If stock eMule `v0.72a` still implements, accepts, or advertises an ED2K
+behavior on the live network, this repo should treat that behavior as in scope
+until parity is reached or the user explicitly re-scopes it.
 
 ## Only Accepted Exclusions
 
-The only ED2K protocol surfaces currently treated as obsolete for this target
-are:
+The only ED2K protocol surface currently excluded from the parity target is
+defunct PeerCache support:
 
-- legacy outbound `OP_MULTIPACKET`
-- legacy outbound `OP_MULTIPACKETANSWER`
-- legacy outbound `OP_MULTIPACKET_EXT`
-- legacy standalone `OP_AICHFILEHASHREQ` / `OP_AICHFILEHASHANS` as the primary
-  active path once `FileIdentifier` + modern AICH tree parity is implemented
-- peer-cache advertisement
+- do not advertise PeerCache capability bits
+- do not implement active `OP_PEERCACHE_QUERY`, `OP_PEERCACHE_ANSWER`, or
+  `OP_PEERCACHE_ACK` behavior
 
-Deprecated packets may still be parsed inbound where practical for tolerance,
-but they are not the target active behavior for "full parity".
+Deprecated packets and compatibility branches remain in scope when stock eMule
+`v0.72a` still implements, accepts, or advertises them.
 
 ## Non-Obsolete Scope That Remains In Scope
 

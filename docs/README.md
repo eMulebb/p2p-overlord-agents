@@ -27,7 +27,8 @@ traffic shape depends on it.
 - ED2K runtime and wire work currently lives alongside the Kad docs in the same
   reference set while parity is still being built out.
 - The current canonical ED2K target is **full stock eMule `v0.72a` parity,
-  excluding obsolete protocol features only**.
+  including deprecated legacy compatibility behavior**. The only standing
+  protocol exception is defunct ED2K PeerCache support.
 
 ED2K-specific planning and status docs:
 
