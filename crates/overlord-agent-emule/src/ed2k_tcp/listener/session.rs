@@ -41,13 +41,13 @@ use super::super::identity::{
 use super::super::{
     ED2K_CONNECTION_IDLE_TIMEOUT, ED2K_SECURE_IDENT_KEY_AND_SIGNATURE_NEEDED,
     ED2K_SECURE_IDENT_SIGNATURE_NEEDED, Ed2kHelloIdentity, Ed2kSecureIdent, Ed2kTransport,
-    FirewallCheckUdpRequest, OP_AICHFILEHASHREQ, OP_CANCELTRANSFER, OP_EDONKEYPROT, OP_EMULEINFO,
-    OP_EMULEINFOANSWER, OP_EMULEPROT, OP_END_OF_DOWNLOAD, OP_FWCHECKUDPREQ, OP_HASHSETREQUEST,
-    OP_HASHSETREQUEST2, OP_HELLO, OP_HELLOANSWER, OP_KAD_FWTCPCHECK_ACK, OP_MULTIPACKET,
-    OP_MULTIPACKET_EXT, OP_MULTIPACKET_EXT2, OP_PORTTEST, OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ,
-    OP_PUBLICKEY, OP_REQUESTFILENAME, OP_REQUESTPARTS, OP_REQUESTPARTS_I64, OP_REQUESTSOURCES,
-    OP_REQUESTSOURCES2, OP_SECIDENTSTATE, OP_SETREQFILEID, OP_SIGNATURE, OP_STARTUPLOADREQ,
-    apply_server_state,
+    FirewallCheckUdpRequest, OP_AICHFILEHASHREQ, OP_BUDDYPING, OP_BUDDYPONG, OP_CANCELTRANSFER,
+    OP_EDONKEYPROT, OP_EMULEINFO, OP_EMULEINFOANSWER, OP_EMULEPROT, OP_END_OF_DOWNLOAD,
+    OP_FWCHECKUDPREQ, OP_HASHSETREQUEST, OP_HASHSETREQUEST2, OP_HELLO, OP_HELLOANSWER,
+    OP_KAD_FWTCPCHECK_ACK, OP_MULTIPACKET, OP_MULTIPACKET_EXT, OP_MULTIPACKET_EXT2, OP_PORTTEST,
+    OP_PUBLICIP_ANSWER, OP_PUBLICIP_REQ, OP_PUBLICKEY, OP_REQUESTFILENAME, OP_REQUESTPARTS,
+    OP_REQUESTPARTS_I64, OP_REQUESTSOURCES, OP_REQUESTSOURCES2, OP_SECIDENTSTATE, OP_SETREQFILEID,
+    OP_SIGNATURE, OP_STARTUPLOADREQ, apply_server_state,
 };
 
 mod shared_file;
@@ -538,6 +538,14 @@ pub(in crate::ed2k_tcp) async fn handle_connection(
                     Some(transport.mode),
                     "kad_firewall_tcp_ack",
                     "received=true",
+                );
+            }
+            (OP_EMULEPROT, OP_BUDDYPING) | (OP_EMULEPROT, OP_BUDDYPONG) => {
+                dump_ed2k_tcp_listener_meta(
+                    peer_addr,
+                    Some(transport.mode),
+                    "kad_buddy_ping_pong",
+                    format!("opcode=0x{:02X}", packet.opcode),
                 );
             }
             _ => {
