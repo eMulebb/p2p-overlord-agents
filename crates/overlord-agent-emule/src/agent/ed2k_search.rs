@@ -613,11 +613,11 @@ pub(super) async fn do_active_ed2k_source_search(
     let file_size = search_file_size(job)?;
     let source_search_timeout = ed2k_source_search_timeout(&config.p2p.ed2k);
     let files = if let Some(background_search) = background_search {
-        // Keep source-search fallback off the already connected background
-        // server. eMule issues local source requests on its one live server
-        // session instead of opening a second parallel login to the same
-        // endpoint with the same client identity.
-        let fallback_excluded_endpoint = preferred_endpoint;
+        // Stock eMule's local source requests are centered on the connected
+        // server. If the background path yielded nothing, keep that endpoint
+        // eligible for the one-shot fallback instead of skipping the best
+        // same-server candidate.
+        let fallback_excluded_endpoint = None;
         match search_source_via_background_session(
             &background_search,
             file_hash,
