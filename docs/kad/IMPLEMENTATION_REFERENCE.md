@@ -103,9 +103,7 @@ p2p-overlord/
 │       └── overlord-agent-emule/  ← Kad2 agent binary and coordinator integration
 ├── p2p-overlord-be/
     └── overlord-be-coordinator/   ← coordinator, result ingestion, search dispatch, snoop APIs
-└── p2p-overlord-ed2k-server/
-    ├── cmd/overlord-ed2k-server/  ← local ED2K server binary
-    └── ed2ksrv/                   ← server protocol/runtime package
+└── ../goed2k-server/              ← eMuleBB ED2K server fork for parity scenarios
 ```
 
 ### Dependency Graph

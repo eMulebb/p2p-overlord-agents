@@ -29,6 +29,8 @@ traffic shape depends on it.
 - The current canonical ED2K target is **full stock eMule `v0.72a` parity,
   including deprecated legacy compatibility behavior**. The only standing
   protocol exception is defunct ED2K PeerCache support.
+- Deterministic ED2K server scenarios should use the eMuleBB `goed2k-server`
+  fork exposed by the eMuleBB workspace manifest as `workspace.repos.ed2k_server`.
 
 ED2K-specific planning and status docs:
 
@@ -62,8 +64,11 @@ Shared protocol reference docs currently reused by the ED2K work:
 
 ## Repo Guards
 
-- Shared workspace quality and opportunistic-refactoring policy lives in
-  `../../p2p-overlord-tooling/docs/WORKSPACE_POLICY.md`; this section keeps the
+- In the eMuleBB workspace, shared workspace policy lives in
+  `../eMule-tooling/docs/WORKSPACE-POLICY.md`. In the standalone
+  p2p-overlord workspace, shared workspace quality and
+  opportunistic-refactoring policy lives in
+  `../../p2p-overlord-tooling/docs/WORKSPACE_POLICY.md`. This section keeps the
   Rust-specific guard notes.
 - From `../p2p-overlord-tooling`, run
   `python -m overlord_tooling guard-tracked-files --repo-root ../p2p-overlord-agents`
