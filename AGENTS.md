@@ -1,7 +1,7 @@
 # Agents Repo Rules
 
 - Follow the eMuleBB workspace policy in
-  `../eMule-tooling/docs/WORKSPACE-POLICY.md` when this repo is checked out
+  `../emulebb-tooling/docs/WORKSPACE-POLICY.md` when this repo is checked out
   under `EMULE_WORKSPACE_ROOT\repos`.
 - If the standalone p2p-overlord workspace is in use, also follow
   `../p2p-overlord-tooling/docs/WORKSPACE_POLICY.md`.

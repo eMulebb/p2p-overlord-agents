@@ -65,7 +65,7 @@ Shared protocol reference docs currently reused by the ED2K work:
 ## Repo Guards
 
 - In the eMuleBB workspace, shared workspace policy lives in
-  `../eMule-tooling/docs/WORKSPACE-POLICY.md`. In the standalone
+  `../emulebb-tooling/docs/WORKSPACE-POLICY.md`. In the standalone
   p2p-overlord workspace, shared workspace quality and
   opportunistic-refactoring policy lives in
   `../../p2p-overlord-tooling/docs/WORKSPACE_POLICY.md`. This section keeps the
