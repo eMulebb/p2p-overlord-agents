@@ -2,7 +2,7 @@
 
 - Follow the eMuleBB workspace policy in
   `../emulebb-tooling/docs/WORKSPACE-POLICY.md` when this repo is checked out
-  under `EMULE_WORKSPACE_ROOT\repos`.
+  under `EMULEBB_WORKSPACE_ROOT\repos`.
 - If the standalone p2p-overlord workspace is in use, also follow
   `../p2p-overlord-tooling/docs/WORKSPACE_POLICY.md`.
 - Use `docs/README.md` as the canonical agents docs home.

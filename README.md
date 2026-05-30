@@ -21,4 +21,14 @@ ED2K server parity scenarios should use the eMuleBB `goed2k-server` fork. The
 obsolete `emulebb-ed2k-server` fork and p2p-overlord ED2K server lineage are
 historical references only.
 
+## Release Naming
+
+The shared p2p-overlord release policy is owned by
+`p2p-overlord-be/docs/RELEASE_POLICY.md` and is available in the combined
+workspace as `../p2p-overlord-be/docs/RELEASE_POLICY.md`. The first planned
+release candidate is `0.1.1-rc.1`; the non-dotted `0.1.1-rc1` spelling is not
+canonical. Keep agent package metadata on dev versions until release mode
+explicitly starts and the agents, backend, and tooling versions are bumped
+together.
+
 Use [docs/README.md](docs/README.md) for the canonical protocol docs and [AGENTS.md](AGENTS.md) for repo-specific rules and quality gates.

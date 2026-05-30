@@ -9,6 +9,16 @@ server search, peer search, sharing, upload, and download. Milestones remain
 staged, but wire-compatible behavior stays mandatory where interoperability or
 traffic shape depends on it.
 
+## Release Policy
+
+Release naming and metadata bump rules are shared across the active
+p2p-overlord repos and are owned by
+[`p2p-overlord-be/docs/RELEASE_POLICY.md`](https://github.com/emulebb/p2p-overlord-be/blob/develop/docs/RELEASE_POLICY.md).
+In a combined workspace, use
+`../../p2p-overlord-be/docs/RELEASE_POLICY.md`. The first planned RC is
+`0.1.1-rc.1`; Rust crate metadata stays on dev versions until release mode
+starts.
+
 ## Kad
 
 - [Kad Docs Landing Page](./kad/README.md)
