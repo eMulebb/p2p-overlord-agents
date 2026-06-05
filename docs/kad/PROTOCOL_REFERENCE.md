@@ -21,9 +21,9 @@ This file owns verified Kad2 wire facts, repo policy choices, and protocol notes
 
 ### Authority Order
 
-1. eMule: `c:\prj\p2p\eMule-my\deps-repos\eMule\srchybrid\kademlia\`
-2. aMule: `c:\prj\p2p\amule\src\kademlia\`
-3. libed2k: `c:\prj\p2p\libed2k\src\kademlia\`
+1. eMule: `%EMULEBB_WORKSPACE_ROOT%\workspaces\workspace\app\emulebb-community-baseline\srchybrid\kademlia\`
+2. aMule: `%EMULEBB_WORKSPACE_ROOT%\repos\amule\src\kademlia\`
+3. libed2k: external libed2k checkout, if present
 
 ### Reading Rule
 
@@ -793,48 +793,48 @@ Use this section first when re-auditing a protocol area.
 
 ### eMule
 
-- `c:\prj\p2p\eMule-my\deps-repos\eMule\srchybrid\Opcodes.h`
+- `%EMULEBB_WORKSPACE_ROOT%\workspaces\workspace\app\emulebb-community-baseline\srchybrid\Opcodes.h`
   - Kad2 UDP opcodes
   - Kad search/publish tag IDs
   - `FT_FILESIZE_HI`
-- `c:\prj\p2p\eMule-my\deps-repos\eMule\srchybrid\kademlia\net\KademliaUDPListener.cpp`
+- `%EMULEBB_WORKSPACE_ROOT%\workspaces\workspace\app\emulebb-community-baseline\srchybrid\kademlia\net\KademliaUDPListener.cpp`
   - search request parsing
   - search response parsing
   - HELLO / firewall / UDP-key handling
-- `c:\prj\p2p\eMule-my\deps-repos\eMule\srchybrid\kademlia\kademlia\Search.cpp`
+- `%EMULEBB_WORKSPACE_ROOT%\workspaces\workspace\app\emulebb-community-baseline\srchybrid\kademlia\kademlia\Search.cpp`
   - search request serialization
   - search result parsing
   - publish request serialization
   - source type semantics
-- `c:\prj\p2p\eMule-my\deps-repos\eMule\srchybrid\kademlia\kademlia\Indexed.cpp`
+- `%EMULEBB_WORKSPACE_ROOT%\workspaces\workspace\app\emulebb-community-baseline\srchybrid\kademlia\kademlia\Indexed.cpp`
   - `SEARCH_RES` emission
   - search result batching
   - keyword/source/notes result limits
-- `c:\prj\p2p\eMule-my\deps-repos\eMule\srchybrid\kademlia\net\PacketTracking.cpp`
+- `%EMULEBB_WORKSPACE_ROOT%\workspaces\workspace\app\emulebb-community-baseline\srchybrid\kademlia\net\PacketTracking.cpp`
   - per-opcode inbound request throttling
-- `c:\prj\p2p\eMule-my\deps-repos\eMule\srchybrid\kademlia\kademlia\Prefs.cpp`
+- `%EMULEBB_WORKSPACE_ROOT%\workspaces\workspace\app\emulebb-community-baseline\srchybrid\kademlia\kademlia\Prefs.cpp`
   - UDP verify key derivation
-- `c:\prj\p2p\eMule-my\deps-repos\eMule\srchybrid\kademlia\kademlia\SearchManager.cpp`
+- `%EMULEBB_WORKSPACE_ROOT%\workspaces\workspace\app\emulebb-community-baseline\srchybrid\kademlia\kademlia\SearchManager.cpp`
   - keyword preparation and duplicate-search policy
-- `c:\prj\p2p\eMule-my\deps-repos\eMule\srchybrid\kademlia\kademlia\Defines.h`
+- `%EMULEBB_WORKSPACE_ROOT%\workspaces\workspace\app\emulebb-community-baseline\srchybrid\kademlia\kademlia\Defines.h`
   - search-related constants such as totals and `SEARCHTOLERANCE`
 
 ### aMule
 
-- `c:\prj\p2p\amule\src\include\protocol\kad2\Client2Client\UDP.h`
+- `%EMULEBB_WORKSPACE_ROOT%\repos\amule\src\include\protocol\kad2\Client2Client\UDP.h`
   - Kad2 UDP opcode cross-check
-- `c:\prj\p2p\amule\src\include\tags\FileTags.h`
+- `%EMULEBB_WORKSPACE_ROOT%\repos\amule\src\include\tags\FileTags.h`
   - Kad search/publish tag IDs
-- `c:\prj\p2p\amule\src\kademlia\net\KademliaUDPListener.cpp`
+- `%EMULEBB_WORKSPACE_ROOT%\repos\amule\src\kademlia\net\KademliaUDPListener.cpp`
   - portable cross-check for search/publish parsing
   - HELLO / firewall / UDP-key handling
-- `c:\prj\p2p\amule\src\kademlia\kademlia\Search.cpp`
+- `%EMULEBB_WORKSPACE_ROOT%\repos\amule\src\kademlia\kademlia\Search.cpp`
   - portable cross-check for search serialization and parsing
-- `c:\prj\p2p\amule\src\kademlia\kademlia\Indexed.cpp`
+- `%EMULEBB_WORKSPACE_ROOT%\repos\amule\src\kademlia\kademlia\Indexed.cpp`
   - portable cross-check for `SEARCH_RES` emission
-- `c:\prj\p2p\amule\src\kademlia\net\PacketTracking.cpp`
+- `%EMULEBB_WORKSPACE_ROOT%\repos\amule\src\kademlia\net\PacketTracking.cpp`
   - portable cross-check for inbound request throttling
-- `c:\prj\p2p\amule\src\kademlia\kademlia\Prefs.cpp`
+- `%EMULEBB_WORKSPACE_ROOT%\repos\amule\src\kademlia\kademlia\Prefs.cpp`
   - UDP verify key derivation
 
 ### Overlord Kad Implementation

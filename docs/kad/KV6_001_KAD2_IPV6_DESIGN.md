@@ -73,11 +73,11 @@ Primary references for `KV6_001` design:
 
 Local oracle and mod references:
 
-- `C:\prj\p2p\eMule\analysis\eMuleAI\Release_Notes.txt`
-- `C:\prj\p2p\eMule\analysis\eMuleAI\srchybrid\BaseClient.cpp`
-- `C:\prj\p2p\eMule\analysis\eMule-mods-archive\eMule-0.50a-neomuleneomule_reloaded-fa3debb\srchybrid\BaseClient.cpp`
-- `C:\prj\p2p\eMule\analysis\eMule-mods-archive\eMule-0.50a-neomuleneomule_reloaded-fa3debb\srchybrid\Neo\Address.h`
-- `C:\prj\p2p\eMule\analysis\eMule-mods-archive\eMule-0.50a-neomuleneomule_reloaded-fa3debb\srchybrid\kademlia\net\KademliaUDPListener.cpp`
+- `%EMULEBB_WORKSPACE_ROOT%\analysis\eMuleAI\Release_Notes.txt`
+- `%EMULEBB_WORKSPACE_ROOT%\analysis\eMuleAI\srchybrid\BaseClient.cpp`
+- `%EMULEBB_WORKSPACE_ROOT%\analysis\eMule-mods-archive\eMule-0.50a-neomuleneomule_reloaded-fa3debb\srchybrid\BaseClient.cpp`
+- `%EMULEBB_WORKSPACE_ROOT%\analysis\eMule-mods-archive\eMule-0.50a-neomuleneomule_reloaded-fa3debb\srchybrid\Neo\Address.h`
+- `%EMULEBB_WORKSPACE_ROOT%\analysis\eMule-mods-archive\eMule-0.50a-neomuleneomule_reloaded-fa3debb\srchybrid\kademlia\net\KademliaUDPListener.cpp`
 
 ## 5. What eMuleAI and NeoMule Already Prove
 

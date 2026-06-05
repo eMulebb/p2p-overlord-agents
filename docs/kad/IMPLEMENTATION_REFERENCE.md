@@ -77,9 +77,9 @@ Three reference codebases were analysed prior to writing this spec:
 
 | Repo | Path | Notes |
 |---|---|---|
-| eMule | `c:\prj\p2p\eMule-my\deps-repos\eMule\srchybrid\kademlia\` | Authoritative Kad2 wire format and protocol behaviour. Windows/MFC-only. |
-| aMule | `c:\prj\p2p\amule\src\kademlia\` | Cross-platform port of eMule. Better code organisation. wxWidgets. |
-| libed2k | `c:\prj\p2p\libed2k\src\kademlia\` | libtorrent-derived C++ library. Best architectural separation of the three. Boost/pre-C++11. |
+| eMule | `%EMULEBB_WORKSPACE_ROOT%\workspaces\workspace\app\emulebb-community-baseline\srchybrid\kademlia\` | Authoritative Kad2 wire format and protocol behaviour. Windows/MFC-only. |
+| aMule | `%EMULEBB_WORKSPACE_ROOT%\repos\amule\src\kademlia\` | Cross-platform port of eMule. Better code organisation. wxWidgets. |
+| libed2k | external libed2k checkout, if present | libtorrent-derived C++ library. Best architectural separation of the three. Boost/pre-C++11. |
 
 The eMule source is ground truth for Kad2 wire format and runtime behaviour. aMule is the
 portable cross-check and readability aid, not a higher authority.

@@ -4,8 +4,8 @@ Comparative implementation report for the two oracle Kad trees used by this work
 
 Authority order for Overlord porting remains:
 
-1. eMule: `c:\prj\p2p\eMule-my\deps-repos\eMule\srchybrid\kademlia\`
-2. aMule: `c:\prj\p2p\amule\src\kademlia\`
+1. eMule: `%EMULEBB_WORKSPACE_ROOT%\workspaces\workspace\app\emulebb-community-baseline\srchybrid\kademlia\`
+2. aMule: `%EMULEBB_WORKSPACE_ROOT%\repos\amule\src\kademlia\`
 
 ## Reading Rules
 
