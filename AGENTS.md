@@ -1,10 +1,15 @@
-# Agents Repo Rules
+# Rules
 
-- Follow the eMuleBB workspace policy in
-  `../emulebb-tooling/docs/WORKSPACE-POLICY.md` when this repo is checked out
-  under `EMULEBB_WORKSPACE_ROOT\repos`.
+- When checked out under `EMULEBB_WORKSPACE_ROOT\repos`, read
+  `EMULEBB_WORKSPACE_ROOT\repos\emulebb-tooling\docs\WORKSPACE-POLICY.md` first
+  (authoritative for workspace-wide rules) and start from
+  `EMULEBB_WORKSPACE_ROOT\repos\emulebb-tooling\docs\reference\AGENT-CHECKLIST.md`
+  for the repeatable operating path.
 - If the standalone p2p-overlord workspace is in use, also follow
   `../p2p-overlord-tooling/docs/WORKSPACE_POLICY.md`.
+
+Everything below is this repo's local deltas only:
+
 - Use `docs/README.md` as the canonical agents docs home.
 - Use `../p2p-overlord-be/BACKLOG.md` as the canonical active backlog.
 - Target full stock eMule `v0.72a` Kad and ED2K parity, including deprecated
@@ -18,8 +23,6 @@
 - When touching oversized or locally complex Rust, opportunistically split or
   simplify the touched area if the change is behavior-preserving, scoped, and
   covered by targeted checks.
-- Keep tracked text files normalized to UTF-8 with LF endings; the workspace
-  line-ending guard is enforced from tooling.
 - Keep public-facing Rust items documented with `///` or `//!`.
 - Treat `rustfmt` output as canonical.
 - Keep `#[allow(...)]` attributes narrow and local; remove stale allowances
